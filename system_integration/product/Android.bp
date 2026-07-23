@@ -1,0 +1,19 @@
+android_app_import {
+    name: "DpuLayerLab",
+    apk: "DpuLayerLab-release.apk",
+    privileged: true,
+    certificate: "platform",
+    dex_preopt: {
+        enabled: true,
+    },
+    required: ["DpuLayerLabPrivPermissions"],
+    product_specific: true,
+}
+
+prebuilt_etc {
+    name: "DpuLayerLabPrivPermissions",
+    src: "privapp-permissions-com.example.dpulayerlab.xml",
+    filename_from_src: true,
+    sub_dir: "permissions",
+    product_specific: true,
+}

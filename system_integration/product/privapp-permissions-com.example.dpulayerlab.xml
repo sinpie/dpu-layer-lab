@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<permissions>
+    <privapp-permissions package="com.example.dpulayerlab">
+        <permission name="android.permission.DUMP" />
+    </privapp-permissions>
+</permissions>

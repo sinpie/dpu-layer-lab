@@ -1,0 +1,42 @@
+# IDE / local SDK
+*.iml
+.idea/
+local.properties
+
+# Gradle / Android build output
+.gradle/
+**/build/
+.externalNativeBuild/
+.cxx/
+captures/
+build-artifacts/
+dist/
+*.apk
+*.apks
+*.aab
+
+# Local UI / emulator captures
+window*.xml
+*.hprof
+
+# Signing material and secrets
+*.jks
+*.keystore
+*.pk8
+*.pem
+*.p12
+*.pfx
+*.key
+keystore.properties
+signing.properties
+signing/
+secrets/
+.env
+.env.*
+!.env.example
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
