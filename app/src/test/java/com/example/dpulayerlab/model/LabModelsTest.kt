@@ -35,6 +35,23 @@ class LabModelsTest {
     }
 
     @Test
+    fun selectedMediaDecoderRoutesIncludeRequiredSbwcButExcludeRgb() {
+        val decoderRoutes = PixelRoute.entries.filter { it.usesSelectedMediaDecoder() }
+
+        assertEquals(
+            setOf(
+                PixelRoute.YUV_420,
+                PixelRoute.P010,
+                PixelRoute.SBWC_AUTO,
+                PixelRoute.SBWC_REQUIRED,
+            ),
+            decoderRoutes.toSet(),
+        )
+        assertTrue(!PixelRoute.RGB_8888.usesSelectedMediaDecoder())
+        assertTrue(!PixelRoute.RGB_565.usesSelectedMediaDecoder())
+    }
+
+    @Test
     fun runProgressIsBounded() {
         val scenario = ScenarioSpec(
             id = "test",
@@ -60,5 +77,53 @@ class LabModelsTest {
         )
         assertEquals(1f, RunProgress(scenario = scenario, elapsedMs = 2_000).overallFraction)
         assertTrue(RunProgress().overallFraction == 0f)
+    }
+
+    @Test
+    fun transitionProgressAndTargetFallbackAreSafeForUi() {
+        val target = PhaseSpec(
+            id = "target",
+            label = "target",
+            durationMs = 1_000,
+            activeLayers = 4,
+            producerFps = 120f,
+            requestedDisplayHz = 120f,
+            backend = LayerBackend.INDEPENDENT_SURFACES,
+            pixelRoute = PixelRoute.RGB_8888,
+            bufferSize = BufferSize.DISPLAY,
+            motion = MotionProfile.STATIC,
+        )
+
+        val invalid = RunProgress(
+            phase = target,
+            transitionFraction = Float.NaN,
+        )
+        assertEquals(0f, invalid.boundedTransitionFraction)
+        assertEquals(target, invalid.displayedTargetPhase)
+
+        val explicit = RunProgress(
+            phase = target.copy(activeLayers = 2),
+            targetPhase = target,
+            transitionFraction = 2f,
+        )
+        assertEquals(1f, explicit.boundedTransitionFraction)
+        assertEquals(target, explicit.displayedTargetPhase)
+    }
+
+    @Test
+    fun producerTeardownFailureIsAVisibleTerminalReason() {
+        assertEquals(
+            "generation=7 teardown timeout",
+            terminalRunReason(
+                listOf(
+                    RunEvent(1L, "PHASE_END", "done"),
+                    RunEvent(
+                        2L,
+                        "PRODUCER_TEARDOWN_UNCONFIRMED",
+                        "generation=7 teardown timeout",
+                    ),
+                ),
+            ),
+        )
     }
 }

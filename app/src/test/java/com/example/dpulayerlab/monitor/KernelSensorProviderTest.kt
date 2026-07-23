@@ -7,6 +7,28 @@ import org.junit.Test
 
 class KernelSensorProviderTest {
     @Test
+    fun directBusyPercentAcceptsDecimalButNotCounterPairs() {
+        assertEquals(37.5f, parseDirectUtilizationPercent("37.5 %")!!, 0.0001f)
+        assertEquals(0f, parseDirectUtilizationPercent("0")!!, 0.0001f)
+        assertNull(parseDirectUtilizationPercent("23 100"))
+        assertNull(parseDirectUtilizationPercent("-1"))
+        assertNull(parseDirectUtilizationPercent("101"))
+        assertNull(parseDirectUtilizationPercent("NaN"))
+    }
+
+    @Test
+    fun scalarCounterParserRejectsAmbiguousAndOverflowingLines() {
+        assertEquals(42L, parseSingleLongToken(" 42\n"))
+        assertEquals(42L, parseSingleLongToken("+42"))
+        assertEquals(-1L, parseSingleLongToken("-1"))
+        assertNull(parseSingleLongToken("underruns: 42"))
+        assertNull(parseSingleLongToken("error 22"))
+        assertNull(parseSingleLongToken("42 43"))
+        assertNull(parseSingleLongToken("1.5"))
+        assertNull(parseSingleLongToken("9223372036854775808"))
+    }
+
+    @Test
     fun cumulativeBusyCountersNeedSameSourceBaseline() {
         val first = parseBusyPercent("100 200", "/sys/gpu-a", previous = null)!!
         assertNull(first.percent)
@@ -48,11 +70,76 @@ class KernelSensorProviderTest {
     }
 
     @Test
+    fun dpuFrequencyValidationRejectsNegativeAndImplausibleValues() {
+        assertEquals(0L, 0L.validDpuFrequencyHz())
+        assertEquals(2_000_000_000L, 2_000_000_000L.validDpuFrequencyHz())
+        assertNull((-1L).validDpuFrequencyHz())
+        assertNull(Long.MAX_VALUE.validDpuFrequencyHz())
+    }
+
+    @Test
+    fun gpuFrequencyNormalizationUsesExplicitUnitsAndRejectsImplausibleValues() {
+        assertEquals(
+            850f,
+            normalizeGpuFrequencyMhz(850_000_000L, ProbeFrequencyUnit.HZ)!!,
+            0.0001f,
+        )
+        assertEquals(
+            800f,
+            normalizeGpuFrequencyMhz(800_000L, ProbeFrequencyUnit.KHZ)!!,
+            0.0001f,
+        )
+        assertEquals(
+            850f,
+            normalizeGpuFrequencyMhz(850L, ProbeFrequencyUnit.MHZ)!!,
+            0f,
+        )
+        assertNull(normalizeGpuFrequencyMhz(Long.MAX_VALUE, ProbeFrequencyUnit.HZ))
+        assertNull(normalizeGpuFrequencyMhz(20_001L, ProbeFrequencyUnit.MHZ))
+        assertNull(normalizeGpuFrequencyMhz(-1L, ProbeFrequencyUnit.KHZ))
+        assertTrue(
+            frequencyProbeSource("/sys/vendor/gpu_clock", ProbeFrequencyUnit.KHZ)
+                .endsWith("[input=KHZ]"),
+        )
+    }
+
+    @Test
+    fun configuredGpuFrequencyKeysAreTypedAndConflictsRemainVisible() {
+        val typed = configuredGpuFrequencyProbes(
+            mapOf("gpu_frequency_khz" to "/sys/vendor/gpu_clock"),
+        )
+        assertEquals(
+            listOf(
+                ConfiguredGpuFrequencyProbe(
+                    path = "/sys/vendor/gpu_clock",
+                    unit = ProbeFrequencyUnit.KHZ,
+                ),
+            ),
+            typed,
+        )
+
+        val legacy = configuredGpuFrequencyProbes(
+            mapOf("gpu_frequency" to "/sys/vendor/legacy_clock"),
+        )
+        assertEquals(ProbeFrequencyUnit.HZ, legacy.single().unit)
+
+        val conflict = configuredGpuFrequencyProbes(
+            mapOf(
+                "gpu_frequency_hz" to "/sys/vendor/gpu_clock",
+                "gpu_frequency_khz" to "/sys/vendor/gpu_clock",
+            ),
+        )
+        assertEquals(2, conflict.size)
+    }
+
+    @Test
     fun customConfigIsAllowlistedAndBounded() {
         val parsed = parseCustomProbeConfig(
             listOf(
                 "gpu_busy=/sys/class/kgsl/kgsl-3d0/gpubusy",
+                "gpu_frequency_khz=/sys/vendor/gpu_clock",
                 "dpu_busy=/proc/vendor/dpu_busy",
+                "dpu_frequency_hz=/sys/vendor/dpu/cur_freq",
                 "unknown=/sys/secret",
                 "bus_busy=/sys/../data/not-allowed",
             ),
@@ -61,7 +148,9 @@ class KernelSensorProviderTest {
         assertEquals(
             mapOf(
                 "gpu_busy" to "/sys/class/kgsl/kgsl-3d0/gpubusy",
+                "gpu_frequency_khz" to "/sys/vendor/gpu_clock",
                 "dpu_busy" to "/proc/vendor/dpu_busy",
+                "dpu_frequency_hz" to "/sys/vendor/dpu/cur_freq",
             ),
             parsed,
         )

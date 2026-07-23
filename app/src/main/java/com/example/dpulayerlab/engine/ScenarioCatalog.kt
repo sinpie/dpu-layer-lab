@@ -10,17 +10,31 @@ import com.example.dpulayerlab.model.PixelRoute
 import com.example.dpulayerlab.model.RiskLevel
 import com.example.dpulayerlab.model.ScenarioCategory
 import com.example.dpulayerlab.model.ScenarioSpec
+import com.example.dpulayerlab.model.TransitionMode
+import com.example.dpulayerlab.model.TransitionSpec
+import com.example.dpulayerlab.model.usesSelectedMediaDecoder
+import java.util.concurrent.atomic.AtomicLong
 
 object ScenarioCatalog {
+    private val customIdSequence = AtomicLong()
+
     val presets: List<ScenarioSpec> = listOf(
         baseline(),
+        dvfsSingleLayerWake(),
+        dvfsCompositionShock(),
+        midLoadPerturbation(),
+        dvfsVideoShock(),
         planeStaircase(),
         compositionPivot(),
         transformStorm(),
         mixed4k(),
-        video8k(),
+        video8k30(),
+        video8k60P010(),
         refreshPacing(),
         resourcePulse(),
+        instantBurstTransitions(),
+        gradualTransitions(),
+        waveRecoveryTransitions(),
         npuCrossLoad(),
         adaptiveHunt(),
         sbwcMatrix(),
@@ -39,32 +53,108 @@ object ScenarioCatalog {
         bufferSize: BufferSize,
         motion: MotionProfile,
         loads: LoadSetpoints,
-    ) = ScenarioSpec(
-        id = "custom-${System.currentTimeMillis()}",
-        name = "Custom Lab",
-        description = "사용자가 지정한 단일 phase 테스트",
-        category = ScenarioCategory.MIXED,
-        risk = if (loads.memory > 0.75f || layers > 12) RiskLevel.HIGH else RiskLevel.MEDIUM,
-        tags = setOf("custom", "${layers}L", "${producerFps.toInt()}fps"),
-        phases = listOf(
-            phase(
-                id = "custom",
-                label = "Custom workload",
-                seconds = durationSeconds,
-                layers = layers,
-                fps = producerFps,
-                hz = requestedHz,
-                backend = backend,
-                route = pixelRoute,
-                size = bufferSize,
-                motion = motion,
-                loads = loads.normalized(),
-                alpha = backend != LayerBackend.INDEPENDENT_SURFACES,
-                gl = loads.gpu > 0.05f,
+        transition: TransitionSpec = TransitionSpec(),
+    ): ScenarioSpec {
+        val normalizedLoads = loads.normalized()
+        val flattenedInputNormalized =
+            backend == LayerBackend.FLATTENED_TEXTURE &&
+                (
+                    pixelRoute != PixelRoute.RGB_8888 ||
+                        bufferSize != BufferSize.DISPLAY
+                    )
+        val effectivePixelRoute = if (backend == LayerBackend.FLATTENED_TEXTURE) {
+            PixelRoute.RGB_8888
+        } else {
+            pixelRoute
+        }
+        val effectiveBufferSize = if (backend == LayerBackend.FLATTENED_TEXTURE) {
+            BufferSize.DISPLAY
+        } else {
+            bufferSize
+        }
+        // Any explicitly requested GPU load needs a GPU-backed producer. Treating a small,
+        // non-zero value as zero made the custom control look accepted while independent
+        // Surface backends had nowhere to execute that workload.
+        val includeGlTail =
+            normalizedLoads.gpu > 0f && backend != LayerBackend.FLATTENED_TEXTURE
+        val needsDedicatedPrimary =
+            backend != LayerBackend.FLATTENED_TEXTURE &&
+                (
+                    effectivePixelRoute.usesSelectedMediaDecoder() ||
+                        effectiveBufferSize != BufferSize.DISPLAY
+                    )
+        val promotedToPrimaryAndGlTail =
+            layers == 1 && includeGlTail && needsDedicatedPrimary
+        val effectiveLayers = if (promotedToPrimaryAndGlTail) 2 else layers
+        val topologyNote = if (promotedToPrimaryAndGlTail) {
+            " 요청 1L은 선택한 primary와 GPU 출력을 모두 보존하도록 " +
+                "2L(primary + GL tail)로 명시적으로 구성합니다."
+        } else {
+            ""
+        }
+        val topologyTags = if (promotedToPrimaryAndGlTail) {
+            setOf("requested 1L", "primary + GL tail")
+        } else {
+            emptySet()
+        }
+        val flattenedNote = if (flattenedInputNormalized) {
+            " Flattened Texture는 display-sized RGBA 단일 producer이므로 요청한 " +
+                "${bufferSize.label}/${pixelRoute.label} 입력은 DISPLAY/RGB_8888로 " +
+                "명시적으로 정규화했습니다. decoder 또는 4K/8K BufferQueue 부하가 아닙니다."
+        } else {
+            ""
+        }
+        val flattenedTags = if (flattenedInputNormalized) {
+            setOf("flattened DISPLAY/RGB", "input normalized")
+        } else {
+            emptySet()
+        }
+
+        return ScenarioSpec(
+            id = "custom-${System.currentTimeMillis()}-${customIdSequence.incrementAndGet()}",
+            name = "Custom Lab",
+            description =
+                "사용자가 지정한 단일 phase 테스트.$topologyNote$flattenedNote",
+            category = ScenarioCategory.MIXED,
+            risk = if (
+                normalizedLoads.memory > 0.75f || effectiveLayers > 12
+            ) {
+                RiskLevel.HIGH
+            } else {
+                RiskLevel.MEDIUM
+            },
+            tags = setOf(
+                "custom",
+                "${effectiveLayers}L",
+                "${producerFps.toInt()}fps",
+            ) + topologyTags + flattenedTags,
+            phases = listOf(
+                phase(
+                    id = "custom",
+                    label = when {
+                        promotedToPrimaryAndGlTail ->
+                            "Custom workload · requested 1L → 2L primary + GL tail"
+                        flattenedInputNormalized ->
+                            "Custom workload · flattened DISPLAY/RGB normalization"
+                        else -> "Custom workload"
+                    },
+                    seconds = durationSeconds,
+                    layers = effectiveLayers,
+                    fps = producerFps,
+                    hz = requestedHz,
+                    backend = backend,
+                    route = effectivePixelRoute,
+                    size = effectiveBufferSize,
+                    motion = motion,
+                    loads = normalizedLoads,
+                    alpha = backend != LayerBackend.INDEPENDENT_SURFACES,
+                    gl = includeGlTail,
+                    transition = transition,
+                ),
             ),
-        ),
-        isCustom = true,
-    )
+            isCustom = true,
+        )
+    }
 
     private fun baseline() = ScenarioSpec(
         id = "baseline-display-modes",
@@ -78,6 +168,171 @@ object ScenarioCatalog {
             phase("b90", "90 Hz request", 5, 1, 90f, 90f),
             phase("b120", "120 Hz request", 5, 1, 120f, 120f),
             phase("recover", "60 Hz recovery", 4, 1, 60f, 60f),
+        ),
+    )
+
+    private fun dvfsSingleLayerWake() = ScenarioSpec(
+        id = "dvfs-single-layer-wake",
+        name = "Low-clock Single-layer Wake",
+        description = "긴 1-layer 저부하 구간으로 governor 하강을 유도한 뒤 같은 Surface의 FPS·주사율·확대/회전을 즉시 올려 DPU clock ramp 지연을 관찰합니다. 앱이 DPU clock을 강제로 고정하지는 않습니다.",
+        category = ScenarioCategory.ADAPTIVE,
+        risk = RiskLevel.MEDIUM,
+        tags = setOf("DVFS", "1 layer", "idle→burst", "clock ramp"),
+        requirements = setOf("DPU frequency counter 권장"),
+        phases = listOf(
+            phase("sl-settle-a", "Governor settle · 1L 30fps", 10, 1, 30f, 60f),
+            phase(
+                "sl-wake-a",
+                "Instant 120fps zoom/rotate",
+                4,
+                1,
+                120f,
+                120f,
+                motion = MotionProfile.ZOOM_PAN,
+            ),
+            phase("sl-settle-b", "Second low-power settle", 8, 1, 30f, 60f),
+            phase(
+                "sl-wake-b",
+                "Instant 120fps transform",
+                4,
+                1,
+                120f,
+                120f,
+                motion = MotionProfile.ROTATE,
+            ),
+            phase("sl-recover", "Clock/load recovery", 6, 1, 30f, 60f),
+        ),
+    )
+
+    private fun dvfsCompositionShock() = ScenarioSpec(
+        id = "dvfs-composition-shock",
+        name = "Idle → Composition Shock",
+        description = "저부하 governor settle 직후 HWC-friendly plane 증가, alpha/client 합성, DRAM+3D 충돌을 각각 짧게 인가하고 완전히 해제합니다.",
+        category = ScenarioCategory.ADAPTIVE,
+        risk = RiskLevel.HIGH,
+        tags = setOf("DVFS", "HWC", "client", "DRAM", "instant"),
+        requirements = setOf("DPU/DDR frequency counter 권장"),
+        phases = listOf(
+            phase("cs-settle-a", "Governor settle", 10, 1, 30f, 60f),
+            phase(
+                "cs-plane",
+                "12-plane instant shock",
+                4,
+                12,
+                120f,
+                120f,
+                motion = MotionProfile.PARALLAX,
+            ),
+            phase("cs-release-a", "Plane release", 7, 1, 30f, 60f),
+            phase(
+                "cs-client",
+                "Alpha/client composition shock",
+                4,
+                12,
+                120f,
+                120f,
+                backend = LayerBackend.MIXED_SURFACE_TEXTURE,
+                motion = MotionProfile.TRANSFORM_STORM,
+                alpha = true,
+            ),
+            phase("cs-release-b", "Client release", 7, 1, 30f, 60f),
+            phase(
+                "cs-dram",
+                "DPU + DRAM + 3D collision",
+                5,
+                8,
+                120f,
+                120f,
+                backend = LayerBackend.MIXED_SURFACE_TEXTURE,
+                motion = MotionProfile.ZOOM_PAN,
+                loads = LoadSetpoints(cpu = 0.35f, memory = 0.9f, gpu = 0.7f),
+                alpha = true,
+                gl = true,
+            ),
+            phase("cs-recover", "Full recovery", 8, 1, 30f, 60f),
+        ),
+    )
+
+    private fun midLoadPerturbation() = ScenarioSpec(
+        id = "mid-load-perturbation",
+        name = "Mid-load Perturbation Matrix",
+        description = "최대 부하가 아닌 4~8 layer·60~90fps 구간에서 scroll, rotate, alpha, layer 증가와 CPU/DRAM 간섭을 한 항목씩 바꿔 취약점을 분리합니다.",
+        category = ScenarioCategory.ADAPTIVE,
+        risk = RiskLevel.MEDIUM,
+        tags = setOf("mid load", "isolation", "60–90fps", "A/B"),
+        phases = listOf(
+            phase("mp-base", "4L static reference", 6, 4, 60f, 60f),
+            phase("mp-scroll", "Scroll only", 5, 4, 60f, 60f, motion = MotionProfile.SCROLL),
+            phase("mp-rotate", "Rotate only", 5, 4, 60f, 60f, motion = MotionProfile.ROTATE),
+            phase("mp-layers", "8L plane step", 5, 8, 60f, 60f, motion = MotionProfile.PARALLAX),
+            phase(
+                "mp-alpha",
+                "8L alpha/client step",
+                5,
+                8,
+                60f,
+                60f,
+                backend = LayerBackend.MIXED_SURFACE_TEXTURE,
+                motion = MotionProfile.ZOOM_PAN,
+                alpha = true,
+            ),
+            phase(
+                "mp-90",
+                "8L 90fps pacing",
+                5,
+                8,
+                90f,
+                90f,
+                motion = MotionProfile.SCROLL,
+            ),
+            phase(
+                "mp-bus",
+                "Moderate CPU + DRAM contention",
+                6,
+                6,
+                60f,
+                60f,
+                loads = LoadSetpoints(cpu = 0.45f, memory = 0.6f),
+            ),
+            phase("mp-recover", "Reference recovery", 6, 4, 60f, 60f),
+        ),
+    )
+
+    private fun dvfsVideoShock() = ScenarioSpec(
+        id = "dvfs-video-shock",
+        name = "Idle → 4K Video Shock",
+        description = "RGB 1-layer settle에서 4K decoder-to-Surface와 RGB overlay로 즉시 전환해 codec/DPU/DRAM 동시 ramp를 확인합니다. 영상이 없으면 visual proxy로 실행됩니다.",
+        category = ScenarioCategory.VIDEO_FORMAT,
+        risk = RiskLevel.HIGH,
+        tags = setOf("DVFS", "4K", "YUV", "decoder", "overlay"),
+        requirements = setOf("4K local media 권장", "DPU/DDR frequency counter 권장"),
+        phases = listOf(
+            phase("vs-settle-a", "Governor settle", 10, 1, 30f, 60f),
+            phase(
+                "vs-yuv",
+                "4K YUV + 4 overlays shock",
+                5,
+                5,
+                60f,
+                120f,
+                route = PixelRoute.YUV_420,
+                size = BufferSize.UHD_4K,
+                motion = MotionProfile.ZOOM_PAN,
+            ),
+            phase("vs-release", "Decoder/display release", 8, 1, 30f, 60f),
+            phase(
+                "vs-bus",
+                "4K YUV + DRAM collision",
+                5,
+                6,
+                60f,
+                120f,
+                route = PixelRoute.YUV_420,
+                size = BufferSize.UHD_4K,
+                motion = MotionProfile.PARALLAX,
+                loads = LoadSetpoints(cpu = 0.25f, memory = 0.85f),
+            ),
+            phase("vs-recover", "Post-video recovery", 8, 1, 30f, 60f),
         ),
     )
 
@@ -132,7 +387,6 @@ object ScenarioCatalog {
                 motion = MotionProfile.TRANSFORM_STORM,
                 alpha = true,
                 loads = LoadSetpoints(gpu = 0.65f),
-                gl = true,
             ),
             phase("restore", "HWC recovery", 5, 4, 60f, 60f),
         ),
@@ -199,14 +453,15 @@ object ScenarioCatalog {
         ),
     )
 
-    private fun video8k() = ScenarioSpec(
+    private fun video8k30() = ScenarioSpec(
         id = "8k-decoder-pressure",
-        name = "8K Decoder Pressure",
-        description = "8K YUV 영상 Surface와 6개 overlay를 결합합니다. 장치 codec/asset capability를 반드시 확인합니다.",
+        name = "8K30 YUV Decoder Pressure",
+        description = "8K30 YUV 영상 Surface와 6개 overlay를 결합합니다. " +
+            "장치의 8K30 codec/asset capability를 반드시 확인합니다.",
         category = ScenarioCategory.VIDEO_FORMAT,
         risk = RiskLevel.HIGH,
-        tags = setOf("8K", "HEVC", "AV1", "codec"),
-        requirements = setOf("8K decoder", "8K local media"),
+        tags = setOf("8K30", "YUV", "HEVC", "AV1", "codec"),
+        requirements = setOf("8K30 decoder", "8K 30fps local media"),
         phases = listOf(
             phase(
                 "8k30",
@@ -219,11 +474,26 @@ object ScenarioCatalog {
                 size = BufferSize.UHD_8K,
                 motion = MotionProfile.ZOOM_PAN,
             ),
+            phase("release", "Decoder recovery", 6, 2, 60f, 60f),
+        ),
+    )
+
+    private fun video8k60P010() = ScenarioSpec(
+        id = "8k60-p010-pressure",
+        name = "8K60 P010 Decoder Pressure",
+        description = "8K60 10-bit P010 영상 Surface와 6개 overlay 및 GPU tail을 결합합니다. " +
+            "장치의 8K60 10-bit codec/asset capability를 반드시 확인합니다.",
+        category = ScenarioCategory.VIDEO_FORMAT,
+        risk = RiskLevel.HIGH,
+        tags = setOf("8K60", "P010", "10-bit", "HEVC", "AV1", "codec"),
+        requirements = setOf("8K60 10-bit decoder", "8K 60fps 10-bit local media"),
+        phases = listOf(
             phase(
                 "8k60",
                 "8K60 + overlays",
                 12,
-                7,
+                // Decoder primary + six RGB overlays + one GL tail.
+                8,
                 60f,
                 120f,
                 route = PixelRoute.P010,
@@ -294,6 +564,165 @@ object ScenarioCatalog {
         ),
     )
 
+    private fun instantBurstTransitions() = ScenarioSpec(
+        id = "instant-burst-transitions",
+        name = "Instant Step & Burst",
+        description = "layer·FPS·교차 부하를 즉시 켜고 끈 뒤 동일 topology에서 짧은 burst duty cycle을 반복합니다.",
+        category = ScenarioCategory.TRANSITION,
+        risk = RiskLevel.HIGH,
+        tags = setOf("step", "burst", "latency", "release"),
+        phases = listOf(
+            phase("ib-base", "Quiet baseline", 4, 4, 60f, 60f),
+            phase(
+                "ib-step-on",
+                "Instant contention on",
+                5,
+                10,
+                120f,
+                120f,
+                backend = LayerBackend.MIXED_SURFACE_TEXTURE,
+                motion = MotionProfile.TRANSFORM_STORM,
+                loads = LoadSetpoints(cpu = 0.55f, memory = 0.8f, gpu = 0.65f),
+                alpha = true,
+                gl = true,
+                transition = TransitionSpec(TransitionMode.STEP),
+            ),
+            phase("ib-step-off", "Instant release", 4, 4, 60f, 60f, gl = true),
+            phase(
+                "ib-burst",
+                "25% duty contention bursts",
+                12,
+                10,
+                120f,
+                120f,
+                motion = MotionProfile.PARALLAX,
+                loads = LoadSetpoints(cpu = 0.65f, memory = 0.9f, gpu = 0.55f),
+                gl = true,
+                transition = TransitionSpec(
+                    mode = TransitionMode.PULSE_BURST,
+                    cycleMs = 2_000L,
+                    dutyCycle = 0.25f,
+                ),
+            ),
+            phase("ib-recover", "Burst recovery", 5, 4, 60f, 60f),
+        ),
+    )
+
+    private fun gradualTransitions() = ScenarioSpec(
+        id = "gradual-load-transitions",
+        name = "Linear Ramp & Staircase",
+        description = "부하를 천천히 올리고 내리는 선형 ramp와 제한된 단계의 staircase를 비교합니다.",
+        category = ScenarioCategory.TRANSITION,
+        risk = RiskLevel.HIGH,
+        tags = setOf("linear", "staircase", "up", "down"),
+        phases = listOf(
+            phase("gt-base", "Quiet baseline", 4, 4, 60f, 60f, gl = true),
+            phase(
+                "gt-ramp-up",
+                "Linear ramp up",
+                10,
+                12,
+                120f,
+                120f,
+                motion = MotionProfile.PARALLAX,
+                loads = LoadSetpoints(cpu = 0.55f, memory = 0.85f, gpu = 0.5f),
+                gl = true,
+                transition = TransitionSpec(
+                    mode = TransitionMode.LINEAR_RAMP,
+                    transitionDurationMs = 8_000L,
+                ),
+            ),
+            phase(
+                "gt-ramp-down",
+                "Linear ramp down",
+                8,
+                4,
+                60f,
+                60f,
+                gl = true,
+                transition = TransitionSpec(
+                    mode = TransitionMode.LINEAR_RAMP,
+                    transitionDurationMs = 6_000L,
+                ),
+            ),
+            phase(
+                "gt-stairs-up",
+                "Six-level load increase",
+                10,
+                14,
+                120f,
+                120f,
+                motion = MotionProfile.SCROLL,
+                loads = LoadSetpoints(cpu = 0.45f, memory = 0.9f, gpu = 0.55f),
+                gl = true,
+                transition = TransitionSpec(
+                    mode = TransitionMode.STAIRCASE,
+                    transitionDurationMs = 7_200L,
+                    stepCount = 6,
+                ),
+            ),
+            phase(
+                "gt-stairs-down",
+                "Six-level load release",
+                8,
+                4,
+                60f,
+                60f,
+                gl = true,
+                transition = TransitionSpec(
+                    mode = TransitionMode.STAIRCASE,
+                    transitionDurationMs = 6_000L,
+                    stepCount = 6,
+                ),
+            ),
+            phase("gt-recover", "Stable recovery", 4, 4, 60f, 60f),
+        ),
+    )
+
+    private fun waveRecoveryTransitions() = ScenarioSpec(
+        id = "wave-soak-recovery",
+        name = "Triangle Wave & Soak Recovery",
+        description = "삼각파 반복과 attack/hold/release soak로 점진적인 bus 획득·해제 및 복구 지연을 관찰합니다.",
+        category = ScenarioCategory.TRANSITION,
+        risk = RiskLevel.HIGH,
+        tags = setOf("triangle", "wave", "soak", "recovery"),
+        phases = listOf(
+            phase("wr-base", "Quiet baseline", 4, 4, 60f, 60f, gl = true),
+            phase(
+                "wr-triangle",
+                "Two triangle load cycles",
+                12,
+                10,
+                120f,
+                120f,
+                motion = MotionProfile.ZOOM_PAN,
+                loads = LoadSetpoints(cpu = 0.5f, memory = 0.85f, gpu = 0.65f),
+                gl = true,
+                transition = TransitionSpec(
+                    mode = TransitionMode.TRIANGLE_WAVE,
+                    cycleMs = 6_000L,
+                ),
+            ),
+            phase("wr-reset", "Wave reset", 3, 4, 60f, 60f, gl = true),
+            phase(
+                "wr-soak",
+                "3s attack · 8s hold · 3s release",
+                14,
+                12,
+                120f,
+                120f,
+                motion = MotionProfile.TRANSFORM_STORM,
+                loads = LoadSetpoints(cpu = 0.55f, memory = 0.9f, gpu = 0.7f),
+                gl = true,
+                transition = TransitionSpec(
+                    mode = TransitionMode.SOAK_RECOVERY,
+                    transitionDurationMs = 3_000L,
+                ),
+            ),
+            phase("wr-recover", "Post-soak recovery", 5, 4, 60f, 60f),
+        ),
+    )
+
     private fun npuCrossLoad() = ScenarioSpec(
         id = "npu-cross-load",
         name = "NPU Cross-load",
@@ -344,7 +773,12 @@ object ScenarioCatalog {
                 120f,
                 backend = if (layers < 8) LayerBackend.INDEPENDENT_SURFACES else LayerBackend.MIXED_SURFACE_TEXTURE,
                 motion = MotionProfile.TRANSFORM_STORM,
-                loads = LoadSetpoints(memory = (index * 0.13f).coerceAtMost(0.9f), shape = LoadShape.RAMP),
+                // Hold each boundary setpoint through the end-of-phase counter sample. A legacy
+                // 6 s sawtooth ramp inside this 7 s phase reset before that boundary.
+                loads = LoadSetpoints(
+                    memory = (index * 0.13f).coerceAtMost(0.9f),
+                    shape = LoadShape.STEADY,
+                ),
                 alpha = layers >= 8,
             )
         } + phase("hunt-recover", "Recovery check", 8, 2, 60f, 60f),
@@ -353,11 +787,12 @@ object ScenarioCatalog {
     private fun sbwcMatrix() = ScenarioSpec(
         id = "sbwc-matrix",
         name = "Linear ↔ SBWC A/B",
-        description = "동일 콘텐츠를 linear/YUV/SBWC로 비교합니다. SBWC 검증은 vendor gralloc adapter가 필수입니다.",
+        description = "YUV와 SBWC는 선택한 동일 decoder 콘텐츠로 비교하고 RGB linear는 " +
+            "procedural reference로 사용합니다. SBWC 검증은 vendor gralloc adapter가 필수입니다.",
         category = ScenarioCategory.VIDEO_FORMAT,
         risk = RiskLevel.MEDIUM,
         tags = setOf("SBWC", "compression", "A/B"),
-        requirements = setOf("SBWC vendor adapter"),
+        requirements = setOf("SBWC vendor adapter", "4K local media 권장"),
         phases = listOf(
             phase("linear", "RGB linear reference", 8, 6, 60f, 120f, route = PixelRoute.RGB_8888, size = BufferSize.UHD_4K),
             phase("yuv", "YUV codec reference", 8, 6, 60f, 120f, route = PixelRoute.YUV_420, size = BufferSize.UHD_4K),
@@ -410,6 +845,7 @@ object ScenarioCatalog {
         loads: LoadSetpoints = LoadSetpoints(),
         alpha: Boolean = false,
         gl: Boolean = false,
+        transition: TransitionSpec = TransitionSpec(),
     ) = PhaseSpec(
         id = id,
         label = label,
@@ -424,5 +860,6 @@ object ScenarioCatalog {
         workloads = loads,
         alphaOverlap = alpha,
         includeGlLayer = gl,
+        transition = transition,
     )
 }

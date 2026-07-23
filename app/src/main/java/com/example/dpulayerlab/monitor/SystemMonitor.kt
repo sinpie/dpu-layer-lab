@@ -15,10 +15,17 @@ import com.example.dpulayerlab.model.SensorReading
 import com.example.dpulayerlab.model.TelemetrySnapshot
 import com.example.dpulayerlab.model.PixelRoute
 import com.example.dpulayerlab.vendor.VendorBridge
+import com.example.dpulayerlab.vendor.VendorShutdownResult
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+
+enum class CompressionControlResult {
+    APPLIED,
+    NO_ADAPTER,
+    REJECTED_OR_TIMEOUT,
+}
 
 class SystemMonitor(
     private val context: Context,
@@ -71,23 +78,26 @@ class SystemMonitor(
         lastWallMs = now
 
         val memoryInfo = ActivityManager.MemoryInfo().also(activityManager::getMemoryInfo)
-        val totalMb = memoryInfo.totalMem / 1_048_576f
-        val availableMb = memoryInfo.availMem / 1_048_576f
-        val usedPercent = if (totalMb > 0f && availableMb >= 0f) {
-            ((totalMb - availableMb) * 100f / totalMb).coerceIn(0f, 100f)
-        } else {
-            null
-        }
-        val appPssMb = Debug.getPss() / 1_024f
+        val memory = normalizedMemoryMetrics(
+            totalBytes = memoryInfo.totalMem,
+            availableBytes = memoryInfo.availMem,
+            appPssKilobytes = Debug.getPss().toLong(),
+        )
 
         val hz = display?.refreshRate?.takeIf { it.isFinite() && it > 0f }
         hz?.let(frameTracker::updateExpectedRefresh)
-        val kernel = kernelSensors.sample()
-        val vendor = vendorBridge.snapshot()
 
         compositionSampleCounter++
         if (compositionSampleCounter == 1 || compositionSampleCounter % 5 == 0) {
             lastComposition = surfaceFlinger.sample()
+        }
+        // Exact counters are intentionally sampled after the potentially slow SurfaceFlinger
+        // probe. A caller waiting for a post-warm-up baseline can then start its first phase
+        // immediately after this sample without charging probe latency to that phase.
+        val vendor = vendorBridge.snapshot()
+        val kernel = kernelSensors.sample()
+        val vendorSource = vendor?.let {
+            vendorServiceSource(it.apiVersion, it.serviceSession)
         }
 
         val vendorDpu = vendor?.dpuUtilization?.validUtilizationPercent()
@@ -100,7 +110,7 @@ class SystemMonitor(
                         "DPU underrun",
                         underrunCount.toString(),
                         MetricQuality.HARDWARE_COUNTER,
-                        "IDpuLabVendorService v${vendor.apiVersion}",
+                        checkNotNull(vendorSource),
                     ),
                 )
             }
@@ -111,7 +121,7 @@ class SystemMonitor(
                         "DPU busy",
                         "$dpu%",
                         MetricQuality.HARDWARE_COUNTER,
-                        "IDpuLabVendorService",
+                        checkNotNull(vendorSource),
                     ),
                 )
             }
@@ -152,6 +162,30 @@ class SystemMonitor(
         val generatedGbps = normalizedGigabitsPerSecond(generatedBytes, rateDeltaMs)
         val missedFrames = frameTracker.totalMissedFrames()
         val thermalStatus = powerManager.currentThermalStatus
+        val vendorDeviceLayers = vendor?.deviceLayers
+        val vendorClientLayers = vendor?.clientLayers
+        val hwcDeviceLayers = vendorDeviceLayers ?: lastComposition.deviceLayers
+        val hwcClientLayers = vendorClientLayers ?: lastComposition.clientLayers
+        val hwcDeviceLayersQuality = when {
+            vendorDeviceLayers != null -> MetricQuality.HARDWARE_COUNTER
+            lastComposition.deviceLayers != null -> MetricQuality.SYSTEM_SERVICE
+            else -> MetricQuality.UNAVAILABLE
+        }
+        val hwcClientLayersQuality = when {
+            vendorClientLayers != null -> MetricQuality.HARDWARE_COUNTER
+            lastComposition.clientLayers != null -> MetricQuality.SYSTEM_SERVICE
+            else -> MetricQuality.UNAVAILABLE
+        }
+        val hwcDeviceLayersSource = when {
+            vendorDeviceLayers != null -> checkNotNull(vendorSource)
+            lastComposition.deviceLayers != null -> lastComposition.source
+            else -> ""
+        }
+        val hwcClientLayersSource = when {
+            vendorClientLayers != null -> checkNotNull(vendorSource)
+            lastComposition.clientLayers != null -> lastComposition.source
+            else -> ""
+        }
 
         TelemetrySnapshot(
             monotonicMs = now,
@@ -163,9 +197,15 @@ class SystemMonitor(
             appCpu = appCpu?.let {
                 Gauge(it, "%", MetricQuality.MEASURED, "Process.getElapsedCpuTime")
             } ?: Gauge(source = "Process.getElapsedCpuTime"),
-            memoryUsed = Gauge(usedPercent, "%", MetricQuality.SYSTEM_SERVICE, "ActivityManager"),
-            memoryAvailable = Gauge(availableMb, " MB", MetricQuality.SYSTEM_SERVICE, "ActivityManager"),
-            appPss = Gauge(appPssMb, " MB", MetricQuality.MEASURED, "Debug.getPss"),
+            memoryUsed = memory.usedPercent?.let {
+                Gauge(it, "%", MetricQuality.SYSTEM_SERVICE, "ActivityManager")
+            } ?: Gauge(source = "ActivityManager"),
+            memoryAvailable = memory.availableMb?.let {
+                Gauge(it, " MB", MetricQuality.SYSTEM_SERVICE, "ActivityManager")
+            } ?: Gauge(source = "ActivityManager"),
+            appPss = memory.appPssMb?.let {
+                Gauge(it, " MB", MetricQuality.MEASURED, "Debug.getPss")
+            } ?: Gauge(source = "Debug.getPss"),
             displayHz = hz?.let {
                 Gauge(it, " Hz", MetricQuality.SYSTEM_SERVICE, "Display.getRefreshRate")
             } ?: Gauge(source = "Display.getRefreshRate"),
@@ -174,31 +214,56 @@ class SystemMonitor(
             } ?: Gauge(source = "primary BufferQueue producer · sample baseline pending"),
             missedFrames = missedFrames,
             suspectedUnderruns = missedFrames,
+            suspectedUnderrunQuality = MetricQuality.PROXY,
+            suspectedUnderrunSource = "FrameTracker · Choreographer deadline miss",
             exactUnderruns = vendor?.underrunCount?.takeIf { it >= 0L } ?: kernel.exactUnderruns,
             exactUnderrunSource = if (vendor?.underrunCount?.let { it >= 0L } == true) {
-                "IDpuLabVendorService v${vendor.apiVersion}"
+                vendorSource
             } else {
                 kernel.exactUnderrunSource
+            },
+            exactUnderrunQuality = when {
+                vendor?.underrunCount?.let { it >= 0L } == true ->
+                    MetricQuality.HARDWARE_COUNTER
+                kernel.exactUnderruns != null && !kernel.exactUnderrunSource.isNullOrBlank() ->
+                    MetricQuality.KERNEL
+                else -> MetricQuality.UNAVAILABLE
             },
             gpuBusy = kernel.gpuBusy,
             gpuFrequency = kernel.gpuFrequency,
             busBusy = vendorBus?.let {
-                Gauge(it, "%", MetricQuality.HARDWARE_COUNTER, "IDpuLabVendorService")
+                Gauge(it, "%", MetricQuality.HARDWARE_COUNTER, checkNotNull(vendorSource))
             } ?: kernel.busBusy,
             generatedBandwidth = generatedGbps?.let {
                 Gauge(it, " Gbps", MetricQuality.MEASURED, "memory load generator")
             } ?: Gauge(source = "memory load generator · sample baseline pending"),
             dpuBusy = vendorDpu?.let {
-                Gauge(it, "%", MetricQuality.HARDWARE_COUNTER, "IDpuLabVendorService")
+                Gauge(it, "%", MetricQuality.HARDWARE_COUNTER, checkNotNull(vendorSource))
             } ?: kernel.dpuBusy,
-            hwcDeviceLayers = vendor?.deviceLayers ?: lastComposition.deviceLayers,
-            hwcClientLayers = vendor?.clientLayers ?: lastComposition.clientLayers,
+            dpuFrequency = kernel.dpuFrequency,
+            hwcDeviceLayers = hwcDeviceLayers,
+            hwcDeviceLayersQuality = hwcDeviceLayersQuality,
+            hwcDeviceLayersSource = hwcDeviceLayersSource,
+            hwcClientLayers = hwcClientLayers,
+            hwcClientLayersQuality = hwcClientLayersQuality,
+            hwcClientLayersSource = hwcClientLayersSource,
             surfaceFlingerHwcMissed = lastComposition.hwcMissedFrames,
             surfaceFlingerGpuMissed = lastComposition.gpuMissedFrames,
+            surfaceFlingerMissSource = if (
+                lastComposition.hwcMissedFrames != null ||
+                lastComposition.gpuMissedFrames != null
+            ) {
+                lastComposition.source
+            } else {
+                ""
+            },
             thermalStatus = thermalStatus,
             thermalLabel = thermalLabel(thermalStatus),
             memoryLow = memoryInfo.lowMemory || loadManager.hasMemoryAllocationFailure(),
-            npuState = loadManager.npuStatus(),
+            powerSaveMode = powerManager.isPowerSaveMode,
+            // Reuse the vendor transaction already completed at the start of this sample.
+            // NPU status must not trigger a second snapshot or contend with control-to-zero.
+            npuState = loadManager.npuStatus(vendor?.npuStatus),
         )
     }
 
@@ -210,33 +275,39 @@ class SystemMonitor(
 
     fun hasSbwcAdapter(): Boolean = vendorBridge.supportsSbwc()
 
-    fun setCompressionRoute(route: PixelRoute): Boolean = vendorBridge.setCompressionRoute(route)
+    fun isVendorCapabilityDiscoveryPending(): Boolean =
+        vendorBridge.isCapabilityDiscoveryPending()
 
-    fun close() {
-        vendorBridge.close()
+    fun setCompressionRoute(route: PixelRoute): CompressionControlResult {
+        if (!vendorBridge.supportsSbwc()) return CompressionControlResult.NO_ADAPTER
+        return if (vendorBridge.setCompressionRoute(route)) {
+            CompressionControlResult.APPLIED
+        } else {
+            CompressionControlResult.REJECTED_OR_TIMEOUT
+        }
     }
 
+    fun close(): VendorShutdownResult = vendorBridge.closeWithResult()
+
     private fun readCpuTimes(): CpuTimes? = runCatching {
-        val fields = File("/proc/stat").bufferedReader().use { it.readLine() }
-            .trim()
-            .split(Regex("""\s+"""))
-            .drop(1)
-            .map { it.toLong() }
-        if (fields.size < 5) return null
-        CpuTimes(
-            idle = Math.addExact(fields[3], fields.getOrElse(4) { 0L }),
-            total = fields.checkedSum(),
-        )
+        File("/proc/stat").bufferedReader().use { reader ->
+            parseProcStatCpuLine(reader.readLine())
+        }
     }.getOrNull()
 
     private fun readHardwareCpuTimes(): CpuTimes? = runCatching {
-        val usages = hardwareProperties.cpuUsages.filterNotNull()
-        if (usages.isEmpty()) return null
+        val rawUsages = hardwareProperties.cpuUsages
+        val usages = rawUsages.filterNotNull()
+        if (usages.isEmpty() || usages.size != rawUsages.size) return null
         if (usages.any { it.active < 0L || it.total <= 0L || it.active > it.total }) return null
         val active = usages.map { it.active }.checkedSum()
         val total = usages.map { it.total }.checkedSum()
         if (total <= 0) return null
-        CpuTimes(idle = total - active, total = total)
+        CpuTimes(
+            idle = total - active,
+            total = total,
+            participantCount = usages.size,
+        )
     }.getOrNull()
 
     private fun thermalLabel(status: Int): String = when (status) {
@@ -252,10 +323,59 @@ class SystemMonitor(
 
 }
 
-internal data class CpuTimes(val idle: Long, val total: Long) {
+internal data class NormalizedMemoryMetrics(
+    val usedPercent: Float?,
+    val availableMb: Float?,
+    val appPssMb: Float?,
+)
+
+internal fun normalizedMemoryMetrics(
+    totalBytes: Long,
+    availableBytes: Long,
+    appPssKilobytes: Long,
+): NormalizedMemoryMetrics {
+    val validSystemMemory =
+        totalBytes > 0L && availableBytes >= 0L && availableBytes <= totalBytes
+    val availableMb = if (validSystemMemory) {
+        (availableBytes.toDouble() / BYTES_PER_MEBIBYTE)
+            .takeIf { it.isFinite() && it <= Float.MAX_VALUE }
+            ?.toFloat()
+    } else {
+        null
+    }
+    val usedPercent = if (validSystemMemory) {
+        ((totalBytes - availableBytes).toDouble() * 100.0 / totalBytes.toDouble())
+            .takeIf { it.isFinite() && it in 0.0..100.0 }
+            ?.toFloat()
+    } else {
+        null
+    }
+    val appPssMb = if (appPssKilobytes >= 0L) {
+        (appPssKilobytes.toDouble() / KIBIBYTES_PER_MEBIBYTE)
+            .takeIf { it.isFinite() && it <= Float.MAX_VALUE }
+            ?.toFloat()
+    } else {
+        null
+    }
+    return NormalizedMemoryMetrics(
+        usedPercent = usedPercent,
+        availableMb = availableMb,
+        appPssMb = appPssMb,
+    )
+}
+
+internal fun vendorServiceSource(apiVersion: Int, serviceSession: Long): String =
+    "IDpuLabVendorService v$apiVersion · session=$serviceSession"
+
+internal data class CpuTimes(
+    val idle: Long,
+    val total: Long,
+    val participantCount: Int = 0,
+) {
     fun percentSince(previous: CpuTimes?): Float? {
         previous ?: return null
         if (!isValid() || !previous.isValid()) return null
+        if (participantCount != previous.participantCount) return null
         if (total <= previous.total || idle < previous.idle) return null
         val totalDelta = total - previous.total
         val idleDelta = idle - previous.idle
@@ -265,8 +385,29 @@ internal data class CpuTimes(val idle: Long, val total: Long) {
             ?.toFloat()
     }
 
-    private fun isValid(): Boolean = idle >= 0L && total > 0L && idle <= total
+    private fun isValid(): Boolean =
+        idle >= 0L && total > 0L && idle <= total && participantCount >= 0
 }
+
+/**
+ * Parses the aggregate Linux CPU line without double-counting guest/guest_nice. Those fields are
+ * already included in user/nice by the kernel ABI.
+ */
+internal fun parseProcStatCpuLine(line: String?): CpuTimes? = runCatching {
+    val tokens = line
+        ?.trim()
+        ?.split(Regex("""\s+"""))
+        ?: return null
+    if (tokens.firstOrNull() != "cpu" || tokens.size < 6) return null
+    val fields = tokens.drop(1).map(String::toLong)
+    if (fields.any { it < 0L }) return null
+    val idle = Math.addExact(fields[3], fields.getOrElse(4) { 0L })
+    // user, nice, system, idle, iowait, irq, softirq, steal. guest values after this range
+    // are accounting subsets rather than additional elapsed time.
+    val total = fields.take(8).checkedSum()
+    if (total <= 0L || idle > total) return null
+    CpuTimes(idle = idle, total = total)
+}.getOrNull()
 
 internal fun normalizedPerSecond(count: Long, elapsedMs: Long?): Float? {
     if (count < 0L || elapsedMs == null || elapsedMs <= 0L) return null
@@ -291,3 +432,5 @@ private fun Iterable<Long>.checkedSum(): Long {
 private const val MILLIS_PER_SECOND = 1_000.0
 private const val BITS_PER_BYTE = 8.0
 private const val BITS_PER_GIGABIT = 1_000_000_000.0
+private const val BYTES_PER_MEBIBYTE = 1_048_576.0
+private const val KIBIBYTES_PER_MEBIBYTE = 1_024.0

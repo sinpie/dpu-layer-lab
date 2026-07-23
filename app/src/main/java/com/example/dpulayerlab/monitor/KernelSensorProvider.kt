@@ -1,6 +1,7 @@
 package com.example.dpulayerlab.monitor
 
 import android.content.Context
+import com.example.dpulayerlab.BuildConfig
 import com.example.dpulayerlab.model.Gauge
 import com.example.dpulayerlab.model.MetricQuality
 import com.example.dpulayerlab.model.SensorReading
@@ -12,6 +13,7 @@ data class KernelSensorSnapshot(
     val gpuFrequency: Gauge = Gauge(),
     val busBusy: Gauge = Gauge(),
     val dpuBusy: Gauge = Gauge(),
+    val dpuFrequency: Gauge = Gauge(),
     val exactUnderruns: Long? = null,
     val exactUnderrunSource: String? = null,
     val readings: List<SensorReading> = emptyList(),
@@ -19,13 +21,16 @@ data class KernelSensorSnapshot(
 
 /**
  * Read-only, allowlisted sysfs adapter. Broad filesystem access remains a vendor service concern.
- * Additional product paths can be listed in /data/local/tmp/dpulayerlab-probes.conf as
- * key=/absolute/path. SELinux and DAC still apply even for a platform-signed APK.
+ * Additional product paths can be listed as key=/absolute/path. The
+ * /data/local/tmp/dpulayerlab-probes.conf convenience path is accepted only by DEBUG builds;
+ * release products use the app-private or /vendor/etc configuration. SELinux and DAC still apply
+ * even for a platform-signed APK.
  */
 class KernelSensorProvider(private val context: Context) {
     private val customPaths = AtomicReference<Map<String, String>>(emptyMap())
     private var lastGpuBusyCounter: BusyCounterState? = null
     private var lastBusBusyCounter: BusyCounterState? = null
+    private var lastDpuBusyCounter: BusyCounterState? = null
 
     init {
         reloadCustomPaths()
@@ -34,9 +39,12 @@ class KernelSensorProvider(private val context: Context) {
     fun reloadCustomPaths() {
         val candidates = listOf(
             File(context.filesDir, "probe_paths.conf"),
-            File("/data/local/tmp/dpulayerlab-probes.conf"),
             File("/vendor/etc/dpulayerlab/probe_paths.conf"),
-        )
+        ) + if (BuildConfig.DEBUG) {
+            listOf(File("/data/local/tmp/dpulayerlab-probes.conf"))
+        } else {
+            emptyList()
+        }
         val values = linkedMapOf<String, String>()
         candidates.filter { it.isFile && it.canRead() }.forEach { file ->
             val fileLength = runCatching { file.length() }.getOrNull() ?: return@forEach
@@ -62,14 +70,7 @@ class KernelSensorProvider(private val context: Context) {
         )
         if (gpuBusy != null) lastGpuBusyCounter = gpuBusy.nextCounter
 
-        val gpuFreq = readFirstLong(
-            paths["gpu_frequency"],
-            listOf(
-                "/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq",
-                "/sys/class/kgsl/kgsl-3d0/gpuclk",
-                "/sys/class/misc/mali0/device/devfreq/devfreq0/cur_freq",
-            ),
-        )?.takeIf { (value, _) -> value >= 0L }
+        val gpuFreq = readGpuFrequencyMhz(paths)
         val busBusy = readBusyPercent(
             explicit = paths["bus_busy"],
             candidates = listOf(
@@ -80,14 +81,22 @@ class KernelSensorProvider(private val context: Context) {
         )
         if (busBusy != null) lastBusBusyCounter = busBusy.nextCounter
 
-        val dpuBusy = readFirstFloat(
-            paths["dpu_busy"],
-            listOf(
+        val dpuBusy = readBusyPercent(
+            explicit = paths["dpu_busy"],
+            candidates = listOf(
                 "/sys/class/dpu/dpu0/utilization",
                 "/sys/class/dpu/dpu0/busy_percent",
                 "/sys/class/drm/card0/device/dpu_busy",
             ),
-        )?.takeIf { (value, _) -> value.validUtilizationPercent() != null }
+            previous = lastDpuBusyCounter,
+        )
+        if (dpuBusy != null) lastDpuBusyCounter = dpuBusy.nextCounter
+        // There is no portable Android DPU/decon clock node and vendor units differ. Accept this
+        // metric only through an explicitly configured, Hz-valued product path.
+        val dpuFrequencyHz = readFirstLong(
+            paths["dpu_frequency_hz"],
+            emptyList(),
+        )?.takeIf { (value, _) -> value.validDpuFrequencyHz() != null }
         val underruns = readFirstLong(
             paths["dpu_underrun"],
             listOf(
@@ -101,8 +110,7 @@ class KernelSensorProvider(private val context: Context) {
             readings += SensorReading("gpu_busy", "GPU busy", "$value%", MetricQuality.KERNEL, path)
             Gauge(value, "%", MetricQuality.KERNEL, path)
         } ?: Gauge()
-        val gpuFreqGauge = gpuFreq?.let { (value, path) ->
-            val mhz = if (value > 100_000L) value / 1_000_000f else value.toFloat()
+        val gpuFreqGauge = gpuFreq?.let { (mhz, path) ->
             readings += SensorReading("gpu_frequency", "GPU clock", "%.0f MHz".format(mhz), MetricQuality.KERNEL, path)
             Gauge(mhz, " MHz", MetricQuality.KERNEL, path)
         } ?: Gauge()
@@ -110,12 +118,29 @@ class KernelSensorProvider(private val context: Context) {
             readings += SensorReading("bus_busy", "Memory bus", "$value%", MetricQuality.KERNEL, path)
             Gauge(value, "%", MetricQuality.KERNEL, path)
         } ?: Gauge()
-        val dpuGauge = dpuBusy?.let { (value, path) ->
-            readings += SensorReading("dpu_busy", "DPU busy", "$value%", MetricQuality.HARDWARE_COUNTER, path)
-            Gauge(value, "%", MetricQuality.HARDWARE_COUNTER, path)
+        val dpuGauge = dpuBusy?.percent?.let { (value, path) ->
+            readings += SensorReading("dpu_busy", "DPU busy", "$value%", MetricQuality.KERNEL, path)
+            Gauge(value, "%", MetricQuality.KERNEL, path)
+        } ?: Gauge()
+        val dpuFrequencyGauge = dpuFrequencyHz?.let { (value, path) ->
+            val mhz = value / 1_000_000f
+            readings += SensorReading(
+                "dpu_frequency",
+                "DPU clock",
+                "%.0f MHz".format(mhz),
+                MetricQuality.KERNEL,
+                path,
+            )
+            Gauge(mhz, " MHz", MetricQuality.KERNEL, path)
         } ?: Gauge()
         underruns?.let { (value, path) ->
-            readings += SensorReading("dpu_underrun", "DPU underrun", value.toString(), MetricQuality.HARDWARE_COUNTER, path)
+            readings += SensorReading(
+                "dpu_underrun",
+                "DPU underrun",
+                value.toString(),
+                MetricQuality.KERNEL,
+                path,
+            )
         }
 
         return KernelSensorSnapshot(
@@ -123,6 +148,7 @@ class KernelSensorProvider(private val context: Context) {
             gpuFrequency = gpuFreqGauge,
             busBusy = busGauge,
             dpuBusy = dpuGauge,
+            dpuFrequency = dpuFrequencyGauge,
             exactUnderruns = underruns?.first,
             exactUnderrunSource = underruns?.second,
             readings = readings,
@@ -135,6 +161,12 @@ class KernelSensorProvider(private val context: Context) {
         previous: BusyCounterState?,
     ): BusySensorResult? {
         val result = readFirstText(explicit, candidates) ?: return null
+        parseDirectUtilizationPercent(result.first)?.let { direct ->
+            return BusySensorResult(
+                percent = direct to result.second,
+                nextCounter = null,
+            )
+        }
         val parsed = parseBusyPercent(result.first, result.second, previous) ?: return null
         return BusySensorResult(
             percent = parsed.percent?.let { it to result.second },
@@ -144,16 +176,34 @@ class KernelSensorProvider(private val context: Context) {
 
     private fun readFirstLong(explicit: String?, candidates: List<String>): Pair<Long, String>? {
         val result = readFirstText(explicit, candidates) ?: return null
-        val value = INTEGER_TOKEN.find(result.first)?.value?.toLongOrNull() ?: return null
+        val value = parseSingleLongToken(result.first) ?: return null
         return value to result.second
     }
 
-    private fun readFirstFloat(explicit: String?, candidates: List<String>): Pair<Float, String>? {
-        val result = readFirstText(explicit, candidates) ?: return null
-        val token = FLOAT_TOKEN.find(result.first)?.value ?: return null
-        val value = token.toDoubleOrNull()?.takeIf(Double::isFinite) ?: return null
-        if (value < -Float.MAX_VALUE || value > Float.MAX_VALUE) return null
-        return value.toFloat() to result.second
+    private fun readGpuFrequencyMhz(paths: Map<String, String>): Pair<Float, String>? {
+        val configured = configuredGpuFrequencyProbes(paths)
+        val raw = when (configured.size) {
+            0 -> {
+                val reading = readFirstLong(
+                    explicit = null,
+                    candidates = DEFAULT_GPU_FREQUENCY_HZ_PATHS,
+                ) ?: return null
+                Triple(reading.first, reading.second, ProbeFrequencyUnit.HZ)
+            }
+            1 -> {
+                val probe = configured.single()
+                val reading = readFirstLong(
+                    explicit = probe.path,
+                    candidates = emptyList(),
+                ) ?: return null
+                Triple(reading.first, reading.second, probe.unit)
+            }
+            // Multiple unit declarations are contradictory even when they point at one path.
+            // Guessing here would silently publish a plausible but wrong clock.
+            else -> return null
+        }
+        val mhz = normalizeGpuFrequencyMhz(raw.first, raw.third) ?: return null
+        return mhz to frequencyProbeSource(raw.second, raw.third)
     }
 
     private fun readFirstText(explicit: String?, candidates: List<String>): Pair<String, String>? {
@@ -181,7 +231,10 @@ class KernelSensorProvider(private val context: Context) {
             while (count < bytes.size) {
                 val read = input.read(bytes, count, bytes.size - count)
                 if (read < 0) break
-                if (read == 0) continue
+                // The requested length is non-zero, so FileInputStream must either make
+                // progress or report EOF. Fail closed on a contract-violating zero read instead
+                // of spinning or carrying a warning-only retry counter.
+                if (read == 0) return null
                 count += read
             }
         }
@@ -196,7 +249,11 @@ class KernelSensorProvider(private val context: Context) {
 
     private companion object {
         const val MAX_CONFIG_BYTES = 64L * 1_024L
-        const val MAX_CONFIG_LINES = 128
+        val DEFAULT_GPU_FREQUENCY_HZ_PATHS = listOf(
+            "/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq",
+            "/sys/class/kgsl/kgsl-3d0/gpuclk",
+            "/sys/class/misc/mali0/device/devfreq/devfreq0/cur_freq",
+        )
     }
 }
 
@@ -249,6 +306,20 @@ internal fun parseBusyPercent(
     return BusyPercentParse(percent = percent, nextCounter = current)
 }
 
+internal fun parseDirectUtilizationPercent(text: String): Float? {
+    val tokens = FLOAT_TOKEN.findAll(text).take(2).map { it.value }.toList()
+    if (tokens.size != 1) return null
+    val value = tokens.single().toDoubleOrNull()?.takeIf(Double::isFinite) ?: return null
+    if (value < 0.0 || value > 100.0) return null
+    return value.toFloat()
+}
+
+internal fun parseSingleLongToken(text: String): Long? {
+    val scalar = text.trim()
+    if (!SIGNED_INTEGER_SCALAR.matches(scalar)) return null
+    return scalar.toLongOrNull()
+}
+
 internal fun parseCustomProbeConfig(lines: List<String>): Map<String, String> {
     if (lines.size > MAX_CUSTOM_CONFIG_LINES || lines.any { it.length > MAX_CUSTOM_CONFIG_LINE_CHARS }) {
         return emptyMap()
@@ -275,6 +346,42 @@ internal fun parseCustomProbeConfig(lines: List<String>): Map<String, String> {
 
 internal fun Float.validUtilizationPercent(): Float? = takeIf { isFinite() && this in 0f..100f }
 
+internal fun Long.validDpuFrequencyHz(): Long? = takeIf { this in 0L..MAX_DPU_FREQUENCY_HZ }
+
+internal enum class ProbeFrequencyUnit {
+    HZ,
+    KHZ,
+    MHZ,
+}
+
+internal data class ConfiguredGpuFrequencyProbe(
+    val path: String,
+    val unit: ProbeFrequencyUnit,
+)
+
+internal fun configuredGpuFrequencyProbes(
+    paths: Map<String, String>,
+): List<ConfiguredGpuFrequencyProbe> = GPU_FREQUENCY_CONFIG_KEYS.mapNotNull { (key, unit) ->
+    paths[key]?.takeIf { it.isNotBlank() }?.let { path ->
+        ConfiguredGpuFrequencyProbe(path = path, unit = unit)
+    }
+}
+
+internal fun normalizeGpuFrequencyMhz(rawValue: Long, unit: ProbeFrequencyUnit): Float? {
+    if (rawValue < 0L) return null
+    val mhz = when (unit) {
+        ProbeFrequencyUnit.HZ -> rawValue.toDouble() / HZ_PER_MHZ
+        ProbeFrequencyUnit.KHZ -> rawValue.toDouble() / KHZ_PER_MHZ
+        ProbeFrequencyUnit.MHZ -> rawValue.toDouble()
+    }
+    return mhz
+        .takeIf { it.isFinite() && it in 0.0..MAX_PLAUSIBLE_GPU_FREQUENCY_MHZ }
+        ?.toFloat()
+}
+
+internal fun frequencyProbeSource(path: String, unit: ProbeFrequencyUnit): String =
+    "$path [input=${unit.name}]"
+
 private fun readBoundedFirstLine(reader: java.io.BufferedReader): String? {
     val result = StringBuilder()
     repeat(MAX_SENSOR_LINE_CHARS + 1) {
@@ -288,15 +395,31 @@ private fun readBoundedFirstLine(reader: java.io.BufferedReader): String? {
 }
 
 private val INTEGER_TOKEN = Regex("""(?<![\d.])-?\d+(?![\d.])""")
+private val SIGNED_INTEGER_SCALAR = Regex("""[+-]?\d+""")
 private val FLOAT_TOKEN = Regex("""(?<![\w.])-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?(?![\w.])""")
 private val ALLOWED_PROBE_KEYS = setOf(
     "gpu_busy",
+    // Legacy gpu_frequency has one fixed contract: Hz. Typed keys are preferred.
     "gpu_frequency",
+    "gpu_frequency_hz",
+    "gpu_frequency_khz",
+    "gpu_frequency_mhz",
     "bus_busy",
     "dpu_busy",
+    "dpu_frequency_hz",
     "dpu_underrun",
 )
 private const val MAX_CUSTOM_CONFIG_LINES = 128
 private const val MAX_CUSTOM_CONFIG_LINE_CHARS = 1_024
 private const val MAX_CUSTOM_PATH_CHARS = 512
 private const val MAX_SENSOR_LINE_CHARS = 4_096
+private const val MAX_DPU_FREQUENCY_HZ = 20_000_000_000L
+private const val MAX_PLAUSIBLE_GPU_FREQUENCY_MHZ = 20_000.0
+private const val HZ_PER_MHZ = 1_000_000.0
+private const val KHZ_PER_MHZ = 1_000.0
+private val GPU_FREQUENCY_CONFIG_KEYS = listOf(
+    "gpu_frequency_hz" to ProbeFrequencyUnit.HZ,
+    "gpu_frequency_khz" to ProbeFrequencyUnit.KHZ,
+    "gpu_frequency_mhz" to ProbeFrequencyUnit.MHZ,
+    "gpu_frequency" to ProbeFrequencyUnit.HZ,
+)

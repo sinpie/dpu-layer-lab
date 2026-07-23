@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!--
+        Dedicated lab/debug builds remain callable from `adb shell am start`.
+        The release/system manifest protects this alias with a signature|privileged permission.
+    -->
+    <application>
+        <activity-alias
+            android:name="com.example.dpulayerlab.AutomationActivity"
+            tools:remove="android:permission" />
+    </application>
+</manifest>

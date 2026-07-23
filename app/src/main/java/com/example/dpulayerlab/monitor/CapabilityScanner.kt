@@ -4,9 +4,11 @@ import android.app.Activity
 import android.hardware.HardwareBuffer
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
+import android.media.MediaFormat
 import android.os.Build
 import android.view.Display
 import com.example.dpulayerlab.util.currentDisplayCompat
+import java.util.Locale
 
 data class CodecCapability(
     val name: String,
@@ -34,7 +36,10 @@ object CapabilityScanner {
     fun supportsCanvasBuffer(width: Int, height: Int, rgb565: Boolean): Boolean {
         if (width <= 0 || height <= 0) return false
         val format = if (rgb565) HardwareBuffer.RGB_565 else HardwareBuffer.RGBA_8888
-        val usage = HardwareBuffer.USAGE_CPU_WRITE_OFTEN or
+        // Procedural layers use Surface.lockHardwareCanvas(), whose Skia producer renders through
+        // the GPU. A CPU-write probe can reject a valid GPU-renderable BufferQueue (notably large
+        // RGB565 buffers), so probe the usage that the producer and compositor actually need.
+        val usage = HardwareBuffer.USAGE_GPU_COLOR_OUTPUT or
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 HardwareBuffer.USAGE_COMPOSER_OVERLAY
             } else {
@@ -48,31 +53,74 @@ object CapabilityScanner {
         width: Int,
         height: Int,
         framesPerSecond: Float,
-    ): Boolean {
-        if (
-            !mime.startsWith("video/") ||
-            width <= 0 ||
-            height <= 0 ||
-            !framesPerSecond.isFinite() ||
-            framesPerSecond <= 0f
-        ) {
-            return false
-        }
+        requiredProfile: Int? = null,
+        requiredLevel: Int? = null,
+        bitRate: Int? = null,
+    ): Boolean = findHardwareVideoDecoder(
+        mime = mime,
+        width = width,
+        height = height,
+        framesPerSecond = framesPerSecond,
+        requiredProfile = requiredProfile,
+        requiredLevel = requiredLevel,
+        bitRate = bitRate,
+    ) != null
+
+    /**
+     * Resolves the exact hardware decoder that the renderer must instantiate. Returning only a
+     * Boolean here would allow MediaCodec's later default selection to choose a software codec or
+     * a hardware codec that did not advertise the P010 source profile checked during preflight.
+     */
+    fun findHardwareVideoDecoder(
+        mime: String,
+        width: Int,
+        height: Int,
+        framesPerSecond: Float,
+        requiredProfile: Int? = null,
+        requiredLevel: Int? = null,
+        bitRate: Int? = null,
+    ): String? {
+        val request = sanitizeVideoDecoderRequest(
+            mime = mime,
+            width = width,
+            height = height,
+            framesPerSecond = framesPerSecond,
+            requiredProfile = requiredProfile,
+            requiredLevel = requiredLevel,
+            bitRate = bitRate,
+        ) ?: return null
         return runCatching {
-            MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos.any { codec ->
-                !codec.isEncoder &&
-                    codec.isHardwareAccelerated &&
-                    codec.supportedTypes.any { it.equals(mime, ignoreCase = true) } &&
-                    runCatching {
-                        codec.getCapabilitiesForType(mime).videoCapabilities
-                            ?.areSizeAndRateSupported(
-                                width,
-                                height,
-                                framesPerSecond.toDouble(),
-                            ) == true
-                    }.getOrDefault(false)
+            MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos.firstNotNullOfOrNull { codec ->
+                runCatching {
+                    val advertisedMime = codec.supportedTypes.firstOrNull {
+                        it.equals(request.mime, ignoreCase = true)
+                    }
+                    if (advertisedMime == null) {
+                        null
+                    } else {
+                        val basicCandidate = decoderCandidateEligible(
+                            isEncoder = codec.isEncoder,
+                            isHardwareAccelerated = codec.isHardwareAccelerated,
+                            isAlias = codec.isAlias,
+                            requiresSecurePlayback = false,
+                        )
+                        if (!basicCandidate) {
+                            null
+                        } else {
+                            val capabilities = codec.getCapabilitiesForType(advertisedMime)
+                            codec.name.takeIf {
+                                !capabilities.isFeatureRequired(
+                                    MediaCodecInfo.CodecCapabilities.FEATURE_SecurePlayback,
+                                ) &&
+                                    capabilities.isFormatSupported(
+                                        request.toMediaFormat(advertisedMime),
+                                    )
+                            }
+                        }
+                    }
+                }.getOrNull()
             }
-        }.getOrDefault(false)
+        }.getOrNull()
     }
 
     fun scan(
@@ -162,3 +210,71 @@ object CapabilityScanner {
         areSizeAndRateSupported(width, height, framesPerSecond)
     }.getOrDefault(false)
 }
+
+internal data class SanitizedVideoDecoderRequest(
+    val mime: String,
+    val width: Int,
+    val height: Int,
+    val framesPerSecond: Float,
+    val requiredProfile: Int?,
+    val requiredLevel: Int?,
+    val bitRate: Int?,
+) {
+    fun toMediaFormat(advertisedMime: String): MediaFormat =
+        MediaFormat.createVideoFormat(advertisedMime, width, height).apply {
+            setFloat(MediaFormat.KEY_FRAME_RATE, framesPerSecond)
+            requiredProfile?.let { setInteger(MediaFormat.KEY_PROFILE, it) }
+            requiredLevel?.let { setInteger(MediaFormat.KEY_LEVEL, it) }
+            bitRate?.let { setInteger(MediaFormat.KEY_BIT_RATE, it) }
+        }
+}
+
+internal fun sanitizeVideoDecoderRequest(
+    mime: String,
+    width: Int,
+    height: Int,
+    framesPerSecond: Float,
+    requiredProfile: Int?,
+    requiredLevel: Int?,
+    bitRate: Int?,
+): SanitizedVideoDecoderRequest? {
+    if (mime.length !in 1..MAX_CODEC_MIME_LENGTH) return null
+    val canonicalMime = mime.lowercase(Locale.ROOT)
+    if (
+        canonicalMime.length !in 1..MAX_CODEC_MIME_LENGTH ||
+        !VIDEO_MIME_PATTERN.matches(canonicalMime) ||
+        width !in 1..MAX_CODEC_DIMENSION ||
+        height !in 1..MAX_CODEC_DIMENSION ||
+        width.toLong() * height.toLong() > MAX_CODEC_PIXEL_COUNT ||
+        !framesPerSecond.isFinite() ||
+        framesPerSecond <= 0f ||
+        framesPerSecond > MAX_CODEC_FRAME_RATE ||
+        requiredProfile != null && requiredProfile <= 0 ||
+        requiredLevel != null && (requiredProfile == null || requiredLevel <= 0) ||
+        bitRate != null && bitRate <= 0
+    ) {
+        return null
+    }
+    return SanitizedVideoDecoderRequest(
+        mime = canonicalMime,
+        width = width,
+        height = height,
+        framesPerSecond = framesPerSecond,
+        requiredProfile = requiredProfile,
+        requiredLevel = requiredLevel,
+        bitRate = bitRate,
+    )
+}
+
+internal fun decoderCandidateEligible(
+    isEncoder: Boolean,
+    isHardwareAccelerated: Boolean,
+    isAlias: Boolean,
+    requiresSecurePlayback: Boolean,
+): Boolean = !isEncoder && isHardwareAccelerated && !isAlias && !requiresSecurePlayback
+
+private const val MAX_CODEC_MIME_LENGTH = 127
+private const val MAX_CODEC_DIMENSION = 16_384
+private const val MAX_CODEC_PIXEL_COUNT = 268_435_456L
+private const val MAX_CODEC_FRAME_RATE = 1_000f
+private val VIDEO_MIME_PATTERN = Regex("""video/[a-z0-9][a-z0-9.+-]*""")

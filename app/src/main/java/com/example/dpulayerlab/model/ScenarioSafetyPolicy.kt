@@ -1,5 +1,7 @@
 package com.example.dpulayerlab.model
 
+import java.math.BigInteger
+
 data class RenderSafetyLimits(
     val displayWidthPx: Int,
     val displayHeightPx: Int,
@@ -12,12 +14,26 @@ data class RenderSafetyLimits(
     val maxMemoryLoad: Float,
     val maxGpuLoad: Float,
     val maxNpuLoad: Float,
+    /** Power-save state captured by the same detection pass that produced these caps. */
+    val powerSaveMode: Boolean = false,
 )
 
 data class ScenarioSafetyDecision(
     val effectiveScenario: ScenarioSpec?,
     val adjustments: List<String>,
     val rejectionReason: String?,
+)
+
+/**
+ * Actual dimensions of the selected decoder output.
+ *
+ * A non-null instance means a media source was selected. Nullable dimensions deliberately
+ * preserve that distinction so decoder-backed phases fail closed instead of falling back to the
+ * requested phase size when track metadata is unavailable.
+ */
+data class SelectedDecoderBuffer(
+    val widthPx: Int?,
+    val heightPx: Int?,
 )
 
 /**
@@ -39,12 +55,15 @@ object ScenarioSafetyPolicy {
     const val MAX_METADATA_ITEMS = 64
 
     private const val RGBA_BYTES_PER_PIXEL = 4L
+    // EGL requests a 16-bit depth buffer, but drivers may round the attachment up to 24/32 bits.
+    private const val CONSERVATIVE_GL_DEPTH_BYTES_PER_PIXEL = 4L
     private const val BUFFER_COUNT = 3L
     private const val MAX_NORMALIZED_LOAD = 1f
 
     fun evaluate(
         scenario: ScenarioSpec,
         limits: RenderSafetyLimits,
+        selectedDecoderBuffer: SelectedDecoderBuffer? = null,
     ): ScenarioSafetyDecision {
         validateLimits(limits)?.let { return rejected(it) }
         validateScenario(scenario)?.let { return rejected(it) }
@@ -72,6 +91,7 @@ object ScenarioSafetyPolicy {
                 phase = phase,
                 requestedLayers = layerCapped,
                 limits = limits,
+                selectedDecoderBuffer = selectedDecoderBuffer,
             )
             if (budgetCapped == 0) {
                 return rejected(
@@ -83,6 +103,25 @@ object ScenarioSafetyPolicy {
             val displayHz = minOf(phase.requestedDisplayHz, HARD_MAX_DISPLAY_HZ)
             val durationMs = minOf(phase.durationMs, limits.maxPhaseDurationMs)
             val workloads = capWorkloads(phase.workloads, workloadLimits)
+            val transition = transitionForDuration(
+                transition = phase.transition,
+                originalDurationMs = phase.durationMs,
+                effectiveDurationMs = durationMs,
+            )
+            val includeGlLayer =
+                phase.includeGlLayer &&
+                    phase.backend != LayerBackend.FLATTENED_TEXTURE &&
+                    !(phase.activeLayers > 1 && budgetCapped == 1)
+            if (
+                phase.includeGlLayer &&
+                !includeGlLayer &&
+                phase.backend != LayerBackend.FLATTENED_TEXTURE &&
+                workloads.gpu > 0f
+            ) {
+                return rejected(
+                    "Phase '${phase.id}' cannot fit the GL producer required by its GPU load",
+                )
+            }
 
             if (budgetCapped != phase.activeLayers) {
                 adjustments +=
@@ -103,6 +142,18 @@ object ScenarioSafetyPolicy {
             if (workloads != phase.workloads) {
                 adjustments += "Phase '${phase.id}': workloads capped to configured limits"
             }
+            if (transition != phase.transition) {
+                adjustments +=
+                    "Phase '${phase.id}': transition parameters bounded for ${durationMs} ms"
+            }
+            if (includeGlLayer != phase.includeGlLayer) {
+                adjustments += if (phase.backend == LayerBackend.FLATTENED_TEXTURE) {
+                    "Phase '${phase.id}': ignored GL-tail marker removed; the flattened " +
+                        "producer carries GPU work"
+                } else {
+                    "Phase '${phase.id}': GL tail removed to preserve the primary producer"
+                }
+            }
 
             boundedPhases += phase.copy(
                 durationMs = durationMs,
@@ -110,6 +161,8 @@ object ScenarioSafetyPolicy {
                 producerFps = producerFps,
                 requestedDisplayHz = displayHz,
                 workloads = workloads,
+                transition = transition,
+                includeGlLayer = includeGlLayer,
             )
         }
 
@@ -122,6 +175,7 @@ object ScenarioSafetyPolicy {
         } else {
             boundedPhases
         }
+        validateEffectiveTransitions(durationBoundedPhases)?.let { return rejected(it) }
 
         return ScenarioSafetyDecision(
             effectiveScenario = scenario.copy(phases = durationBoundedPhases),
@@ -193,6 +247,28 @@ object ScenarioSafetyPolicy {
             if (phase.activeLayers <= 0) {
                 return "Phase '${phase.id}' layer count must be positive"
             }
+            if (
+                phase.backend == LayerBackend.FLATTENED_TEXTURE &&
+                (
+                    phase.pixelRoute != PixelRoute.RGB_8888 ||
+                        phase.bufferSize != BufferSize.DISPLAY
+                    )
+            ) {
+                return "Phase '${phase.id}' flattened backend is a display-sized RGB_8888 " +
+                    "producer and cannot claim a decoder or explicit buffer size"
+            }
+            if (
+                phase.backend != LayerBackend.FLATTENED_TEXTURE &&
+                phase.activeLayers == 1 &&
+                phase.includeGlLayer &&
+                (
+                    phase.pixelRoute.usesSelectedMediaDecoder() ||
+                        phase.bufferSize != BufferSize.DISPLAY
+                    )
+            ) {
+                return "Phase '${phase.id}' needs at least two layers to keep its " +
+                    "dedicated primary and GL tail"
+            }
             if (!phase.producerFps.isFinite() || phase.producerFps <= 0f) {
                 return "Phase '${phase.id}' producer FPS must be finite and positive"
             }
@@ -204,6 +280,23 @@ object ScenarioSafetyPolicy {
             }
             if (loadValues.any { !it.isFinite() }) {
                 return "Phase '${phase.id}' workloads must be finite"
+            }
+            with(phase.transition) {
+                if (transitionDurationMs < 0L) {
+                    return "Phase '${phase.id}' transition duration must be non-negative"
+                }
+                if (cycleMs <= 0L) {
+                    return "Phase '${phase.id}' transition cycle must be positive"
+                }
+                if (stepCount <= 0) {
+                    return "Phase '${phase.id}' transition step count must be positive"
+                }
+                if (!dutyCycle.isFinite() || !floor.isFinite()) {
+                    return "Phase '${phase.id}' transition values must be finite"
+                }
+                if (mode != TransitionMode.STEP && floor >= 1f) {
+                    return "Phase '${phase.id}' transition floor leaves no dynamic range"
+                }
             }
         }
         return null
@@ -223,6 +316,7 @@ object ScenarioSafetyPolicy {
         phase: PhaseSpec,
         requestedLayers: Int,
         limits: RenderSafetyLimits,
+        selectedDecoderBuffer: SelectedDecoderBuffer?,
     ): Int {
         if (phase.backend == LayerBackend.FLATTENED_TEXTURE) {
             return if (
@@ -241,7 +335,16 @@ object ScenarioSafetyPolicy {
         }
 
         for (candidate in requestedLayers downTo 1) {
-            if (independentLayersFit(phase, candidate, limits)) return candidate
+            if (
+                independentLayersFit(
+                    phase = phase,
+                    layerCount = candidate,
+                    limits = limits,
+                    selectedDecoderBuffer = selectedDecoderBuffer,
+                )
+            ) {
+                return candidate
+            }
         }
         return 0
     }
@@ -250,17 +353,27 @@ object ScenarioSafetyPolicy {
         phase: PhaseSpec,
         layerCount: Int,
         limits: RenderSafetyLimits,
+        selectedDecoderBuffer: SelectedDecoderBuffer?,
     ): Boolean {
-        val primaryIsGl = phase.includeGlLayer && layerCount == 1
-        val primaryWidth = if (primaryIsGl) {
-            limits.displayWidthPx
-        } else {
-            phase.bufferSize.width.takeIf { it > 0 } ?: limits.displayWidthPx
+        // A multi-layer phase with a GL tail must not silently turn into a different GL-only
+        // experiment when safety clamps it to one layer. Its primary producer is preserved and
+        // the tail is removed in the effective phase.
+        val primaryIsGl = phase.includeGlLayer && phase.activeLayers == 1
+        val primaryUsesDecoder =
+            selectedDecoderBuffer != null &&
+                !primaryIsGl &&
+                phase.pixelRoute.usesSelectedMediaDecoder()
+        val primaryWidth = when {
+            primaryIsGl -> limits.displayWidthPx
+            primaryUsesDecoder ->
+                selectedDecoderBuffer?.widthPx?.takeIf { it > 0 } ?: return false
+            else -> phase.bufferSize.width.takeIf { it > 0 } ?: limits.displayWidthPx
         }
-        val primaryHeight = if (primaryIsGl) {
-            limits.displayHeightPx
-        } else {
-            phase.bufferSize.height.takeIf { it > 0 } ?: limits.displayHeightPx
+        val primaryHeight = when {
+            primaryIsGl -> limits.displayHeightPx
+            primaryUsesDecoder ->
+                selectedDecoderBuffer?.heightPx?.takeIf { it > 0 } ?: return false
+            else -> phase.bufferSize.height.takeIf { it > 0 } ?: limits.displayHeightPx
         }
         val primaryBytes = productWithinBudget(
             budget = limits.maxGraphicsBytes,
@@ -269,17 +382,40 @@ object ScenarioSafetyPolicy {
             RGBA_BYTES_PER_PIXEL,
             BUFFER_COUNT,
         ) ?: return false
+        val primaryDepthBytes = if (primaryIsGl) {
+            productWithinBudget(
+                budget = limits.maxGraphicsBytes - primaryBytes,
+                primaryWidth.toLong(),
+                primaryHeight.toLong(),
+                CONSERVATIVE_GL_DEPTH_BYTES_PER_PIXEL,
+                BUFFER_COUNT,
+            ) ?: return false
+        } else {
+            0L
+        }
 
         val overlayCount = layerCount - 1L
         if (overlayCount == 0L) return true
-        val remainingBudget = limits.maxGraphicsBytes - primaryBytes
-        return productWithinBudget(
+        val remainingBudget = limits.maxGraphicsBytes - primaryBytes - primaryDepthBytes
+        val overlayBytes = productWithinBudget(
             budget = remainingBudget,
             limits.displayWidthPx.toLong(),
             limits.displayHeightPx.toLong(),
             RGBA_BYTES_PER_PIXEL,
             BUFFER_COUNT,
             overlayCount,
+        ) ?: return false
+        val glTailPresent =
+            phase.includeGlLayer &&
+                phase.activeLayers > 1 &&
+                layerCount > 1
+        if (!glTailPresent) return true
+        return productWithinBudget(
+            budget = remainingBudget - overlayBytes,
+            limits.displayWidthPx.toLong(),
+            limits.displayHeightPx.toLong(),
+            CONSERVATIVE_GL_DEPTH_BYTES_PER_PIXEL,
+            BUFFER_COUNT,
         ) != null
     }
 
@@ -318,14 +454,236 @@ object ScenarioSafetyPolicy {
         phases: List<PhaseSpec>,
         capMs: Long,
     ): List<PhaseSpec> {
-        var remaining = capMs
-        return phases.mapIndexed { index, phase ->
-            val phasesAfterThis = phases.size - index - 1L
-            val maximumForThisPhase = remaining - phasesAfterThis
-            val duration = minOf(phase.durationMs, maximumForThisPhase)
-            remaining -= duration
-            phase.copy(durationMs = duration)
+        val phaseCount = phases.size
+        val distributableMs = capMs - phaseCount.toLong()
+        if (distributableMs == 0L) {
+            return phases.map { phase ->
+                phase.copy(
+                    durationMs = 1L,
+                    transition = transitionForDuration(
+                        transition = phase.transition,
+                        originalDurationMs = phase.durationMs,
+                        effectiveDurationMs = 1L,
+                    ),
+                )
+            }
         }
+
+        // Reserve 1 ms for every phase, then divide the remaining budget in proportion to
+        // each phase's remaining duration. BigInteger keeps hostile Long.MAX_VALUE inputs from
+        // overflowing and the largest-remainder pass makes the final sum exactly capMs.
+        val weights = phases.map { BigInteger.valueOf(it.durationMs - 1L) }
+        val totalWeight = weights.fold(BigInteger.ZERO, BigInteger::add)
+        check(totalWeight.signum() > 0)
+        val distributable = BigInteger.valueOf(distributableMs)
+        val extras = LongArray(phaseCount)
+        val remainders = Array(phaseCount) { BigInteger.ZERO }
+        var allocatedMs = phaseCount.toLong()
+        weights.forEachIndexed { index, weight ->
+            val division = weight.multiply(distributable).divideAndRemainder(totalWeight)
+            extras[index] = checkedNonNegativeLong(division[0])
+            remainders[index] = division[1]
+            allocatedMs += extras[index]
+        }
+        var leftoverMs = capMs - allocatedMs
+        val remainderOrder = phases.indices.sortedWith(
+            compareByDescending<Int> { remainders[it] }.thenBy { it },
+        )
+        var remainderIndex = 0
+        while (leftoverMs > 0L) {
+            extras[remainderOrder[remainderIndex]]++
+            leftoverMs--
+            remainderIndex++
+        }
+
+        return phases.mapIndexed { index, phase ->
+            val durationMs = 1L + extras[index]
+            phase.copy(
+                durationMs = durationMs,
+                transition = transitionForDuration(
+                    transition = phase.transition,
+                    originalDurationMs = phase.durationMs,
+                    effectiveDurationMs = durationMs,
+                ),
+            )
+        }
+    }
+
+    /**
+     * Shrinks transition timing with its containing phase.
+     *
+     * Simply clipping an 8 s ramp to a phase reduced from 10 s to 5 s turns the ramp into a
+     * phase-wide transition and removes the intended target plateau. Proportional scaling keeps
+     * the attack/hold/release shape and cyclic repetition count as close as the safety cap allows.
+     */
+    private fun transitionForDuration(
+        transition: TransitionSpec,
+        originalDurationMs: Long,
+        effectiveDurationMs: Long,
+    ): TransitionSpec {
+        val original = transition.boundedFor(originalDurationMs)
+        val durationReduced = effectiveDurationMs < originalDurationMs
+        val scalesTransitionWindow = when (original.mode) {
+            TransitionMode.LINEAR_RAMP,
+            TransitionMode.STAIRCASE,
+            TransitionMode.SOAK_RECOVERY,
+            -> true
+
+            TransitionMode.STEP,
+            TransitionMode.PULSE_BURST,
+            TransitionMode.TRIANGLE_WAVE,
+            -> false
+        }
+        val scaledTransitionDuration = if (
+            durationReduced &&
+            original.transitionDurationMs > 0L &&
+            scalesTransitionWindow
+        ) {
+            scalePositiveDuration(
+                value = original.transitionDurationMs,
+                originalDurationMs = originalDurationMs,
+                effectiveDurationMs = effectiveDurationMs,
+            )
+        } else {
+            original.transitionDurationMs
+        }
+        val scalesCycle = when (original.mode) {
+            TransitionMode.PULSE_BURST,
+            TransitionMode.TRIANGLE_WAVE,
+            -> true
+
+            TransitionMode.STEP,
+            TransitionMode.LINEAR_RAMP,
+            TransitionMode.STAIRCASE,
+            TransitionMode.SOAK_RECOVERY,
+            -> false
+        }
+        val scaledCycleMs = if (durationReduced && scalesCycle) {
+            scalePositiveDuration(
+                value = original.cycleMs,
+                originalDurationMs = originalDurationMs,
+                effectiveDurationMs = effectiveDurationMs,
+            )
+        } else {
+            original.cycleMs
+        }
+        var effective = original.copy(
+            transitionDurationMs = scaledTransitionDuration,
+            cycleMs = scaledCycleMs,
+        ).boundedFor(effectiveDurationMs)
+
+        if (
+            effective.mode == TransitionMode.SOAK_RECOVERY &&
+            effective.transitionDurationMs > 0L &&
+            effectiveDurationMs > LOAD_CONTROL_CADENCE_MS
+        ) {
+            // Keep at least one full controller tick between attack and release. The evaluator
+            // still handles malformed direct calls, while safety-vetted scenarios retain an
+            // observable high-load plateau.
+            val maximumEdgeMs =
+                (effectiveDurationMs - LOAD_CONTROL_CADENCE_MS) / 2L
+            effective = effective.copy(
+                transitionDurationMs = minOf(
+                    effective.transitionDurationMs,
+                    maximumEdgeMs,
+                ),
+            )
+        }
+        return effective
+    }
+
+    private fun scalePositiveDuration(
+        value: Long,
+        originalDurationMs: Long,
+        effectiveDurationMs: Long,
+    ): Long {
+        if (value <= 0L) return 0L
+        return BigInteger.valueOf(value)
+            .multiply(BigInteger.valueOf(effectiveDurationMs))
+            .divide(BigInteger.valueOf(originalDurationMs))
+            .let(::checkedNonNegativeLong)
+            .coerceAtLeast(1L)
+    }
+
+    private fun checkedNonNegativeLong(value: BigInteger): Long {
+        check(value.signum() >= 0 && value <= LONG_MAX_BIG_INTEGER) {
+            "Duration allocation escaped the non-negative Long range"
+        }
+        return value.toLong()
+    }
+
+    private fun validateEffectiveTransitions(phases: List<PhaseSpec>): String? {
+        for (phase in phases) {
+            when (phase.transition.mode) {
+                TransitionMode.PULSE_BURST -> {
+                    if (phase.durationMs < phase.transition.cycleMs) {
+                        return "Phase '${phase.id}' is too short for one bounded transition cycle"
+                    }
+                    val cycleMs = phase.transition.cycleMs.toDouble()
+                    val onWindowMs = cycleMs * phase.transition.dutyCycle.toDouble()
+                    val offWindowMs =
+                        cycleMs * (1.0 - phase.transition.dutyCycle.toDouble())
+                    if (
+                        !onWindowMs.isFinite() ||
+                        !offWindowMs.isFinite() ||
+                        onWindowMs < LOAD_CONTROL_CADENCE_MS.toDouble() ||
+                        offWindowMs < LOAD_CONTROL_CADENCE_MS.toDouble()
+                    ) {
+                        return "Phase '${phase.id}' pulse ON/OFF windows are shorter than the " +
+                            "control cadence"
+                    }
+                }
+
+                TransitionMode.TRIANGLE_WAVE -> if (
+                    phase.durationMs < phase.transition.cycleMs
+                ) {
+                    return "Phase '${phase.id}' is too short for one bounded transition cycle"
+                }
+
+                TransitionMode.SOAK_RECOVERY -> {
+                    val edgeMs = phase.transition.transitionDurationMs
+                        .takeIf { it > 0L }
+                        ?: (phase.durationMs / 5L).coerceAtLeast(1L)
+                    val holdMs = (phase.durationMs - edgeMs - edgeMs).coerceAtLeast(0L)
+                    if (
+                        edgeMs < LOAD_CONTROL_CADENCE_MS * 2L ||
+                        holdMs < LOAD_CONTROL_CADENCE_MS
+                    ) {
+                        return "Phase '${phase.id}' has no observable gradual attack, hold, " +
+                            "and recovery windows at the control cadence"
+                    }
+                }
+
+                TransitionMode.STEP -> if (
+                    phase.durationMs < LOAD_CONTROL_CADENCE_MS * 2L
+                ) {
+                    return "Phase '${phase.id}' is too short to apply its target after baseline"
+                }
+
+                TransitionMode.LINEAR_RAMP -> {
+                    val windowMs = phase.transition.transitionDurationMs
+                        .takeIf { it > 0L }
+                        ?: phase.durationMs
+                    if (windowMs < LOAD_CONTROL_CADENCE_MS * 2L) {
+                        return "Phase '${phase.id}' ramp window is too short for an observable " +
+                            "intermediate control tick"
+                    }
+                }
+
+                TransitionMode.STAIRCASE -> {
+                    val windowMs = phase.transition.transitionDurationMs
+                        .takeIf { it > 0L }
+                        ?: phase.durationMs
+                    val requiredDurationMs =
+                        phase.transition.stepCount.toLong() * LOAD_CONTROL_CADENCE_MS
+                    if (windowMs < requiredDurationMs) {
+                        return "Phase '${phase.id}' staircase window is too short to observe " +
+                            "${phase.transition.stepCount} staircase levels"
+                    }
+                }
+            }
+        }
+        return null
     }
 
     private fun rejected(reason: String) = ScenarioSafetyDecision(
@@ -333,4 +691,6 @@ object ScenarioSafetyPolicy {
         adjustments = emptyList(),
         rejectionReason = reason,
     )
+
+    private val LONG_MAX_BIG_INTEGER: BigInteger = BigInteger.valueOf(Long.MAX_VALUE)
 }

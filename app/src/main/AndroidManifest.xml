@@ -8,6 +8,10 @@
         tools:ignore="ProtectedPermissions" />
     <uses-permission android:name="com.example.dpulayerlab.permission.ACCESS_VENDOR_TELEMETRY" />
 
+    <permission
+        android:name="${applicationId}.permission.CONTROL_TESTS"
+        android:protectionLevel="signature|privileged" />
+
     <queries>
         <intent>
             <action android:name="com.example.dpulayerlab.VENDOR_TELEMETRY" />
@@ -23,21 +27,39 @@
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
         android:hardwareAccelerated="true"
-        android:icon="@drawable/ic_launcher"
+        android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
-        android:roundIcon="@drawable/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.DpuLayerLab"
         tools:targetApi="35">
         <activity
             android:name=".MainActivity"
             android:configChanges="keyboardHidden|orientation|screenSize|smallestScreenSize|screenLayout|uiMode"
-            android:exported="true">
+            android:exported="true"
+            android:launchMode="singleTask">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!--
+            Keep stress control separate from the unprotected launcher entry point. Android's
+            safer-intent matching validates explicit Activity intents against these actions.
+            CATEGORY_DEFAULT is deliberately absent, so general implicit resolution stays off.
+            src/debug removes the permission solely for adb-driven lab automation.
+        -->
+        <activity-alias
+            android:name=".AutomationActivity"
+            android:exported="true"
+            android:permission="${applicationId}.permission.CONTROL_TESTS"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="com.example.dpulayerlab.action.START" />
+                <action android:name="com.example.dpulayerlab.action.STOP" />
+                <action android:name="com.example.dpulayerlab.action.SHOW" />
+            </intent-filter>
+        </activity-alias>
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.files"

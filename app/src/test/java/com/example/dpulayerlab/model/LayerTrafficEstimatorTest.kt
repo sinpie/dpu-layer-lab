@@ -47,9 +47,60 @@ class LayerTrafficEstimatorTest {
             mediaSelected = true,
             mediaWidthPx = 80,
             mediaHeightPx = 40,
+            decoderLinearReference = p010Reference,
         )
 
         assertEquals(9_600.0, estimate.bytesPerFrame!!, 0.001)
+    }
+
+    @Test
+    fun selectedDecoderFormatTakesPriorityOverSurfaceAlpha() {
+        val yuv = LayerTrafficEstimator.estimate(
+            phase = phase(
+                pixelRoute = PixelRoute.YUV_420,
+                alphaOverlap = true,
+            ),
+            displayWidthPx = 40,
+            displayHeightPx = 20,
+            mediaSelected = true,
+            mediaWidthPx = 80,
+            mediaHeightPx = 40,
+            decoderLinearReference = yuv420Reference,
+        )
+        val p010 = LayerTrafficEstimator.estimate(
+            phase = phase(
+                pixelRoute = PixelRoute.P010,
+                alphaOverlap = true,
+            ),
+            displayWidthPx = 40,
+            displayHeightPx = 20,
+            mediaSelected = true,
+            mediaWidthPx = 80,
+            mediaHeightPx = 40,
+            decoderLinearReference = p010Reference,
+        )
+
+        assertEquals(4_800.0, yuv.bytesPerFrame!!, 0.001)
+        assertEquals(9_600.0, p010.bytesPerFrame!!, 0.001)
+        assertTrue(yuv.formatLabel.contains("decoder primary YUV420"))
+        assertTrue(p010.formatLabel.contains("Surface alpha"))
+    }
+
+    @Test
+    fun requiredSbwcWithSelectedMediaUsesDecoderDimensions() {
+        val estimate = LayerTrafficEstimator.estimate(
+            phase = phase(pixelRoute = PixelRoute.SBWC_REQUIRED),
+            displayWidthPx = 40,
+            displayHeightPx = 20,
+            mediaSelected = true,
+            mediaWidthPx = 80,
+            mediaHeightPx = 40,
+            decoderLinearReference = p010Reference,
+        )
+
+        assertEquals(9_600.0, estimate.bytesPerFrame!!, 0.001)
+        assertTrue(estimate.formatLabel.contains("route SBWC_REQUIRED"))
+        assertTrue(estimate.compressionRatioExcluded)
     }
 
     @Test
@@ -108,12 +159,102 @@ class LayerTrafficEstimatorTest {
         assertNull(estimate.dpuReadBytesPerSecond)
     }
 
+    @Test
+    fun decoderRouteDoesNotChangeTheVerifiedLinearReference() {
+        val estimates = listOf(
+            PixelRoute.YUV_420,
+            PixelRoute.P010,
+            PixelRoute.SBWC_AUTO,
+            PixelRoute.SBWC_REQUIRED,
+        ).map { route ->
+            LayerTrafficEstimator.estimate(
+                phase = phase(pixelRoute = route),
+                displayWidthPx = 40,
+                displayHeightPx = 20,
+                mediaSelected = true,
+                mediaWidthPx = 80,
+                mediaHeightPx = 40,
+                decoderLinearReference = yuv420Reference,
+            )
+        }
+
+        assertTrue(estimates.all { it.bytesPerFrame == 4_800.0 })
+        assertTrue(estimates.all { it.formatLabel.contains("does not force Surface format") })
+        assertTrue(estimates.takeLast(2).all { it.compressionRatioExcluded })
+    }
+
+    @Test
+    fun unknownDecoderLinearReferenceMakesAggregateTrafficUnavailable() {
+        val estimate = LayerTrafficEstimator.estimate(
+            phase = phase(pixelRoute = PixelRoute.P010, activeLayers = 2),
+            displayWidthPx = 40,
+            displayHeightPx = 20,
+            mediaSelected = true,
+            mediaWidthPx = 80,
+            mediaHeightPx = 40,
+            decoderLinearReference = DecoderLinearReference(
+                bytesPerPixel = null,
+                label = "decoder linear reference N/A",
+                source = "test",
+            ),
+        )
+
+        assertNull(estimate.bytesPerFrame)
+        assertNull(estimate.dpuReadBytesPerSecond)
+        assertNull(estimate.producerWriteBytesPerSecond)
+        assertTrue(estimate.formatLabel.contains("N/A"))
+    }
+
+    @Test
+    fun invalidDecoderLinearReferencesFailClosedInsteadOfLeakingNonFiniteTraffic() {
+        listOf(
+            Double.NaN,
+            Double.NEGATIVE_INFINITY,
+            Double.POSITIVE_INFINITY,
+            -1.0,
+            0.0,
+            16.0001,
+        ).forEach { invalidBytesPerPixel ->
+            val estimate = LayerTrafficEstimator.estimate(
+                phase = phase(pixelRoute = PixelRoute.P010),
+                displayWidthPx = 40,
+                displayHeightPx = 20,
+                mediaSelected = true,
+                mediaWidthPx = 80,
+                mediaHeightPx = 40,
+                decoderLinearReference = DecoderLinearReference(
+                    bytesPerPixel = invalidBytesPerPixel,
+                    label = "invalid $invalidBytesPerPixel B/px",
+                    source = "untrusted test descriptor",
+                ),
+            )
+
+            assertNull("B/px=$invalidBytesPerPixel", estimate.bytesPerFrame)
+            assertNull("B/px=$invalidBytesPerPixel", estimate.dpuReadBytesPerSecond)
+            assertNull("B/px=$invalidBytesPerPixel", estimate.producerWriteBytesPerSecond)
+            assertTrue(estimate.formatLabel.contains("N/A"))
+        }
+    }
+
+    private val yuv420Reference = DecoderLinearReference(
+        bytesPerPixel = 1.5,
+        label = "YUV420 linear reference · 1.5 B/px",
+        source = "test",
+    )
+
+    private val p010Reference = DecoderLinearReference(
+        bytesPerPixel = 3.0,
+        label = "P010 linear reference · 3 B/px",
+        source = "test",
+    )
+
     private fun phase(
         activeLayers: Int = 1,
         backend: LayerBackend = LayerBackend.INDEPENDENT_SURFACES,
         pixelRoute: PixelRoute = PixelRoute.RGB_8888,
         bufferSize: BufferSize = BufferSize.DISPLAY,
         includeGlLayer: Boolean = false,
+        alphaOverlap: Boolean = false,
     ) = PhaseSpec(
         id = "test",
         label = "test",
@@ -126,5 +267,6 @@ class LayerTrafficEstimatorTest {
         bufferSize = bufferSize,
         motion = MotionProfile.STATIC,
         includeGlLayer = includeGlLayer,
+        alphaOverlap = alphaOverlap,
     )
 }

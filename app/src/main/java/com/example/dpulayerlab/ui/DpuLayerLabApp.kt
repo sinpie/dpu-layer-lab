@@ -10,6 +10,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -22,6 +23,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
@@ -69,8 +71,10 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -91,27 +95,43 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.example.dpulayerlab.engine.LabController
 import com.example.dpulayerlab.engine.ScenarioCatalog
+import com.example.dpulayerlab.engine.GaugePeak
+import com.example.dpulayerlab.engine.consistentGaugePeak
 import com.example.dpulayerlab.model.BufferSize
+import com.example.dpulayerlab.model.DecoderLinearReference
 import com.example.dpulayerlab.model.Gauge
 import com.example.dpulayerlab.model.LayerBackend
 import com.example.dpulayerlab.model.LayerTrafficEstimate
 import com.example.dpulayerlab.model.LayerTrafficEstimator
+import com.example.dpulayerlab.model.LoadTransitionEvaluator
 import com.example.dpulayerlab.model.LoadSetpoints
 import com.example.dpulayerlab.model.LoadShape
 import com.example.dpulayerlab.model.MetricQuality
 import com.example.dpulayerlab.model.MotionProfile
+import com.example.dpulayerlab.model.PhaseSpec
 import com.example.dpulayerlab.model.PixelRoute
+import com.example.dpulayerlab.model.PlanProgress
+import com.example.dpulayerlab.model.PlanRunResult
+import com.example.dpulayerlab.model.PlanSource
+import com.example.dpulayerlab.model.PlanState
 import com.example.dpulayerlab.model.RiskLevel
 import com.example.dpulayerlab.model.RunProgress
 import com.example.dpulayerlab.model.RunSummary
 import com.example.dpulayerlab.model.RunVerdict
 import com.example.dpulayerlab.model.RunnerStage
 import com.example.dpulayerlab.model.ScenarioCategory
+import com.example.dpulayerlab.model.ScenarioPlanPolicy
+import com.example.dpulayerlab.model.ScenarioQueueEditor
+import com.example.dpulayerlab.model.ScenarioRunPlan
 import com.example.dpulayerlab.model.ScenarioSpec
 import com.example.dpulayerlab.model.TelemetrySnapshot
+import com.example.dpulayerlab.model.terminalReason
+import com.example.dpulayerlab.model.TransitionMode
+import com.example.dpulayerlab.model.TransitionSpec
 import com.example.dpulayerlab.monitor.CapabilityScanner
 import com.example.dpulayerlab.monitor.CapabilitySnapshot
 import com.example.dpulayerlab.render.LayerStageView
+import com.example.dpulayerlab.render.ProducerFrameCallback
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
@@ -141,31 +161,64 @@ private data class LiveHudMetricSpec(
     val color: Color,
 )
 
+private data class DashboardMetricSpec(
+    val label: String,
+    val gauge: Gauge,
+    val detail: String,
+    val valueText: String? = null,
+)
+
+private enum class ScenarioQuickFilter(val label: String) {
+    ALL("전체 패턴"),
+    SHARP("급격한 변화"),
+    GRADUAL("점진 변화"),
+    CROSS_LOAD("교차 부하"),
+    REQUIREMENTS("추가 요구"),
+}
+
+private data class ScenarioOverview(
+    val patternLabel: String,
+    val intensityScore: Int,
+    val intensityLabel: String,
+    val phaseSequence: String,
+)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DpuLayerLabApp(controller: LabController) {
     var section by remember { mutableStateOf(AppSection.DASHBOARD) }
+    var selectedScenarioIds by rememberSaveable {
+        mutableStateOf<List<String>>(arrayListOf())
+    }
+    var planRepeatCount by rememberSaveable { mutableIntStateOf(1) }
     val snackbar = remember { SnackbarHostState() }
     val progress = controller.progress
+    val planProgress = controller.planProgress
     val error = controller.errorMessage
     val mediaPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         controller.setMediaUri(uri)
     }
 
-    LaunchedEffect(progress.stage) {
-        section = when (progress.stage) {
-            RunnerStage.PRECHECK,
-            RunnerStage.WARMUP,
-            RunnerStage.RUNNING,
-            RunnerStage.COOLDOWN,
-            -> AppSection.RUN
+    LaunchedEffect(progress.stage, planProgress.state) {
+        section = when {
+            planProgress.active -> AppSection.RUN
+            // A rejected start attempt is not a new run result. Preserve the screen that owns the
+            // previous summary instead of combining old artifacts with the rejected plan metadata.
+            planProgress.state == PlanState.REJECTED -> section
+            else -> when (progress.stage) {
+                RunnerStage.PRECHECK,
+                RunnerStage.WARMUP,
+                RunnerStage.RUNNING,
+                RunnerStage.COOLDOWN,
+                -> AppSection.RUN
 
-            RunnerStage.COMPLETE,
-            RunnerStage.ABORTED,
-            RunnerStage.UNSUPPORTED,
-            -> AppSection.RESULT
+                RunnerStage.COMPLETE,
+                RunnerStage.ABORTED,
+                RunnerStage.UNSUPPORTED,
+                -> AppSection.RESULT
 
-            else -> section
+                else -> section
+            }
         }
     }
     LaunchedEffect(error) {
@@ -257,6 +310,62 @@ fun DpuLayerLabApp(controller: LabController) {
                 controller = controller,
                 modifier = Modifier.padding(padding),
                 selectMedia = { mediaPicker.launch(arrayOf("video/*")) },
+                selectedScenarioIds = selectedScenarioIds,
+                repeatCount = planRepeatCount,
+                addScenario = { scenarioId ->
+                    val updated = ScenarioQueueEditor.append(
+                        queue = selectedScenarioIds,
+                        scenarioId = scenarioId,
+                    )
+                    selectedScenarioIds = updated
+                    planRepeatCount = planRepeatCount.coerceAtMost(
+                        maximumPlanRepeats(updated.size),
+                    )
+                },
+                removeScenario = { scenarioId ->
+                    selectedScenarioIds = ScenarioQueueEditor.removeLast(
+                        queue = selectedScenarioIds,
+                        scenarioId = scenarioId,
+                    )
+                },
+                removeQueueAt = { index ->
+                    selectedScenarioIds = ScenarioQueueEditor.removeAt(
+                        queue = selectedScenarioIds,
+                        index = index,
+                    )
+                },
+                selectAll = {
+                    val updated = ScenarioCatalog.presets.map { it.id }
+                    selectedScenarioIds = updated
+                    planRepeatCount = planRepeatCount.coerceAtMost(
+                        maximumPlanRepeats(updated.size),
+                    )
+                },
+                clearSelection = {
+                    selectedScenarioIds = arrayListOf()
+                    planRepeatCount = 1
+                },
+                resetOrder = {
+                    selectedScenarioIds = ScenarioQueueEditor.resetToCatalogOrder(
+                        queue = selectedScenarioIds,
+                        catalogOrder = ScenarioCatalog.presets.map { it.id },
+                    )
+                },
+                changeRepeatCount = {
+                    planRepeatCount = it.coerceIn(
+                        1,
+                        maximumPlanRepeats(selectedScenarioIds.size),
+                    )
+                },
+                runSelection = { scenarios, repeats ->
+                    controller.startPlan(
+                        ScenarioRunPlan(
+                            scenarios = scenarios,
+                            repeatCount = repeats,
+                            source = PlanSource.USER_SELECTION,
+                        ),
+                    )
+                },
             )
 
             AppSection.BUILDER -> BuilderScreen(
@@ -307,7 +416,11 @@ private fun DashboardScreen(
         }
         controller.lastSummary?.let { summary ->
             item {
-                LastResultCard(summary, controller::shareLastReport)
+                LastResultCard(
+                    summary = summary,
+                    reportAvailable = controller.lastReportFile?.isFile == true,
+                    share = controller::shareLastReport,
+                )
             }
         }
         item {
@@ -393,27 +506,38 @@ private fun HeroValue(label: String, value: String) {
 
 @Composable
 private fun MetricGrid(telemetry: TelemetrySnapshot) {
+    val compositionGauge = Gauge(
+        value = telemetry.hwcDeviceLayers?.toFloat()
+            ?: telemetry.hwcClientLayers?.toFloat(),
+        quality = when {
+            telemetry.hwcDeviceLayers != null -> telemetry.hwcDeviceLayersQuality
+            telemetry.hwcClientLayers != null -> telemetry.hwcClientLayersQuality
+            else -> MetricQuality.UNAVAILABLE
+        },
+        source = compositionProvenance(telemetry),
+    )
     val metrics = listOf(
-        Triple("AP CPU", telemetry.cpu, "전체 CPU"),
-        Triple("APP CPU", telemetry.appCpu, "프로세스"),
-        Triple("MEMORY", telemetry.memoryUsed, telemetry.memoryAvailable.display()),
-        Triple("PRODUCER", telemetry.producedFps, "primary layer"),
-        Triple("GPU BUSY", telemetry.gpuBusy, telemetry.gpuFrequency.display()),
-        Triple("MEM BUS", telemetry.busBusy, "gen ${telemetry.generatedBandwidth.display(2)}"),
-        Triple(
-            "DPU BUSY",
-            telemetry.dpuBusy,
-            telemetry.surfaceFlingerHwcMissed?.let { "SF HWC miss $it · proxy" } ?: "vendor counter",
+        DashboardMetricSpec("AP CPU", telemetry.cpu, "전체 CPU"),
+        DashboardMetricSpec("APP CPU", telemetry.appCpu, "프로세스"),
+        DashboardMetricSpec("MEMORY", telemetry.memoryUsed, telemetry.memoryAvailable.display()),
+        DashboardMetricSpec("PRODUCER", telemetry.producedFps, "primary layer"),
+        DashboardMetricSpec("GPU BUSY", telemetry.gpuBusy, telemetry.gpuFrequency.display()),
+        DashboardMetricSpec(
+            "MEM BUS",
+            telemetry.busBusy,
+            "gen ${telemetry.generatedBandwidth.display(2)}",
         ),
-        Triple(
-            "HWC D / C",
-            Gauge(
-                telemetry.hwcDeviceLayers?.toFloat(),
-                "",
-                if (telemetry.hwcDeviceLayers != null) MetricQuality.SYSTEM_SERVICE else MetricQuality.UNAVAILABLE,
-                "SurfaceFlinger",
-            ),
-            "${telemetry.hwcDeviceLayers ?: "–"} / ${telemetry.hwcClientLayers ?: "–"}",
+        DashboardMetricSpec(
+            label = "DPU BUSY",
+            gauge = telemetry.dpuBusy,
+            detail = telemetry.dpuBusy.provenanceLabel(),
+        ),
+        DashboardMetricSpec(
+            label = "HWC D / C",
+            gauge = compositionGauge,
+            detail = compositionProvenance(telemetry),
+            valueText = "${telemetry.hwcDeviceLayers ?: "–"} / " +
+                "${telemetry.hwcClientLayers ?: "–"}",
         ),
     )
     LazyVerticalGrid(
@@ -425,14 +549,24 @@ private fun MetricGrid(telemetry: TelemetrySnapshot) {
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        items(metrics) { (label, gauge, detail) ->
-            MetricCard(label, gauge, detail)
+        items(metrics) { metric ->
+            MetricCard(
+                label = metric.label,
+                gauge = metric.gauge,
+                detail = metric.detail,
+                valueText = metric.valueText,
+            )
         }
     }
 }
 
 @Composable
-private fun MetricCard(label: String, gauge: Gauge, detail: String) {
+private fun MetricCard(
+    label: String,
+    gauge: Gauge,
+    detail: String,
+    valueText: String? = null,
+) {
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         shape = RoundedCornerShape(18.dp),
@@ -453,12 +587,22 @@ private fun MetricCard(label: String, gauge: Gauge, detail: String) {
                 )
             }
             Text(
-                if (label == "HWC D / C") detail else gauge.display(if (gauge.unit.contains("fps") || gauge.unit.contains("Hz")) 1 else 0),
+                valueText
+                    ?: gauge.display(
+                        if (
+                            gauge.unit.contains("fps") ||
+                            gauge.unit.contains("Hz")
+                        ) {
+                            1
+                        } else {
+                            0
+                        },
+                    ),
                 style = MaterialTheme.typography.headlineMedium,
                 maxLines = 1,
             )
             Text(
-                if (label == "HWC D / C") "DEVICE / CLIENT" else detail,
+                detail,
                 style = MaterialTheme.typography.labelLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
@@ -516,10 +660,33 @@ private fun CatalogScreen(
     controller: LabController,
     modifier: Modifier,
     selectMedia: () -> Unit,
+    selectedScenarioIds: List<String>,
+    repeatCount: Int,
+    addScenario: (String) -> Unit,
+    removeScenario: (String) -> Unit,
+    removeQueueAt: (Int) -> Unit,
+    selectAll: () -> Unit,
+    clearSelection: () -> Unit,
+    resetOrder: () -> Unit,
+    changeRepeatCount: (Int) -> Unit,
+    runSelection: (List<ScenarioSpec>, Int) -> Unit,
 ) {
     var category by remember { mutableStateOf<ScenarioCategory?>(null) }
-    val scenarios = remember(category) {
-        ScenarioCatalog.presets.filter { category == null || it.category == category }
+    var quickFilter by remember { mutableStateOf(ScenarioQuickFilter.ALL) }
+    val scenarios = remember(category, quickFilter) {
+        ScenarioCatalog.presets.filter { scenario ->
+            (category == null || scenario.category == category) &&
+                quickFilter.matches(scenario)
+        }
+    }
+    val selectedScenarios = remember(selectedScenarioIds) {
+        selectedScenarioIds.mapNotNull(ScenarioCatalog::byId)
+    }
+    val selectedPositions = remember(selectedScenarioIds) {
+        selectedScenarioIds.withIndex().groupBy(
+            keySelector = { it.value },
+            valueTransform = { it.index + 1 },
+        )
     }
     LazyColumn(
         modifier = modifier
@@ -530,9 +697,10 @@ private fun CatalogScreen(
     ) {
         item {
             Column {
-                Text("Test catalog", style = MaterialTheme.typography.displaySmall)
+                Text("DPU Test Program", style = MaterialTheme.typography.displaySmall)
                 Text(
-                    "부하를 올리는 구간과 다시 내리는 recovery 구간을 모두 기록합니다.",
+                    "DPU composition 한계와 underrun 징후를 확인할 테스트를 순서대로 " +
+                        "선택하고, 같은 queue를 반복 실행합니다.",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
@@ -543,6 +711,25 @@ private fun CatalogScreen(
             }
         }
         item {
+            QueuePlanCard(
+                selectedScenarios = selectedScenarios,
+                repeatCount = repeatCount,
+                maximumRepeatCount = maximumPlanRepeats(selectedScenarios.size),
+                running = controller.isRunning,
+                changeRepeatCount = changeRepeatCount,
+                selectAll = selectAll,
+                clearSelection = clearSelection,
+                resetOrder = resetOrder,
+                removeQueueAt = removeQueueAt,
+                runSelection = runSelection,
+            )
+        }
+        item {
+            Text(
+                "카테고리",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             Row(
                 modifier = Modifier
                     .horizontalScroll(rememberScrollState()),
@@ -562,8 +749,282 @@ private fun CatalogScreen(
                 }
             }
         }
+        item {
+            Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                Text(
+                    "빠른 조건",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    ScenarioQuickFilter.entries.forEach { item ->
+                        FilterChip(
+                            selected = quickFilter == item,
+                            onClick = { quickFilter = item },
+                            label = { Text(item.label) },
+                        )
+                    }
+                }
+                Text(
+                    "${scenarios.size}개 테스트 · 예상 강도는 preset 간 비교용이며 HW 수용 한계가 아닙니다.",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        if (scenarios.isEmpty()) {
+            item {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                    ),
+                    shape = RoundedCornerShape(18.dp),
+                ) {
+                    Column(
+                        Modifier.padding(18.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text("조건에 맞는 테스트가 없습니다.", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            "카테고리나 빠른 조건을 변경해 주세요.",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        TextButton(
+                            onClick = {
+                                category = null
+                                quickFilter = ScenarioQuickFilter.ALL
+                            },
+                        ) {
+                            Text("필터 초기화")
+                        }
+                    }
+                }
+            }
+        }
         items(scenarios, key = { it.id }) { scenario ->
-            ScenarioCard(scenario) { controller.startScenario(scenario) }
+            ScenarioCard(
+                scenario = scenario,
+                selectedPositions = selectedPositions[scenario.id].orEmpty(),
+                queueFull = selectedScenarioIds.size >= ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS,
+                queueEditable = !controller.isRunning,
+                addSelection = { addScenario(scenario.id) },
+                removeSelection = { removeScenario(scenario.id) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun QueuePlanCard(
+    selectedScenarios: List<ScenarioSpec>,
+    repeatCount: Int,
+    maximumRepeatCount: Int,
+    running: Boolean,
+    changeRepeatCount: (Int) -> Unit,
+    selectAll: () -> Unit,
+    clearSelection: () -> Unit,
+    resetOrder: () -> Unit,
+    removeQueueAt: (Int) -> Unit,
+    runSelection: (List<ScenarioSpec>, Int) -> Unit,
+) {
+    val oneLoopDurationMs = remember(selectedScenarios) {
+        ScenarioRunPlan(
+            scenarios = selectedScenarios,
+            repeatCount = 1,
+            source = PlanSource.USER_SELECTION,
+        ).estimatedDurationMs
+    }
+    val previewPlan = remember(selectedScenarios, repeatCount) {
+        ScenarioRunPlan(
+            scenarios = selectedScenarios,
+            repeatCount = repeatCount,
+            source = PlanSource.USER_SELECTION,
+        )
+    }
+    val totalDurationMs = previewPlan.estimatedDurationMs
+    val totalRuns = previewPlan.totalRuns
+    val catalogIds = remember { ScenarioCatalog.presets.map { it.id } }
+    val selectionMatchesCatalog = remember(selectedScenarios, catalogIds) {
+        selectedScenarios.map { it.id } == catalogIds
+    }
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.64f),
+        ),
+        shape = RoundedCornerShape(22.dp),
+    ) {
+        Column(
+            Modifier.padding(17.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("선택 실행 큐", style = MaterialTheme.typography.titleLarge)
+                    Text(
+                        "표시된 #번호 순서로 실행합니다. 큐 항목을 누르면 한 개만 제거됩니다.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.labelLarge,
+                    )
+                }
+                Surface(
+                    color = if (selectedScenarios.isEmpty()) {
+                        MaterialTheme.colorScheme.surfaceVariant
+                    } else {
+                        MaterialTheme.colorScheme.primary
+                    },
+                    shape = RoundedCornerShape(100.dp),
+                ) {
+                    Text(
+                        "${selectedScenarios.size} selected",
+                        modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.dp),
+                        color = if (selectedScenarios.isEmpty()) {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        } else {
+                            MaterialTheme.colorScheme.onPrimary
+                        },
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.labelLarge,
+                    )
+                }
+            }
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                ScenarioAttribute(
+                    label = "항목",
+                    value = "${selectedScenarios.size} tests",
+                    modifier = Modifier.weight(1f),
+                )
+                ScenarioAttribute(
+                    label = "1 LOOP",
+                    value = formatDuration(oneLoopDurationMs),
+                    modifier = Modifier.weight(1f),
+                )
+                ScenarioAttribute(
+                    label = "총 예상",
+                    value = formatDuration(totalDurationMs),
+                    modifier = Modifier.weight(1f),
+                )
+            }
+            Text(
+                "실행 순서",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
+            )
+            if (selectedScenarios.isEmpty()) {
+                Text(
+                    "아래 테스트에서 ‘큐에 추가’를 눌러 순서를 만드세요.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(7.dp),
+                ) {
+                    selectedScenarios.forEachIndexed { index, scenario ->
+                        AssistChip(
+                            onClick = { removeQueueAt(index) },
+                            enabled = !running,
+                            label = {
+                                Text(
+                                    "#${index + 1} ${scenario.name}  ×",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.SemiBold,
+                                )
+                            },
+                        )
+                    }
+                }
+            }
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text("LOOP 반복", style = MaterialTheme.typography.titleMedium)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(7.dp),
+                ) {
+                    OutlinedButton(
+                        onClick = { changeRepeatCount(repeatCount - 1) },
+                        enabled = repeatCount > 1 && !running,
+                        contentPadding = PaddingValues(horizontal = 13.dp, vertical = 7.dp),
+                    ) {
+                        Text("−")
+                    }
+                    Text(
+                        "$repeatCount ×",
+                        modifier = Modifier.width(42.dp),
+                        textAlign = TextAlign.Center,
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.titleMedium,
+                    )
+                    OutlinedButton(
+                        onClick = { changeRepeatCount(repeatCount + 1) },
+                        enabled = repeatCount < maximumRepeatCount && !running,
+                        contentPadding = PaddingValues(horizontal = 13.dp, vertical = 7.dp),
+                    ) {
+                        Text("+")
+                    }
+                }
+            }
+            Text(
+                "최대 ${ScenarioPlanPolicy.MAX_REPEAT_COUNT} loops · " +
+                    "${ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS} scenario runs · " +
+                    "현재 $totalRuns runs",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelMedium,
+            )
+            Text(
+                "예상 시간은 scenario phase 합계이며 precheck·warm-up·cooldown·report I/O는 제외합니다.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelSmall,
+            )
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                TextButton(
+                    onClick = resetOrder,
+                    enabled = selectedScenarios.size > 1 && !running,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text("순서 초기화")
+                }
+                TextButton(
+                    onClick = selectAll,
+                    enabled = !selectionMatchesCatalog && !running,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text("전체 선택")
+                }
+                TextButton(
+                    onClick = clearSelection,
+                    enabled = selectedScenarios.isNotEmpty() && !running,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text("모두 해제")
+                }
+            }
+            Button(
+                onClick = { runSelection(selectedScenarios, repeatCount) },
+                enabled = selectedScenarios.isNotEmpty() && !running &&
+                    totalRuns <= ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp),
+            ) {
+                Text("선택한 DPU PLAN 실행 · $totalRuns runs")
+            }
         }
     }
 }
@@ -591,10 +1052,37 @@ private fun MediaSourceCard(uri: android.net.Uri?, selectMedia: () -> Unit, clea
 }
 
 @Composable
-private fun ScenarioCard(scenario: ScenarioSpec, run: () -> Unit) {
+private fun ScenarioCard(
+    scenario: ScenarioSpec,
+    selectedPositions: List<Int>,
+    queueFull: Boolean,
+    queueEditable: Boolean,
+    addSelection: () -> Unit,
+    removeSelection: () -> Unit,
+) {
+    val overview = remember(scenario) { scenario.overview() }
+    val selected = selectedPositions.isNotEmpty()
+    val cardShape = RoundedCornerShape(22.dp)
     Card(
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        shape = RoundedCornerShape(22.dp),
+        modifier = Modifier.then(
+            if (selected) {
+                Modifier.border(
+                    width = 2.dp,
+                    color = MaterialTheme.colorScheme.primary,
+                    shape = cardShape,
+                )
+            } else {
+                Modifier
+            },
+        ),
+        colors = CardDefaults.cardColors(
+            containerColor = if (selected) {
+                MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.30f)
+            } else {
+                MaterialTheme.colorScheme.surface
+            },
+        ),
+        shape = cardShape,
     ) {
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(
@@ -606,9 +1094,61 @@ private fun ScenarioCard(scenario: ScenarioSpec, run: () -> Unit) {
                     Text(scenario.category.label.uppercase(), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
                     Text(scenario.name, style = MaterialTheme.typography.titleLarge)
                 }
-                RiskBadge(scenario.risk)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(7.dp),
+                ) {
+                    selectedPositions.takeIf { it.isNotEmpty() }?.let { positions ->
+                        Surface(
+                            color = MaterialTheme.colorScheme.primary,
+                            shape = RoundedCornerShape(100.dp),
+                        ) {
+                            Text(
+                                positions.positionSummary(),
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                color = MaterialTheme.colorScheme.onPrimary,
+                                fontWeight = FontWeight.Bold,
+                                style = MaterialTheme.typography.labelLarge,
+                            )
+                        }
+                    }
+                    RiskBadge(scenario.risk)
+                }
             }
-            Text(scenario.description, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    "테스트 목적",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+                Text(scenario.description, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                ScenarioAttribute(
+                    label = "부하 패턴",
+                    value = overview.patternLabel,
+                    modifier = Modifier.weight(1f),
+                )
+                ScenarioAttribute(
+                    label = "최대 구성",
+                    value = "${scenario.maxLayers}L · ${scenario.maxHz.toInt()}Hz",
+                    modifier = Modifier.weight(1f),
+                )
+                ScenarioIntensity(
+                    overview = overview,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+            Text(
+                "Phase 흐름 · ${overview.phaseSequence}",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelLarge,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
             Row(
                 modifier = Modifier.horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(7.dp),
@@ -620,11 +1160,17 @@ private fun ScenarioCard(scenario: ScenarioSpec, run: () -> Unit) {
                 }
             }
             if (scenario.requirements.isNotEmpty()) {
-                Text(
-                    "필요: ${scenario.requirements.joinToString()}",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = MaterialTheme.colorScheme.tertiary,
-                )
+                Surface(
+                    color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.55f),
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Text(
+                        "실행 전 확인 · ${scenario.requirements.joinToString()}",
+                        modifier = Modifier.padding(horizontal = 11.dp, vertical = 8.dp),
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer,
+                    )
+                }
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -634,7 +1180,109 @@ private fun ScenarioCard(scenario: ScenarioSpec, run: () -> Unit) {
                     style = MaterialTheme.typography.labelLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                Button(onClick = run) { Text("실행") }
+                if (selected) {
+                    OutlinedButton(
+                        onClick = removeSelection,
+                        enabled = queueEditable,
+                    ) {
+                        Text("1개 제거")
+                    }
+                    Spacer(Modifier.width(7.dp))
+                    Button(
+                        onClick = addSelection,
+                        enabled = queueEditable && !queueFull,
+                    ) {
+                        Text("다시 추가")
+                    }
+                } else {
+                    Button(
+                        onClick = addSelection,
+                        enabled = queueEditable && !queueFull,
+                    ) {
+                        Text("큐에 추가")
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ScenarioAttribute(
+    label: String,
+    value: String,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier,
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
+        shape = RoundedCornerShape(13.dp),
+    ) {
+        Column(
+            Modifier.padding(horizontal = 10.dp, vertical = 9.dp),
+            verticalArrangement = Arrangement.spacedBy(3.dp),
+        ) {
+            Text(
+                label,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                value,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ScenarioIntensity(
+    overview: ScenarioOverview,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier,
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
+        shape = RoundedCornerShape(13.dp),
+    ) {
+        Column(
+            Modifier.padding(horizontal = 10.dp, vertical = 9.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                "예상 강도",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                "${overview.intensityLabel} · ${overview.intensityScore}",
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                val activeSegments = ((overview.intensityScore + 19) / 20).coerceIn(1, 5)
+                repeat(5) { index ->
+                    Box(
+                        Modifier
+                            .weight(1f)
+                            .height(3.dp)
+                            .clip(RoundedCornerShape(100.dp))
+                            .background(
+                                if (index < activeSegments) {
+                                    MaterialTheme.colorScheme.tertiary
+                                } else {
+                                    MaterialTheme.colorScheme.outline.copy(alpha = 0.25f)
+                                },
+                            ),
+                    )
+                }
             }
         }
     }
@@ -677,19 +1325,24 @@ private fun CompactScenarioCard(scenario: ScenarioSpec, run: () -> Unit) {
 
 @Composable
 private fun BuilderScreen(controller: LabController, modifier: Modifier) {
-    var layers by remember { mutableIntStateOf(8) }
-    var duration by remember { mutableIntStateOf(30) }
-    var fps by remember { mutableFloatStateOf(120f) }
-    var hz by remember { mutableFloatStateOf(120f) }
-    var cpu by remember { mutableFloatStateOf(0.25f) }
-    var memory by remember { mutableFloatStateOf(0.55f) }
-    var gpu by remember { mutableFloatStateOf(0.35f) }
-    var npu by remember { mutableFloatStateOf(0f) }
-    var backend by remember { mutableStateOf(LayerBackend.MIXED_SURFACE_TEXTURE) }
-    var route by remember { mutableStateOf(PixelRoute.RGB_8888) }
-    var size by remember { mutableStateOf(BufferSize.DISPLAY) }
-    var motion by remember { mutableStateOf(MotionProfile.TRANSFORM_STORM) }
-    var shape by remember { mutableStateOf(LoadShape.PULSE) }
+    var layers by rememberSaveable { mutableIntStateOf(8) }
+    var duration by rememberSaveable { mutableIntStateOf(30) }
+    var fps by rememberSaveable { mutableFloatStateOf(120f) }
+    var hz by rememberSaveable { mutableFloatStateOf(120f) }
+    var cpu by rememberSaveable { mutableFloatStateOf(0.25f) }
+    var memory by rememberSaveable { mutableFloatStateOf(0.55f) }
+    var gpu by rememberSaveable { mutableFloatStateOf(0.35f) }
+    var npu by rememberSaveable { mutableFloatStateOf(0f) }
+    var backend by rememberSaveable { mutableStateOf(LayerBackend.MIXED_SURFACE_TEXTURE) }
+    var route by rememberSaveable { mutableStateOf(PixelRoute.RGB_8888) }
+    var size by rememberSaveable { mutableStateOf(BufferSize.DISPLAY) }
+    var motion by rememberSaveable { mutableStateOf(MotionProfile.TRANSFORM_STORM) }
+    var shape by rememberSaveable { mutableStateOf(LoadShape.STEADY) }
+    var transitionMode by rememberSaveable { mutableStateOf(TransitionMode.STEP) }
+    var transitionSeconds by rememberSaveable { mutableFloatStateOf(6f) }
+    var transitionCycleSeconds by rememberSaveable { mutableFloatStateOf(4f) }
+    var transitionSteps by rememberSaveable { mutableIntStateOf(6) }
+    var transitionDuty by rememberSaveable { mutableFloatStateOf(0.5f) }
 
     LazyColumn(
         modifier = modifier
@@ -728,6 +1381,12 @@ private fun BuilderScreen(controller: LabController, modifier: Modifier) {
                 LabeledSlider("GPU 3D", "${(gpu * 100).roundToInt()}%", gpu, 0f..1f, 9) { gpu = it }
                 LabeledSlider("NPU adapter", "${(npu * 100).roundToInt()}%", npu, 0f..1f, 9) { npu = it }
                 EnumSelector("Load shape", shape, LoadShape.entries) { shape = it }
+                Text(
+                    "Load shape은 CPU/memory/NPU worker 내부 미세 파형입니다. Phase 전체의 " +
+                        "layer·FPS·교차 부하 변화는 아래 전이 조건으로 제어합니다.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelMedium,
+                )
                 if (npu > 0f && !controller.hasNpuAdapter) {
                     Text(
                         "NPU adapter가 연결되지 않아 이 구성은 UNSUPPORTED로 기록됩니다.",
@@ -738,6 +1397,102 @@ private fun BuilderScreen(controller: LabController, modifier: Modifier) {
             }
         }
         item {
+            BuilderCard("PHASE TRANSITION") {
+                EnumSelector(
+                    "전이 방식",
+                    transitionMode,
+                    TransitionMode.entries,
+                ) { transitionMode = it }
+                Text(
+                    transitionMode.description,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelLarge,
+                )
+                when (transitionMode) {
+                    TransitionMode.LINEAR_RAMP,
+                    TransitionMode.STAIRCASE,
+                    TransitionMode.SOAK_RECOVERY,
+                    -> {
+                        val requestedMaximum = if (
+                            transitionMode == TransitionMode.SOAK_RECOVERY
+                        ) {
+                            duration / 2
+                        } else {
+                            duration
+                        }
+                        val maximumSeconds =
+                            requestedMaximum.coerceAtMost(60).coerceAtLeast(1).toFloat()
+                        LabeledSlider(
+                            label = if (transitionMode == TransitionMode.SOAK_RECOVERY) {
+                                "Attack / release"
+                            } else {
+                                "전이 시간"
+                            },
+                            valueLabel = "${transitionSeconds.coerceAtMost(maximumSeconds).roundToInt()}s",
+                            value = transitionSeconds.coerceAtMost(maximumSeconds),
+                            range = 1f..maximumSeconds,
+                            steps = (maximumSeconds.toInt() - 2).coerceAtLeast(0),
+                        ) { transitionSeconds = it }
+                    }
+
+                    TransitionMode.PULSE_BURST,
+                    TransitionMode.TRIANGLE_WAVE,
+                    -> {
+                        val maximumCycleSeconds =
+                            duration.coerceAtMost(12).coerceAtLeast(1).toFloat()
+                        LabeledSlider(
+                            "반복 주기",
+                            "${transitionCycleSeconds.coerceAtMost(maximumCycleSeconds).roundToInt()}s",
+                            transitionCycleSeconds.coerceAtMost(maximumCycleSeconds),
+                            1f..maximumCycleSeconds,
+                            (maximumCycleSeconds.toInt() - 2).coerceAtLeast(0),
+                        ) { transitionCycleSeconds = it }
+                    }
+
+                    TransitionMode.STEP -> Unit
+                }
+                if (transitionMode == TransitionMode.STAIRCASE) {
+                    LabeledSlider(
+                        "단계 수",
+                        "${transitionSteps}단",
+                        transitionSteps.toFloat(),
+                        2f..12f,
+                        9,
+                    ) { transitionSteps = it.roundToInt() }
+                }
+                if (transitionMode == TransitionMode.PULSE_BURST) {
+                    LabeledSlider(
+                        "ON duty",
+                        "${(transitionDuty * 100).roundToInt()}%",
+                        transitionDuty,
+                        0.1f..0.9f,
+                        7,
+                    ) { transitionDuty = it }
+                }
+                if (shape != LoadShape.STEADY && transitionMode != TransitionMode.STEP) {
+                    Text(
+                        "미세 파형과 phase 전이가 함께 적용됩니다. 단일 전이 응답을 비교하려면 " +
+                            "Load shape을 Steady로 두세요.",
+                        color = MaterialTheme.colorScheme.tertiary,
+                        style = MaterialTheme.typography.labelLarge,
+                    )
+                }
+            }
+        }
+        item {
+            val transitionDurationLimit = if (
+                transitionMode == TransitionMode.SOAK_RECOVERY
+            ) {
+                duration / 2f
+            } else {
+                duration.toFloat()
+            }
+            val safeTransitionSeconds = transitionSeconds
+                .coerceAtMost(transitionDurationLimit)
+                .coerceAtLeast(1f)
+            val safeCycleSeconds = transitionCycleSeconds
+                .coerceAtMost(duration.toFloat())
+                .coerceAtLeast(1f)
             val custom = ScenarioCatalog.custom(
                 layers = layers,
                 durationSeconds = duration,
@@ -748,6 +1503,13 @@ private fun BuilderScreen(controller: LabController, modifier: Modifier) {
                 bufferSize = size,
                 motion = motion,
                 loads = LoadSetpoints(cpu, memory, gpu, npu, shape),
+                transition = TransitionSpec(
+                    mode = transitionMode,
+                    transitionDurationMs = (safeTransitionSeconds * 1_000f).toLong(),
+                    cycleMs = (safeCycleSeconds * 1_000f).toLong(),
+                    stepCount = transitionSteps,
+                    dutyCycle = transitionDuty,
+                ),
             )
             Button(
                 onClick = { controller.startScenario(custom) },
@@ -828,24 +1590,82 @@ private fun enumLabel(value: Any?): String = when (value) {
     is BufferSize -> value.label
     is MotionProfile -> value.label
     is LoadShape -> value.label
+    is TransitionMode -> value.label
     else -> value.toString()
 }
 
 @Composable
 private fun RunningScreen(controller: LabController) {
     val progress = controller.progress
+    val planProgress = controller.planProgress
     val phase = progress.phase
+    val renderStage = phase != null && when (progress.stage) {
+        RunnerStage.WARMUP,
+        RunnerStage.RUNNING,
+        RunnerStage.COOLDOWN,
+        -> true
+        else -> false
+    }
     var stageView by remember { mutableStateOf<LayerStageView?>(null) }
     var stageWidthPx by remember { mutableIntStateOf(0) }
     var stageHeightPx by remember { mutableIntStateOf(0) }
-    var hudSamples by remember(progress.scenario?.id) {
+    val producerFrameCallback = remember(controller) {
+        ProducerFrameCallback { generation, producerId, primary ->
+            controller.frameTracker.onProducerBufferProduced(
+                generation = generation,
+                producerId = producerId,
+                primary = primary,
+            )
+        }
+    }
+    val expectedProducersCallback = remember(controller) {
+        { generation: Long, producerIds: Set<Long> ->
+            controller.frameTracker.expectProducers(generation, producerIds)
+        }
+    }
+    val producerTopologyPendingCallback = remember(controller) {
+        { generation: Long ->
+            controller.onProducerTopologyPending(generation)
+        }
+    }
+    var hudSamples by remember(
+        progress.scenario?.id,
+        planProgress.repeatIndex,
+        planProgress.queueIndex,
+    ) {
         mutableStateOf(emptyList<RunningHudSample>())
+    }
+    var lastHudSampleMs by remember(
+        progress.scenario?.id,
+        planProgress.repeatIndex,
+        planProgress.queueIndex,
+    ) {
+        mutableLongStateOf(0L)
     }
     val telemetry = controller.telemetry
 
-    LaunchedEffect(telemetry.monotonicMs, phase?.id) {
+    LaunchedEffect(renderStage, progress.producerGeneration) {
+        if (!renderStage && progress.producerGeneration > 0L) {
+            stageView?.release()
+            stageView = null
+            // Stage removal and producer-thread termination are independent facts. Always
+            // acknowledge removal; the process-wide lease remains authoritative while a bounded
+            // controller barrier polls a producer that is still draining.
+            controller.frameTracker.markProducerTeardownComplete(
+                progress.producerGeneration,
+            )
+        }
+    }
+
+    LaunchedEffect(telemetry.monotonicMs) {
         val activePhase = phase ?: return@LaunchedEffect
-        if (telemetry.monotonicMs <= 0L) return@LaunchedEffect
+        if (
+            telemetry.monotonicMs <= 0L ||
+            telemetry.monotonicMs <= lastHudSampleMs
+        ) {
+            return@LaunchedEffect
+        }
+        lastHudSampleMs = telemetry.monotonicMs
         hudSamples = (
             hudSamples + RunningHudSample(
                 layerCount = activePhase.activeLayers.toFloat(),
@@ -860,7 +1680,7 @@ private fun RunningScreen(controller: LabController) {
             .fillMaxSize()
             .background(Color.Black),
     ) {
-        if (phase != null) {
+        if (renderStage && phase != null) {
             AndroidView(
                 factory = { context ->
                     LayerStageView(context).also { stageView = it }
@@ -869,7 +1689,26 @@ private fun RunningScreen(controller: LabController) {
                     stage.configure(
                         newPhase = phase,
                         selectedMedia = controller.selectedMediaUri,
-                        onPrimaryFrame = controller.frameTracker::onPrimaryBufferProduced,
+                        selectedDecoder = controller.selectedVideoDecoder,
+                        newProducerGeneration = progress.producerGeneration,
+                        onProducerFrame = producerFrameCallback,
+                        onExpectedProducers = expectedProducersCallback,
+                        onProducerTopologyPending = producerTopologyPendingCallback,
+                        onProducerTeardownFailure =
+                            controller.frameTracker::markProducerTeardownFailure,
+                        onProducerRuntimeFailure = controller::onProducerRuntimeFailure,
+                        onStageRemoved = { generation, _ ->
+                            controller.frameTracker.markProducerTeardownComplete(generation)
+                            // Lifecycle stop can race a just-published generation before AndroidView
+                            // receives its update. In that case the detached stage is also proof
+                            // that no producer for the newer generation remains attached.
+                            val publishedGeneration = controller.progress.producerGeneration
+                            if (publishedGeneration > 0L && publishedGeneration != generation) {
+                                controller.frameTracker.markProducerTeardownComplete(
+                                    publishedGeneration,
+                                )
+                            }
+                        },
                     )
                 },
                 modifier = Modifier
@@ -882,6 +1721,7 @@ private fun RunningScreen(controller: LabController) {
         }
         RunningHud(
             progress = progress,
+            planProgress = planProgress,
             telemetry = telemetry,
             history = hudSamples,
             stageWidthPx = stageWidthPx,
@@ -889,6 +1729,8 @@ private fun RunningScreen(controller: LabController) {
             mediaSelected = controller.selectedMediaUri != null,
             mediaWidthPx = controller.selectedMediaWidthPx,
             mediaHeightPx = controller.selectedMediaHeightPx,
+            decoderLinearReference = controller.selectedMediaLinearReference,
+            safetyAdjustments = controller.lastSafetyAdjustments,
             stop = controller::stopScenario,
         )
     }
@@ -903,6 +1745,7 @@ private fun RunningScreen(controller: LabController) {
 @Composable
 private fun RunningHud(
     progress: RunProgress,
+    planProgress: PlanProgress,
     telemetry: TelemetrySnapshot,
     history: List<RunningHudSample>,
     stageWidthPx: Int,
@@ -910,11 +1753,21 @@ private fun RunningHud(
     mediaSelected: Boolean,
     mediaWidthPx: Int?,
     mediaHeightPx: Int?,
+    decoderLinearReference: DecoderLinearReference?,
+    safetyAdjustments: List<String>,
     stop: () -> Unit,
 ) {
     val phase = progress.phase
-    val compactLandscape =
-        LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+    val configuration = LocalConfiguration.current
+    val compactHud =
+        configuration.orientation == Configuration.ORIENTATION_LANDSCAPE ||
+            configuration.screenHeightDp < 640
+    val detailPanelMaxHeight = when {
+        compactHud && configuration.screenHeightDp < 400 -> 92.dp
+        compactHud -> 116.dp
+        configuration.screenHeightDp < 720 -> 132.dp
+        else -> 168.dp
+    }
     val traffic = phase?.let {
         LayerTrafficEstimator.estimate(
             phase = it,
@@ -924,6 +1777,7 @@ private fun RunningHud(
             mediaSelected = mediaSelected,
             mediaWidthPx = mediaWidthPx,
             mediaHeightPx = mediaHeightPx,
+            decoderLinearReference = decoderLinearReference,
         )
     }
     val layerScale = maxOf(
@@ -931,12 +1785,31 @@ private fun RunningHud(
         progress.scenario?.maxLayers ?: 1,
         phase?.activeLayers ?: 1,
     ).toFloat()
+    val phaseFraction = phase?.let {
+        if (it.durationMs > 0L) {
+            (progress.phaseElapsedMs.toDouble() / it.durationMs.toDouble())
+                .coerceIn(0.0, 1.0)
+                .toFloat()
+        } else {
+            0f
+        }
+    } ?: 0f
+    val layerHistory = remember(history) { history.map { it.layerCount } }
+    val dpuHistory = remember(history) { history.map { it.dpuBusy } }
+    val cpuHistory = remember(history) { history.map { it.cpuBusy } }
+    val gpuHistory = remember(history) { history.map { it.gpuBusy } }
     val liveMetrics = listOf(
         LiveHudMetricSpec(
             label = "LAYERS",
             value = phase?.activeLayers?.toFloat(),
-            valueText = phase?.activeLayers?.toString() ?: "N/A",
-            history = history.map { it.layerCount },
+            valueText = phase?.let {
+                "${it.activeLayers}L · " +
+                    producerCountDisplay(
+                        observed = progress.observedProducerCount,
+                        expected = progress.expectedProducerCount,
+                    )
+            } ?: "N/A",
+            history = layerHistory,
             maxValue = layerScale,
             color = Color(0xFF65E6C4),
         ),
@@ -944,7 +1817,7 @@ private fun RunningHud(
             label = "DPU",
             value = telemetry.dpuBusy.value,
             valueText = telemetry.dpuBusy.display(),
-            history = history.map { it.dpuBusy },
+            history = dpuHistory,
             maxValue = 100f,
             color = Color(0xFFFFC857),
         ),
@@ -952,7 +1825,7 @@ private fun RunningHud(
             label = "CPU",
             value = telemetry.cpu.value,
             valueText = telemetry.cpu.display(),
-            history = history.map { it.cpuBusy },
+            history = cpuHistory,
             maxValue = 100f,
             color = Color(0xFF4CC9F0),
         ),
@@ -960,7 +1833,7 @@ private fun RunningHud(
             label = "GPU",
             value = telemetry.gpuBusy.value,
             valueText = telemetry.gpuBusy.display(),
-            history = history.map { it.gpuBusy },
+            history = gpuHistory,
             maxValue = 100f,
             color = Color(0xFFC77DFF),
         ),
@@ -975,23 +1848,30 @@ private fun RunningHud(
     ) {
         Surface(
             modifier = Modifier
-                .widthIn(max = if (compactLandscape) 620.dp else 370.dp)
+                .widthIn(max = if (compactHud) 620.dp else 370.dp)
                 .fillMaxWidth(),
             color = Color(0xD90A1512),
             shape = RoundedCornerShape(18.dp),
         ) {
-            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+            Column(
+                Modifier.padding(if (compactHud) 9.dp else 12.dp),
+                verticalArrangement = Arrangement.spacedBy(if (compactHud) 4.dp else 7.dp),
+            ) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         Text(
-                            progress.scenario?.name ?: "Preparing",
+                            planProgress.currentScenario?.name
+                                ?: progress.scenario?.name
+                                ?: "DPU test 준비",
                             style = MaterialTheme.typography.titleMedium,
                             color = Color.White,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
                         Text(
-                            "${progress.phaseIndex + 1}/${progress.scenario?.phases?.size ?: 0} · ${progress.statusText}",
+                            "QUEUE ${planProgress.currentQueuePosition}/" +
+                                "${planProgress.queueSize} · LOOP ${planProgress.currentRepeat}/" +
+                                "${planProgress.repeatCount} · ${progress.stage.displayLabel()}",
                             color = Color(0xFFB8CBC5),
                             style = MaterialTheme.typography.labelMedium,
                             maxLines = 1,
@@ -1007,13 +1887,35 @@ private fun RunningHud(
                         )
                     }
                 }
-                LinearProgressIndicator(
-                    progress = { progress.overallFraction },
-                    modifier = Modifier.fillMaxWidth(),
+                HudProgressLine(
+                    label = if (compactHud) {
+                        "PLAN ${(planProgress.overallFraction * 100f).roundToInt()}% · " +
+                            "PHASE ${(progress.phaseIndex + 1).coerceAtLeast(1)}/" +
+                            "${progress.scenario?.phases?.size ?: 0} " +
+                            "${(phaseFraction * 100f).roundToInt()}%"
+                    } else {
+                        "DPU PLAN · ${planProgress.completedRuns}/${planProgress.totalRuns} runs"
+                    },
+                    detail = if (compactHud) {
+                        "${planProgress.completedRuns}/${planProgress.totalRuns} runs"
+                    } else {
+                        "현재 scenario ${(planProgress.boundedCurrentRunFraction * 100f).roundToInt()}%"
+                    },
+                    fraction = planProgress.overallFraction,
                     color = Color(0xFF65E6C4),
-                    trackColor = Color.White.copy(alpha = 0.15f),
                 )
-                if (compactLandscape) {
+                if (!compactHud) phase?.let { activePhase ->
+                    HudProgressLine(
+                        label = "PHASE ${(progress.phaseIndex + 1).coerceAtLeast(1)}/" +
+                            "${progress.scenario?.phases?.size ?: 0}",
+                        detail = "${activePhase.label} · " +
+                            "${formatDuration(progress.phaseElapsedMs)} / " +
+                            formatDuration(activePhase.durationMs),
+                        fraction = phaseFraction,
+                        color = Color(0xFFFFC857),
+                    )
+                }
+                if (compactHud) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -1049,42 +1951,328 @@ private fun RunningHud(
                     }
                 }
                 HorizontalDivider(color = Color.White.copy(alpha = 0.13f))
-                TrafficHud(traffic, compact = compactLandscape)
+                TrafficHud(traffic, compact = compactHud)
             }
         }
         Surface(
+            modifier = Modifier
+                .widthIn(max = if (compactHud) 760.dp else 520.dp)
+                .fillMaxWidth(),
             color = Color(0xD90A1512),
             shape = RoundedCornerShape(18.dp),
         ) {
-            Row(
-                Modifier.padding(13.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text(
-                        progress.phase?.let { "${it.activeLayers}L · ${it.backend.label}" } ?: "surface 준비",
-                        color = Color.White,
-                        style = MaterialTheme.typography.titleMedium,
-                    )
-                    Text(
-                        progress.phase?.let {
-                            "${it.pixelRoute.label} · ${it.producerFps.toInt()}fps · ${it.workloads.summary()}"
-                        } ?: "부하 없음",
-                        color = Color(0xFFB8CBC5),
-                        style = MaterialTheme.typography.labelLarge,
-                        maxLines = 1,
-                    )
-                }
-                Button(
-                    onClick = stop,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.error,
-                        contentColor = MaterialTheme.colorScheme.onError,
-                    ),
+            if (compactHud) {
+                Row(
+                    Modifier.padding(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    Text("STOP")
+                    Box(Modifier.weight(1f)) {
+                        RunTransitionStatus(
+                            progress = progress,
+                            planProgress = planProgress,
+                            telemetry = telemetry,
+                            safetyAdjustments = safetyAdjustments,
+                            compact = true,
+                            modifier = Modifier
+                                .heightIn(max = detailPanelMaxHeight)
+                                .verticalScroll(rememberScrollState()),
+                        )
+                    }
+                    Button(
+                        onClick = stop,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.error,
+                            contentColor = MaterialTheme.colorScheme.onError,
+                        ),
+                    ) {
+                        Text("STOP")
+                    }
                 }
+            } else {
+                Column(
+                    Modifier.padding(13.dp),
+                    verticalArrangement = Arrangement.spacedBy(9.dp),
+                ) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            val coolingDown = progress.stage == RunnerStage.COOLDOWN
+                            val targetPhase =
+                                if (coolingDown) null else progress.displayedTargetPhase
+                            Text(
+                                when {
+                                    coolingDown -> "Cooldown · 부하 해제 및 counter 안정화"
+                                    progress.phase != null ->
+                                        "현재 ${progress.phase.activeLayers}L / " +
+                                            producerCountDisplay(
+                                                observed = progress.observedProducerCount,
+                                                expected = progress.expectedProducerCount,
+                                            ) +
+                                            " / " +
+                                            "${progress.phase.producerFps.toInt()}fps · " +
+                                            "목표 ${targetPhase?.activeLayers ?: progress.phase.activeLayers}L / " +
+                                            "${(targetPhase?.producerFps ?: progress.phase.producerFps).toInt()}fps"
+                                    else -> "surface 준비"
+                                },
+                                color = Color.White,
+                                style = MaterialTheme.typography.titleMedium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                progress.phase?.let {
+                                    "${it.backend.label} · ${it.pixelRoute.label} · " +
+                                        "${it.motion.label} · ${it.requestedDisplayHz.toInt()}Hz"
+                                } ?: "부하 없음",
+                                color = Color(0xFFB8CBC5),
+                                style = MaterialTheme.typography.labelLarge,
+                                maxLines = 1,
+                            )
+                        }
+                        Button(
+                            onClick = stop,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.error,
+                                contentColor = MaterialTheme.colorScheme.onError,
+                            ),
+                        ) {
+                            Text("STOP")
+                        }
+                    }
+                    RunTransitionStatus(
+                        progress = progress,
+                        planProgress = planProgress,
+                        telemetry = telemetry,
+                        safetyAdjustments = safetyAdjustments,
+                        compact = false,
+                        modifier = Modifier
+                            .heightIn(max = detailPanelMaxHeight)
+                            .verticalScroll(rememberScrollState()),
+                    )
+                }
+            }
+        }
+    }
+}
+
+internal fun producerCountDisplay(observed: Int, expected: Int): String {
+    val safeObserved = observed.coerceAtLeast(0)
+    return if (expected > 0) {
+        "$safeObserved/${expected}P"
+    } else {
+        "$safeObserved/\u2014P"
+    }
+}
+
+@Composable
+private fun HudProgressLine(
+    label: String,
+    detail: String,
+    fraction: Float,
+    color: Color,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(
+                label,
+                color = color,
+                fontSize = 9.sp,
+                fontWeight = FontWeight.Bold,
+            )
+            Text(
+                detail,
+                color = Color(0xFFB8CBC5),
+                fontSize = 9.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        LinearProgressIndicator(
+            progress = { fraction.coerceIn(0f, 1f) },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(3.dp)
+                .clip(RoundedCornerShape(100.dp)),
+            color = color,
+            trackColor = Color.White.copy(alpha = 0.15f),
+        )
+    }
+}
+
+@Composable
+private fun RunTransitionStatus(
+    progress: RunProgress,
+    planProgress: PlanProgress,
+    telemetry: TelemetrySnapshot,
+    safetyAdjustments: List<String>,
+    compact: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val phase = progress.phase
+    val coolingDown = progress.stage == RunnerStage.COOLDOWN
+    val targetPhase = if (coolingDown) null else progress.displayedTargetPhase
+    val nextPhase = progress.scenario?.phases?.getOrNull(progress.phaseIndex + 1)
+    val nextPhaseText = nextPhase?.let {
+        "다음 phase · ${it.label} · ${it.activeLayers}L / " +
+            "${it.producerFps.toInt()}fps · ${it.workloads.peakSummary()}"
+    } ?: "다음 phase · 현재 scenario cooldown"
+    val nextScenarioText = planProgress.nextScenario?.let {
+        "다음 scenario · ${it.name}"
+    } ?: "다음 scenario · plan 종료"
+    val dpuClockText = telemetry.dpuFrequency.value
+        ?.takeIf(Float::isFinite)
+        ?.let { "DPU CLK ${telemetry.dpuFrequency.display()}" }
+    val transitionSample = targetPhase?.let {
+        LoadTransitionEvaluator.sampleAt(
+            spec = it.transition,
+            elapsedMs = progress.phaseElapsedMs,
+            phaseDurationMs = it.durationMs,
+        )
+    }
+    val transitionLabel = when {
+        coolingDown -> "COOLDOWN · 부하 해제"
+        targetPhase != null ->
+            "${targetPhase.transition.mode.label} · " +
+                "${transitionSample?.segment?.label ?: "Target"} · " +
+                "${(progress.boundedTransitionFraction * 100f).roundToInt()}%"
+        else -> "준비 중"
+    }
+    val transitionTitle = if (coolingDown) {
+        "회복 상태 · $transitionLabel"
+    } else {
+        "부하 전이 · $transitionLabel"
+    }
+    val safetyDerated = progress.thermalDerated
+    val safetyLabel = when {
+        telemetry.memoryLow -> "MEMORY LOW · 안전 중단"
+        safetyDerated -> "THERMAL DERATE · 제한 유지"
+        safetyAdjustments.isNotEmpty() -> "SAFETY CLAMP · ${safetyAdjustments.size}건"
+        else -> "SAFETY ENVELOPE · 정상"
+    }
+    val safetyColor = when {
+        telemetry.memoryLow -> Color(0xFFFF7A90)
+        safetyDerated || safetyAdjustments.isNotEmpty() -> Color(0xFFFFC857)
+        else -> Color(0xFF65E6C4)
+    }
+
+    Surface(
+        modifier = modifier,
+        color = Color.White.copy(alpha = 0.07f),
+        shape = RoundedCornerShape(13.dp),
+    ) {
+        Column(
+            Modifier.padding(horizontal = 11.dp, vertical = 9.dp),
+            verticalArrangement = Arrangement.spacedBy(if (compact) 3.dp else 6.dp),
+        ) {
+            if (compact) {
+                Text(
+                    transitionTitle,
+                    color = Color(0xFFFFC857),
+                    fontWeight = FontWeight.SemiBold,
+                    style = MaterialTheme.typography.labelLarge,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    safetyLabel,
+                    color = safetyColor,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 9.sp,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            } else {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text(
+                        transitionTitle,
+                        modifier = Modifier.weight(1f),
+                        color = Color(0xFFFFC857),
+                        fontWeight = FontWeight.SemiBold,
+                        style = MaterialTheme.typography.labelLarge,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        safetyLabel,
+                        color = safetyColor,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 9.sp,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            Text(
+                when {
+                    coolingDown -> phase?.let { current ->
+                        "현재 cooldown · ${current.activeLayers}L / " +
+                            "${current.producerFps.toInt()}fps · 교차 부하 해제"
+                    } ?: "현재 cooldown · 부하 해제"
+                    phase != null ->
+                        "현재 → 목표 · ${phase.activeLayers}→" +
+                            "${targetPhase?.activeLayers ?: phase.activeLayers}L · " +
+                            "${phase.producerFps.toInt()}→" +
+                            "${(targetPhase?.producerFps ?: phase.producerFps).toInt()}fps · " +
+                            workloadTransitionSummary(
+                                current = phase.workloads,
+                                target = targetPhase?.workloads ?: phase.workloads,
+                            )
+                    else -> "현재 부하를 준비하는 중"
+                },
+                color = Color.White,
+                style = MaterialTheme.typography.labelLarge,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                nextPhaseText,
+                color = Color(0xFFB8CBC5),
+                style = MaterialTheme.typography.labelMedium,
+                maxLines = if (compact) 2 else 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                nextScenarioText,
+                color = Color(0xFF86A39A),
+                style = MaterialTheme.typography.labelMedium,
+                maxLines = if (compact) 2 else 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (dpuClockText != null) {
+                Text(
+                    "$dpuClockText · product probe read-only · 앱은 clock을 강제하지 않음",
+                    color = Color(0xFF86A39A),
+                    fontSize = 9.sp,
+                    maxLines = if (compact) 2 else 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (safetyAdjustments.isNotEmpty()) {
+                Text(
+                    "제한 사유 · ${safetyAdjustments.first()}" +
+                        if (safetyAdjustments.size > 1) {
+                            " 외 ${safetyAdjustments.size - 1}건"
+                        } else {
+                            ""
+                        },
+                    color = safetyColor,
+                    fontSize = 9.sp,
+                    maxLines = if (compact) 2 else 3,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            } else if (!compact) {
+                Text(
+                    "Thermal ${telemetry.thermalLabel} · runtime memory/thermal watchdog 활성",
+                    color = Color(0xFF86A39A),
+                    fontSize = 9.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
             }
         }
     }
@@ -1266,12 +2454,29 @@ private fun Double?.formatTrafficRate(): String = when {
 @Composable
 private fun ResultScreen(controller: LabController, modifier: Modifier, onDone: () -> Unit) {
     val summary = controller.lastSummary
+    val planResults = controller.planResultHistory.toList()
+    val reportFile = controller.lastReportFile
+    val reportAvailable = reportFile?.isFile == true
     if (summary == null) {
         Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Text(controller.progress.statusText)
         }
         return
     }
+    val peakDpuBusy = summary.peakGauge(0f..100f) { it.dpuBusy }
+    val peakGpuBusy = summary.peakGauge(0f..100f) { it.gpuBusy }
+    val peakBusBusy = summary.peakGauge(0f..100f) { it.busBusy }
+    val peakProducedFps = summary.peakGauge(0f..Float.MAX_VALUE) { it.producedFps }
+    val peakHwcDeviceLayers = summary.peakLayerCount(
+        value = TelemetrySnapshot::hwcDeviceLayers,
+        quality = TelemetrySnapshot::hwcDeviceLayersQuality,
+        source = TelemetrySnapshot::hwcDeviceLayersSource,
+    )
+    val peakHwcClientLayers = summary.peakLayerCount(
+        value = TelemetrySnapshot::hwcClientLayers,
+        quality = TelemetrySnapshot::hwcClientLayersQuality,
+        source = TelemetrySnapshot::hwcClientLayersSource,
+    )
     LazyColumn(
         modifier = modifier
             .fillMaxSize()
@@ -1279,6 +2484,36 @@ private fun ResultScreen(controller: LabController, modifier: Modifier, onDone: 
         contentPadding = PaddingValues(top = 16.dp, bottom = 28.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
+        if (
+            controller.planProgress.state != PlanState.REJECTED &&
+            (
+                controller.planProgress.state == PlanState.ABORTED ||
+                    controller.planProgress.source != PlanSource.SINGLE_SCENARIO ||
+                    controller.planProgress.totalRuns > 1
+                )
+        ) {
+            item {
+                PlanResultOverview(
+                    progress = controller.planProgress,
+                    results = planResults,
+                )
+            }
+            item {
+                Text(
+                    "Scenario 결과",
+                    style = MaterialTheme.typography.titleLarge,
+                )
+            }
+            items(planResults, key = { "${it.runIndex}-${it.scenario.id}" }) { result ->
+                PlanResultCard(result)
+            }
+            item {
+                Text(
+                    "최신 실행 상세",
+                    style = MaterialTheme.typography.titleLarge,
+                )
+            }
+        }
         item {
             ResultHero(summary)
         }
@@ -1290,17 +2525,45 @@ private fun ResultScreen(controller: LabController, modifier: Modifier, onDone: 
                 Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     ResultRow("Exact underrun Δ", summary.exactUnderrunDelta?.toString() ?: "N/A")
                     ResultRow(
-                        "Exact counter source",
-                        summary.exactUnderrunSource ?: "N/A",
+                        "Exact counter provenance",
+                        if (summary.exactUnderrunSource.isNullOrBlank()) {
+                            "N/A"
+                        } else {
+                            "${summary.exactUnderrunQuality.label} · " +
+                                summary.exactUnderrunSource
+                        },
                     )
                     ResultRow("Suspected proxy Δ", summary.suspectedUnderrunDelta.toString())
                     ResultRow("Peak CPU", summary.peakCpu?.let { "%.1f%%".format(it) } ?: "N/A")
+                    ResultRow("Peak DPU busy", peakDpuBusy.formatPercent())
+                    ResultRow("Peak GPU busy", peakGpuBusy.formatPercent())
+                    ResultRow("Peak bus busy", peakBusBusy.formatPercent())
+                    ResultRow(
+                        "Peak produced FPS",
+                        when {
+                            peakProducedFps.provenanceChanged -> "N/A · source changed"
+                            peakProducedFps.value != null ->
+                                "%.1f fps".format(peakProducedFps.value)
+                            else -> "N/A"
+                        },
+                    )
+                    ResultRow(
+                        "Peak HWC composition",
+                        if (peakHwcDeviceLayers == null && peakHwcClientLayers == null) {
+                            "N/A"
+                        } else {
+                            "device ${peakHwcDeviceLayers ?: "N/A"} · client ${peakHwcClientLayers ?: "N/A"}"
+                        },
+                    )
                     ResultRow("Peak memory", summary.peakMemoryUsed?.let { "%.1f%%".format(it) } ?: "N/A")
                     ResultRow(
                         "Generated bus traffic",
                         summary.peakGeneratedBandwidth?.let { "%.2f Gbps".format(it) } ?: "N/A",
                     )
                     ResultRow("Samples", summary.samples.size.toString())
+                    summary.terminalReason()?.let { reason ->
+                        ResultRow("종료 사유", reason)
+                    }
                 }
             }
         }
@@ -1310,7 +2573,7 @@ private fun ResultScreen(controller: LabController, modifier: Modifier, onDone: 
                     RunVerdict.SUSPECTED_PROXY ->
                         "프레임 deadline miss가 관찰됐지만 DPU underrun으로 확정할 직접 counter는 없습니다."
                     RunVerdict.INCONCLUSIVE ->
-                        "직접 counter가 연결되지 않았고 proxy 이상도 없으므로 CLEAN으로 단정하지 않습니다."
+                        "필수 counter·producer·capability 조건 중 하나가 충분하지 않아 판정을 보류했습니다. 종료 사유와 event를 확인하세요."
                     RunVerdict.CLEAN ->
                         "직접 underrun counter 기준으로 증가가 없었습니다."
                     else -> "결과 보고서에는 phase, 요청/실제 Hz, telemetry source와 event가 함께 저장됩니다."
@@ -1320,20 +2583,274 @@ private fun ResultScreen(controller: LabController, modifier: Modifier, onDone: 
         }
         item {
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Button(onClick = controller::shareLastReport, modifier = Modifier.weight(1f)) {
-                    Text("JSON 보고서 공유")
+                Button(
+                    onClick = controller::shareLastReport,
+                    enabled = reportAvailable,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text(if (reportAvailable) "최신 JSON 공유" else "공유할 보고서 없음")
                 }
                 OutlinedButton(onClick = onDone, modifier = Modifier.weight(1f)) {
                     Text("완료")
                 }
             }
         }
-        controller.lastReportFile?.let { file ->
+        reportFile?.takeIf { it.isFile }?.let { file ->
             item {
                 Text(
                     file.absolutePath,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     style = MaterialTheme.typography.labelLarge,
+                )
+            }
+        } ?: item {
+            Text(
+                "최신 실행의 JSON 보고서가 저장되지 않아 공유할 수 없습니다.",
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.labelLarge,
+            )
+        }
+    }
+}
+
+private fun RunSummary.peakGauge(
+    validRange: ClosedFloatingPointRange<Float>,
+    selector: (TelemetrySnapshot) -> Gauge,
+): GaugePeak = consistentGaugePeak(samples, selector, validRange)
+
+private fun RunSummary.peakLayerCount(
+    value: (TelemetrySnapshot) -> Int?,
+    quality: (TelemetrySnapshot) -> MetricQuality,
+    source: (TelemetrySnapshot) -> String,
+): Int? {
+    var peak: Int? = null
+    var firstQuality: MetricQuality? = null
+    var firstSource: String? = null
+    for (sample in samples) {
+        val count = value(sample)?.takeIf { it >= 0 } ?: continue
+        val sampleQuality = quality(sample)
+        val sampleSource = source(sample)
+        if (sampleQuality == MetricQuality.UNAVAILABLE || sampleSource.isBlank()) continue
+        if (firstQuality == null) {
+            firstQuality = sampleQuality
+            firstSource = sampleSource
+        } else if (sampleQuality != firstQuality || sampleSource != firstSource) {
+            return null
+        }
+        peak = peak?.let { maxOf(it, count) } ?: count
+    }
+    return peak
+}
+
+private fun GaugePeak.formatPercent(): String = when {
+    provenanceChanged -> "N/A · source changed"
+    value != null -> "%.1f%%".format(value)
+    else -> "N/A"
+}
+
+@Composable
+private fun PlanResultOverview(
+    progress: PlanProgress,
+    results: List<PlanRunResult>,
+) {
+    val clean = results.count { it.verdict == RunVerdict.CLEAN }
+    val underrun = results.count { it.verdict == RunVerdict.UNDERRUN_DETECTED }
+    val unsupported = results.count { it.verdict == RunVerdict.UNSUPPORTED }
+    val suspected = results.count { it.verdict == RunVerdict.SUSPECTED_PROXY }
+    val remaining = results.size - clean - underrun - unsupported - suspected
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer,
+        ),
+        shape = RoundedCornerShape(24.dp),
+    ) {
+        Column(
+            Modifier.padding(19.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("DPU PLAN RESULTS", style = MaterialTheme.typography.titleLarge)
+                    Text(
+                        "${progress.state.name} · ${results.size}/${progress.totalRuns} runs · " +
+                            "${progress.repeatCount} loops",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.labelLarge,
+                    )
+                }
+                Text(
+                    progress.source.label,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.SemiBold,
+                    style = MaterialTheme.typography.labelLarge,
+                )
+            }
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                PlanCountMetric(
+                    label = "CLEAN",
+                    count = clean,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.weight(1f),
+                )
+                PlanCountMetric(
+                    label = "UNDERRUN",
+                    count = underrun,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.weight(1f),
+                )
+                PlanCountMetric(
+                    label = "UNSUPPORTED",
+                    count = unsupported,
+                    color = MaterialTheme.colorScheme.tertiary,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+            Text(
+                "Proxy suspected $suspected · aborted/inconclusive $remaining · " +
+                    "UNDERRUN은 direct counter 판정만 집계",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelMedium,
+            )
+            progress.terminalReason?.let { reason ->
+                Surface(
+                    color = MaterialTheme.colorScheme.error.copy(alpha = 0.12f),
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Text(
+                        "Plan 종료 사유 · $reason",
+                        modifier = Modifier.padding(horizontal = 11.dp, vertical = 9.dp),
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.labelLarge,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PlanCountMetric(
+    label: String,
+    count: Int,
+    color: Color,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier,
+        color = color.copy(alpha = 0.13f),
+        shape = RoundedCornerShape(14.dp),
+    ) {
+        Column(
+            Modifier.padding(horizontal = 9.dp, vertical = 11.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                count.toString(),
+                color = color,
+                fontWeight = FontWeight.Bold,
+                style = MaterialTheme.typography.headlineSmall,
+            )
+            Text(
+                label,
+                color = color,
+                fontSize = 9.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+            )
+        }
+    }
+}
+
+@Composable
+private fun PlanResultCard(result: PlanRunResult) {
+    val verdictColor = when (result.verdict) {
+        RunVerdict.CLEAN -> MaterialTheme.colorScheme.primary
+        RunVerdict.UNDERRUN_DETECTED -> MaterialTheme.colorScheme.error
+        RunVerdict.SUSPECTED_PROXY -> MaterialTheme.colorScheme.tertiary
+        else -> MaterialTheme.colorScheme.outline
+    }
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        shape = RoundedCornerShape(17.dp),
+    ) {
+        Row(
+            Modifier.padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(11.dp),
+        ) {
+            Box(
+                Modifier
+                    .size(40.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(verdictColor.copy(alpha = 0.14f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    "#${result.runNumber}",
+                    color = verdictColor,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+            Column(Modifier.weight(1f)) {
+                Text(
+                    result.scenario.name,
+                    style = MaterialTheme.typography.titleMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    "Loop ${result.repeatIndex + 1} · Queue ${result.queueIndex + 1} · " +
+                        formatDuration(result.finishedEpochMs - result.startedEpochMs),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelMedium,
+                )
+                Text(
+                    "Exact Δ ${result.exactUnderrunDelta?.toString() ?: "N/A"} · " +
+                        "Proxy Δ ${result.suspectedUnderrunDelta}",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelMedium,
+                )
+                result.terminalReason?.let { reason ->
+                    Text(
+                        "종료 사유 · $reason",
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.labelMedium,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                Text(
+                    if (result.reportPath.isNullOrBlank()) {
+                        "JSON 보고서 없음"
+                    } else {
+                        "JSON 보고서 저장됨"
+                    },
+                    color = if (result.reportPath.isNullOrBlank()) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        MaterialTheme.colorScheme.primary
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
+            Surface(
+                color = verdictColor.copy(alpha = 0.14f),
+                shape = RoundedCornerShape(100.dp),
+            ) {
+                Text(
+                    result.verdict.label,
+                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
+                    color = verdictColor,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 9.sp,
+                    maxLines = 1,
                 )
             }
         }
@@ -1383,7 +2900,11 @@ private fun ResultRow(label: String, value: String) {
 private fun SystemScreen(controller: LabController, modifier: Modifier) {
     val context = LocalContext.current
     var capabilities by remember { mutableStateOf<CapabilitySnapshot?>(null) }
-    LaunchedEffect(controller.hasDumpPermission, controller.hasNpuAdapter) {
+    LaunchedEffect(
+        controller.hasDumpPermission,
+        controller.hasNpuAdapter,
+        controller.hasSbwcAdapter,
+    ) {
         capabilities = withContext(Dispatchers.Default) {
             CapabilityScanner.scan(
                 activity = context as Activity,
@@ -1586,14 +3107,29 @@ private fun RiskBadge(risk: RiskLevel) {
 }
 
 @Composable
-private fun LastResultCard(summary: RunSummary, share: () -> Unit) {
+private fun LastResultCard(
+    summary: RunSummary,
+    reportAvailable: Boolean,
+    share: () -> Unit,
+) {
     Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(20.dp)) {
         Row(Modifier.padding(17.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text("최근 결과 · ${summary.verdict.label}", style = MaterialTheme.typography.titleMedium)
                 Text(summary.scenario.name, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                summary.terminalReason()?.let { reason ->
+                    Text(
+                        reason,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.labelMedium,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
-            TextButton(onClick = share) { Text("공유") }
+            TextButton(onClick = share, enabled = reportAvailable) {
+                Text(if (reportAvailable) "공유" else "보고서 없음")
+            }
         }
     }
 }
@@ -1608,6 +3144,244 @@ private fun qualityColor(quality: MetricQuality): Color = when (quality) {
     MetricQuality.PROXY,
     -> MaterialTheme.colorScheme.tertiary
     MetricQuality.UNAVAILABLE -> MaterialTheme.colorScheme.outline
+}
+
+private fun Gauge.provenanceLabel(): String =
+    if (source.isBlank()) {
+        "${quality.label} · source N/A"
+    } else {
+        "${quality.label} · $source"
+    }
+
+private fun compositionProvenance(telemetry: TelemetrySnapshot): String {
+    val sources = buildList {
+        if (telemetry.hwcDeviceLayers != null) {
+            add(
+                Triple(
+                    "D",
+                    telemetry.hwcDeviceLayersQuality,
+                    telemetry.hwcDeviceLayersSource,
+                ),
+            )
+        }
+        if (telemetry.hwcClientLayers != null) {
+            add(
+                Triple(
+                    "C",
+                    telemetry.hwcClientLayersQuality,
+                    telemetry.hwcClientLayersSource,
+                ),
+            )
+        }
+    }
+    if (sources.isEmpty()) return "Unavailable · source N/A"
+
+    val first = sources.first()
+    if (sources.all { it.second == first.second && it.third == first.third }) {
+        return Gauge(
+            quality = first.second,
+            source = first.third,
+        ).provenanceLabel()
+    }
+    return sources.joinToString(" · ") { (label, quality, source) ->
+        "$label ${Gauge(quality = quality, source = source).provenanceLabel()}"
+    }
+}
+
+private fun ScenarioQuickFilter.matches(scenario: ScenarioSpec): Boolean = when (this) {
+    ScenarioQuickFilter.ALL -> true
+    ScenarioQuickFilter.SHARP ->
+        scenario.phases.any {
+            it.transition.mode == TransitionMode.PULSE_BURST ||
+                it.workloads.shape == LoadShape.PULSE
+        } ||
+            scenario.phases.zipWithNext().any { (from, to) ->
+                to.transition.mode == TransitionMode.STEP &&
+                    kotlin.math.abs(
+                        from.relativeIntensityScore() - to.relativeIntensityScore(),
+                    ) >= 25
+            }
+    ScenarioQuickFilter.GRADUAL ->
+        scenario.phases.any {
+            it.transition.mode in setOf(
+                TransitionMode.LINEAR_RAMP,
+                TransitionMode.STAIRCASE,
+                TransitionMode.TRIANGLE_WAVE,
+                TransitionMode.SOAK_RECOVERY,
+            ) ||
+                it.workloads.shape == LoadShape.RAMP ||
+                it.workloads.shape == LoadShape.SAW
+        }
+    ScenarioQuickFilter.CROSS_LOAD -> scenario.phases.any { it.workloads.hasCrossLoad() }
+    ScenarioQuickFilter.REQUIREMENTS -> scenario.requirements.isNotEmpty()
+}
+
+private fun ScenarioSpec.overview(): ScenarioOverview {
+    val patternParts = buildList {
+        val transitionModes = phases
+            .map { it.transition.mode }
+            .filter { it != TransitionMode.STEP }
+            .distinct()
+        transitionModes.forEach { mode ->
+            add(mode.catalogLabel())
+        }
+        if (isEmpty()) {
+            if (phases.any { it.workloads.shape == LoadShape.PULSE }) add("Worker 펄스")
+            if (phases.any { it.workloads.shape == LoadShape.RAMP }) add("Worker 램프")
+            if (phases.any { it.workloads.shape == LoadShape.SAW }) add("Worker 왕복")
+        }
+        if (isEmpty() && phases.size > 1) add("즉시 STEP")
+    }
+    val score = phases.maxOfOrNull(PhaseSpec::relativeIntensityScore) ?: 0
+    val label = when {
+        score < 30 -> "낮음"
+        score < 50 -> "보통"
+        score < 70 -> "높음"
+        else -> "매우 높음"
+    }
+    val sequencePhases = if (phases.size <= 5) {
+        phases
+    } else {
+        phases.take(4) + phases.last()
+    }
+    val sequence = sequencePhases.mapIndexed { index, phase ->
+        val token = buildString {
+            append("${phase.activeLayers}L·${phase.producerFps.toInt()}f")
+            phase.workloads.peakPercent()
+                .takeIf { it > 0 }
+                ?.let { append("·$it%") }
+            if (phase.transition.mode != TransitionMode.STEP) {
+                append("·${phase.transition.mode.shortLabel()}")
+            }
+        }
+        if (phases.size > 5 && index == sequencePhases.lastIndex) "… → $token" else token
+    }.joinToString(" → ")
+    return ScenarioOverview(
+        patternLabel = patternParts.take(2).joinToString(" + ").ifBlank { "고정 유지" },
+        intensityScore = score,
+        intensityLabel = label,
+        phaseSequence = sequence.ifBlank { "phase 없음" },
+    )
+}
+
+private fun PhaseSpec.relativeIntensityScore(): Int {
+    val layerFactor = (activeLayers.toFloat() / 20f).coerceIn(0f, 1f)
+    val fpsFactor = (producerFps / 120f).takeIf(Float::isFinite)?.coerceIn(0f, 1f) ?: 0f
+    val hzFactor =
+        (requestedDisplayHz / 120f).takeIf(Float::isFinite)?.coerceIn(0f, 1f) ?: 0f
+    val resolutionFactor = when (bufferSize) {
+        BufferSize.DISPLAY -> 0.35f
+        BufferSize.FHD -> 0.45f
+        BufferSize.UHD_4K -> 0.75f
+        BufferSize.UHD_8K -> 1f
+    }
+    val crossLoadFactor = workloads.normalized().let {
+        maxOf(it.cpu, it.memory, it.gpu, it.npu)
+    }
+    val complexityFactor = maxOf(
+        if (backend == LayerBackend.INDEPENDENT_SURFACES) 0f else 0.7f,
+        if (motion == MotionProfile.STATIC) 0f else 0.55f,
+        if (alphaOverlap) 0.8f else 0f,
+        if (includeGlLayer) 1f else 0f,
+    )
+    return (
+        (
+            layerFactor * 0.25f +
+                fpsFactor * 0.15f +
+                hzFactor * 0.10f +
+                resolutionFactor * 0.25f +
+                crossLoadFactor * 0.20f +
+                complexityFactor * 0.05f
+            ) * 100f
+        ).roundToInt().coerceIn(0, 100)
+}
+
+private fun LoadSetpoints.hasCrossLoad(): Boolean =
+    normalized().let { maxOf(it.cpu, it.memory, it.gpu, it.npu) > 0.001f }
+
+private fun LoadSetpoints.peakPercent(): Int = normalized().let {
+    (maxOf(it.cpu, it.memory, it.gpu, it.npu) * 100f).roundToInt()
+}
+
+private fun LoadSetpoints.peakSummary(): String {
+    val safe = normalized()
+    val active = listOf(
+        "CPU" to safe.cpu,
+        "MEM" to safe.memory,
+        "GPU" to safe.gpu,
+        "NPU" to safe.npu,
+    ).filter { (_, value) -> value > 0.001f }
+    return if (active.isEmpty()) {
+        "교차 부하 없음"
+    } else {
+        active.joinToString(" · ") { (label, value) ->
+            "$label ${(value * 100f).roundToInt()}%"
+        }
+    }
+}
+
+private fun workloadTransitionSummary(
+    current: LoadSetpoints?,
+    target: LoadSetpoints,
+): String {
+    val safeCurrent = current?.normalized() ?: LoadSetpoints()
+    val safeTarget = target.normalized()
+    val resources = listOf(
+        Triple("CPU", safeCurrent.cpu, safeTarget.cpu),
+        Triple("MEM", safeCurrent.memory, safeTarget.memory),
+        Triple("GPU", safeCurrent.gpu, safeTarget.gpu),
+        Triple("NPU", safeCurrent.npu, safeTarget.npu),
+    ).filter { (_, from, to) -> from > 0.001f || to > 0.001f }
+    return if (resources.isEmpty()) {
+        "교차 부하 0%"
+    } else {
+        resources.joinToString(" · ") { (label, from, to) ->
+            "$label ${(from * 100f).roundToInt()}→${(to * 100f).roundToInt()}%"
+        }
+    }
+}
+
+private fun TransitionMode.catalogLabel(): String = when (this) {
+    TransitionMode.STEP -> "즉시 STEP"
+    TransitionMode.LINEAR_RAMP -> "선형 RAMP"
+    TransitionMode.STAIRCASE -> "계단 전이"
+    TransitionMode.PULSE_BURST -> "ON/OFF BURST"
+    TransitionMode.TRIANGLE_WAVE -> "삼각파"
+    TransitionMode.SOAK_RECOVERY -> "SOAK 복구"
+}
+
+private fun TransitionMode.shortLabel(): String = when (this) {
+    TransitionMode.STEP -> "STEP"
+    TransitionMode.LINEAR_RAMP -> "RAMP"
+    TransitionMode.STAIRCASE -> "STAIR"
+    TransitionMode.PULSE_BURST -> "BURST"
+    TransitionMode.TRIANGLE_WAVE -> "WAVE"
+    TransitionMode.SOAK_RECOVERY -> "SOAK"
+}
+
+private fun RunnerStage.displayLabel(): String = when (this) {
+    RunnerStage.IDLE -> "대기"
+    RunnerStage.PRECHECK -> "사전 검사"
+    RunnerStage.WARMUP -> "워밍업"
+    RunnerStage.RUNNING -> "실행 중"
+    RunnerStage.COOLDOWN -> "회복 확인"
+    RunnerStage.COMPLETE -> "완료"
+    RunnerStage.ABORTED -> "중단"
+    RunnerStage.UNSUPPORTED -> "미지원"
+}
+
+private fun maximumPlanRepeats(queueSize: Int): Int {
+    if (queueSize <= 0) return ScenarioPlanPolicy.MAX_REPEAT_COUNT
+    val totalRunLimit = ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS / queueSize
+    return minOf(
+        ScenarioPlanPolicy.MAX_REPEAT_COUNT,
+        totalRunLimit.coerceAtLeast(1),
+    )
+}
+
+private fun List<Int>.positionSummary(): String {
+    val visible = take(2).joinToString(separator = " · ") { "#$it" }
+    return if (size > 2) "$visible +${size - 2}" else visible
 }
 
 private fun formatDuration(ms: Long): String {

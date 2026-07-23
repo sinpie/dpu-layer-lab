@@ -4,8 +4,9 @@ package com.example.dpulayerlab.model
  * A deterministic, linear-buffer traffic model for the buffers actually produced by the renderer.
  *
  * This is deliberately kept separate from hardware counters. It estimates one full-buffer read per
- * display refresh and one full-buffer write per producer frame. YUV/P010 bytes-per-pixel are only
- * used for a selected decoder source; Canvas/TextureView visual proxies are RGBA buffers. Tiling,
+ * display refresh and one full-buffer write per producer frame. A selected decoder uses only the
+ * metadata-verified [DecoderLinearReference]; the requested YUV/P010/SBWC route does not force a
+ * MediaCodec Surface allocation. Canvas/TextureView visual proxies are RGBA buffers. Tiling,
  * crop/occlusion, cache
  * effects, HWC client-target fallback, compression metadata, and vendor-specific compression ratios
  * are not knowable from the portable app surface and therefore are not folded into the number.
@@ -22,8 +23,23 @@ data class LayerTrafficEstimate(
     val compressionRatioExcluded: Boolean,
 )
 
+/**
+ * Linear byte reference inferred from selected media metadata, not from the requested route.
+ *
+ * MediaCodec Surface output allocation remains vendor-controlled. A null B/px means the portable
+ * app cannot distinguish an 8-bit YUV420 output from another decoder format and must report N/A.
+ */
+data class DecoderLinearReference(
+    val bytesPerPixel: Double?,
+    val label: String,
+    val source: String,
+)
+
 object LayerTrafficEstimator {
     private const val MAX_RENDERED_LAYERS = 20
+    // 16 B/px covers an RGBA32F linear reference and prevents malformed public descriptors from
+    // producing negative, non-finite, or effectively unbounded HUD traffic.
+    private const val MAX_LINEAR_BYTES_PER_PIXEL = 16.0
 
     fun estimate(
         phase: PhaseSpec,
@@ -33,7 +49,15 @@ object LayerTrafficEstimator {
         mediaSelected: Boolean = false,
         mediaWidthPx: Int? = null,
         mediaHeightPx: Int? = null,
+        decoderLinearReference: DecoderLinearReference? = null,
     ): LayerTrafficEstimate {
+        val verifiedDecoderLinearReference = decoderLinearReference?.takeIf { reference ->
+            reference.bytesPerPixel?.let { bytesPerPixel ->
+                bytesPerPixel.isFinite() &&
+                    bytesPerPixel > 0.0 &&
+                    bytesPerPixel <= MAX_LINEAR_BYTES_PER_PIXEL
+            } == true
+        }
         val logicalLayers = phase.activeLayers.coerceIn(1, MAX_RENDERED_LAYERS)
         val displaySizeKnown = displayWidthPx > 0 && displayHeightPx > 0
         val scanoutFps = measuredDisplayHz
@@ -67,7 +91,8 @@ object LayerTrafficEstimator {
 
         var producerFrameBytes = 0.0
         var directScanoutFrameBytes = 0.0
-        var producerSizesKnown = true
+        var producerDimensionsKnown = true
+        var producerFormatsKnown = true
         var hasTextureOutput = false
 
         repeat(logicalLayers) { index ->
@@ -76,11 +101,7 @@ object LayerTrafficEstimator {
                 index == 0 &&
                     mediaSelected &&
                     !isGlOutput &&
-                    phase.pixelRoute in setOf(
-                        PixelRoute.YUV_420,
-                        PixelRoute.P010,
-                        PixelRoute.SBWC_AUTO,
-                    )
+                    phase.pixelRoute.usesSelectedMediaDecoder()
             val primaryUsesRequestedSize =
                 index == 0 &&
                     phase.bufferSize != BufferSize.DISPLAY &&
@@ -97,7 +118,7 @@ object LayerTrafficEstimator {
                 else -> displayHeightPx
             }
             if (width <= 0 || height <= 0) {
-                producerSizesKnown = false
+                producerDimensionsKnown = false
             } else {
                 val isTextureOutput =
                     phase.backend == LayerBackend.MIXED_SURFACE_TEXTURE &&
@@ -109,18 +130,24 @@ object LayerTrafficEstimator {
                     isGlOutput = isGlOutput,
                     isTextureOutput = isTextureOutput,
                     mediaSelected = mediaSelected,
+                    decoderLinearReference = verifiedDecoderLinearReference,
                 )
-                val layerBytes = width.toDouble() * height.toDouble() * bytesPerPixel
-                producerFrameBytes += layerBytes
-                if (isTextureOutput) {
-                    hasTextureOutput = true
+                if (bytesPerPixel == null) {
+                    producerFormatsKnown = false
                 } else {
-                    directScanoutFrameBytes += layerBytes
+                    val layerBytes = width.toDouble() * height.toDouble() * bytesPerPixel
+                    producerFrameBytes += layerBytes
+                    if (isTextureOutput) {
+                        hasTextureOutput = true
+                    } else {
+                        directScanoutFrameBytes += layerBytes
+                    }
                 }
             }
         }
 
-        val knownProducerBytes = producerFrameBytes.takeIf { producerSizesKnown }
+        val trafficKnown = producerDimensionsKnown && producerFormatsKnown
+        val knownProducerBytes = producerFrameBytes.takeIf { trafficKnown }
         val mixedClientTargetBytes = if (hasTextureOutput && displaySizeKnown) {
             displayWidthPx.toDouble() * displayHeightPx.toDouble() * 4.0
         } else if (hasTextureOutput) {
@@ -128,26 +155,26 @@ object LayerTrafficEstimator {
         } else {
             0.0
         }
-        val knownDpuBytes = if (producerSizesKnown && mixedClientTargetBytes != null) {
+        val knownDpuBytes = if (trafficKnown && mixedClientTargetBytes != null) {
             directScanoutFrameBytes + mixedClientTargetBytes
         } else {
             null
         }
-        val formatLabel = actualFormatLabel(phase, mediaSelected)
+        val formatLabel = actualFormatLabel(
+            phase = phase,
+            mediaSelected = mediaSelected,
+            decoderLinearReference = verifiedDecoderLinearReference,
+        )
         val decoderMediaSizeKnown =
             mediaSelected &&
                 !(phase.includeGlLayer && logicalLayers == 1) &&
-                phase.pixelRoute in setOf(
-                    PixelRoute.YUV_420,
-                    PixelRoute.P010,
-                    PixelRoute.SBWC_AUTO,
-                ) &&
+                phase.pixelRoute.usesSelectedMediaDecoder() &&
                 mediaWidthPx != null &&
                 mediaWidthPx > 0 &&
                 mediaHeightPx != null &&
                 mediaHeightPx > 0
         val resolutionLabel = when {
-            !producerSizesKnown -> "display size pending"
+            !producerDimensionsKnown -> "display size pending"
             decoderMediaSizeKnown && logicalLayers == 1 ->
                 "${mediaWidthPx}×${mediaHeightPx} decoder × 1 producer"
             decoderMediaSizeKnown ->
@@ -185,23 +212,43 @@ object LayerTrafficEstimator {
         isGlOutput: Boolean,
         isTextureOutput: Boolean,
         mediaSelected: Boolean,
-    ): Double = when {
-        isGlOutput || isTextureOutput || phase.alphaOverlap -> 4.0
-        index == 0 &&
+        decoderLinearReference: DecoderLinearReference?,
+    ): Double? = when {
+        !isGlOutput &&
+            index == 0 &&
             mediaSelected &&
-            phase.pixelRoute in setOf(PixelRoute.YUV_420, PixelRoute.P010, PixelRoute.SBWC_AUTO) ->
-            phase.pixelRoute.linearBytesPerPixel()
+            phase.pixelRoute.usesSelectedMediaDecoder() ->
+            decoderLinearReference?.bytesPerPixel
+        isGlOutput || isTextureOutput || phase.alphaOverlap -> 4.0
         phase.pixelRoute == PixelRoute.RGB_565 -> 2.0
         else -> 4.0
     }
 
-    private fun actualFormatLabel(phase: PhaseSpec, mediaSelected: Boolean): String {
+    private fun actualFormatLabel(
+        phase: PhaseSpec,
+        mediaSelected: Boolean,
+        decoderLinearReference: DecoderLinearReference?,
+    ): String {
+        val decoderPrimaryActive =
+            mediaSelected &&
+                !(phase.includeGlLayer && phase.activeLayers == 1) &&
+                phase.pixelRoute.usesSelectedMediaDecoder()
         val base = when {
+            decoderPrimaryActive -> buildString {
+                append("decoder primary ")
+                append(decoderLinearReference?.label ?: "linear reference N/A")
+                append(" · route ")
+                append(phase.pixelRoute.name)
+                append(" does not force Surface format")
+                if (
+                    phase.pixelRoute == PixelRoute.SBWC_AUTO ||
+                    phase.pixelRoute == PixelRoute.SBWC_REQUIRED
+                ) {
+                    append(" · compression excluded")
+                }
+                append(" · overlays RGBA")
+            }
             phase.alphaOverlap -> "RGBA 8888 alpha · 4 B/px"
-            mediaSelected && phase.pixelRoute == PixelRoute.YUV_420 ->
-                "decoder primary YUV420 1.5 B/px · overlays RGBA"
-            mediaSelected && phase.pixelRoute == PixelRoute.P010 ->
-                "decoder primary P010 3 B/px · overlays RGBA"
             phase.pixelRoute in setOf(PixelRoute.YUV_420, PixelRoute.P010) ->
                 "RGBA 8888 visual proxy · 4 B/px"
             phase.pixelRoute == PixelRoute.RGB_565 -> "RGB 565 · 2 B/px"
@@ -213,19 +260,8 @@ object LayerTrafficEstimator {
             ""
         }
         val glSuffix = if (phase.includeGlLayer) " · GL=4 B/px" else ""
-        return "$base$textureSuffix$glSuffix"
-    }
-
-    private fun PixelRoute.linearBytesPerPixel(): Double = when (this) {
-        PixelRoute.RGB_8888 -> 4.0
-        PixelRoute.RGB_565 -> 2.0
-        PixelRoute.YUV_420 -> 1.5
-        PixelRoute.P010 -> 3.0
-        // The route does not encode an SBWC base format or vendor ratio. Use a 32-bit linear
-        // reference and explicitly mark the result as excluding compression in the HUD.
-        PixelRoute.SBWC_AUTO,
-        PixelRoute.SBWC_REQUIRED,
-        -> 4.0
+        val alphaSuffix = if (decoderPrimaryActive && phase.alphaOverlap) " · Surface alpha" else ""
+        return "$base$textureSuffix$glSuffix$alphaSuffix"
     }
 
 }

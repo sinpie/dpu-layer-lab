@@ -2,7 +2,10 @@
 # Values must be readable under both DAC and SELinux policy.
 
 gpu_busy=/sys/vendor/path/to/gpu_busy
-gpu_frequency=/sys/vendor/path/to/gpu_cur_freq
+# Choose exactly one typed unit key. This example node reports kHz.
+gpu_frequency_khz=/sys/vendor/path/to/gpu_cur_freq_khz
 bus_busy=/sys/vendor/path/to/ddr_busy
 dpu_busy=/sys/vendor/path/to/dpu_active_percent
+# Explicit unit contract: this value must be Hz.
+dpu_frequency_hz=/sys/vendor/path/to/dpu_cur_freq_hz
 dpu_underrun=/sys/vendor/path/to/dpu_underrun_count
