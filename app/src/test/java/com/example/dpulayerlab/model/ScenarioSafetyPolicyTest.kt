@@ -316,6 +316,27 @@ class ScenarioSafetyPolicyTest {
     }
 
     @Test
+    fun nonCyclicTransitionCannotCarryAHiddenLoadFloor() {
+        val decision = ScenarioSafetyPolicy.evaluate(
+            scenario(
+                phases = listOf(
+                    phase(
+                        transition = TransitionSpec(
+                            mode = TransitionMode.LINEAR_RAMP,
+                            transitionDurationMs = 2_000L,
+                            floor = 0.4f,
+                        ),
+                    ),
+                ),
+            ),
+            limits(),
+        )
+
+        assertRejected(decision)
+        assertTrue(decision.rejectionReason!!.contains("floor"))
+    }
+
+    @Test
     fun layersFpsHzDurationAndLoadsAreCapped() {
         val decision = ScenarioSafetyPolicy.evaluate(
             scenario(

@@ -1,6 +1,6 @@
-# DPU Layer Lab
+# DPULayerTest
 
-![DPU Layer Lab icon](docs/assets/dpu-layer-lab-icon.png)
+![DPULayerTest icon](docs/assets/dpu-layer-lab-icon.png)
 
 Android AP의 DPU underrun 재현·검출과 Hardware Composer 합성 한계 탐색을 위한
 실험용 앱입니다. 독립 BufferQueue layer, 화면 변환, 고해상도 영상, CPU·메모리·GPU·NPU
@@ -9,6 +9,12 @@ Android AP의 DPU underrun 재현·검출과 Hardware Composer 합성 한계 탐
 일반 APK에서도 실행할 수 있습니다. Platform-signed `priv-app` 또는 vendor telemetry
 service를 연결하면 DPU·DDR·HWC·SBWC·NPU와 같은 제품 전용 기능을 추가로 사용할 수
 있습니다.
+
+현재 launcher/Gradle project 표시 이름과 앱 버전은 **DPULayerTest 0.2.0**입니다.
+소스 저장소는 계속 [sinpie/dpu-layer-lab](https://github.com/sinpie/dpu-layer-lab)을
+사용합니다. 기존 제품 이미지와 자동화 harness를 깨지 않기 위해 package
+`com.example.dpulayerlab`, START/STOP/SHOW action, `dpu-layer-lab-` report prefix,
+Soong module/APK 통합 이름 `DpuLayerLab`은 이름을 바꾸지 않는 호환성 계약입니다.
 
 > [!CAUTION]
 > 이 앱은 의도적으로 발열, 메모리 대역폭 포화, 프레임 지연과 드라이버 경계 조건을
@@ -41,7 +47,8 @@ service를 연결하면 DPU·DDR·HWC·SBWC·NPU와 같은 제품 전용 기능�
 - HWC DEVICE/CLIENT layer 파싱(`DUMP` 권한이 있을 때)
 - exact underrun counter와 frame-deadline proxy를 분리한 판정
 - thermal·low-memory·graphics-memory budget 기반 런타임 안전 정책
-- 카테고리별 시나리오 선택, 순서가 보존되는 queue, plan 반복과 실행/결과 진행률
+- 카테고리·변화 파형·예상 강도·부하/조건을 조합하는 시나리오 필터와 순서가 보존되는
+  queue, plan 반복 및 실행/결과 진행률
 - phase/event/telemetry를 포함한 로컬 JSON 결과와 명시적 공유
 
 Backend/pixel route/buffer size 같은 topology가 바뀌는 경계는 검증된 target topology와
@@ -52,6 +59,10 @@ Safety policy는 100 ms control cadence에서 실제 적용될 transition window
 attack/hold/release, pulse/triangle에는 최소 한 cycle이 있어야 합니다. `STEP`은 fresh
 baseline 뒤 origin producer buffer를 generation 안에서 먼저 확인하고 다음 measured
 active tick에서 target을 적용하며, 그 tick까지 실행할 시간이 없으면 `INCONCLUSIVE`입니다.
+`floor`는 반복 파형인 pulse/triangle의 valley에만 적용합니다. STEP/linear/staircase/
+soak 같은 one-shot transition에 0이 아닌 `floor`를 넣은 runnable plan은 의미가
+모호하므로 safety policy가 거부합니다. 순수 evaluator의 defensive bounding만 잘못된
+직접 호출이 origin을 건너뛰지 않도록 floor를 0으로 지웁니다.
 
 ## 런타임 안전 정책
 
@@ -87,6 +98,12 @@ active tick에서 target을 적용하며, 그 tick까지 실행할 시간이 없
   layer/FPS/workload만 clamp하며 safety adjustment event에 기록합니다.
 - `ActivityManager.MemoryInfo.lowMemory` 또는 memory-load allocation 실패가 감지되면
   실행 중인 test를 중단하고 memory working set도 즉시 버린 뒤 모든 부하를 해제합니다.
+- memory workload가 있는 scenario는 계측 baseline 전에 bounded worker별 working set을
+  사전 할당하고 page touch acknowledgment를 기다립니다. 이 prewarm은 generated traffic
+  byte에 더하지 않고 완료 뒤 byte baseline을 초기화합니다. 할당 실패, timeout, 중단 또는
+  worker acknowledgment 누락은 부하가 실행된 것처럼 계속하지 않고 plan을 fail-closed로
+  중단합니다. 확인된 buffer는 run 동안 pin해 5초가 넘는 idle/settle 뒤에도 measured
+  phase에서 재할당되지 않으며, run 종료·low-memory·명시적 drop에서만 해제합니다.
 - thermal `SEVERE`부터 layer/FPS/Hz와 CPU·memory·GPU·NPU 부하를 줄이며, 이
   derating은 뒤 phase에도 유지됩니다. Workload 또는 display 감속 적용을 확인하지
   못하면 일부만 감속된 상태로 계속하지 않고 `THERMAL_DERATE_FAILED`로 중단합니다.
@@ -152,6 +169,19 @@ active tick에서 target을 적용하며, 그 tick까지 실행할 시간이 없
 - 정상 완료, 사용자 중단, 예외, 화면 종료 모두에서 worker, codec, Surface, NPU load,
   SBWC request, wake flag를 해제하는 것이 불변식입니다. SBWC를 활성화한 뒤
   linear/default reset을 확인하지 못하면 남은 plan을 계속하지 않습니다.
+- 정상 cooldown도 마지막 phase를 복사해 renderer를 유지하지 않습니다. 먼저 phase와
+  target을 null로 게시하고 CPU/memory/GPU/NPU 부하를 내린 뒤 physical
+  Surface/codec/EGL/Canvas producer teardown을 확인하며, 그 다음에만 SBWC/compression
+  route를 linear/default로 reset합니다. Producer teardown 또는 compression reset 중
+  하나라도 확인되지 않으면 남은 plan을 중단합니다.
+- phase 사이 pixel/compression route가 바뀌어도 같은 순서를 적용합니다. 이전 load/NPU
+  zero를 확인하고 producer teardown barrier를 통과한 뒤 vendor route를 설정하고 새
+  generation을 게시합니다. Run warm-up은 route 적용 전 codec/SBWC allocation을 만들지
+  않는 1-layer RGB/DISPLAY producer입니다. Activity destroy는 Compose/AndroidView
+  teardown의 동기 증거가 아니므로 lifecycle `close()`에서는 compression reset을 항상
+  생략합니다. 비선형 route가 active/unknown이면 process-wide sticky 상태로 보존하고,
+  다음 controller가 producer-free 상태에서 linear recovery를 확인하기 전에는 실행하지
+  않습니다. RGB-only 종료는 compression sticky 상태를 만들지 않습니다.
 - STOP 또는 Activity pause는 취소 reason 유무와 관계없이 render phase를 먼저 제거하고
   CPU·memory·GPU·NPU setpoint와 display request를 즉시 안전값으로 내립니다. 취소된
   run의 `NonCancellable` cleanup/report가 완전히 끝나 `runJob` 소유권을 해제하기
@@ -179,16 +209,19 @@ storage를 완전히 알 수 없으므로 보수적 휴리스틱입니다. “�
 
 ## 시나리오
 
+0.2.0 catalog에는 다음 **22개 preset**이 있습니다. Custom은 catalog preset 수에
+포함하지 않습니다.
+
 | 카테고리 | 대표 테스트 |
 |---|---|
-| Layer / HWC | HWC Plane Staircase, HWC ↔ GPU Composition Pivot |
+| Layer / HWC | HWC Plane Staircase, backend만 바꾸는 HWC ↔ GPU Composition Pivot |
 | Transform | 12-layer Transform Storm |
 | Video / Format | 4K YUV + RGB Overlay, 8K30 YUV / 8K60 P010 Decoder Pressure, Linear ↔ SBWC |
 | Refresh | 60 → 90 → 120 Hz baseline, mixed producer pacing |
-| Resource | CPU / Memory / GPU Pulse, NPU Cross-load |
-| Load Transition | Instant Step & Burst, Linear Ramp & Staircase, Triangle Wave & Soak Recovery |
+| Resource | Fixed-topology Resource Pulse, NPU Cross-load |
+| Load Transition | Instant Isolated Contention, Instant Step & Burst, Topology + Load Combined Ramp, Continuous Fixed-topology Cross-load Ramp, Triangle Wave & Soak Recovery |
 | Mixed | 사용자 custom 단일 phase |
-| DVFS / Adaptive | Low-clock Single-layer Wake, Idle → Composition Shock, Mid-load Perturbation, adaptive hunt |
+| DVFS / Adaptive | Low-clock Single-layer Wake, Idle → Composition/4K Shock, Paired Mid-load Perturbation Matrix, Multidimensional Adaptive Underrun Hunt |
 | Soak | mixed load/thermal regression cycle |
 
 각 stress preset에는 부하를 다시 내리는 recovery phase가 포함됩니다. 런타임 안전 정책이
@@ -197,6 +230,26 @@ phase를 clamp하거나 거부할 수 있으므로, 보고서의 실행 event를
 8K60 preset은 decoder primary 한 장, RGB overlay 6장과 GL tail 한 장으로 총 8개의
 physical layer를 구성합니다. 8K30 preset과 분리되어 있으므로 8K30-only 장치가 8K60
 capability 때문에 불필요하게 거부되지 않습니다.
+
+원인을 분리해 비교할 때는 topology/FPS/Hz/motion/alpha를 고정한
+`Fixed-topology Resource Pulse`와 `Instant Isolated Contention`을 사용합니다. 전자는
+동일한 기준 phase 전후에서 CPU, memory, GPU 자원을 한 종류씩 4초 완전 주기로 pulse하고,
+후자는 같은 8-layer topology에서 순간적인 CPU, memory, GPU contention을 각각 켰다
+끕니다. 두 시나리오 모두 축 사이에 명시적인 same-topology zero-load reference를 두어
+이전 축이 다음 축의 transition origin으로 재적용되지 않습니다. 여러 축의 burst가
+필요하면 별도 `Instant Step & Burst`를 사용합니다. Burst/triangle/soak envelope의
+ON/OFF 동안 producer topology는 고정되고, 필요한 topology 전환은 앞선 zero-load
+arming/reset phase에서만 수행합니다.
+`Continuous Fixed-topology Cross-load Ramp`는 같은 topology를 유지하면서 cross-load만
+천천히 올리고 내리므로 producer 재구성 구간을 점진 부하로 오해하지 않게 합니다.
+`Paired Mid-load Perturbation Matrix`는 최대 부하가 아닌 중간 부하에서 각 변화 직전과
+직후에 동일 reference를 다시 두며, `HWC ↔ GPU Composition Pivot`은 콘텐츠 수,
+FPS/Hz, motion, alpha와 외부 workload를 고정하고 backend만 바꿉니다.
+
+`Multidimensional Adaptive Underrun Hunt`는 layer 수, composition 경로와 memory 부하를
+함께 올려 첫 경계를 빨리 찾는 **다변수 탐색**입니다. 이 결과만으로 특정 자원 하나를
+원인으로 결론 내리면 안 되며, 경계를 찾은 뒤 위 fixed-topology/paired preset으로
+분리 재현해야 합니다.
 
 Custom에서 `Flattened Texture`를 고르면 logical layer를 한 개의 display-sized RGBA
 physical producer에서 합성합니다. 이 backend에 고른 YUV/P010/SBWC 또는 4K/8K 입력은
@@ -224,17 +277,29 @@ DVFS preset의 settle 구간은 작은 layer/FPS/Hz 부하를 유지해 governor
 1. **시스템** 탭에서 display mode, HardwareBuffer, 4K/8K decoder, direct sensor와 vendor
    adapter 연결 상태를 확인합니다.
 2. YUV/P010/4K/8K test라면 **시나리오** 탭에서 실험용 로컬 영상을 선택합니다.
-3. 실행할 preset을 queue에 원하는 순서와 중복으로 넣고, 전체 queue 반복 횟수를
-   1~10회에서 선택합니다. 총 expanded run은 40회를 넘을 수 없습니다.
-4. 냉각 상태에서 `Baseline 60 → Max`, 다음 `Low-clock Single-layer Wake`와
+3. **카테고리 · 부하 · 조건 조합**에서 카테고리, 변화 파형, 예상 강도와
+   부하/조건을 고릅니다. 같은 행의 복수 선택은 OR, 서로 다른 행은 AND입니다.
+   부하/조건에는 CPU/memory/GPU/NPU, RGB/YUV/P010/SBWC, 4K/8K,
+   scroll/zoom/rotate, high refresh와 DVFS가 포함됩니다.
+4. 필터 결과를 기존 queue 뒤에 **결과 추가**하거나 **결과로 교체**합니다. 개별 항목을
+   중복 추가할 수 있고 `←`/`→`로 순서를 옮기거나 `×`로 한 항목만 제거할 수 있습니다.
+   저장 상태에 더 이상 catalog에 없는 ID가 있으면 UI와 실행 index가 어긋나지 않도록
+   복원 시 제거합니다.
+5. 전체 queue 반복 횟수를 1~10회에서 선택합니다. queue × repeat로 확장한 총 run은
+   40회를 넘을 수 없으며 UI가 허용 가능한 반복 상한을 함께 제한합니다.
+6. 냉각 상태에서 `Baseline 60 → Max`, 다음 `Low-clock Single-layer Wake`와
    `Idle → Composition Shock`, `HWC Plane Staircase`를 실행합니다.
-5. transform, resource pulse, composition pivot, gradual transition 순서로 실패 경계를
-   좁힙니다. 최대 부하에서만 찾지 말고 `Mid-load Perturbation Matrix`로 중간 부하와
-   DVFS ramp 지연도 확인합니다.
-6. 실행 화면의 queue/repeat 위치, phase transition, safety event와 좌측 상단 HUD를
-   함께 보고, 종료 후 run별 결과와 report를 확인합니다.
-7. 안전 clamp/reject/derate/abort event가 있었는지 먼저 확인한 뒤 결과를 해석합니다.
-8. `Exact underrun Δ`가 값이면 직접 counter 판정입니다. `Suspected proxy`만 증가한
+7. transform, resource pulse, composition pivot, gradual transition 순서로 실패 경계를
+   좁힙니다. 최대 부하에서만 찾지 말고 `Paired Mid-load Perturbation Matrix`로 중간
+   부하와 DVFS ramp 지연도 확인합니다.
+8. 실행 화면의 queue/repeat 위치, phase transition, safety event와 좌측 상단 HUD를
+   함께 봅니다. HUD는 현재 logical/observed·expected physical layer, DPU/CPU/GPU
+   숫자와 60-sample 그래프, DPU read/producer write 예상 traffic을 표시합니다.
+   `STOP`은 작은 화면/landscape의 스크롤 아래로 숨지 않도록 상단 실행 header에 항상
+   표시됩니다.
+9. 종료 후 run별 결과와 report를 확인하고 안전 clamp/reject/derate/abort event가
+   있었는지 먼저 확인합니다.
+10. `Exact underrun Δ`가 값이면 직접 counter 판정입니다. `Suspected proxy`만 증가한
    경우 DPU underrun으로 확정하면 안 됩니다.
 
 영상이 선택되지 않은 YUV 시나리오는 `PROXY_FALLBACK` event를 기록합니다. SBWC
@@ -264,7 +329,8 @@ adb shell am start -n `
 adb shell am start -n `
   com.example.dpulayerlab.debug/com.example.dpulayerlab.AutomationActivity `
   -a com.example.dpulayerlab.action.START `
-  --es scenario_ids "baseline-display-modes,gradual-load-transitions"
+  --es scenario_ids "instant-isolated-contention,continuous-crossload-ramp" `
+  --ei repeat_count 2
 
 # 현재 전체 plan 중단 / UI만 표시
 adb shell am start -n `
@@ -297,6 +363,11 @@ alias에는 `com.example.dpulayerlab.permission.CONTROL_TESTS`
 모든 미실행 `START`를 폐기하므로 오래된 `STOP`과의 중복 제거 때문에 재시작되지 않습니다.
 Extra는 `START`에서만 읽으므로 잘못 직렬화된 START payload가 뒤의 명시적 `STOP`
 처리를 막지 않습니다.
+
+앱 표시 이름이 DPULayerTest로 바뀌어도 위 component와
+`com.example.dpulayerlab.action.START`, `.STOP`, `.SHOW` action 문자열은 0.2.0에서
+그대로입니다. 제품 harness는 launcher label을 파싱하지 말고 이 stable contract를
+사용해야 합니다.
 
 Cold start에서 신뢰된 vendor broker가 아직 bind/capability 조회 중이면 최대 2초 동안
 비차단 대기합니다. 그때도 조회가 진행 중이면 adapter가 없다고 단정하지 않고 해당
@@ -409,6 +480,17 @@ estimate와 별도 열로 비교해야 합니다.
 adapter가 없으면 `UNSUPPORTED`이고, adapter가 route를 거부하거나 timeout이 나거나
 활성 SBWC를 linear/default로 되돌렸다는 응답을 확인할 수 없으면 fail-closed로
 `ABORTED` 처리해 다음 queue 항목을 실행하지 않습니다.
+
+성공한 비선형 route는 그 명령을 확인한 vendor Binder session에 결속됩니다. 실제
+disconnect/reconnect로 session ID가 없어지거나 바뀌면 provider watchdog이 route를
+default로 되돌렸을 수 있으므로 즉시 `COMPRESSION_SESSION_CHANGED`로 중단합니다. 반면
+느린 remote telemetry snapshot 자체의 timeout은 process-local registration ID와
+분리되어 있어 session 단절로 오인하지 않습니다. Sanitized compression/NPU 상태와
+session ID는 실시간 HUD, telemetry sample, JSON report에 함께 남습니다.
+Route 전환 뒤에는 준비 단계뿐 아니라 모든 active control tick에서
+layer/backend/pixel route/buffer size/alpha/GL의 discrete allocation topology를 target에
+고정합니다. FPS와 workload 같은 연속 값만 transition envelope를 따르므로,
+fraction-zero tick이 이미 해제한 이전 RGB/SBWC route를 다시 게시하지 않습니다.
 선택 영상이 있으면 `SBWC_REQUIRED`도 YUV reference와 같은 codec-to-Surface 콘텐츠와
 실제 track 크기를 사용하며, 압축 적용 여부는 위 vendor 검증과 별도로 추정하지 않습니다.
 
@@ -486,14 +568,35 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 - debug: `app/build/outputs/apk/debug/app-debug.apk`
 - release: `app/build/outputs/apk/release/app-release-unsigned.apk`
 
-2026-07-23 기준으로 `clean testDebugUnitTest lintDebug assembleDebug assembleRelease`를
-한 번에 실행해 26 suite/273 test가 실패·오류·skip 없이 통과했습니다. Lint error는
-0개이며 남은 warning 6개는 빌드 도구/의존성의 새 버전 알림뿐입니다. Android emulator
-스모크에서는 debug 전용 automation alias를 통한 2-item queue 완주, 완료 후 `STOP`
-무시, 실행 중
-`STOP`의 `ABORTED` 전환, schema v2 internal report 발행과 process crash/ANR 부재를
-확인했습니다. Emulator 결과의 `SUSPECTED_PROXY`는 exact DPU counter가 없는 환경에서
-의도된 판정이며 실기기 underrun 검증을 대체하지 않습니다.
+### 0.2.0 릴리스 산출물의 의미
+
+- `DPULayerTest-v0.2.0-debug.apk`는 Android debug key로 서명되어 바로 설치 가능한
+  **전용 lab/개발용** APK입니다. Explicit automation alias에는 debug manifest에서
+  `CONTROL_TESTS` permission이 제거되어 있으므로 ADB 사용이 쉽지만, 신뢰 경계가 열린
+  이 동작을 제품 release 보안으로 간주하거나 일반 사용자 단말에 배포하면 안 됩니다.
+- `DPULayerTest-v0.2.0-release-unsigned.apk`는 제품 빌드/서명 파이프라인 입력을 위한
+  **서명되지 않은 통합 산출물**입니다. 그대로 설치 가능한 최종 제품 APK가 아닙니다.
+- 실제 제품 APK는 secure product build 환경에서 platform/product key로 서명하고
+  `priv-app` permission allowlist와 SELinux/Binder 정책을 함께 검증해야 합니다.
+  Platform signing만으로 vendor node 접근 권한이 생기지는 않습니다.
+- GitHub Release나 저장소에는 platform key, certificate, keystore, password 또는
+  signing token을 넣지 않습니다. 배포한 APK와 `SHA256SUMS.txt`만 공개 검증
+  산출물로 취급합니다.
+
+2026-07-24 기준으로 `clean testDebugUnitTest lintDebug assembleDebug assembleRelease`를
+한 번에 실행해 28 suite/310 test가 failure/error/skip 없이 통과했습니다. Lint error는
+0개이며 warning 6개는 빌드 도구/의존성의 새 버전 알림뿐입니다. Debug APK는
+`com.example.dpulayerlab.debug`/`0.2.0-debug`와 Android debug certificate를,
+release APK는 `com.example.dpulayerlab`/`0.2.0`과 unsigned 상태를 확인했으며 두 APK
+모두 zipalign 검증을 통과했습니다.
+
+Android emulator 스모크에서는 `DPULayerTest` cold launch, 대시보드와 22개 catalog
+조합/queue UI, 실시간 layer·DPU·CPU·GPU 그래프와 예상 traffic HUD를 확인했습니다.
+Debug 전용 explicit automation alias로 baseline 완주와 `resource-pulse` 2-loop plan
+실행 중 `STOP`의 `ABORTED · 1/2 runs · 2 loops` 전환, schema v2 internal report의
+compression/session/NPU field, process crash/ANR 0건을 확인했습니다. Emulator 결과의
+`SUSPECTED / PROXY`는 exact DPU counter가 없는 환경에서 의도된 판정이며 실기기
+underrun 검증을 대체하지 않습니다.
 
 Debug build는 package suffix가 `.debug`이므로 제품의 release privapp allowlist와
 동일하게 취급되지 않습니다. 실제 system integration 검증은 release package로
@@ -509,12 +612,14 @@ build machine에서 실행합니다.
 apksigner sign `
   --key '<PLATFORM_KEY_PATH>' `
   --cert '<PLATFORM_CERT_PATH>' `
-  --out DpuLayerLab-release.apk `
+  --out DPULayerTest-platform.apk `
   app\build\outputs\apk\release\app-release-unsigned.apk
 ```
 
 Platform key, certificate, keystore password 또는 vendor signing material을 저장소와
-`dist/`에 넣지 마세요. Platform signing/`priv-app` 배치만으로 vendor node의 DAC 또는
+`dist/`에 넣지 마세요. 출력 파일 이름은 바꿀 수 있지만 제품 호환성을 위해 Soong module
+`DpuLayerLab`과 package `com.example.dpulayerlab`은 그대로 유지합니다. Platform
+signing/`priv-app` 배치만으로 vendor node의 DAC 또는
 SELinux 접근이 생기지 않습니다. 최소 권한의 system broker와 typed Binder API를
 사용하는 제품 통합 절차는 [docs/SYSTEM_INTEGRATION.md](docs/SYSTEM_INTEGRATION.md)를
 참고하세요.

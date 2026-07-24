@@ -121,6 +121,8 @@ class LabController(
     private var thermalReduced = false
     /** True after an accepted SBWC route until a linear/default reset is acknowledged. */
     private var compressionControlActive = false
+    /** Binder registration that acknowledged the currently active non-linear route. */
+    private var compressionControlSession: Long? = null
     private var cancellationReason: String? = null
     private var runFinalized = false
     private var pendingRendererGeneration: Long? = null
@@ -716,6 +718,10 @@ class LabController(
     override fun close() {
         if (closed) return
         closed = true
+        val hadPublishedProducer =
+            progress.phase != null ||
+                progress.targetPhase != null ||
+                RendererSafetyState.hasUnconfirmedTeardown()
         progress = progress.copy(
             phase = null,
             targetPhase = null,
@@ -731,15 +737,26 @@ class LabController(
         pause()
         closeSelectedVideoDecoder()
         val loadShutdown = loadManager.closeWithResult()
-        val shutdown = systemMonitor.close()
-        if (shutdown.compressionResetConfirmed) {
-            compressionControlActive = false
-            CompressionSafetyState.recordLinearReset(confirmed = true)
-        } else if (compressionControlActive) {
+        // Activity destruction cannot prove that Compose/AndroidView/Surface teardown completed
+        // synchronously. Never change the allocation route from this non-suspending lifecycle
+        // path; the normal run finalizer is the only path that may reset compression after its
+        // explicit renderer barrier. A later controller recovers a sticky non-linear route.
+        val rendererReleasedForClose =
+            !hadPublishedProducer && !RendererSafetyState.hasUnconfirmedTeardown()
+        val shutdown = systemMonitor.close(
+            resetCompression = false,
+        )
+        val compressionCleanupRequired =
+            compressionControlActive ||
+                CompressionSafetyState.hasUnconfirmedCompressionCleanup()
+        if (compressionCleanupRequired) {
             CompressionSafetyState.markNonLinearRouteMayBeActive()
             recordCleanupFailure(
-                "Activity 종료 compression reset",
-                IllegalStateException("vendor linear/default state was not confirmed"),
+                "Activity 종료 compression 보류",
+                IllegalStateException(
+                    "lifecycle close cannot prove producer teardown; " +
+                        "linear reset was intentionally deferred",
+                ),
             )
         }
         if (!loadShutdown.workersStopped) {
@@ -773,6 +790,7 @@ class LabController(
             loadShutdown.workersStopped &&
                 npuLoadReleaseConfirmed &&
                 loadShutdown.npu.backendCloseConfirmed &&
+                rendererReleasedForClose &&
                 !CompressionSafetyState.hasUnconfirmedCompressionCleanup()
         scope.cancel()
     }
@@ -941,13 +959,39 @@ class LabController(
                 phaseIndex = 0,
                 phase = scenario.phases.firstOrNull()
                     ?.let(::applyPersistentSafety)
-                    ?.let(::neutralPhaseFor),
+                    ?.let(::safeWarmupPhaseFor),
                 targetPhase = scenario.phases.firstOrNull()?.let(::applyPersistentSafety),
                 transitionFraction = 0f,
                 statusText = "surface warm-up",
                 producerGeneration = warmupProducerGeneration,
             )
             loadManager.releaseLoads()
+            if (scenarioNeedsMemoryPrewarm(scenario)) {
+                progress = progress.copy(
+                    statusText = "surface 및 DRAM working-set 사전 준비",
+                )
+                val prewarmed = withContext(Dispatchers.IO) {
+                    loadManager.prewarmMemoryWorkingSet()
+                }
+                if (!prewarmed) {
+                    val reason = if (loadManager.hasMemoryAllocationFailure()) {
+                        "Memory workload working-set 사전 할당 실패로 전체 plan을 안전 중단합니다."
+                    } else {
+                        "Memory workload working-set 사전 준비를 확인하지 못해 전체 plan을 안전 중단합니다."
+                    }
+                    cancellationReason = reason
+                    runEvents += event("MEMORY_PREWARM_FAILURE", reason)
+                    throw PlanAbortException(reason)
+                }
+                // Page touches are deliberately outside measured traffic. Reset the generated-byte
+                // window once more before the fresh telemetry/counter baseline.
+                loadManager.releaseLoads()
+                loadManager.sampleAndResetBandwidthBytes()
+                runEvents += event(
+                    "MEMORY_PREWARM",
+                    "working-set allocation/page touch confirmed; measured-byte baseline reset",
+                )
+            }
             delay(WARMUP_DELAY_MS)
             // Attribute deltas to the actual scenario, not Surface creation, codec preparation,
             // or the Compose transition into the run screen.
@@ -964,34 +1008,23 @@ class LabController(
             establishCounterBaseline(baselineSample)
             runScenarioPhases(scenario)
 
-            val cooldownProducerGeneration = beginTrackedProducerGeneration()
-            progress = progress.copy(
-                stage = RunnerStage.COOLDOWN,
-                phase = scenario.phases.lastOrNull()?.copy(
-                    activeLayers = 1,
-                    producerFps = min(60f, safetyLimits.maxProducerFps),
-                    requestedDisplayHz = 60f,
-                    workloads = LoadSetpoints(),
-                ),
-                targetPhase = null,
-                transitionFraction = 0f,
-                statusText = "부하 해제 및 counter 안정화",
-                producerGeneration = cooldownProducerGeneration,
-            )
+            // Preserve the last measured generation and publish phase=null first. This lets
+            // Compose detach codec/EGL/Canvas producers before a vendor compression reset changes
+            // their allocation route. A copied last phase is not a neutral cooldown: it can retain
+            // an 8K decoder, GL tail, alpha/client composition, or SBWC-backed buffers.
+            progress = progressForCooldownTeardown(progress)
             planProgress = planProgress.copy(currentRunFraction = 1f)
             if (!releaseActiveLoadsForRun()) {
-                val reason = "부하 또는 compression 해제를 확인할 수 없어 plan을 안전 중단합니다."
+                val reason =
+                    "부하, physical producer 또는 compression 해제를 확인할 수 없어 " +
+                        "plan을 안전 중단합니다."
                 cancellationReason = reason
                 throw PlanAbortException(reason)
             }
             cleanupConfirmed = true
             requestDisplayModeSafely(60f, "cooldown")
             delay(COOLDOWN_DELAY_MS)
-            // Remove even the neutral cooldown Surface before potentially slow report I/O.
             progress = progress.copy(
-                phase = null,
-                targetPhase = null,
-                transitionFraction = 0f,
                 statusText = "결과 보고서 저장 중",
             )
             // A normal verdict is derived only after the final physical producer has drained and
@@ -1195,6 +1228,7 @@ class LabController(
         directSensors.addAll(systemMonitor.directSensorReadings())
         if (!isRunning) return
         // Safety observations stay conservative even if the sample was requested by an older run.
+        enforceCompressionSessionContinuity(snapshot)
         enforceRuntimeSafety(snapshot)
         if (!telemetrySampleGate.belongsToCurrentRun(generation)) return
 
@@ -1249,25 +1283,58 @@ class LabController(
                 elapsedMs = 0L,
                 phaseDurationMs = requestedPhase.durationMs,
             )
-            val initialRawRuntime = LoadTransitionEvaluator.interpolate(
-                previous = transitionOrigin,
+            val initialRawRuntime = allocationRouteSafePhase(
+                initial = LoadTransitionEvaluator.interpolate(
+                    previous = transitionOrigin,
+                    target = requestedPhase,
+                    fraction = initialTransition.fraction,
+                ),
                 target = requestedPhase,
-                fraction = initialTransition.fraction,
             )
             var initialRuntime = applyPersistentSafety(initialRawRuntime)
-            // A previous phase's cross-load must not compete with a physical producer that is
-            // still draining or remain active while a bounded vendor compression Binder call
-            // completes. The route is still configured before any new Surface allocation.
-            progress.phase?.let { previousRendererPhase ->
+            val previousRendererPhase = progress.phase
+            val allocationRouteChanges = rendererAllocationRouteChanges(
+                active = previousRendererPhase,
+                target = targetPhase,
+            )
+            // A compression/codec allocation route is a discrete boundary. Detach and confirm
+            // the previous producer before touching the vendor route; otherwise an SBWC→RGB or
+            // RGB→SBWC transition can reconfigure an allocator under live buffers. Keep the
+            // prewarmed DRAM working set pinned because this is a phase boundary, not run cleanup.
+            if (allocationRouteChanges) {
                 progress = progress.copy(
-                    phase = rendererPreparationPhase(previousRendererPhase),
+                    phase = null,
+                    targetPhase = null,
                     transitionFraction = 0f,
-                    statusText = "이전 producer/cross-load quiesce",
+                    statusText = "Allocation route 전환 전 producer teardown 확인 중",
                 )
+                val loadsReleased = confirmGeneratedLoadQuiesce()
+                val rendererReleased = awaitRendererTeardownBarrier()
+                if (!loadsReleased || !rendererReleased) {
+                    val reason =
+                        "Phase '${targetPhase.id}' allocation route 전환 전 " +
+                            "부하/producer 해제를 확인하지 못했습니다."
+                    cancellationReason = reason
+                    runEvents += event("ROUTE_TRANSITION_BLOCKED", reason)
+                    throw PlanAbortException(reason)
+                }
+                configureCompression(targetPhase)
+                runEvents += event(
+                    "ROUTE_TRANSITION_READY",
+                    "${previousRendererPhase?.pixelRoute?.name ?: "NONE"} → " +
+                        targetPhase.pixelRoute.name,
+                )
+            } else {
+                previousRendererPhase?.let {
+                    progress = progress.copy(
+                        phase = rendererPreparationPhase(it),
+                        transitionFraction = 0f,
+                        statusText = "이전 producer/cross-load quiesce",
+                    )
+                }
+                loadManager.releaseLoads()
             }
-            loadManager.releaseLoads()
             requestDisplayMode(min(60f, targetPhase.requestedDisplayHz))
-            configureCompression(targetPhase)
             val adaptiveBoundaryBefore = if (adaptiveCandidate) {
                 collectAdaptiveBoundarySample(targetPhase.id, "before")
             } else {
@@ -1669,10 +1736,13 @@ class LabController(
                     },
                     phaseDurationMs = requestedPhase.durationMs,
                 )
-                val rawRuntimePhase = LoadTransitionEvaluator.interpolate(
-                    previous = transitionOrigin,
+                val rawRuntimePhase = allocationRouteSafePhase(
+                    initial = LoadTransitionEvaluator.interpolate(
+                        previous = transitionOrigin,
+                        target = requestedPhase,
+                        fraction = transitionSample.fraction,
+                    ),
                     target = requestedPhase,
-                    fraction = transitionSample.fraction,
                 )
                 val runtimePhase = applyPersistentSafety(rawRuntimePhase)
                 if (targetThermalState != thermalReduced) {
@@ -1875,12 +1945,14 @@ class LabController(
             route = phase.pixelRoute,
             activeBefore = activeBeforeAttempt,
         )
-        val result = withContext(Dispatchers.IO) {
+        val outcome = withContext(Dispatchers.IO) {
             systemMonitor.setCompressionRoute(phase.pixelRoute)
         }
+        val result = outcome.result
         runEvents += event(
             "COMPRESSION_ROUTE",
-            "${phase.pixelRoute.name}; result=${result.name}",
+            "${phase.pixelRoute.name}; result=${result.name}; " +
+                "session=${outcome.serviceSession ?: "N/A"}",
         )
         val decision = decideCompressionTransition(
             route = phase.pixelRoute,
@@ -1892,6 +1964,12 @@ class LabController(
             },
         )
         compressionControlActive = decision.activeAfter
+        compressionControlSession = when {
+            decision.activeAfter && result == CompressionControlResult.APPLIED ->
+                outcome.serviceSession
+            !decision.activeAfter -> null
+            else -> compressionControlSession
+        }
         when {
             decision.activeAfter ->
                 CompressionSafetyState.markNonLinearRouteMayBeActive()
@@ -1919,33 +1997,56 @@ class LabController(
     }
 
     /**
-     * Run-path release keeps vendor Binder waiting off the main thread. Publishing phase=null
-     * before this call can then detach Surface/codec/GL producers while compression reset waits.
+     * The only run-path cleanup ordering. Every verdict/cancellation path must detach and confirm
+     * physical producers before asking the vendor to return a possibly compressed allocation route
+     * to linear/default. If renderer teardown is unconfirmed, compression remains sticky and the
+     * next plan is fail-closed instead of resetting underneath an SBWC/codec/EGL producer.
      */
     private suspend fun releaseActiveLoadsForRun(): Boolean {
         if (closed) return controllerCloseCleanupConfirmed == true
-        var loadsReleased = confirmGeneratedLoadRelease()
-        if (closed) return controllerCloseCleanupConfirmed == true
-        if (!loadsReleased) loadsReleased = confirmGeneratedLoadRelease()
-        if (closed) return controllerCloseCleanupConfirmed == true
+        if (progress.phase != null || progress.targetPhase != null) {
+            progress = progress.copy(
+                phase = null,
+                targetPhase = null,
+                transitionFraction = 0f,
+                statusText = "부하 해제 및 physical producer teardown 확인 중",
+            )
+        }
+        val loadsReleased = releaseGeneratedLoadsForRun()
+        val rendererReleased = awaitRendererTeardownBarrier()
+        val compressionReleased =
+            if (rendererReleased) releaseCompressionRouteForRun() else false
+        return loadsReleased && rendererReleased && compressionReleased
+    }
 
-        var compressionReleased = resetCompressionRoute()
+    private suspend fun releaseGeneratedLoadsForRun(): Boolean {
         if (closed) return controllerCloseCleanupConfirmed == true
-        if (!compressionReleased) compressionReleased = resetCompressionRoute()
+        var released = confirmGeneratedLoadRelease()
         if (closed) return controllerCloseCleanupConfirmed == true
-        return loadsReleased && compressionReleased
+        if (!released) released = confirmGeneratedLoadRelease()
+        return if (closed) controllerCloseCleanupConfirmed == true else released
+    }
+
+    private suspend fun releaseCompressionRouteForRun(): Boolean {
+        if (closed) return controllerCloseCleanupConfirmed == true
+        var released = resetCompressionRoute()
+        if (closed) return controllerCloseCleanupConfirmed == true
+        if (!released) released = resetCompressionRoute()
+        return if (closed) controllerCloseCleanupConfirmed == true else released
     }
 
     private suspend fun resetCompressionRoute(): Boolean {
-        val result = withContext(Dispatchers.IO) {
+        val outcome = withContext(Dispatchers.IO) {
             runCatching { systemMonitor.setCompressionRoute(PixelRoute.RGB_8888) }
         }.getOrElse { error ->
             recordCleanupFailure("compression reset", error)
             return false
         }
+        val result = outcome.result
         runEvents += event(
             "COMPRESSION_RESET",
-            "RGB_8888; result=${result.name}; activeBefore=$compressionControlActive",
+            "RGB_8888; result=${result.name}; activeBefore=$compressionControlActive; " +
+                "session=${outcome.serviceSession ?: "N/A"}",
         )
         val decision = decideCompressionTransition(
             route = PixelRoute.RGB_8888,
@@ -1953,6 +2054,7 @@ class LabController(
             activeBefore = compressionControlActive,
         )
         compressionControlActive = decision.activeAfter
+        if (!decision.activeAfter) compressionControlSession = null
         when {
             decision.activeAfter ->
                 CompressionSafetyState.markNonLinearRouteMayBeActive()
@@ -1990,10 +2092,25 @@ class LabController(
 
     private suspend fun confirmGeneratedLoadRelease(): Boolean {
         val result = withContext(Dispatchers.IO) {
-            runCatching { loadManager.releaseLoadsAndConfirm() }
+            // A successful prewarm pins reusable DRAM buffers for measurement fidelity. Every
+            // run-boundary cleanup must explicitly drop them; ordinary phase quiesce keeps them.
+            runCatching { loadManager.releaseLoadsAndConfirm(dropMemoryBuffers = true) }
         }
         return result.getOrElse { error ->
             recordCleanupFailure("load/NPU confirmed release", error)
+            false
+        }
+    }
+
+    private suspend fun confirmGeneratedLoadQuiesce(): Boolean {
+        val result = withContext(Dispatchers.IO) {
+            runCatching { loadManager.releaseLoadsAndConfirm(dropMemoryBuffers = false) }
+        }
+        return result.getOrElse { error ->
+            runEvents += event(
+                "LOAD_QUIESCE_FAILURE",
+                "phase-boundary load/NPU release exception: ${error.javaClass.simpleName}",
+            )
             false
         }
     }
@@ -2077,18 +2194,25 @@ class LabController(
     private suspend fun recoverCompressionRouteBeforeRun() {
         if (!CompressionSafetyState.hasUnconfirmedCompressionCleanup()) return
         progress = progress.copy(statusText = "이전 compression route를 linear로 복구 확인 중")
-        val result = withContext(Dispatchers.IO) {
+        val outcome = withContext(Dispatchers.IO) {
             runCatching { systemMonitor.setCompressionRoute(PixelRoute.RGB_8888) }
-                .getOrDefault(CompressionControlResult.REJECTED_OR_TIMEOUT)
+                .getOrDefault(
+                    com.example.dpulayerlab.monitor.CompressionControlOutcome(
+                        CompressionControlResult.REJECTED_OR_TIMEOUT,
+                    ),
+                )
         }
+        val result = outcome.result
         val confirmed = result == CompressionControlResult.APPLIED
         CompressionSafetyState.recordLinearReset(confirmed)
         runEvents += event(
             "COMPRESSION_RECOVERY",
-            "process-wide linear reset; result=${result.name}; confirmed=$confirmed",
+            "process-wide linear reset; result=${result.name}; confirmed=$confirmed; " +
+                "session=${outcome.serviceSession ?: "N/A"}",
         )
         if (confirmed) {
             compressionControlActive = false
+            compressionControlSession = null
             return
         }
         val reason =
@@ -2105,11 +2229,21 @@ class LabController(
             runEvents += event("LOCAL_WORKER_FAILURE", reason)
             throw PlanAbortException(reason)
         }
-        if (
-            !loadManager.hasMemoryAllocationFailure() &&
-            !DeviceRenderSafety.isLowMemory(activity)
+        when (
+            memorySafetyFailure(
+                workloadAllocationFailed = loadManager.hasMemoryAllocationFailure(),
+                systemLowMemory = DeviceRenderSafety.isLowMemory(activity),
+            )
         ) {
-            return
+            null -> return
+            MemorySafetyFailure.WORKLOAD_ALLOCATION -> {
+                val reason =
+                    "Memory workload working-set 할당 실패로 전체 plan을 안전 중단합니다."
+                cancellationReason = reason
+                runEvents += event("MEMORY_WORKLOAD_FAILURE", reason)
+                throw PlanAbortException(reason)
+            }
+            MemorySafetyFailure.SYSTEM_LOW_MEMORY -> Unit
         }
         val reason = "시스템 low-memory 상태로 전체 plan을 안전 중단합니다."
         cancellationReason = reason
@@ -2119,6 +2253,30 @@ class LabController(
 
     private fun enforceRuntimeSafety(snapshot: TelemetrySnapshot) {
         if (abortForLocalWorkerFailure()) return
+        when (
+            memorySafetyFailure(
+                workloadAllocationFailed = loadManager.hasMemoryAllocationFailure(),
+                systemLowMemory = snapshot.memoryLow,
+            )
+        ) {
+            MemorySafetyFailure.WORKLOAD_ALLOCATION -> {
+                abortForSafety(
+                    reason =
+                        "Memory workload working-set 할당 실패로 요청한 DRAM traffic을 " +
+                            "유지할 수 없습니다.",
+                    eventType = "MEMORY_WORKLOAD_FAILURE",
+                )
+                return
+            }
+            MemorySafetyFailure.SYSTEM_LOW_MEMORY -> {
+                abortForSafety(
+                    reason = "시스템 low-memory 신호로 안전 중단",
+                    eventType = "LOW_MEMORY_STOP",
+                )
+                return
+            }
+            null -> Unit
+        }
         if (
             safetyEnvelopeInvalidatedByPowerSave(
                 envelopePowerSaveMode = safetyLimits.powerSaveMode,
@@ -2128,13 +2286,6 @@ class LabController(
             abortForSafety(
                 reason = "실행 중 Battery Saver가 활성화되어 기존 safety envelope를 폐기합니다.",
                 eventType = "SAFETY_ENVELOPE_CHANGED",
-            )
-            return
-        }
-        if (snapshot.memoryLow) {
-            abortForSafety(
-                reason = "시스템 low-memory 신호로 안전 중단",
-                eventType = "LOW_MEMORY_STOP",
             )
             return
         }
@@ -2191,6 +2342,27 @@ class LabController(
             runEvents += event("THERMAL_DERATE", "thermal=${snapshot.thermalLabel}; persistent=true")
             errorMessage = "열 상태 ${snapshot.thermalLabel}: 남은 테스트 부하를 지속 감속합니다."
         }
+    }
+
+    private fun enforceCompressionSessionContinuity(snapshot: TelemetrySnapshot) {
+        val activeRoute = progress.phase?.pixelRoute ?: progress.targetPhase?.pixelRoute
+        if (
+            !compressionSessionContinuityLost(
+                compressionControlActive = compressionControlActive,
+                activeRoute = activeRoute,
+                expectedSession = compressionControlSession,
+                observedSession = snapshot.vendorServiceSession,
+            )
+        ) {
+            return
+        }
+        CompressionSafetyState.markNonLinearRouteMayBeActive()
+        val reason =
+            "활성 ${activeRoute?.name ?: "SBWC"} compression route의 vendor session이 " +
+                "${compressionControlSession ?: "N/A"} → " +
+                "${snapshot.vendorServiceSession ?: "disconnected"}로 변경되어 " +
+                "route 적용 상태를 검증할 수 없습니다."
+        abortForSafety(reason, "COMPRESSION_SESSION_CHANGED")
     }
 
     private fun abortForLocalWorkerFailure(): Boolean {
@@ -3542,6 +3714,16 @@ internal fun compressionStateAtAttemptStart(
 ): Boolean =
     activeBefore || route == PixelRoute.SBWC_AUTO || route == PixelRoute.SBWC_REQUIRED
 
+internal fun compressionSessionContinuityLost(
+    compressionControlActive: Boolean,
+    activeRoute: PixelRoute?,
+    expectedSession: Long?,
+    observedSession: Long?,
+): Boolean =
+    compressionControlActive &&
+        activeRoute in setOf(PixelRoute.SBWC_AUTO, PixelRoute.SBWC_REQUIRED) &&
+        (expectedSession == null || observedSession != expectedSession)
+
 internal fun decideCompressionTransition(
     route: PixelRoute,
     result: CompressionControlResult,
@@ -3760,6 +3942,53 @@ internal fun producerRecoveryDeadlineExceeded(
     }
 }
 
+/**
+ * Warm-up must never allocate codec/SBWC-labelled buffers before the matching vendor route has
+ * been applied. It is intentionally a small portable RGB producer; the measured generation is
+ * created only after the route-transition teardown barrier.
+ */
+internal fun safeWarmupPhaseFor(target: PhaseSpec): PhaseSpec =
+    target.copy(
+        activeLayers = 1,
+        producerFps = min(60f, target.producerFps),
+        requestedDisplayHz = min(60f, target.requestedDisplayHz),
+        backend = LayerBackend.INDEPENDENT_SURFACES,
+        pixelRoute = PixelRoute.RGB_8888,
+        bufferSize = BufferSize.DISPLAY,
+        motion = MotionProfile.STATIC,
+        workloads = LoadSetpoints(),
+        alphaOverlap = false,
+        includeGlLayer = false,
+    )
+
+internal fun rendererAllocationRouteChanges(
+    active: PhaseSpec?,
+    target: PhaseSpec,
+): Boolean =
+    (active?.pixelRoute ?: PixelRoute.RGB_8888) != target.pixelRoute
+
+/**
+ * Pixel/compression routes cannot be interpolated under a live producer. Continuous fields can
+ * still start at the prior values, but the preparation producer must use the already validated
+ * target allocation topology after the old route has been detached.
+ */
+internal fun allocationRouteSafePhase(
+    initial: PhaseSpec,
+    target: PhaseSpec,
+): PhaseSpec =
+    if (initial.pixelRoute == target.pixelRoute) {
+        initial
+    } else {
+        initial.copy(
+            activeLayers = target.activeLayers,
+            backend = target.backend,
+            pixelRoute = target.pixelRoute,
+            bufferSize = target.bufferSize,
+            alphaOverlap = target.alphaOverlap,
+            includeGlLayer = target.includeGlLayer,
+        )
+    }
+
 internal fun rendererPreparationPhase(initialRuntime: PhaseSpec): PhaseSpec =
     initialRuntime.copy(
         producerFps = min(60f, initialRuntime.producerFps),
@@ -3776,6 +4005,44 @@ internal fun progressForControllerPause(
 } else {
     current
 }
+
+internal fun progressForCooldownTeardown(current: RunProgress): RunProgress = current.copy(
+    stage = RunnerStage.COOLDOWN,
+    phase = null,
+    targetPhase = null,
+    transitionFraction = 0f,
+    statusText = "부하 해제 및 physical producer/counter 안정화",
+)
+
+internal enum class MemorySafetyFailure {
+    WORKLOAD_ALLOCATION,
+    SYSTEM_LOW_MEMORY,
+}
+
+/**
+ * The workload failure wins when both signals arrive together: it is the direct evidence that the
+ * requested DRAM traffic was not produced, while the system signal remains covered by the same
+ * fail-closed abort path.
+ */
+internal fun memorySafetyFailure(
+    workloadAllocationFailed: Boolean,
+    systemLowMemory: Boolean,
+): MemorySafetyFailure? = when {
+    workloadAllocationFailed -> MemorySafetyFailure.WORKLOAD_ALLOCATION
+    systemLowMemory -> MemorySafetyFailure.SYSTEM_LOW_MEMORY
+    else -> null
+}
+
+internal fun scenarioNeedsMemoryPrewarm(scenario: ScenarioSpec): Boolean =
+    scenario.phases.any { phase ->
+        phase.workloads.memory
+            .takeIf(Float::isFinite)
+            ?.coerceIn(0f, 1f)
+            ?.let { it > MEMORY_PREWARM_EPSILON }
+            ?: false
+    }
+
+private const val MEMORY_PREWARM_EPSILON = 0.001f
 
 internal fun progressForImmediateStop(
     current: RunProgress,

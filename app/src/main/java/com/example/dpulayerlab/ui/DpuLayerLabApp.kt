@@ -41,7 +41,6 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -120,9 +119,14 @@ import com.example.dpulayerlab.model.RunSummary
 import com.example.dpulayerlab.model.RunVerdict
 import com.example.dpulayerlab.model.RunnerStage
 import com.example.dpulayerlab.model.ScenarioCategory
+import com.example.dpulayerlab.model.ScenarioChangePattern
+import com.example.dpulayerlab.model.ScenarioClassifier
+import com.example.dpulayerlab.model.ScenarioCondition
+import com.example.dpulayerlab.model.ScenarioLoadBand
 import com.example.dpulayerlab.model.ScenarioPlanPolicy
 import com.example.dpulayerlab.model.ScenarioQueueEditor
 import com.example.dpulayerlab.model.ScenarioRunPlan
+import com.example.dpulayerlab.model.ScenarioSelectionFilter
 import com.example.dpulayerlab.model.ScenarioSpec
 import com.example.dpulayerlab.model.TelemetrySnapshot
 import com.example.dpulayerlab.model.terminalReason
@@ -168,14 +172,6 @@ private data class DashboardMetricSpec(
     val valueText: String? = null,
 )
 
-private enum class ScenarioQuickFilter(val label: String) {
-    ALL("전체 패턴"),
-    SHARP("급격한 변화"),
-    GRADUAL("점진 변화"),
-    CROSS_LOAD("교차 부하"),
-    REQUIREMENTS("추가 요구"),
-}
-
 private data class ScenarioOverview(
     val patternLabel: String,
     val intensityScore: Int,
@@ -191,6 +187,18 @@ fun DpuLayerLabApp(controller: LabController) {
         mutableStateOf<List<String>>(arrayListOf())
     }
     var planRepeatCount by rememberSaveable { mutableIntStateOf(1) }
+    val knownScenarioIds = remember {
+        ScenarioCatalog.presets.mapTo(LinkedHashSet()) { it.id }
+    }
+    val validatedScenarioIds = remember(selectedScenarioIds, knownScenarioIds) {
+        ScenarioQueueEditor.retainKnown(selectedScenarioIds, knownScenarioIds)
+    }
+    val validatedRepeatCount = remember(validatedScenarioIds.size, planRepeatCount) {
+        ScenarioPlanPolicy.normalizeRepeatCount(
+            queueSize = validatedScenarioIds.size,
+            requested = planRepeatCount,
+        )
+    }
     val snackbar = remember { SnackbarHostState() }
     val progress = controller.progress
     val planProgress = controller.planProgress
@@ -227,6 +235,19 @@ fun DpuLayerLabApp(controller: LabController) {
             controller.clearError()
         }
     }
+    LaunchedEffect(
+        validatedScenarioIds,
+        selectedScenarioIds,
+        validatedRepeatCount,
+        planRepeatCount,
+    ) {
+        if (validatedScenarioIds != selectedScenarioIds) {
+            selectedScenarioIds = validatedScenarioIds
+        }
+        if (planRepeatCount != validatedRepeatCount) {
+            planRepeatCount = validatedRepeatCount
+        }
+    }
 
     val immersive = section == AppSection.RUN
     Scaffold(
@@ -256,7 +277,7 @@ fun DpuLayerLabApp(controller: LabController) {
                             )
                             Spacer(Modifier.width(10.dp))
                             Column {
-                                Text("DPU Layer Lab", style = MaterialTheme.typography.titleLarge)
+                                Text("DPULayerTest", style = MaterialTheme.typography.titleLarge)
                                 Text(
                                     when {
                                         controller.telemetry.exactUnderruns != null ->
@@ -310,34 +331,64 @@ fun DpuLayerLabApp(controller: LabController) {
                 controller = controller,
                 modifier = Modifier.padding(padding),
                 selectMedia = { mediaPicker.launch(arrayOf("video/*")) },
-                selectedScenarioIds = selectedScenarioIds,
-                repeatCount = planRepeatCount,
+                selectedScenarioIds = validatedScenarioIds,
+                repeatCount = validatedRepeatCount,
                 addScenario = { scenarioId ->
                     val updated = ScenarioQueueEditor.append(
-                        queue = selectedScenarioIds,
+                        queue = validatedScenarioIds,
                         scenarioId = scenarioId,
                     )
                     selectedScenarioIds = updated
-                    planRepeatCount = planRepeatCount.coerceAtMost(
+                    planRepeatCount = validatedRepeatCount.coerceAtMost(
                         maximumPlanRepeats(updated.size),
                     )
                 },
                 removeScenario = { scenarioId ->
                     selectedScenarioIds = ScenarioQueueEditor.removeLast(
-                        queue = selectedScenarioIds,
+                        queue = validatedScenarioIds,
                         scenarioId = scenarioId,
                     )
                 },
                 removeQueueAt = { index ->
                     selectedScenarioIds = ScenarioQueueEditor.removeAt(
-                        queue = selectedScenarioIds,
+                        queue = validatedScenarioIds,
                         index = index,
                     )
                 },
-                selectAll = {
-                    val updated = ScenarioCatalog.presets.map { it.id }
+                moveQueueItem = { fromIndex, toIndex ->
+                    selectedScenarioIds = ScenarioQueueEditor.move(
+                        queue = validatedScenarioIds,
+                        fromIndex = fromIndex,
+                        toIndex = toIndex,
+                    )
+                },
+                appendFiltered = { scenarioIds ->
+                    val updated = ScenarioQueueEditor.appendAll(
+                        queue = validatedScenarioIds,
+                        scenarioIds = scenarioIds,
+                    )
                     selectedScenarioIds = updated
-                    planRepeatCount = planRepeatCount.coerceAtMost(
+                    planRepeatCount = validatedRepeatCount.coerceAtMost(
+                        maximumPlanRepeats(updated.size),
+                    )
+                },
+                replaceWithFiltered = { scenarioIds ->
+                    val updated = ScenarioQueueEditor.appendAll(
+                        queue = emptyList(),
+                        scenarioIds = scenarioIds,
+                    )
+                    selectedScenarioIds = updated
+                    planRepeatCount = validatedRepeatCount.coerceAtMost(
+                        maximumPlanRepeats(updated.size),
+                    )
+                },
+                selectAll = {
+                    val updated = ScenarioQueueEditor.appendAll(
+                        queue = emptyList(),
+                        scenarioIds = ScenarioCatalog.presets.asSequence().map { it.id }.asIterable(),
+                    )
+                    selectedScenarioIds = updated
+                    planRepeatCount = validatedRepeatCount.coerceAtMost(
                         maximumPlanRepeats(updated.size),
                     )
                 },
@@ -347,14 +398,14 @@ fun DpuLayerLabApp(controller: LabController) {
                 },
                 resetOrder = {
                     selectedScenarioIds = ScenarioQueueEditor.resetToCatalogOrder(
-                        queue = selectedScenarioIds,
+                        queue = validatedScenarioIds,
                         catalogOrder = ScenarioCatalog.presets.map { it.id },
                     )
                 },
                 changeRepeatCount = {
                     planRepeatCount = it.coerceIn(
                         1,
-                        maximumPlanRepeats(selectedScenarioIds.size),
+                        maximumPlanRepeats(validatedScenarioIds.size),
                     )
                 },
                 runSelection = { scenarios, repeats ->
@@ -665,19 +716,64 @@ private fun CatalogScreen(
     addScenario: (String) -> Unit,
     removeScenario: (String) -> Unit,
     removeQueueAt: (Int) -> Unit,
+    moveQueueItem: (Int, Int) -> Unit,
+    appendFiltered: (List<String>) -> Unit,
+    replaceWithFiltered: (List<String>) -> Unit,
     selectAll: () -> Unit,
     clearSelection: () -> Unit,
     resetOrder: () -> Unit,
     changeRepeatCount: (Int) -> Unit,
     runSelection: (List<ScenarioSpec>, Int) -> Unit,
 ) {
-    var category by remember { mutableStateOf<ScenarioCategory?>(null) }
-    var quickFilter by remember { mutableStateOf(ScenarioQuickFilter.ALL) }
-    val scenarios = remember(category, quickFilter) {
-        ScenarioCatalog.presets.filter { scenario ->
-            (category == null || scenario.category == category) &&
-                quickFilter.matches(scenario)
-        }
+    var categoryKeys by rememberSaveable { mutableStateOf<List<String>>(arrayListOf()) }
+    var patternKeys by rememberSaveable { mutableStateOf<List<String>>(arrayListOf()) }
+    var loadBandKeys by rememberSaveable { mutableStateOf<List<String>>(arrayListOf()) }
+    var conditionKeys by rememberSaveable { mutableStateOf<List<String>>(arrayListOf()) }
+    val validCategoryKeys = remember(categoryKeys) {
+        categoryKeys.retainKnownEnumKeys<ScenarioCategory>()
+    }
+    val validPatternKeys = remember(patternKeys) {
+        patternKeys.retainKnownEnumKeys<ScenarioChangePattern>()
+    }
+    val validLoadBandKeys = remember(loadBandKeys) {
+        loadBandKeys.retainKnownEnumKeys<ScenarioLoadBand>()
+    }
+    val validConditionKeys = remember(conditionKeys) {
+        conditionKeys.retainKnownEnumKeys<ScenarioCondition>()
+    }
+    LaunchedEffect(categoryKeys, patternKeys, loadBandKeys, conditionKeys) {
+        if (categoryKeys != validCategoryKeys) categoryKeys = validCategoryKeys
+        if (patternKeys != validPatternKeys) patternKeys = validPatternKeys
+        if (loadBandKeys != validLoadBandKeys) loadBandKeys = validLoadBandKeys
+        if (conditionKeys != validConditionKeys) conditionKeys = validConditionKeys
+    }
+    val selectedCategories = remember(validCategoryKeys) {
+        validCategoryKeys.toKnownEnumSet<ScenarioCategory>()
+    }
+    val selectedPatterns = remember(validPatternKeys) {
+        validPatternKeys.toKnownEnumSet<ScenarioChangePattern>()
+    }
+    val selectedLoadBands = remember(validLoadBandKeys) {
+        validLoadBandKeys.toKnownEnumSet<ScenarioLoadBand>()
+    }
+    val selectedConditions = remember(validConditionKeys) {
+        validConditionKeys.toKnownEnumSet<ScenarioCondition>()
+    }
+    val selectionFilter = remember(
+        selectedCategories,
+        selectedPatterns,
+        selectedLoadBands,
+        selectedConditions,
+    ) {
+        ScenarioSelectionFilter(
+            categories = selectedCategories,
+            patterns = selectedPatterns,
+            loadBands = selectedLoadBands,
+            conditions = selectedConditions,
+        )
+    }
+    val scenarios = remember(selectionFilter) {
+        ScenarioClassifier.filter(ScenarioCatalog.presets, selectionFilter)
     }
     val selectedScenarios = remember(selectedScenarioIds) {
         selectedScenarioIds.mapNotNull(ScenarioCatalog::byId)
@@ -697,7 +793,7 @@ private fun CatalogScreen(
     ) {
         item {
             Column {
-                Text("DPU Test Program", style = MaterialTheme.typography.displaySmall)
+                Text("DPULayerTest 시나리오", style = MaterialTheme.typography.displaySmall)
                 Text(
                     "DPU composition 한계와 underrun 징후를 확인할 테스트를 순서대로 " +
                         "선택하고, 같은 queue를 반복 실행합니다.",
@@ -721,59 +817,44 @@ private fun CatalogScreen(
                 clearSelection = clearSelection,
                 resetOrder = resetOrder,
                 removeQueueAt = removeQueueAt,
+                moveQueueItem = moveQueueItem,
                 runSelection = runSelection,
             )
         }
         item {
-            Text(
-                "카테고리",
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            CatalogFilterCard(
+                selectedCategoryKeys = validCategoryKeys.toSet(),
+                selectedPatternKeys = validPatternKeys.toSet(),
+                selectedLoadBandKeys = validLoadBandKeys.toSet(),
+                selectedConditionKeys = validConditionKeys.toSet(),
+                resultCount = scenarios.size,
+                queueSize = selectedScenarioIds.size,
+                running = controller.isRunning,
+                toggleCategory = {
+                    categoryKeys = toggleFilterKey(validCategoryKeys, it)
+                },
+                togglePattern = {
+                    patternKeys = toggleFilterKey(validPatternKeys, it)
+                },
+                toggleLoadBand = {
+                    loadBandKeys = toggleFilterKey(validLoadBandKeys, it)
+                },
+                toggleCondition = {
+                    conditionKeys = toggleFilterKey(validConditionKeys, it)
+                },
+                clearCategories = { categoryKeys = arrayListOf() },
+                clearPatterns = { patternKeys = arrayListOf() },
+                clearLoadBands = { loadBandKeys = arrayListOf() },
+                clearConditions = { conditionKeys = arrayListOf() },
+                clearAll = {
+                    categoryKeys = arrayListOf()
+                    patternKeys = arrayListOf()
+                    loadBandKeys = arrayListOf()
+                    conditionKeys = arrayListOf()
+                },
+                appendResults = { appendFiltered(scenarios.map { it.id }) },
+                replaceWithResults = { replaceWithFiltered(scenarios.map { it.id }) },
             )
-            Row(
-                modifier = Modifier
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                FilterChip(
-                    selected = category == null,
-                    onClick = { category = null },
-                    label = { Text("전체") },
-                )
-                ScenarioCategory.entries.forEach { item ->
-                    FilterChip(
-                        selected = category == item,
-                        onClick = { category = item },
-                        label = { Text(item.label) },
-                    )
-                }
-            }
-        }
-        item {
-            Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
-                Text(
-                    "빠른 조건",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Row(
-                    modifier = Modifier.horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    ScenarioQuickFilter.entries.forEach { item ->
-                        FilterChip(
-                            selected = quickFilter == item,
-                            onClick = { quickFilter = item },
-                            label = { Text(item.label) },
-                        )
-                    }
-                }
-                Text(
-                    "${scenarios.size}개 테스트 · 예상 강도는 preset 간 비교용이며 HW 수용 한계가 아닙니다.",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
         }
         if (scenarios.isEmpty()) {
             item {
@@ -789,13 +870,15 @@ private fun CatalogScreen(
                     ) {
                         Text("조건에 맞는 테스트가 없습니다.", style = MaterialTheme.typography.titleMedium)
                         Text(
-                            "카테고리나 빠른 조건을 변경해 주세요.",
+                            "같은 행의 조건을 줄이거나 다른 조합으로 변경해 주세요.",
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                         TextButton(
                             onClick = {
-                                category = null
-                                quickFilter = ScenarioQuickFilter.ALL
+                                categoryKeys = arrayListOf()
+                                patternKeys = arrayListOf()
+                                loadBandKeys = arrayListOf()
+                                conditionKeys = arrayListOf()
                             },
                         ) {
                             Text("필터 초기화")
@@ -818,6 +901,162 @@ private fun CatalogScreen(
 }
 
 @Composable
+private fun CatalogFilterCard(
+    selectedCategoryKeys: Set<String>,
+    selectedPatternKeys: Set<String>,
+    selectedLoadBandKeys: Set<String>,
+    selectedConditionKeys: Set<String>,
+    resultCount: Int,
+    queueSize: Int,
+    running: Boolean,
+    toggleCategory: (String) -> Unit,
+    togglePattern: (String) -> Unit,
+    toggleLoadBand: (String) -> Unit,
+    toggleCondition: (String) -> Unit,
+    clearCategories: () -> Unit,
+    clearPatterns: () -> Unit,
+    clearLoadBands: () -> Unit,
+    clearConditions: () -> Unit,
+    clearAll: () -> Unit,
+    appendResults: () -> Unit,
+    replaceWithResults: () -> Unit,
+) {
+    val availableQueueSlots =
+        (ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS - queueSize).coerceAtLeast(0)
+    val appendCount = minOf(resultCount.coerceAtLeast(0), availableQueueSlots)
+    val replaceCount = minOf(
+        resultCount.coerceAtLeast(0),
+        ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS,
+    )
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
+        ),
+        shape = RoundedCornerShape(22.dp),
+    ) {
+        Column(
+            Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(11.dp),
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text("카테고리 · 부하 · 조건 조합", style = MaterialTheme.typography.titleLarge)
+                Text(
+                    "같은 행은 OR, 서로 다른 행은 AND로 결합합니다. 결과 순서는 catalog와 같습니다.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelLarge,
+                )
+            }
+            FacetFilterRow(
+                title = "카테고리",
+                allLabel = "모든 카테고리",
+                items = ScenarioCategory.entries.map { it.name to it.label },
+                selectedKeys = selectedCategoryKeys,
+                clear = clearCategories,
+                toggle = toggleCategory,
+            )
+            FacetFilterRow(
+                title = "부하 변화",
+                allLabel = "모든 변화",
+                items = ScenarioChangePattern.entries.map { it.name to it.label },
+                selectedKeys = selectedPatternKeys,
+                clear = clearPatterns,
+                toggle = togglePattern,
+            )
+            FacetFilterRow(
+                title = "예상 강도",
+                allLabel = "모든 강도",
+                items = ScenarioLoadBand.entries.map { it.name to it.label },
+                selectedKeys = selectedLoadBandKeys,
+                clear = clearLoadBands,
+                toggle = toggleLoadBand,
+            )
+            FacetFilterRow(
+                title = "부하/조건",
+                allLabel = "모든 자원",
+                items = ScenarioCondition.entries.map { it.name to it.label },
+                selectedKeys = selectedConditionKeys,
+                clear = clearConditions,
+                toggle = toggleCondition,
+            )
+            HorizontalDivider()
+            Text(
+                "${resultCount}개 테스트 일치 · 예상 강도는 preset 비교용이며 HW 수용 한계가 아닙니다.",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
+            )
+            TextButton(
+                onClick = clearAll,
+                enabled = (
+                    selectedCategoryKeys.isNotEmpty() ||
+                        selectedPatternKeys.isNotEmpty() ||
+                        selectedLoadBandKeys.isNotEmpty() ||
+                        selectedConditionKeys.isNotEmpty()
+                    ) && !running,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("조합 필터 초기화")
+            }
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedButton(
+                    onClick = replaceWithResults,
+                    enabled = replaceCount > 0 && !running,
+                    modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp),
+                ) {
+                    Text("결과로 교체 · $replaceCount")
+                }
+                Button(
+                    onClick = appendResults,
+                    enabled = appendCount > 0 && !running,
+                    modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp),
+                ) {
+                    Text("결과 추가 · $appendCount")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FacetFilterRow(
+    title: String,
+    allLabel: String,
+    items: List<Pair<String, String>>,
+    selectedKeys: Set<String>,
+    clear: () -> Unit,
+    toggle: (String) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+        Text(
+            title,
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Row(
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(7.dp),
+        ) {
+            FilterChip(
+                selected = selectedKeys.isEmpty(),
+                onClick = clear,
+                label = { Text(allLabel) },
+            )
+            items.forEach { (key, label) ->
+                FilterChip(
+                    selected = key in selectedKeys,
+                    onClick = { toggle(key) },
+                    label = { Text(label) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun QueuePlanCard(
     selectedScenarios: List<ScenarioSpec>,
     repeatCount: Int,
@@ -828,6 +1067,7 @@ private fun QueuePlanCard(
     clearSelection: () -> Unit,
     resetOrder: () -> Unit,
     removeQueueAt: (Int) -> Unit,
+    moveQueueItem: (Int, Int) -> Unit,
     runSelection: (List<ScenarioSpec>, Int) -> Unit,
 ) {
     val oneLoopDurationMs = remember(selectedScenarios) {
@@ -868,7 +1108,7 @@ private fun QueuePlanCard(
                 Column(Modifier.weight(1f)) {
                     Text("선택 실행 큐", style = MaterialTheme.typography.titleLarge)
                     Text(
-                        "표시된 #번호 순서로 실행합니다. 큐 항목을 누르면 한 개만 제거됩니다.",
+                        "표시된 #번호 순서로 실행합니다. ←/→로 이동하고 ×로 한 항목만 제거합니다.",
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         style = MaterialTheme.typography.labelLarge,
                     )
@@ -930,17 +1170,45 @@ private fun QueuePlanCard(
                     horizontalArrangement = Arrangement.spacedBy(7.dp),
                 ) {
                     selectedScenarios.forEachIndexed { index, scenario ->
-                        AssistChip(
-                            onClick = { removeQueueAt(index) },
-                            enabled = !running,
-                            label = {
+                        Surface(
+                            color = MaterialTheme.colorScheme.surface,
+                            shape = RoundedCornerShape(100.dp),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(start = 12.dp, end = 3.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
                                 Text(
-                                    "#${index + 1} ${scenario.name}  ×",
+                                    "#${index + 1} ${scenario.name}",
+                                    modifier = Modifier.widthIn(max = 210.dp),
                                     style = MaterialTheme.typography.labelLarge,
                                     fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
                                 )
-                            },
-                        )
+                                TextButton(
+                                    onClick = { moveQueueItem(index, index - 1) },
+                                    enabled = index > 0 && !running,
+                                    contentPadding = PaddingValues(horizontal = 6.dp),
+                                ) {
+                                    Text("←")
+                                }
+                                TextButton(
+                                    onClick = { moveQueueItem(index, index + 1) },
+                                    enabled = index < selectedScenarios.lastIndex && !running,
+                                    contentPadding = PaddingValues(horizontal = 6.dp),
+                                ) {
+                                    Text("→")
+                                }
+                                TextButton(
+                                    onClick = { removeQueueAt(index) },
+                                    enabled = !running,
+                                    contentPadding = PaddingValues(horizontal = 6.dp),
+                                ) {
+                                    Text("×")
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1886,6 +2154,17 @@ private fun RunningHud(
                             style = MaterialTheme.typography.labelLarge,
                         )
                     }
+                    Spacer(Modifier.width(6.dp))
+                    Button(
+                        onClick = stop,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.error,
+                            contentColor = MaterialTheme.colorScheme.onError,
+                        ),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 7.dp),
+                    ) {
+                        Text("STOP", fontWeight = FontWeight.Bold)
+                    }
                 }
                 HudProgressLine(
                     label = if (compactHud) {
@@ -1979,15 +2258,6 @@ private fun RunningHud(
                                 .verticalScroll(rememberScrollState()),
                         )
                     }
-                    Button(
-                        onClick = stop,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.error,
-                            contentColor = MaterialTheme.colorScheme.onError,
-                        ),
-                    ) {
-                        Text("STOP")
-                    }
                 }
             } else {
                 Column(
@@ -2032,15 +2302,6 @@ private fun RunningHud(
                                 style = MaterialTheme.typography.labelLarge,
                                 maxLines = 1,
                             )
-                        }
-                        Button(
-                            onClick = stop,
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = MaterialTheme.colorScheme.error,
-                                contentColor = MaterialTheme.colorScheme.onError,
-                            ),
-                        ) {
-                            Text("STOP")
                         }
                     }
                     RunTransitionStatus(
@@ -2252,6 +2513,14 @@ private fun RunTransitionStatus(
                     overflow = TextOverflow.Ellipsis,
                 )
             }
+            Text(
+                "Vendor S${telemetry.vendorServiceSession ?: "N/A"} · " +
+                    "compression ${telemetry.compressionState} · NPU ${telemetry.npuState}",
+                color = Color(0xFF86A39A),
+                fontSize = 9.sp,
+                maxLines = if (compact) 2 else 1,
+                overflow = TextOverflow.Ellipsis,
+            )
             if (safetyAdjustments.isNotEmpty()) {
                 Text(
                     "제한 사유 · ${safetyAdjustments.first()}" +
@@ -2964,6 +3233,12 @@ private fun PermissionCard(controller: LabController) {
             CapabilityRow("SurfaceFlinger DUMP", controller.hasDumpPermission, "DEVICE / CLIENT layer")
             CapabilityRow("NPU adapter", controller.hasNpuAdapter, controller.telemetry.npuState)
             CapabilityRow(
+                "SBWC adapter",
+                controller.hasSbwcAdapter,
+                "S${controller.telemetry.vendorServiceSession ?: "N/A"} · " +
+                    controller.telemetry.compressionState,
+            )
+            CapabilityRow(
                 "DPU counter",
                 controller.telemetry.exactUnderruns != null,
                 controller.telemetry.dpuBusy.source.ifBlank { "vendor service/sysfs 필요" },
@@ -3188,34 +3463,6 @@ private fun compositionProvenance(telemetry: TelemetrySnapshot): String {
     }
 }
 
-private fun ScenarioQuickFilter.matches(scenario: ScenarioSpec): Boolean = when (this) {
-    ScenarioQuickFilter.ALL -> true
-    ScenarioQuickFilter.SHARP ->
-        scenario.phases.any {
-            it.transition.mode == TransitionMode.PULSE_BURST ||
-                it.workloads.shape == LoadShape.PULSE
-        } ||
-            scenario.phases.zipWithNext().any { (from, to) ->
-                to.transition.mode == TransitionMode.STEP &&
-                    kotlin.math.abs(
-                        from.relativeIntensityScore() - to.relativeIntensityScore(),
-                    ) >= 25
-            }
-    ScenarioQuickFilter.GRADUAL ->
-        scenario.phases.any {
-            it.transition.mode in setOf(
-                TransitionMode.LINEAR_RAMP,
-                TransitionMode.STAIRCASE,
-                TransitionMode.TRIANGLE_WAVE,
-                TransitionMode.SOAK_RECOVERY,
-            ) ||
-                it.workloads.shape == LoadShape.RAMP ||
-                it.workloads.shape == LoadShape.SAW
-        }
-    ScenarioQuickFilter.CROSS_LOAD -> scenario.phases.any { it.workloads.hasCrossLoad() }
-    ScenarioQuickFilter.REQUIREMENTS -> scenario.requirements.isNotEmpty()
-}
-
 private fun ScenarioSpec.overview(): ScenarioOverview {
     val patternParts = buildList {
         val transitionModes = phases
@@ -3232,7 +3479,7 @@ private fun ScenarioSpec.overview(): ScenarioOverview {
         }
         if (isEmpty() && phases.size > 1) add("즉시 STEP")
     }
-    val score = phases.maxOfOrNull(PhaseSpec::relativeIntensityScore) ?: 0
+    val score = ScenarioClassifier.intensityScore(this)
     val label = when {
         score < 30 -> "낮음"
         score < 50 -> "보통"
@@ -3263,41 +3510,6 @@ private fun ScenarioSpec.overview(): ScenarioOverview {
         phaseSequence = sequence.ifBlank { "phase 없음" },
     )
 }
-
-private fun PhaseSpec.relativeIntensityScore(): Int {
-    val layerFactor = (activeLayers.toFloat() / 20f).coerceIn(0f, 1f)
-    val fpsFactor = (producerFps / 120f).takeIf(Float::isFinite)?.coerceIn(0f, 1f) ?: 0f
-    val hzFactor =
-        (requestedDisplayHz / 120f).takeIf(Float::isFinite)?.coerceIn(0f, 1f) ?: 0f
-    val resolutionFactor = when (bufferSize) {
-        BufferSize.DISPLAY -> 0.35f
-        BufferSize.FHD -> 0.45f
-        BufferSize.UHD_4K -> 0.75f
-        BufferSize.UHD_8K -> 1f
-    }
-    val crossLoadFactor = workloads.normalized().let {
-        maxOf(it.cpu, it.memory, it.gpu, it.npu)
-    }
-    val complexityFactor = maxOf(
-        if (backend == LayerBackend.INDEPENDENT_SURFACES) 0f else 0.7f,
-        if (motion == MotionProfile.STATIC) 0f else 0.55f,
-        if (alphaOverlap) 0.8f else 0f,
-        if (includeGlLayer) 1f else 0f,
-    )
-    return (
-        (
-            layerFactor * 0.25f +
-                fpsFactor * 0.15f +
-                hzFactor * 0.10f +
-                resolutionFactor * 0.25f +
-                crossLoadFactor * 0.20f +
-                complexityFactor * 0.05f
-            ) * 100f
-        ).roundToInt().coerceIn(0, 100)
-}
-
-private fun LoadSetpoints.hasCrossLoad(): Boolean =
-    normalized().let { maxOf(it.cpu, it.memory, it.gpu, it.npu) > 0.001f }
 
 private fun LoadSetpoints.peakPercent(): Int = normalized().let {
     (maxOf(it.cpu, it.memory, it.gpu, it.npu) * 100f).roundToInt()
@@ -3370,13 +3582,24 @@ private fun RunnerStage.displayLabel(): String = when (this) {
     RunnerStage.UNSUPPORTED -> "미지원"
 }
 
+private fun toggleFilterKey(current: List<String>, key: String): List<String> {
+    if (key.isBlank()) return current
+    return ArrayList(current).apply {
+        if (!remove(key)) add(key)
+    }
+}
+
+private inline fun <reified T : Enum<T>> List<String>.toKnownEnumSet(): Set<T> {
+    if (isEmpty()) return emptySet()
+    val valuesByName = enumValues<T>().associateBy { it.name }
+    return mapNotNullTo(LinkedHashSet(size)) { valuesByName[it] }
+}
+
+private inline fun <reified T : Enum<T>> List<String>.retainKnownEnumKeys(): List<String> =
+    toKnownEnumSet<T>().mapTo(ArrayList()) { it.name }
+
 private fun maximumPlanRepeats(queueSize: Int): Int {
-    if (queueSize <= 0) return ScenarioPlanPolicy.MAX_REPEAT_COUNT
-    val totalRunLimit = ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS / queueSize
-    return minOf(
-        ScenarioPlanPolicy.MAX_REPEAT_COUNT,
-        totalRunLimit.coerceAtLeast(1),
-    )
+    return ScenarioPlanPolicy.maximumRepeatCount(queueSize)
 }
 
 private fun List<Int>.positionSummary(): String {

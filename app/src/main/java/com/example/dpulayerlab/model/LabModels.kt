@@ -136,6 +136,14 @@ data class TransitionSpec(
      */
     fun boundedFor(phaseDurationMs: Long): TransitionSpec {
         val safeDuration = phaseDurationMs.coerceAtLeast(1L)
+        val cyclicFloor = if (
+            mode == TransitionMode.PULSE_BURST ||
+            mode == TransitionMode.TRIANGLE_WAVE
+        ) {
+            floor.finiteUnitValue()
+        } else {
+            0f
+        }
         return copy(
             transitionDurationMs = transitionDurationMs.coerceIn(0L, safeDuration),
             cycleMs = cycleMs.coerceIn(
@@ -147,7 +155,10 @@ data class TransitionSpec(
                 .takeIf(Float::isFinite)
                 ?.coerceIn(MIN_DUTY_CYCLE, MAX_DUTY_CYCLE)
                 ?: DEFAULT_DUTY_CYCLE,
-            floor = floor.finiteUnitValue(),
+            // A floor changes the zero-time origin. It is meaningful only for profiles that
+            // intentionally cycle through a non-zero valley; every one-shot transition must
+            // retain an exact origin sample before the first measured control tick.
+            floor = cyclicFloor,
         )
     }
 
@@ -294,6 +305,17 @@ object ScenarioPlanPolicy {
     const val MAX_REPEAT_COUNT = 10
     const val MAX_TOTAL_PLAN_RUNS = 40
     const val ALLOW_DUPLICATE_SCENARIOS = true
+
+    fun maximumRepeatCount(queueSize: Int): Int {
+        if (queueSize <= 0) return MAX_REPEAT_COUNT
+        return minOf(
+            MAX_REPEAT_COUNT,
+            (MAX_TOTAL_PLAN_RUNS / queueSize).coerceAtLeast(1),
+        )
+    }
+
+    fun normalizeRepeatCount(queueSize: Int, requested: Int): Int =
+        requested.coerceIn(1, maximumRepeatCount(queueSize))
 
     fun validate(plan: ScenarioRunPlan): String? {
         if (plan.scenarios.isEmpty()) return "Plan scenario queue must not be empty"
@@ -493,6 +515,10 @@ data class TelemetrySnapshot(
     val thermalLabel: String = "정상",
     val memoryLow: Boolean = false,
     val powerSaveMode: Boolean = false,
+    /** Current process-local vendor Binder registration, independent of snapshot success. */
+    val vendorServiceSession: Long? = null,
+    /** Bounded, sanitized provider-reported compression state. */
+    val compressionState: String = "Adapter 없음",
     val npuState: String = "Adapter 없음",
 )
 

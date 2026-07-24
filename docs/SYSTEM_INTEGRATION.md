@@ -1,5 +1,11 @@
 # System / BSP 통합
 
+사용자에게 보이는 launcher/Gradle project 이름은 **DPULayerTest 0.2.0**이고 canonical
+source remote는 `sinpie/dpu-layer-lab`입니다. 아래 `DpuLayerLab` directory/Soong module,
+package `com.example.dpulayerlab`, automation action/component, vendor action/AIDL과
+`dpu-layer-lab-` report prefix는 기존 제품 이미지·harness·consumer 호환성을 위한 stable
+identifier입니다. 표시 이름에 맞춰 이 계약들을 일괄 rename하지 마세요.
+
 ## 권장 배치
 
 ```text
@@ -31,6 +37,13 @@ Product image
 
 샘플 `Android.bp`는 Soong이 platform certificate로 다시 서명하는 구성입니다. 외부에서 이미 platform key로 서명한 APK를 쓴다면 `certificate: "PRESIGNED"`로 바꿉니다.
 
+GitHub의 0.2.0 debug APK는 Android debug key로 서명된 lab-only 산출물이며 debug
+manifest가 automation alias의 `CONTROL_TESTS` permission을 제거합니다. 제품 이미지에
+넣지 마세요. `DPULayerTest-v0.2.0-release-unsigned.apk`는 Soong 또는 secure signing
+pipeline 입력용이며 그대로 설치하는 최종 제품 APK가 아닙니다. Platform key,
+certificate, keystore, password/token은 저장소, GitHub Release, `dist/`에 두지 않고
+제품 보안 환경에서만 사용합니다.
+
 현재 APK가 요청하는 privileged permission은 SurfaceFlinger 진단 snapshot용 `DUMP`
 하나이며 APK와 같은 partition의 allowlist에 선언해야 합니다. portable refresh 경로는
 window의 preferred display mode API를 사용하므로 `DEVICE_POWER`를 요청하지 않습니다.
@@ -58,6 +71,28 @@ Alias filter에는 의도적으로 `CATEGORY_DEFAULT`가 없으므로 implicit a
 
 ```text
 com.example.dpulayerlab.debug/com.example.dpulayerlab.AutomationActivity
+```
+
+표시 이름과 무관하게 automation action은 다음 문자열을 유지합니다.
+
+```text
+com.example.dpulayerlab.action.START
+com.example.dpulayerlab.action.STOP
+com.example.dpulayerlab.action.SHOW
+```
+
+Debug lab에서 fixed-topology 순간/점진 부하를 순서대로 2회 실행하고 중단하는 예:
+
+```powershell
+adb shell am start -n `
+  com.example.dpulayerlab.debug/com.example.dpulayerlab.AutomationActivity `
+  -a com.example.dpulayerlab.action.START `
+  --es scenario_ids "instant-isolated-contention,continuous-crossload-ramp" `
+  --ei repeat_count 2
+
+adb shell am start -n `
+  com.example.dpulayerlab.debug/com.example.dpulayerlab.AutomationActivity `
+  -a com.example.dpulayerlab.action.STOP
 ```
 
 Release 제품 검증에서는 debug override를 복제하지 마세요. Harness는 catalog scenario
@@ -137,6 +172,34 @@ fail-closed `ABORTED`이며 남은 plan을 실행하지 않습니다. 따라서 
 단순 request enqueue가 아니라 해당 route가 확인되었다는 bounded acknowledgment여야
 합니다. `setCompressionMode(0)`도 실제 안전 default 복구를 확인한 뒤에만 `true`여야
 합니다.
+
+정상 cooldown에서도 앱은 마지막 SBWC/decoder/GL phase를 유지한 채 reset하지 않습니다.
+Phase/target null 게시와 generated-load zero 이후 실제 Surface/codec/EGL/Canvas
+producer teardown acknowledgment를 먼저 확인하고 그 다음 `setCompressionMode(0)`을
+호출합니다. Provider는 producer가 아직 해당 allocation을 소유한 상태에서 route
+reset이 들어오는 흐름을 정상 순서로 가정하면 안 되며, teardown 또는 reset 확인 실패
+뒤 후속 plan이 오지 않는 fail-closed 동작을 허용해야 합니다.
+
+동일한 ordering은 scenario 내부 route 변경에도 적용됩니다. 앱은 이전 load/NPU의 zero
+acknowledgment와 renderer teardown을 먼저 확인한 뒤 새 `setCompressionMode(...)`를
+호출하고, 그 후에만 새 producer generation을 게시합니다. Run warm-up은 route 적용 전에
+codec/SBWC allocation을 만들지 않는 1-layer RGB/DISPLAY producer입니다. Activity
+destroy 시 process-wide producer lease가 남아 있으면 bridge/NPU는 닫지만 compression
+reset은 생략하며, sticky cleanup 상태가 다음 controller의 recovery를 차단/직렬화합니다.
+현재 구현은 lifecycle destruction이 Compose/AndroidView teardown의 동기 증거가
+아니라고 보고 lease 관찰 여부와 무관하게 `close()`에서 compression reset을 호출하지
+않습니다. 비선형 route가 active/unknown일 때만 sticky latch를 남기며, RGB-only
+renderer teardown 지연은 compression latch를 만들지 않습니다.
+
+비선형 route를 적용한 `setCompressionMode()` acknowledgment는 해당 Binder service
+session ID와 결속됩니다. Active SBWC 중 실제 service disconnect/reconnect로
+process-local registration ID가 없어지거나 바뀌면 앱은
+`COMPRESSION_SESSION_CHANGED`로 즉시 중단합니다. 이 registration ID는 remote
+telemetry transaction의 성공 여부와 별도로 `connectionLock` 아래에서 읽으므로,
+고부하로 `snapshot()`이 timeout/null이 된 것만으로 disconnect를 오인하지 않습니다.
+Route 전환 후 preparation과 모든 active tick은 target의 discrete allocation topology를
+유지합니다. Transition fraction-zero origin은 FPS/workload 같은 연속 값에만 적용되며,
+이미 vendor에 target mode를 설정한 뒤 이전 RGB/SBWC topology를 다시 게시하지 않습니다.
 
 ### NPU adapter classpath
 
@@ -410,16 +473,21 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 - exact counter의 post-warmup baseline, post-teardown terminal sample, telemetry gap,
   source/quality 변화, reset/wrap, invalid-delta provenance와 stable-source peak
 - SBWC route 거부/timeout/provider death와 linear reset 실패가 fail-closed이고 모든
-  route/reset event가 report에 남는지
+  route/reset event가 report에 남는지, 정상 cooldown에서 physical producer teardown
+  acknowledgment가 compression reset보다 먼저인지
 - NPU/SBWC lease expiry, client death와 provider watchdog이 load/default state를
   복구하는지
 - local CPU/memory worker의 예상하지 못한 `Throwable` 또는 active external interrupt가
   first-wins process latch, `LOCAL_WORKER_FAILURE`, `ABORTED`를 만들고 process 재시작
   전까지 후속 worker/plan을 차단하는지, partial start 뒤 same-owner overlap도 막는지
+- memory workload의 worker별 allocation/page-touch prewarm이 measured byte baseline
+  전에 끝나고 generated traffic에 포함되지 않는지, allocation/ack timeout이
+  fail-closed인지
 - 이전 Surface/codec의 늦은 frame이 generation이 바뀐 phase startup을 만족하지 않는지
 - 100 ms cadence에서 실제 transition window가 중간 tick/각 step/한 cycle/
   attack-hold-recovery를 보존하고, STEP target이 fresh baseline과 origin buffer 뒤의
-  measured tick에서만 적용되는지
+  measured tick에서만 적용되는지, noncyclic nonzero floor plan이 reject되고 pure
+  evaluator의 defensive fallback도 origin을 건너뛰지 않는지
 - aggregate physical producer actual/expected가 30 frame 이상에서 70% 미만이면
   `PRODUCER_RATE_SHORTFALL`과 exact-positive 우선/그 외 `INCONCLUSIVE`를 만드는지,
   flattened count가 1인지, topology-pending callback 경계에서 적분과 교차 부하가

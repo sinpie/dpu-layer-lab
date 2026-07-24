@@ -93,7 +93,9 @@ internal fun readBoundedText(reader: java.io.Reader, maxChars: Int): String {
 
 internal fun parseSurfaceFlingerDump(text: String): CompositionSnapshot {
     val source = "dumpsys SurfaceFlinger --hwclayers"
-    val appTokens = listOf("dpulayerlab", "DpuLab", "DPU Layer Lab")
+    // Keep legacy tokens because package/vendor integration identifiers intentionally remain
+    // stable across the user-facing DPULayerTest rename.
+    val appTokens = listOf("dpulayerlab", "DpuLab", "DPU Layer Lab", "DPULayerTest")
     val blocks = text.split(Regex("""(?m)(?=^\* Layer )"""))
     val appBlocks = blocks.filter { block ->
         val header = block.lineSequence().firstOrNull().orEmpty()

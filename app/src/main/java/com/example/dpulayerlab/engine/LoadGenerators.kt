@@ -18,6 +18,7 @@ import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicLongArray
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.LockSupport
 import kotlin.math.cos
@@ -50,14 +51,17 @@ class LoadManager private constructor(
         memoryWorkerCount: Int,
         memoryWorkingSetBytes: Int,
         workerStarter: (Thread) -> Unit,
+        memoryBufferAllocator: (Int) -> ByteArray = { ByteArray(it) },
+        monotonicNowMs: () -> Long = { 0L },
     ) : this(
         LoadManagerDependencies(
             npuAdapter = npuAdapter,
             cpuWorkerCount = cpuWorkerCount,
             memoryWorkerCount = memoryWorkerCount,
             memoryWorkingSetBytes = memoryWorkingSetBytes,
-            monotonicNowMs = { 0L },
+            monotonicNowMs = monotonicNowMs,
             workerStarter = workerStarter,
+            memoryBufferAllocator = memoryBufferAllocator,
         ),
     )
 
@@ -67,6 +71,7 @@ class LoadManager private constructor(
     private val memoryWorkingSetBytes = dependencies.memoryWorkingSetBytes
     private val monotonicNowMs = dependencies.monotonicNowMs
     private val workerStarter = dependencies.workerStarter
+    private val memoryBufferAllocator = dependencies.memoryBufferAllocator
     private val running = AtomicBoolean(false)
     private val closed = AtomicBoolean(false)
     private val runtimeConfig = AtomicReference(
@@ -79,6 +84,11 @@ class LoadManager private constructor(
     private val copiedBytes = AtomicLong(0)
     private val memoryAllocationFailed = AtomicBoolean(false)
     private val memoryBufferDropGeneration = AtomicLong(0L)
+    private val memoryPrewarmGeneration = AtomicLong(0L)
+    private val memoryPrewarmRequest = AtomicReference<MemoryPrewarmRequest?>(null)
+    private val memoryPrewarmAcknowledgedGenerations = AtomicLongArray(memoryWorkerCount)
+    private val memoryPrewarmStateLock = Any()
+    private val memoryBuffersPinned = AtomicBoolean(false)
     private val shutdownResult = AtomicReference<LoadShutdownResult?>(null)
     private val localWorkerOwner = Any()
     private val localWorkerStateLock = Any()
@@ -89,7 +99,10 @@ class LoadManager private constructor(
         synchronized(localWorkerStateLock) {
             if (LoadSafetyState.localWorkerFailure() != null) return false
             if (running.get()) {
-                val activeWorkers = threads.toList()
+                // Do not combine ConcurrentLinkedQueue.size() with iterator.next(): a worker can
+                // remove itself between those operations and Kotlin's single-item toList fast
+                // path may then throw NoSuchElementException.
+                val activeWorkers = threads.toArray().filterIsInstance<Thread>()
                 return activeWorkers.size == cpuWorkerCount + memoryWorkerCount &&
                     activeWorkers.all(Thread::isAlive)
             }
@@ -108,6 +121,11 @@ class LoadManager private constructor(
             return false
         }
         memoryAllocationFailed.set(false)
+        memoryPrewarmRequest.set(null)
+        memoryBuffersPinned.set(false)
+        repeat(memoryWorkerCount) { index ->
+            memoryPrewarmAcknowledgedGenerations.set(index, 0L)
+        }
         val pendingWorkers = try {
             ArrayList<Thread>(cpuWorkerCount + memoryWorkerCount).apply {
                 repeat(cpuWorkerCount) { index ->
@@ -199,9 +217,106 @@ class LoadManager private constructor(
     fun releaseLoads(dropMemoryBuffers: Boolean = false) {
         apply(LoadSetpoints())
         if (dropMemoryBuffers) {
-            memoryBufferDropGeneration.incrementAndGet()
+            synchronized(memoryPrewarmStateLock) {
+                memoryBuffersPinned.set(false)
+                memoryBufferDropGeneration.incrementAndGet()
+                // A safety-driven working-set drop wins over an in-flight prewarm. Workers
+                // re-check both the request identity and drop generation before publishing
+                // acknowledgment, so a cancelled request cannot silently re-populate buffers.
+                memoryPrewarmRequest.set(null)
+            }
             threads.forEach(LockSupport::unpark)
         }
+    }
+
+    /**
+     * Allocates and page-touches every memory worker's reusable source/destination pair before a
+     * measured memory phase. The request is generation-scoped and succeeds only after every worker
+     * acknowledges that exact generation.
+     *
+     * Page touches are deliberately not added to [copiedBytes]. While a request is active, memory
+     * workers do not run the copy loop, so prewarming itself cannot be reported as generated bus
+     * traffic. A concurrent [releaseLoads] with `dropMemoryBuffers=true` cancels the request.
+     */
+    fun prewarmMemoryWorkingSet(
+        timeoutMs: Long = DEFAULT_MEMORY_PREWARM_TIMEOUT_MS,
+    ): Boolean {
+        if (
+            timeoutMs <= 0L ||
+            closed.get() ||
+            !running.get() ||
+            memoryWorkerCount <= 0 ||
+            memoryWorkingSetBytes < COPY_BLOCK_BYTES ||
+            memoryAllocationFailed.get()
+        ) {
+            return false
+        }
+        val boundedTimeoutMs = timeoutMs.coerceAtMost(MAX_MEMORY_PREWARM_TIMEOUT_MS)
+        val request = synchronized(memoryPrewarmStateLock) {
+            if (
+                closed.get() ||
+                !running.get() ||
+                memoryAllocationFailed.get()
+            ) {
+                return false
+            }
+            MemoryPrewarmRequest(
+                generation = memoryPrewarmGeneration.incrementAndGet(),
+                bufferDropGeneration = memoryBufferDropGeneration.get(),
+            ).also(memoryPrewarmRequest::set)
+        }
+        threads.forEach(LockSupport::unpark)
+
+        val deadlineNanos = System.nanoTime() +
+            TimeUnit.MILLISECONDS.toNanos(boundedTimeoutMs)
+        var completed = false
+        try {
+            while (
+                !closed.get() &&
+                running.get() &&
+                !memoryAllocationFailed.get() &&
+                memoryPrewarmRequest.get() === request &&
+                memoryBufferDropGeneration.get() == request.bufferDropGeneration
+            ) {
+                if (allMemoryWorkersAcknowledged(request.generation)) {
+                    val pinned = synchronized(memoryPrewarmStateLock) {
+                        if (
+                            memoryPrewarmRequest.get() === request &&
+                            memoryBufferDropGeneration.get() == request.bufferDropGeneration &&
+                            !memoryAllocationFailed.get() &&
+                            running.get() &&
+                            !closed.get()
+                        ) {
+                            memoryBuffersPinned.set(true)
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    if (pinned) {
+                        completed = true
+                        break
+                    }
+                }
+                val remainingNanos = deadlineNanos - System.nanoTime()
+                if (remainingNanos <= 0L) break
+                LockSupport.parkNanos(
+                    remainingNanos.coerceAtMost(MEMORY_PREWARM_POLL_NANOS),
+                )
+                if (Thread.interrupted()) {
+                    Thread.currentThread().interrupt()
+                    break
+                }
+            }
+        } finally {
+            memoryPrewarmRequest.compareAndSet(request, null)
+            threads.forEach(LockSupport::unpark)
+        }
+        return completed &&
+            !closed.get() &&
+            running.get() &&
+            !memoryAllocationFailed.get() &&
+            memoryBufferDropGeneration.get() == request.bufferDropGeneration
     }
 
     /**
@@ -252,13 +367,20 @@ class LoadManager private constructor(
             )
         }
         markLocalWorkersStopping()
+        synchronized(memoryPrewarmStateLock) {
+            memoryBuffersPinned.set(false)
+            memoryPrewarmRequest.set(null)
+        }
         runtimeConfig.set(
             RuntimeLoadConfig(
                 setpoints = LoadSetpoints(),
                 phaseStartedMs = monotonicNowMs(),
             ),
         )
-        val activeThreads = threads.toList()
+        // Kotlin's Collection.toList() can select its single-element fast path from a racy size()
+        // and then observe the worker removing itself before iterator.next(). CLQ.toArray() owns a
+        // weakly-consistent snapshot and cannot throw that size/iterator NoSuchElement race.
+        val activeThreads = threads.toArray().filterIsInstance<Thread>()
         activeThreads.forEach { it.interrupt() }
         val npuResult = runCatching {
             npuAdapter.closeWithResult()
@@ -438,11 +560,66 @@ class LoadManager private constructor(
                 observedDropGeneration = requestedDropGeneration
                 idleSinceMs = monotonicNowMs()
             }
+            val prewarmRequest = memoryPrewarmRequest.get()
+            if (prewarmRequest != null) {
+                if (
+                    prewarmRequest.bufferDropGeneration != observedDropGeneration ||
+                    memoryAllocationFailed.get()
+                ) {
+                    LockSupport.parkNanos(MEMORY_PREWARM_POLL_NANOS)
+                    throwIfUnexpectedWorkerInterrupt()
+                    continue
+                }
+                if (
+                    memoryPrewarmAcknowledgedGenerations.get(workerIndex) !=
+                    prewarmRequest.generation
+                ) {
+                    try {
+                        val existingSource = source
+                        val existingDestination = destination
+                        val candidateSource = existingSource ?: memoryBufferAllocator(workingSet)
+                        val candidateDestination =
+                            existingDestination ?: memoryBufferAllocator(workingSet)
+                        touchMemoryWorkingSet(
+                            source = candidateSource,
+                            destination = candidateDestination,
+                            workerIndex = workerIndex,
+                        )
+                        if (
+                            running.get() &&
+                            !memoryAllocationFailed.get() &&
+                            memoryPrewarmRequest.get() === prewarmRequest &&
+                            memoryBufferDropGeneration.get() ==
+                            prewarmRequest.bufferDropGeneration
+                        ) {
+                            source = candidateSource
+                            destination = candidateDestination
+                            idleSinceMs = monotonicNowMs()
+                            memoryPrewarmAcknowledgedGenerations.set(
+                                workerIndex,
+                                prewarmRequest.generation,
+                            )
+                        }
+                    } catch (_: OutOfMemoryError) {
+                        source = null
+                        destination = null
+                        memoryAllocationFailed.set(true)
+                    }
+                }
+                // Keep the copy loop quiescent until the requester has observed every worker's
+                // acknowledgment and cleared the request.
+                LockSupport.parkNanos(MEMORY_PREWARM_POLL_NANOS)
+                throwIfUnexpectedWorkerInterrupt()
+                continue
+            }
             val runtime = runtimeConfig.get()
             val config = runtime.setpoints
             val intensity = shapedIntensity(config.memory, config.shape, runtime.phaseStartedMs)
             if (intensity <= 0.001f) {
-                if (monotonicNowMs() - idleSinceMs >= IDLE_BUFFER_RELEASE_MS) {
+                if (
+                    !memoryBuffersPinned.get() &&
+                    monotonicNowMs() - idleSinceMs >= IDLE_BUFFER_RELEASE_MS
+                ) {
                     source = null
                     destination = null
                 }
@@ -466,16 +643,15 @@ class LoadManager private constructor(
             }
             if (source == null || destination == null) {
                 try {
-                    // ByteArray is already zero-filled. Touch one byte per page instead of
-                    // invoking a Kotlin initializer for every byte; the load under test is the
-                    // bounded copy loop, not object construction.
-                    source = ByteArray(workingSet)
-                    destination = ByteArray(workingSet)
-                    var page = 0
-                    while (page < workingSet) {
-                        source[page] = ((page / PAGE_TOUCH_BYTES + workerIndex * 31) and 0xff).toByte()
-                        page += PAGE_TOUCH_BYTES
-                    }
+                    val candidateSource = memoryBufferAllocator(workingSet)
+                    val candidateDestination = memoryBufferAllocator(workingSet)
+                    touchMemoryWorkingSet(
+                        source = candidateSource,
+                        destination = candidateDestination,
+                        workerIndex = workerIndex,
+                    )
+                    source = candidateSource
+                    destination = candidateDestination
                 } catch (_: OutOfMemoryError) {
                     source = null
                     destination = null
@@ -496,6 +672,30 @@ class LoadManager private constructor(
             memoryFence = activeDestination[(cursor - 1).coerceAtLeast(0)]
             parkUntil(burstStart + MEMORY_PERIOD_NANOS)
         }
+    }
+
+    private fun touchMemoryWorkingSet(
+        source: ByteArray,
+        destination: ByteArray,
+        workerIndex: Int,
+    ) {
+        // ByteArray is already zero-filled. Touch one byte per page rather than invoking a Kotlin
+        // initializer for every byte. Touch both arrays so the first measured copy does not absorb
+        // destination-page faults that would make the requested load profile non-repeatable.
+        var page = 0
+        while (page < source.size) {
+            val value = ((page / PAGE_TOUCH_BYTES + workerIndex * 31) and 0xff).toByte()
+            source[page] = value
+            destination[page] = (value.toInt() xor 0xff).toByte()
+            page += PAGE_TOUCH_BYTES
+        }
+    }
+
+    private fun allMemoryWorkersAcknowledged(generation: Long): Boolean {
+        repeat(memoryWorkerCount) { index ->
+            if (memoryPrewarmAcknowledgedGenerations.get(index) != generation) return false
+        }
+        return true
     }
 
     private fun parkUntil(deadlineNanos: Long) {
@@ -535,7 +735,10 @@ class LoadManager private constructor(
         private const val IDLE_WORKER_PARK_NANOS = 500_000_000L
         private const val WAVEFORM_CONTROL_PARK_NANOS = 25_000_000L
         private const val MEMORY_FAILURE_RETRY_PARK_NANOS = 1_000_000_000L
+        private const val MEMORY_PREWARM_POLL_NANOS = 1_000_000L
         private const val IDLE_BUFFER_RELEASE_MS = 5_000L
+        private const val DEFAULT_MEMORY_PREWARM_TIMEOUT_MS = 2_000L
+        private const val MAX_MEMORY_PREWARM_TIMEOUT_MS = 5_000L
         private const val NANOS_PER_MILLI = 1_000_000L
         private const val WORKER_JOIN_TIMEOUT_NANOS = 500_000_000L
 
@@ -545,6 +748,11 @@ class LoadManager private constructor(
         @Volatile
         private var memoryFence: Byte = 0
     }
+
+    private data class MemoryPrewarmRequest(
+        val generation: Long,
+        val bufferDropGeneration: Long,
+    )
 }
 
 private data class LoadManagerDependencies(
@@ -554,6 +762,7 @@ private data class LoadManagerDependencies(
     val memoryWorkingSetBytes: Int,
     val monotonicNowMs: () -> Long,
     val workerStarter: (Thread) -> Unit,
+    val memoryBufferAllocator: (Int) -> ByteArray = { ByteArray(it) },
 )
 
 private fun loadManagerDependencies(context: Context): LoadManagerDependencies {

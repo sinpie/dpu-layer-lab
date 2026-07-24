@@ -10,4 +10,7 @@ latch, terminal counter continuity와 media fingerprint fail-closed 규칙을 �
 100 ms transition window와 measured STEP, GL color+depth budget, aggregate physical
 producer-rate fidelity/topology-pending 즉시 pause, 실행 중 Battery Saver envelope
 및 display-envelope 무효화, internal-only report/전체 backup 제외와 Adaptive Hunt
-`STEADY` plateau도 `AGENTS.md`의 안전 불변식입니다.
+`STEADY` plateau도 `AGENTS.md`의 안전 불변식입니다. 또한 lifecycle close에서는
+compression reset을 하지 않고, active SBWC route를 명령 acknowledgment의 vendor
+service session에 결속하며, remote snapshot timeout과 실제 registration 단절을
+구분해야 합니다.

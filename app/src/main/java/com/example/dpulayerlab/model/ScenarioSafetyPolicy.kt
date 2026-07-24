@@ -294,7 +294,14 @@ object ScenarioSafetyPolicy {
                 if (!dutyCycle.isFinite() || !floor.isFinite()) {
                     return "Phase '${phase.id}' transition values must be finite"
                 }
-                if (mode != TransitionMode.STEP && floor >= 1f) {
+                val boundedFloor = floor.coerceIn(0f, 1f)
+                val cyclic =
+                    mode == TransitionMode.PULSE_BURST ||
+                        mode == TransitionMode.TRIANGLE_WAVE
+                if (!cyclic && boundedFloor != 0f) {
+                    return "Phase '${phase.id}' transition floor is supported only for cyclic modes"
+                }
+                if (cyclic && boundedFloor >= 1f) {
                     return "Phase '${phase.id}' transition floor leaves no dynamic range"
                 }
             }

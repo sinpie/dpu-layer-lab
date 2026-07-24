@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "DpuLayerLab"
+rootProject.name = "DPULayerTest"
 include(":app")

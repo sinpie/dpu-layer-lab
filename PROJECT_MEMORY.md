@@ -1,7 +1,12 @@
 # Project Memory
 
-이 문서는 DPU Layer Lab의 장기 설계 맥락을 보존하는 canonical project memory입니다.
+이 문서는 DPULayerTest의 장기 설계 맥락을 보존하는 canonical project memory입니다.
 구현을 바꾸면 코드, test, `README.md`, 이 문서를 함께 갱신합니다.
+
+0.2.0에서 launcher와 Gradle project 표시 이름은 `DPULayerTest`다. Canonical GitHub
+저장소는 `sinpie/dpu-layer-lab`이며, 기존 제품 통합과 report consumer를 위해 package
+`com.example.dpulayerlab`, automation action/component, `dpu-layer-lab-` report prefix,
+Soong module/APK 이름 `DpuLayerLab`은 stable compatibility identifier로 유지한다.
 
 ## 목적
 
@@ -30,6 +35,9 @@
    transition window를 검증해 ramp 중간 tick, staircase level, cyclic one-cycle과
    soak attack/hold/recovery를 관측할 수 없는 phase를 reject한다. `STEP`은 fresh
    baseline과 origin producer buffer 뒤의 measured active tick에서 target을 적용한다.
+   `floor`는 pulse/triangle 반복 valley 전용이다. STEP/linear/staircase/soak는
+   nonzero floor가 있는 runnable plan을 policy에서 reject한다. 순수 evaluator는
+   hostile direct call에서도 origin을 보존하도록 defensive하게 floor를 0으로 지운다.
 4. **부하 상승 뒤 recovery를 둔다.** 부하 획득과 해제를 같은 run에서 관찰한다.
    Adaptive hunt는 boundary 이후 남은 stress step 대신 명시적 recovery로 이동하고,
    recovery 자체는 boundary 판정에서 제외한다. Proxy threshold는 phase 안에서 실제
@@ -90,8 +98,16 @@
     주입하지 못한다. Launcher `MainActivity`에 직접 보낸 control action은 무시한다.
 13. **부하 worker는 backlog를 만들지 않는다.** CPU/memory는 bounded fixed-period
     worker와 재사용 buffer를 사용하고 NPU control은 bounded latest-wins로 합친다.
+    Memory workload가 있는 plan은 계측 전에 worker별 buffer 할당/page touch를
+    acknowledgment하는 bounded prewarm을 실행한다. Prewarm byte는 generated traffic에
+    포함하지 않으며 allocation/timeout/cancel/ack 실패는 fail-closed다.
 14. **DVFS는 관찰 대상이다.** settle/shock scenario는 governor가 낮은 clock을 선택할
     기회를 주지만 앱이 DPU frequency를 쓰거나 고정하지 않는다.
+15. **실험 선택은 직교 facet과 ordered queue다.** Catalog의 카테고리·변화 파형·예상
+    강도·부하/조건은 같은 facet 안에서 OR, facet 사이에서 AND로 결합한다. Filter
+    결과는 catalog 순서로 queue에 append/replace하고, queue는 중복과 명시적 이동을
+    보존하되 복원된 unknown ID는 실행 index를 만들기 전에 제거한다. Repeat는 1~10,
+    expanded plan은 40 run 상한이다.
 
 ## 반드시 유지할 불변식
 
@@ -129,8 +145,10 @@
   `THERMAL_DERATE_FAILED`로 중단한다.
 - thermal `CRITICAL` 이상과 `ActivityManager.MemoryInfo.lowMemory` 감지는 run을
   중단한다.
-- 정상/중단/예외/Activity 종료 시 CPU·memory worker, codec, Surface, GL, NPU,
-  compression request, wake flag를 해제한다.
+- 정상/중단/예외 시 CPU·memory worker, codec, Surface, GL, NPU, compression request,
+  wake flag를 해제한다. Activity lifecycle close는 renderer teardown을 동기 증명할 수
+  없으므로 compression reset을 호출하지 않고, 비선형 active/unknown 상태만 sticky
+  recovery latch로 넘긴다.
 - CPU/memory loop는 fixed period, bounded batch/buffer/worker count와 cancellation을
   유지한다. NPU의 reflection/Binder 제어는 bounded queue와 latest-wins를 유지해 phase
   변경이 오래된 request backlog 뒤에 갇히지 않게 한다.
@@ -146,6 +164,12 @@
   실제 종료하기 전에는 같은 owner의 재획득도 거부해 구/신 worker overlap을 막는다.
 - low-memory 중단은 재사용하던 memory worker buffer를 즉시 버린다. 정상 phase 전환은
   buffer를 재사용해 allocation 자체가 측정 부하를 왜곡하지 않게 한다.
+- Memory workload plan은 warm-up/baseline 전에 모든 memory worker의 working-set
+  allocation과 page touch acknowledgment를 bounded 대기한다. Prewarm 중 copy loop는
+  정지하고 page-touch byte를 traffic counter에 넣지 않으며 완료 직후 byte baseline을
+  reset한다. 확인된 buffer는 run-scoped pin으로 유지해 긴 idle 뒤 재할당을 막고,
+  run 종료/low-memory/명시적 drop에서만 해제한다. Allocation failure 또는 ack timeout을
+  단순 저부하 실행으로 계속하지 않는다.
 - Run 경계 NPU 해제는 backend별 single-lane ordered zero/stop acknowledgment를
   bounded 시간 안에 확인해야 한다. Enqueue 성공만으로 cleanup을 성공 처리하지 않는다.
 - 미확인 NPU cleanup은 process-wide latch로 후속 adapter 초기화와 새 plan을 차단한다.
@@ -219,6 +243,24 @@
 - 모든 compression route/reset 결과를 event에 남긴다. 적용 거부/timeout 또는 활성
   SBWC의 linear/default reset 미확인은 fail-closed `ABORTED`이며 다음 plan run을
   진행하지 않는다.
+- 정상 cooldown도 phase/target null 게시와 generated-load zero, physical producer
+  teardown confirmation을 compression linear/default reset보다 먼저 수행한다. 마지막
+  SBWC/decoder/GL phase를 neutral cooldown처럼 복사하거나 producer가 붙은 상태에서
+  allocation route를 reset하지 않는다.
+- inter-phase pixel/compression route 변경도 load/NPU zero 확인, phase/target null,
+  renderer teardown barrier, vendor route 설정, 새 producer generation 순서를 지킨다.
+  Warm-up은 항상 1-layer RGB/DISPLAY portable producer다. Activity close는 renderer
+  lease 관찰 여부와 무관하게 compression reset을 생략한다. 비선형 route 증거가 있을
+  때만 sticky cleanup latch가 후속 controller를 fail-closed recovery로 보내며,
+  RGB-only teardown 지연은 compression latch를 만들지 않는다.
+- 비선형 route 적용 acknowledgment는 vendor Binder service session ID와 결속한다.
+  Active SBWC 중 실제 disconnect/reconnect로 process-local registration ID가
+  없어지거나 바뀌면 즉시 `COMPRESSION_SESSION_CHANGED`로 중단한다. Remote telemetry
+  snapshot timeout은 registration continuity와 분리해 고부하 오탐 중단을 막는다.
+- RGB/SBWC route 전환 뒤 모든 active tick은 target의 discrete allocation topology
+  (layer/backend/pixel route/buffer size/alpha/GL)를 유지한다. Fraction-zero transition
+  origin은 FPS/workload 같은 연속 값에만 사용하며 이전 allocation route를 재게시하지
+  않는다.
 - 외부 plan은 repeat 10회, expanded run 40회 상한을 유지한다. 실행 중 `START`는
   active plan을 교체하지 않으며 `STOP`은 plan 전체를 취소한다. 시작 전 queue의 최신
   `STOP`은 기존 중복 여부와 무관하게 모든 미실행 명령을 supersede한다.
@@ -231,8 +273,16 @@
 
 ## 현재 구현
 
-- Compose 기반 scenario browser, system dashboard, running HUD, result 화면
-- catalog 및 custom phase
+- DPULayerTest 0.2.0 launcher/Gradle project와 stable
+  `com.example.dpulayerlab`/`DpuLayerLab` 제품 통합 identifier
+- Compose 기반 scenario browser, system dashboard, running HUD, result 화면. 실행
+  header의 STOP은 compact/landscape에서도 상단에 유지한다.
+- 22개 catalog preset 및 custom phase. Fixed-topology resource isolation,
+  instant isolated contention, continuous cross-load ramp, paired mid-load reference,
+  backend-only composition pivot과 다변수 adaptive hunt의 용도를 구분한다.
+- 카테고리/변화 파형/예상 강도/부하·조건의 OR-within/AND-across facet filter,
+  filtered append/replace, 중복·이동이 가능한 ordered queue, restored unknown-ID
+  sanitize, repeat 1~10과 expanded 40-run cap
 - 독립 Surface, mixed Surface/Texture, flattened RGBA, app-owned EGL stress layer
 - scroll/zoom/pan/rotate/parallax/storm/Z-order animation
 - RAM tier, logical core 수, emulator/`goldfish`/`ranchu`, power-save와 low-memory를
@@ -245,23 +295,27 @@
 - custom flattened DISPLAY/RGB 정규화, non-zero GPU의 실제 GL topology 및
   8K60 decoder primary + RGB overlay 6개 + GL tail의 8-layer preset
 - fixed-period bounded CPU worker, 기기 등급에 따라 1~2개의 bounded memory-copy
-  worker, GLES load, latest-wins vendor/reflection NPU hook
+  worker, 측정 전 allocation/page-touch prewarm과 fail-closed acknowledgment,
+  GLES load, latest-wins vendor/reflection NPU hook
 - telemetry/compression/NPU vendor lane 분리, reconnect desired-setpoint 복구,
   run-boundary ordered NPU zero 확인, reflection constructor/runtime-timeout process latch
 - steady/pulse/ramp/saw generator shape와 step/ramp/staircase/burst/triangle/
   soak-recovery phase transition, 100 ms actual-window validation과 measured STEP
 - 저부하 settle 뒤 single-layer/composition/4K shock, 중간 부하 perturbation과
   `STEADY` memory plateau를 쓰는 adaptive boundary preset
-- 1초 telemetry sample과 최근 60 sample HUD
+- 1초 telemetry sample과 최근 60 sample HUD. 좌측 상단에 layer/DPU/CPU/GPU
+  숫자·그래프와 linear full-buffer 예상 DPU read/producer write traffic을 표시한다.
 - stable-provenance DPU/GPU/bus/produced FPS/HWC DEVICE·CLIENT result peak
 - Android service, kernel allowlist, SurfaceFlinger parser, vendor AIDL 계측
 - post-warmup baseline/continuity가 적용된 exact/proxy verdict
 - physical producer aggregate frame 적분과 `PRODUCER_RATE_SHORTFALL` fidelity verdict
 - ordered scenario plan/repeat 실행과 보호된 explicit `AutomationActivity`
   START/STOP/SHOW Intent 계약
+- cooldown에서 physical producer teardown을 확인한 뒤에만 compression route reset
 - schema v2 JSON report와 FileProvider 공유
-- Binder vendor status는 HUD/sample/report에 보존하기 전에 256자로 제한하고
-  whitespace/control/format 문자를 정규화
+- Binder vendor NPU/compression status는 HUD/sample/report에 보존하기 전에 256자로
+  제한하고 whitespace/control/format 문자를 정규화하며, current service session도
+  함께 보존
 - cloud backup/device-to-device/legacy backup에서 모든 app data domain 제외
 - host-side unit test와 Android lint/build
 
@@ -320,11 +374,13 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 .\gradlew.bat assembleRelease
 ```
 
-마지막 회귀 기준(2026-07-23)은 clean build에서 26 suite/273 test, failure/error/skip 0,
-lint error 0입니다. Lint warning 6개는 Android Gradle Plugin/의존성의 새 버전 알림입니다.
-Emulator에서는 explicit automation alias의 2-item 순차 queue 완주, 완료 후 STOP의
-terminal result 보존, 실행 중 STOP의 ABORTED 전환, schema v2 internal report 생성과
-crash/ANR 부재를 확인했습니다. Exact DPU/SBWC/HWC/NPU 판정은 이 회귀 기준에 포함되지
+마지막 회귀 기준(2026-07-24)은 clean build에서 28 suite/310 test,
+failure/error/skip 0, lint error 0입니다. Lint warning 6개는 Android Gradle
+Plugin/의존성의 새 버전 알림입니다. Debug/release APK의 package/version, debug
+certificate/unsigned release, zipalign도 확인했습니다. Emulator에서는 22개 catalog
+조합/queue UI와 live HUD, explicit automation baseline 완주, 2-loop plan 실행 중 STOP의
+`ABORTED · 1/2 runs · 2 loops`, schema v2 report의 compression/session/NPU field,
+crash/ANR 0건을 확인했습니다. Exact DPU/SBWC/HWC/NPU 판정은 이 회귀 기준에 포함되지
 않으며 platform-signed target BSP에서 별도로 검증해야 합니다.
 
 안전 정책 또는 renderer를 바꿨다면 최소한 다음을 추가 확인합니다.
@@ -335,7 +391,7 @@ crash/ANR 부재를 확인했습니다. Exact DPU/SBWC/HWC/NPU 판정은 이 회
   축소되며 100 ms cadence의 실제 window에서 의미를 유지할 수 없는 짧은
   transition은 reject되는지
 - STEP이 fresh baseline/origin buffer 뒤 measured tick에서 target을 적용하고 그 tick을
-  실행할 시간이 없으면 `INCONCLUSIVE`인지
+  실행할 시간이 없으면 `INCONCLUSIVE`인지, noncyclic transition의 floor가 0인지
 - custom flattened 입력이 DISPLAY/RGB 단일 producer로 표시되고, non-zero GPU 요청의
   GL producer가 보존되거나 budget 부족으로 명시적으로 reject되는지, flattened
   1-layer intensity가 bounded extra draw pass를 실제로 바꾸는지
@@ -346,8 +402,11 @@ crash/ANR 부재를 확인했습니다. Exact DPU/SBWC/HWC/NPU 판정은 이 회
 - local worker Throwable/active interrupt가 first-wins latch와
   `LOCAL_WORKER_FAILURE`/`ABORTED`를 만들고 같은 process의 후속 plan을 차단하는지
 - partial worker start 실패가 기존 worker 종료 전 same-owner retry/overlap을 막는지
+- memory workload prewarm이 모든 worker의 allocation/page touch를 baseline 전에
+  확인하고 byte counter를 reset하는지, allocation/ack timeout이 plan을 중단하는지
 - compression adapter 거부/timeout/연결 상실과 linear reset 실패가 plan을 fail-closed
-  중단하고 각 route 결과 event를 남기는지
+  중단하고 각 route 결과 event를 남기는지, physical producer teardown 뒤에만
+  compression reset하는지
 - producer generation 변경 전 frame이 다음 phase startup guard를 만족하지 않는지
 - 실제 video track MIME, encoded/visible dimensions, FPS/profile/codecs/P010
   fingerprint가 runtime에도 일치하고, horizontal/vertical crop pair를 독립 검증하며,
@@ -360,12 +419,16 @@ crash/ANR 부재를 확인했습니다. Exact DPU/SBWC/HWC/NPU 판정은 이 회
 - aggregate physical actual/expected가 30 frame 이상에서 70% 미만일 때 event와
   exact-positive 우선/그 외 `INCONCLUSIVE` 판정, flattened physical count 1
 - unpublished/pending/process-lease HUD가 fake expected `1P` 대신 `—P`인지
+- compact/landscape 실행 화면에서도 상단 STOP과 layer/DPU/CPU/GPU 그래프 및 예상
+  traffic이 보이는지
 - Adaptive Hunt boundary가 `STEADY` memory plateau를 유지하는지
 - exact counter의 post-warmup baseline, source/quality 변화, reset/regress, 0-delta
   continuity, post-teardown terminal sample, telemetry gap과 invalid delta provenance,
   stable-source peak 및 report schema v2 직렬화
 - `AutomationActivity` explicit 호출만 허용되고 direct `MainActivity` START와 implicit
   resolution이 거부되며 plan/repeat 상한을 유지하는지
+- catalog facet의 OR-within/AND-across 의미, filtered append/replace 순서와 cap,
+  queue move/duplicate 및 restored unknown-ID sanitize가 일치하는지
 - vendor source가 없을 때 DPU/GPU/bus가 `N/A`이고 proxy verdict만 생성되는지
 
 실기기 stress test는 사용자가 대상 실험기와 실행 범위를 명시한 경우에만 수행합니다.

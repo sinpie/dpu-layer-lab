@@ -8,6 +8,26 @@ import org.junit.Test
 
 class AutomationIntentContractTest {
     @Test
+    fun automationIntegrationIdentifiersRemainStableAcrossLauncherRebranding() {
+        assertEquals(
+            "com.example.dpulayerlab.AutomationActivity",
+            AutomationIntentContract.COMPONENT_CLASS_NAME,
+        )
+        assertEquals(
+            "com.example.dpulayerlab.action.START",
+            AutomationIntentContract.ACTION_START,
+        )
+        assertEquals(
+            "com.example.dpulayerlab.action.STOP",
+            AutomationIntentContract.ACTION_STOP,
+        )
+        assertEquals(
+            "com.example.dpulayerlab.action.SHOW",
+            AutomationIntentContract.ACTION_SHOW,
+        )
+    }
+
+    @Test
     fun launcherAndUnrelatedActionsAreIgnored() {
         assertEquals(
             AutomationIntentParseResult.Ignored,

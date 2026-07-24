@@ -189,6 +189,29 @@ class LoadTransitionEvaluatorTest {
     }
 
     @Test
+    fun nonCyclicFloorCannotSkipTheMeasuredOrigin() {
+        listOf(
+            TransitionMode.STEP,
+            TransitionMode.LINEAR_RAMP,
+            TransitionMode.STAIRCASE,
+            TransitionMode.SOAK_RECOVERY,
+        ).forEach { mode ->
+            val spec = TransitionSpec(
+                mode = mode,
+                transitionDurationMs = 2_000L,
+                floor = 1f,
+            )
+
+            assertEquals(
+                "mode=$mode",
+                0f,
+                LoadTransitionEvaluator.factorAt(spec, 0L, 8_000L),
+            )
+            assertEquals("mode=$mode", 0f, spec.boundedFor(8_000L).floor)
+        }
+    }
+
+    @Test
     fun phaseInterpolationDoesNotOverflowBetweenFiniteExtremeFpsValues() {
         val previous = phase(
             layers = 1,

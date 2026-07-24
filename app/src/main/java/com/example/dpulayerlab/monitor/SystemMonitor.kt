@@ -27,6 +27,12 @@ enum class CompressionControlResult {
     REJECTED_OR_TIMEOUT,
 }
 
+data class CompressionControlOutcome(
+    val result: CompressionControlResult,
+    /** Binder registration that acknowledged this command. */
+    val serviceSession: Long? = null,
+)
+
 class SystemMonitor(
     private val context: Context,
     private val frameTracker: FrameTracker,
@@ -95,6 +101,9 @@ class SystemMonitor(
         // probe. A caller waiting for a post-warm-up baseline can then start its first phase
         // immediately after this sample without charging probe latency to that phase.
         val vendor = vendorBridge.snapshot()
+        // Registration continuity is local state and must remain observable when the remote
+        // metrics call times out under load. Only a real disconnect/reconnect changes this ID.
+        val currentVendorServiceSession = vendorBridge.currentServiceSession()
         val kernel = kernelSensors.sample()
         val vendorSource = vendor?.let {
             vendorServiceSource(it.apiVersion, it.serviceSession)
@@ -261,6 +270,12 @@ class SystemMonitor(
             thermalLabel = thermalLabel(thermalStatus),
             memoryLow = memoryInfo.lowMemory || loadManager.hasMemoryAllocationFailure(),
             powerSaveMode = powerManager.isPowerSaveMode,
+            vendorServiceSession = currentVendorServiceSession,
+            compressionState = when {
+                vendor != null -> vendor.compressionState.ifBlank { "Unknown" }
+                currentVendorServiceSession != null -> "Unavailable · snapshot timeout"
+                else -> "Adapter 없음"
+            },
             // Reuse the vendor transaction already completed at the start of this sample.
             // NPU status must not trigger a second snapshot or contend with control-to-zero.
             npuState = loadManager.npuStatus(vendor?.npuStatus),
@@ -278,16 +293,24 @@ class SystemMonitor(
     fun isVendorCapabilityDiscoveryPending(): Boolean =
         vendorBridge.isCapabilityDiscoveryPending()
 
-    fun setCompressionRoute(route: PixelRoute): CompressionControlResult {
-        if (!vendorBridge.supportsSbwc()) return CompressionControlResult.NO_ADAPTER
-        return if (vendorBridge.setCompressionRoute(route)) {
-            CompressionControlResult.APPLIED
+    fun setCompressionRoute(route: PixelRoute): CompressionControlOutcome {
+        if (!vendorBridge.supportsSbwc()) {
+            return CompressionControlOutcome(CompressionControlResult.NO_ADAPTER)
+        }
+        val vendorResult = vendorBridge.setCompressionRoute(route)
+        return if (vendorResult.applied && vendorResult.serviceSession != null) {
+            CompressionControlOutcome(
+                result = CompressionControlResult.APPLIED,
+                serviceSession = vendorResult.serviceSession,
+            )
         } else {
-            CompressionControlResult.REJECTED_OR_TIMEOUT
+            CompressionControlOutcome(CompressionControlResult.REJECTED_OR_TIMEOUT)
         }
     }
 
-    fun close(): VendorShutdownResult = vendorBridge.closeWithResult()
+    fun close(
+        resetCompression: Boolean = true,
+    ): VendorShutdownResult = vendorBridge.closeWithResult(resetCompression)
 
     private fun readCpuTimes(): CpuTimes? = runCatching {
         File("/proc/stat").bufferedReader().use { reader ->

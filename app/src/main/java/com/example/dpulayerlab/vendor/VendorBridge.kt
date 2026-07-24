@@ -39,6 +39,12 @@ data class VendorShutdownResult(
     val compressionResetConfirmed: Boolean,
 )
 
+data class VendorCompressionControlResult(
+    val applied: Boolean,
+    /** Binder registration that acknowledged the route, or null when it was not acknowledged. */
+    val serviceSession: Long?,
+)
+
 class VendorBridge private constructor(private val context: Context) : AutoCloseable {
     private val connectionLock = Any()
     @Volatile
@@ -248,6 +254,18 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
 
     fun isConnected(): Boolean = service != null
 
+    /**
+     * Process-local registration identity, independent of whether the latest remote telemetry
+     * transaction completed. A snapshot timeout must not be mistaken for a Binder disconnect.
+     */
+    fun currentServiceSession(): Long? = synchronized(connectionLock) {
+        if (closed.get() || service == null || serviceBinder == null) {
+            null
+        } else {
+            serviceGeneration.get()
+        }
+    }
+
     fun supportsNpu(): Boolean = npuSupported == true
 
     fun supportsSbwc(): Boolean = sbwcSupported == true
@@ -290,7 +308,7 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
         }
     }
 
-    fun setCompressionRoute(route: PixelRoute): Boolean {
+    fun setCompressionRoute(route: PixelRoute): VendorCompressionControlResult {
         val mode = when (route) {
             PixelRoute.SBWC_AUTO -> COMPRESSION_AUTO
             PixelRoute.SBWC_REQUIRED -> COMPRESSION_SBWC_REQUIRED
@@ -298,9 +316,17 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
         }
         return callRemote(
             executor = controlExecutor,
-            fallback = false,
+            fallback = VendorCompressionControlResult(
+                applied = false,
+                serviceSession = null,
+            ),
             timeoutMs = CONTROL_TIMEOUT_MS,
-        ) { remote, _ -> remote.setCompressionMode(mode) }
+        ) { remote, serviceSession ->
+            VendorCompressionControlResult(
+                applied = remote.setCompressionMode(mode),
+                serviceSession = serviceSession,
+            )
+        }
     }
 
     fun snapshot(): VendorSnapshot? {
@@ -325,7 +351,9 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
     }
 
     @Synchronized
-    fun closeWithResult(): VendorShutdownResult {
+    fun closeWithResult(
+        resetCompression: Boolean = true,
+    ): VendorShutdownResult {
         // Shutdown acknowledgements are evidence for the caller that actually performed this
         // bridge cleanup. A quarantined closed singleton can be returned to a later controller
         // to avoid spawning another stuck Binder lane; never let that controller reuse an old
@@ -361,7 +389,9 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
         var npuStopAcknowledged = false
         var compressionResetConfirmed = false
         repeat(SHUTDOWN_RESET_ATTEMPTS) {
-            if (npuStopAcknowledged && compressionResetConfirmed) return@repeat
+            if (npuStopAcknowledged && (!resetCompression || compressionResetConfirmed)) {
+                return@repeat
+            }
             val result = callRemote(
                 executor = controlExecutor,
                 fallback = RemoteResetResult(),
@@ -372,9 +402,13 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
                     remote.stopNpuLoad()
                     true
                 }.getOrDefault(false)
-                val compressionReset = runCatching {
-                    remote.setCompressionMode(COMPRESSION_LINEAR)
-                }.getOrDefault(false)
+                val compressionReset = if (resetCompression) {
+                    runCatching {
+                        remote.setCompressionMode(COMPRESSION_LINEAR)
+                    }.getOrDefault(false)
+                } else {
+                    false
+                }
                 RemoteResetResult(
                     npuStopConfirmed = npuStopped,
                     compressionResetConfirmed = compressionReset,

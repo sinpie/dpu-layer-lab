@@ -84,8 +84,13 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         pendingAutomation.clear()
-        controller.close()
-        super.onDestroy()
+        // Request UI disposal first. This is not a synchronous producer-teardown proof, so
+        // LabController.close() deliberately never resets compression from this lifecycle path.
+        try {
+            super.onDestroy()
+        } finally {
+            controller.close()
+        }
     }
 
     private fun enqueueAutomation(incoming: Intent?) {

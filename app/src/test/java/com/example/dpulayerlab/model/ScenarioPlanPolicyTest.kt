@@ -7,6 +7,14 @@ import org.junit.Test
 
 class ScenarioPlanPolicyTest {
     @Test
+    fun restoredRepeatCountIsAlwaysNormalizedToBothLimits() {
+        assertEquals(10, ScenarioPlanPolicy.normalizeRepeatCount(queueSize = 0, requested = 99))
+        assertEquals(10, ScenarioPlanPolicy.normalizeRepeatCount(queueSize = 1, requested = 11))
+        assertEquals(4, ScenarioPlanPolicy.normalizeRepeatCount(queueSize = 10, requested = 10))
+        assertEquals(1, ScenarioPlanPolicy.normalizeRepeatCount(queueSize = 40, requested = 0))
+    }
+
+    @Test
     fun emptyQueueAndInvalidRepeatCountsAreRejected() {
         assertTrue(
             ScenarioPlanPolicy.validate(ScenarioRunPlan(emptyList()))

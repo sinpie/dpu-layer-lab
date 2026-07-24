@@ -1,13 +1,17 @@
 package com.example.dpulayerlab.engine
 
 import android.media.MediaCodecInfo
+import com.example.dpulayerlab.model.BufferSize
 import com.example.dpulayerlab.model.Gauge
+import com.example.dpulayerlab.model.LayerBackend
 import com.example.dpulayerlab.model.LoadTransitionEvaluator
+import com.example.dpulayerlab.model.LoadSetpoints
 import com.example.dpulayerlab.model.MetricQuality
 import com.example.dpulayerlab.model.MotionProfile
 import com.example.dpulayerlab.model.PixelRoute
 import com.example.dpulayerlab.model.RunProgress
 import com.example.dpulayerlab.model.RunVerdict
+import com.example.dpulayerlab.model.RunnerStage
 import com.example.dpulayerlab.model.ScenarioRunPlan
 import com.example.dpulayerlab.model.TelemetrySnapshot
 import com.example.dpulayerlab.monitor.CompressionControlResult
@@ -82,6 +86,58 @@ class LabControllerMathTest {
         } finally {
             CompressionSafetyState.recordLinearReset(confirmed = true)
         }
+    }
+
+    @Test
+    fun activeCompressionRouteIsBoundToItsAcknowledgingVendorSession() {
+        assertFalse(
+            compressionSessionContinuityLost(
+                compressionControlActive = false,
+                activeRoute = PixelRoute.SBWC_REQUIRED,
+                expectedSession = 4L,
+                observedSession = 5L,
+            ),
+        )
+        assertFalse(
+            compressionSessionContinuityLost(
+                compressionControlActive = true,
+                activeRoute = PixelRoute.RGB_8888,
+                expectedSession = 4L,
+                observedSession = 5L,
+            ),
+        )
+        assertFalse(
+            compressionSessionContinuityLost(
+                compressionControlActive = true,
+                activeRoute = PixelRoute.SBWC_AUTO,
+                expectedSession = 4L,
+                observedSession = 4L,
+            ),
+        )
+        assertTrue(
+            compressionSessionContinuityLost(
+                compressionControlActive = true,
+                activeRoute = PixelRoute.SBWC_AUTO,
+                expectedSession = 4L,
+                observedSession = null,
+            ),
+        )
+        assertTrue(
+            compressionSessionContinuityLost(
+                compressionControlActive = true,
+                activeRoute = PixelRoute.SBWC_REQUIRED,
+                expectedSession = 4L,
+                observedSession = 5L,
+            ),
+        )
+        assertTrue(
+            compressionSessionContinuityLost(
+                compressionControlActive = true,
+                activeRoute = PixelRoute.SBWC_REQUIRED,
+                expectedSession = null,
+                observedSession = 5L,
+            ),
+        )
     }
 
     @Test
@@ -616,6 +672,83 @@ class LabControllerMathTest {
     }
 
     @Test
+    fun warmupIsPortableRgbAndRouteChangeUsesTargetAllocationTopology() {
+        val source = checkNotNull(ScenarioCatalog.byId("sbwc-matrix")).phases
+            .first { it.id == "sbwc" }
+        val target = source.copy(
+            activeLayers = 8,
+            backend = LayerBackend.MIXED_SURFACE_TEXTURE,
+            pixelRoute = PixelRoute.SBWC_REQUIRED,
+            bufferSize = BufferSize.UHD_4K,
+            alphaOverlap = true,
+            includeGlLayer = true,
+        )
+
+        val warmup = safeWarmupPhaseFor(target)
+        assertEquals(1, warmup.activeLayers)
+        assertEquals(LayerBackend.INDEPENDENT_SURFACES, warmup.backend)
+        assertEquals(PixelRoute.RGB_8888, warmup.pixelRoute)
+        assertEquals(BufferSize.DISPLAY, warmup.bufferSize)
+        assertFalse(warmup.alphaOverlap)
+        assertFalse(warmup.includeGlLayer)
+        assertTrue(rendererAllocationRouteChanges(warmup, target))
+        assertFalse(rendererAllocationRouteChanges(null, warmup))
+
+        val priorRuntime = warmup.copy(
+            activeLayers = 3,
+            producerFps = 30f,
+            workloads = LoadSetpoints(cpu = 0.4f),
+        )
+        val safeInitial = allocationRouteSafePhase(priorRuntime, target)
+        assertEquals(target.activeLayers, safeInitial.activeLayers)
+        assertEquals(target.backend, safeInitial.backend)
+        assertEquals(target.pixelRoute, safeInitial.pixelRoute)
+        assertEquals(target.bufferSize, safeInitial.bufferSize)
+        assertEquals(target.alphaOverlap, safeInitial.alphaOverlap)
+        assertEquals(target.includeGlLayer, safeInitial.includeGlLayer)
+        assertEquals(priorRuntime.producerFps, safeInitial.producerFps, 0f)
+        assertEquals(priorRuntime.workloads, safeInitial.workloads)
+
+        // Every active tick, including the measured fraction-zero origin, must retain the
+        // allocation topology matching the vendor route that was already applied.
+        listOf(0f, 0.25f, 1f).forEach { fraction ->
+            val interpolated = LoadTransitionEvaluator.interpolate(
+                previous = priorRuntime,
+                target = target,
+                fraction = fraction,
+            )
+            val safeRuntime = allocationRouteSafePhase(interpolated, target)
+            assertEquals(target.activeLayers, safeRuntime.activeLayers)
+            assertEquals(target.backend, safeRuntime.backend)
+            assertEquals(target.pixelRoute, safeRuntime.pixelRoute)
+            assertEquals(target.bufferSize, safeRuntime.bufferSize)
+            assertEquals(target.alphaOverlap, safeRuntime.alphaOverlap)
+            assertEquals(target.includeGlLayer, safeRuntime.includeGlLayer)
+            assertEquals(interpolated.producerFps, safeRuntime.producerFps, 0f)
+            assertEquals(interpolated.workloads, safeRuntime.workloads)
+        }
+
+        val sbwcOrigin = target
+        val linearTarget = warmup.copy(
+            activeLayers = 5,
+            backend = LayerBackend.MIXED_SURFACE_TEXTURE,
+            bufferSize = BufferSize.FHD,
+            producerFps = 72f,
+        )
+        val reverseOrigin = LoadTransitionEvaluator.interpolate(
+            previous = sbwcOrigin,
+            target = linearTarget,
+            fraction = 0f,
+        )
+        val safeReverse = allocationRouteSafePhase(reverseOrigin, linearTarget)
+        assertEquals(PixelRoute.RGB_8888, safeReverse.pixelRoute)
+        assertEquals(linearTarget.backend, safeReverse.backend)
+        assertEquals(linearTarget.bufferSize, safeReverse.bufferSize)
+        assertEquals(linearTarget.activeLayers, safeReverse.activeLayers)
+        assertEquals(sbwcOrigin.producerFps, safeReverse.producerFps, 0f)
+    }
+
+    @Test
     fun controllerPauseAlwaysDetachesActiveRenderStage() {
         val scenario = checkNotNull(ScenarioCatalog.byId("instant-burst-transitions"))
         val phase = scenario.phases.first()
@@ -637,6 +770,85 @@ class LabControllerMathTest {
         assertNull(stopped.phase)
         assertNull(stopped.targetPhase)
         assertEquals("external stop", stopped.statusText)
+    }
+
+    @Test
+    fun normalCooldownDetachesLastProducerWithoutChangingItsTrackedGeneration() {
+        val scenario = checkNotNull(ScenarioCatalog.byId("instant-burst-transitions"))
+        val phase = scenario.phases.first().copy(
+            pixelRoute = PixelRoute.SBWC_AUTO,
+            includeGlLayer = true,
+        )
+        val active = RunProgress(
+            stage = RunnerStage.RUNNING,
+            scenario = scenario,
+            phase = phase,
+            targetPhase = phase,
+            transitionFraction = 1f,
+            producerGeneration = 42L,
+        )
+
+        val cooldown = progressForCooldownTeardown(active)
+
+        assertEquals(RunnerStage.COOLDOWN, cooldown.stage)
+        assertNull(cooldown.phase)
+        assertNull(cooldown.targetPhase)
+        assertEquals(0f, cooldown.transitionFraction, 0f)
+        assertEquals(42L, cooldown.producerGeneration)
+        assertTrue(cooldown.statusText.contains("physical producer"))
+    }
+
+    @Test
+    fun memoryWorkloadFailureIsFailClosedEvenWithoutSystemLowMemory() {
+        assertEquals(
+            MemorySafetyFailure.WORKLOAD_ALLOCATION,
+            memorySafetyFailure(
+                workloadAllocationFailed = true,
+                systemLowMemory = false,
+            ),
+        )
+        assertEquals(
+            MemorySafetyFailure.WORKLOAD_ALLOCATION,
+            memorySafetyFailure(
+                workloadAllocationFailed = true,
+                systemLowMemory = true,
+            ),
+        )
+        assertEquals(
+            MemorySafetyFailure.SYSTEM_LOW_MEMORY,
+            memorySafetyFailure(
+                workloadAllocationFailed = false,
+                systemLowMemory = true,
+            ),
+        )
+        assertNull(
+            memorySafetyFailure(
+                workloadAllocationFailed = false,
+                systemLowMemory = false,
+            ),
+        )
+    }
+
+    @Test
+    fun onlyScenariosWithFinitePositiveMemoryLoadNeedPrewarm() {
+        val base = checkNotNull(ScenarioCatalog.byId("baseline-display-modes"))
+        assertTrue(!scenarioNeedsMemoryPrewarm(base))
+
+        val memoryPhase = base.phases.first().copy(
+            workloads = LoadSetpoints(memory = 0.4f),
+        )
+        assertTrue(scenarioNeedsMemoryPrewarm(base.copy(phases = listOf(memoryPhase))))
+        assertTrue(
+            !scenarioNeedsMemoryPrewarm(
+                base.copy(
+                    phases = listOf(
+                        memoryPhase.copy(
+                            workloads = LoadSetpoints(memory = Float.NaN),
+                        ),
+                    ),
+                ),
+            ),
+        )
     }
 
     @Test

@@ -1,8 +1,13 @@
 # Repository Working Rules
 
-이 파일은 사람과 coding agent가 DPU Layer Lab을 수정할 때 따르는 canonical repository
+이 파일은 사람과 coding agent가 DPULayerTest를 수정할 때 따르는 canonical repository
 instruction입니다. 장기 설계 맥락은 `PROJECT_MEMORY.md`, 사용자-facing 설명은
 `README.md`를 먼저 확인합니다.
+
+Launcher와 Gradle project의 표시 이름은 `DPULayerTest`이고 canonical remote는
+`https://github.com/sinpie/dpu-layer-lab`이다. 제품 호환성 계약인 package
+`com.example.dpulayerlab`, automation component/action, `dpu-layer-lab-` report
+prefix, Soong module/APK 이름 `DpuLayerLab`은 별도 migration 요구 없이 바꾸지 않는다.
 
 ## 기본 작업 규칙
 
@@ -14,6 +19,10 @@ instruction입니다. 장기 설계 맥락은 `PROJECT_MEMORY.md`, 사용자-fac
   격리한다.
 - 오류를 삼켜 성공처럼 보이게 하지 않는다. unsupported/unavailable/proxy를 구분한다.
 - APK, capture, report, signing material과 local SDK 경로를 commit하지 않는다.
+- Release asset의 debug APK는 설치 가능한 lab-only 산출물이며 automation alias
+  permission이 제거되어 있다. `release-unsigned` APK는 제품 서명 파이프라인 입력일
+  뿐 최종 설치 산출물이 아니다. Platform key/certificate/keystore/token은 release
+  asset이나 저장소에 넣지 않고 secure product environment에서만 사용한다.
 
 ## 빌드
 
@@ -60,6 +69,10 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   cancellation 경로가 있어야 한다.
 - CPU/memory 부하는 fixed-period bounded worker와 재사용 buffer를 유지한다. NPU/vendor
   control은 bounded latest-wins로 처리하며 오래된 setpoint backlog를 만들지 않는다.
+- Memory workload는 measured baseline 전에 bounded working-set allocation/page-touch
+  prewarm과 worker acknowledgment를 완료한다. Prewarm byte는 generated traffic에서
+  제외하고 완료 뒤 counter를 reset하며, allocation/timeout/cancel/ack 실패를 저부하
+  성공으로 삼지 않는다.
 - 실행 중 예상하지 못한 local worker exception/interrupt는 first-wins bounded
   process latch로 남기고 모든 local worker를 중단한다. 같은 process에서 latch를
   clear하거나 worker/plan을 재시작하지 않는다. Active run은
@@ -73,6 +86,9 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   40회 상한과 실행 중 START 거부를 유지한다. 시작 전 최신 STOP은 모든 미실행 START를
   폐기하며 기존 STOP과의 중복 제거보다 우선한다. Extra unmarshalling은 START에서만
   수행해 malformed START payload가 STOP 처리를 막지 않게 한다.
+- UI catalog facet은 같은 행 OR/서로 다른 행 AND 의미를 유지한다. Filtered
+  append/replace는 catalog 순서와 40-run cap을 지키고, queue의 중복·명시적 이동은
+  보존하되 복원된 unknown preset ID는 표시/index/실행 전에 제거한다.
 - 외부 control은 explicit `AutomationActivity` alias에서만 처리한다. Release의
   `CONTROL_TESTS`(`signature|privileged`) 보호, debug-only permission 제거,
   `CATEGORY_DEFAULT` 부재와 direct `MainActivity` START 무시를 유지한다.
@@ -95,6 +111,9 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   2 tick/hold 1 tick/recovery 2 tick을 보존할 수 없으면 reject한다. `STEP`은 fresh
   baseline과 origin producer buffer가 확인된 뒤 measured active tick에서 target을
   적용하고, post-ready tick 없이 끝난 phase는 `INCONCLUSIVE`다.
+- Transition `floor`는 pulse/triangle의 반복 valley에만 허용한다. STEP/linear/
+  staircase/soak에 nonzero floor가 있는 runnable plan은 reject한다. 순수 evaluator는
+  hostile direct call에서만 defensive하게 0으로 지워 origin sample을 건너뛰지 않는다.
 - 16 ms producer hand-off를 넘기면 새 codec/EGL/Canvas replacement를 만들지 않고
   process-wide lease를 bounded poll한다. 5초 안의 transient drain은 phase active time과
   frame budget에서 제외하고 교차 부하를 0으로 유지한다. 연속 recovery deadline을
@@ -107,8 +126,28 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   runJob의 NonCancellable finalizer가 소유권을 해제하기 전 새 START를 허용하지 않는다.
   Main.immediate run Job은 lazy 상태로 owner를 먼저 게시한 뒤 시작하고, finalizer는
   identity가 일치하는 자기 owner만 해제한다.
+- 실행 UI의 STOP은 compact/landscape에서도 상단 header에 항상 보여야 한다. 좌측 상단
+  HUD의 layer/DPU/CPU/GPU 숫자·그래프와 예상 DPU-read/producer-write traffic은
+  unavailable/provenance 및 pending `—P` 의미를 숨기지 않는다.
 - SBWC route 적용/해제 결과는 모두 event로 남긴다. 활성 SBWC의 linear/default reset을
   확인하지 못하거나 adapter가 거부/timeout되면 fail-closed로 plan을 중단한다.
+- 정상 cooldown에서도 phase/target과 generated load를 먼저 제거하고 physical
+  Surface/codec/EGL/Canvas producer teardown을 확인한 뒤 compression route를
+  linear/default로 reset한다. 마지막 renderer phase를 cooldown에 복사하지 않는다.
+- inter-phase pixel/compression route 변경도 load/NPU zero 확인 → phase/target null →
+  renderer teardown barrier → vendor route → 새 producer generation 순서를 사용한다.
+  Warm-up은 vendor route 설정 전에 1-layer RGB/DISPLAY producer만 만든다.
+- Activity destroy는 Compose/AndroidView teardown의 동기 증거가 아니다. Lifecycle
+  `close()`에서는 producer lease 관찰 여부와 무관하게 compression reset을 호출하지
+  않는다. 비선형 route가 active/unknown일 때만 sticky cleanup latch를 유지하고,
+  RGB-only renderer 지연으로 compression latch를 세우지 않는다.
+- 성공한 비선형 route는 acknowledgment를 반환한 vendor service session에 결속한다.
+  Active SBWC에서 process-local registration이 없어지거나 바뀌면 fail-closed로
+  중단한다. Remote snapshot timeout/null은 registration continuity와 별개이므로
+  Binder disconnect로 오인하지 않는다.
+- Allocation route를 바꾼 phase의 모든 active control tick은 target의 discrete
+  layer/backend/pixel route/buffer size/alpha/GL topology를 유지한다. Fraction-zero
+  origin은 FPS/workload 등 연속 값만 제공하며 이전 route를 다시 게시하면 안 된다.
 - 모든 종료 경로에서 CPU/memory worker, codec, Surface, GL, vendor NPU/SBWC state,
   wake flag를 해제한다.
 - NPU ordered zero/adapter close가 미확인이면 process-wide latch를 유지하고 후속

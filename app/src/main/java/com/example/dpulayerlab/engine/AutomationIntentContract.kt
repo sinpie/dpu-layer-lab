@@ -11,6 +11,8 @@ import java.util.ArrayDeque
  * CATEGORY_DEFAULT so they are not launchable as general implicit Activity intents.
  */
 object AutomationIntentContract {
+    /** Stable explicit component used by adb/lab harnesses; launcher rebranding must not alter it. */
+    const val COMPONENT_CLASS_NAME = "com.example.dpulayerlab.AutomationActivity"
     const val ACTION_START = "com.example.dpulayerlab.action.START"
     const val ACTION_STOP = "com.example.dpulayerlab.action.STOP"
     const val ACTION_SHOW = "com.example.dpulayerlab.action.SHOW"

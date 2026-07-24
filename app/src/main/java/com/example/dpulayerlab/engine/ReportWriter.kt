@@ -354,6 +354,8 @@ object ReportWriter {
                 append(""""thermal": ${quote(sample.thermalLabel)}, """)
                 append(""""memoryLow": ${sample.memoryLow}, """)
                 append(""""powerSaveMode": ${sample.powerSaveMode}, """)
+                append(""""vendorServiceSession": ${sample.vendorServiceSession ?: "null"}, """)
+                append(""""compressionState": ${quote(sample.compressionState)}, """)
                 append(""""npuState": ${quote(sample.npuState)}""")
                 append("}")
                 appendLine(if (index == summary.samples.lastIndex) "" else ",")

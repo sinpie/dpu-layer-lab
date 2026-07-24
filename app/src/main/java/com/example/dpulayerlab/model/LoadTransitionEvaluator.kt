@@ -100,7 +100,19 @@ object LoadTransitionEvaluator {
                 requestedEdgeMs = safe.transitionDurationMs,
             )
         }
-        val floor = safe.floor
+        // boundedFor() clears floors from one-shot transitions. Keep this explicit here as a
+        // second fail-safe because STEP/linear/stair/soak must always preserve their zero origin.
+        val floor = when (safe.mode) {
+            TransitionMode.PULSE_BURST,
+            TransitionMode.TRIANGLE_WAVE,
+            -> safe.floor
+
+            TransitionMode.STEP,
+            TransitionMode.LINEAR_RAMP,
+            TransitionMode.STAIRCASE,
+            TransitionMode.SOAK_RECOVERY,
+            -> 0f
+        }
         val fraction = (floor + (1f - floor) * raw.fraction)
             .takeIf(Float::isFinite)
             ?.coerceIn(0f, 1f)

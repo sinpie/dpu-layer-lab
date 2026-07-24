@@ -49,6 +49,21 @@ class SurfaceFlingerProbeTest {
     }
 
     @Test
+    fun parsesRenamedAppLabelWithoutPackageToken() {
+        val parsed = parseSurfaceFlingerDump(
+            """
+                * Layer 0x1 (DPULayerTest#10)
+                      composition type=DEVICE (2)
+                * Layer 0x2 (SurfaceView[DPULayerTest]#11)
+                      composition type=CLIENT (1)
+            """.trimIndent(),
+        )
+
+        assertEquals(1, parsed.deviceLayers)
+        assertEquals(1, parsed.clientLayers)
+    }
+
+    @Test
     fun overflowingMissedCountersRemainUnavailable() {
         val parsed = parseSurfaceFlingerDump(
             """
