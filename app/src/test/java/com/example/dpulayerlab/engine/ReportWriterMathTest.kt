@@ -132,6 +132,35 @@ class ReportWriterMathTest {
     }
 
     @Test
+    fun reportMarksViewZOrderProxyAsNotChangingPhysicalHwcOrder() {
+        val summary = RunSummary(
+            scenario = ScenarioCatalog.byId("transform-storm")!!,
+            startedEpochMs = 1_000L,
+            finishedEpochMs = 2_000L,
+            verdict = RunVerdict.INCONCLUSIVE,
+            exactUnderrunDelta = null,
+            exactUnderrunSource = null,
+            exactUnderrunQuality = MetricQuality.UNAVAILABLE,
+            suspectedUnderrunDelta = 0L,
+            peakCpu = null,
+            peakMemoryUsed = null,
+            peakGeneratedBandwidth = null,
+            events = emptyList(),
+            samples = emptyList(),
+        )
+
+        val json = ReportWriter.toJson(summary, TEST_DEVICE)
+
+        assertTrue(
+            json.contains(
+                """"motion": "Z_ORDER_SWAP", """ +
+                    """"motionSemantics": "VIEW_CLIENT_Z_ORDER_PROXY", """ +
+                    """"physicalHwcZOrderChange": false""",
+            ),
+        )
+    }
+
+    @Test
     fun sampleProvenanceSurvivesSourceChangesAndNonFiniteValues() {
         val vendorSample = TelemetrySnapshot(
             monotonicMs = 10L,

@@ -6,6 +6,11 @@ import android.os.SystemClock
 import com.example.dpulayerlab.model.LoadShapeEvaluator
 import com.example.dpulayerlab.model.LoadSetpoints
 import com.example.dpulayerlab.model.LoadShape
+import com.example.dpulayerlab.model.MIN_EFFECTIVE_LOAD
+import com.example.dpulayerlab.vendor.NpuCommandAcknowledgments
+import com.example.dpulayerlab.vendor.NpuControlCommandHealth
+import com.example.dpulayerlab.vendor.NpuControlCommandState
+import com.example.dpulayerlab.vendor.NpuControlCommandTicket
 import com.example.dpulayerlab.vendor.VendorBridge
 import java.lang.reflect.Method
 import java.util.IdentityHashMap
@@ -90,6 +95,8 @@ class LoadManager private constructor(
     private val memoryPrewarmStateLock = Any()
     private val memoryBuffersPinned = AtomicBoolean(false)
     private val shutdownResult = AtomicReference<LoadShutdownResult?>(null)
+    private val latestPositiveNpuRequest = AtomicReference<NpuControlRequest?>(null)
+    private val npuRequestContractMissing = AtomicBoolean(false)
     private val localWorkerOwner = Any()
     private val localWorkerStateLock = Any()
 
@@ -172,10 +179,80 @@ class LoadManager private constructor(
         }
     }
 
-    @Synchronized
     fun apply(newSetpoints: LoadSetpoints, restartProfile: Boolean = true) {
-        if (closed.get()) return
-        val normalized = newSetpoints.normalized()
+        applyInternal(newSetpoints, restartProfile)
+    }
+
+    /**
+     * Phase-boundary apply path for a positive NPU setpoint. The normal 100 ms control loop keeps
+     * using [apply]; only first apply and safety derating need this bounded acknowledgment wait.
+     */
+    internal fun applyAndConfirmNpu(
+        newSetpoints: LoadSetpoints,
+        restartProfile: Boolean = true,
+        timeoutMs: Long = DEFAULT_NPU_APPLY_TIMEOUT_MS,
+    ): NpuControlHealth {
+        val normalized = newSetpoints.normalizedForExecution()
+        val request = applyInternal(normalized, restartProfile)
+        if (normalized.npu <= 0f) return NpuControlHealth.idle()
+        if (request == null) {
+            return if (npuAdapter.isAvailable()) {
+                NpuControlHealth.failed(
+                    "NPU backend did not provide apply acknowledgment",
+                )
+            } else {
+                NpuControlHealth.unavailable("NPU workload adapter unavailable")
+            }
+        }
+        val result = npuAdapter.awaitControl(
+            request = request,
+            timeoutMs = timeoutMs.coerceIn(1L, MAX_NPU_APPLY_TIMEOUT_MS),
+        )
+        if (latestPositiveNpuRequest.get() !== request) {
+            return NpuControlHealth.failed(
+                "NPU setpoint changed while apply confirmation was pending",
+            )
+        }
+        return result
+    }
+
+    /**
+     * Non-blocking health check for the newest positive command. It reports async invocation,
+     * queue, disconnect, and stuck-lane failures without waiting on the 100 ms controller path.
+     */
+    internal fun npuControlHealth(
+        pendingTimeoutMs: Long = DEFAULT_NPU_PENDING_TIMEOUT_MS,
+    ): NpuControlHealth {
+        if (closed.get()) {
+            return NpuControlHealth.failed("Load manager is closed")
+        }
+        if (runtimeConfig.get().setpoints.npu <= 0f) return NpuControlHealth.idle()
+        val request = latestPositiveNpuRequest.get()
+        if (request == null || npuRequestContractMissing.get()) {
+            return if (npuAdapter.isAvailable()) {
+                NpuControlHealth.failed(
+                    "NPU backend did not provide apply acknowledgment",
+                )
+            } else {
+                NpuControlHealth.unavailable("NPU workload adapter unavailable")
+            }
+        }
+        return npuAdapter.controlHealth(
+            request = request,
+            pendingTimeoutMs = pendingTimeoutMs.coerceIn(
+                1L,
+                MAX_NPU_PENDING_TIMEOUT_MS,
+            ),
+        )
+    }
+
+    @Synchronized
+    private fun applyInternal(
+        newSetpoints: LoadSetpoints,
+        restartProfile: Boolean,
+    ): NpuControlRequest? {
+        if (closed.get()) return null
+        val normalized = newSetpoints.normalizedForExecution()
         val previousConfig = runtimeConfig.get()
         val previous = previousConfig.setpoints
         val profileRestarted = restartProfile || normalized.shape != previous.shape
@@ -201,17 +278,24 @@ class LoadManager private constructor(
             normalized.shape != previous.shape ||
             normalized.npu != previous.npu
         ) {
-            val composite = npuAdapter as? CompositeNpuWorkloadAdapter
-            if (composite != null) {
-                composite.applyLoad(
-                    intensity = normalized.npu,
-                    newShape = normalized.shape,
-                    restartProfile = profileRestarted,
-                )
+            val request = npuAdapter.requestLoad(
+                intensity = normalized.npu,
+                shape = normalized.shape,
+                restartProfile = profileRestarted,
+            )
+            if (normalized.npu > 0f) {
+                latestPositiveNpuRequest.set(request)
+                npuRequestContractMissing.set(request == null)
             } else {
-                npuAdapter.setIntensity(normalized.npu)
+                latestPositiveNpuRequest.set(null)
+                npuRequestContractMissing.set(false)
             }
         }
+        if (normalized.npu <= 0f) {
+            latestPositiveNpuRequest.set(null)
+            npuRequestContractMissing.set(false)
+        }
+        return latestPositiveNpuRequest.get()
     }
 
     fun releaseLoads(dropMemoryBuffers: Boolean = false) {
@@ -518,9 +602,9 @@ class LoadManager private constructor(
         val runtime = runtimeConfig.get()
         val config = runtime.setpoints
         val intensity = shapedIntensity(config.cpu, config.shape, runtime.phaseStartedMs)
-        if (intensity <= 0.001f) {
+        if (intensity <= MIN_EFFECTIVE_LOAD) {
             LockSupport.parkNanos(
-                if (config.cpu <= 0.001f) {
+                if (config.cpu <= MIN_EFFECTIVE_LOAD) {
                     IDLE_WORKER_PARK_NANOS
                 } else {
                     WAVEFORM_CONTROL_PARK_NANOS
@@ -615,7 +699,7 @@ class LoadManager private constructor(
             val runtime = runtimeConfig.get()
             val config = runtime.setpoints
             val intensity = shapedIntensity(config.memory, config.shape, runtime.phaseStartedMs)
-            if (intensity <= 0.001f) {
+            if (intensity <= MIN_EFFECTIVE_LOAD) {
                 if (
                     !memoryBuffersPinned.get() &&
                     monotonicNowMs() - idleSinceMs >= IDLE_BUFFER_RELEASE_MS
@@ -624,7 +708,7 @@ class LoadManager private constructor(
                     destination = null
                 }
                 LockSupport.parkNanos(
-                    if (config.memory <= 0.001f) {
+                    if (config.memory <= MIN_EFFECTIVE_LOAD) {
                         IDLE_WORKER_PARK_NANOS
                     } else {
                         WAVEFORM_CONTROL_PARK_NANOS
@@ -739,6 +823,10 @@ class LoadManager private constructor(
         private const val IDLE_BUFFER_RELEASE_MS = 5_000L
         private const val DEFAULT_MEMORY_PREWARM_TIMEOUT_MS = 2_000L
         private const val MAX_MEMORY_PREWARM_TIMEOUT_MS = 5_000L
+        private const val DEFAULT_NPU_APPLY_TIMEOUT_MS = 750L
+        private const val MAX_NPU_APPLY_TIMEOUT_MS = 1_000L
+        private const val DEFAULT_NPU_PENDING_TIMEOUT_MS = 1_000L
+        private const val MAX_NPU_PENDING_TIMEOUT_MS = 2_000L
         private const val NANOS_PER_MILLI = 1_000_000L
         private const val WORKER_JOIN_TIMEOUT_NANOS = 500_000_000L
 
@@ -798,9 +886,86 @@ private fun loadManagerDependencies(context: Context): LoadManagerDependencies {
  * image. Expected methods: constructor(Context), setIntensity(Float), status(): String, close().
  * This keeps the portable APK honest: no NPU claim is made when a vendor/NNAPI backend is absent.
  */
-interface NpuWorkloadAdapter : AutoCloseable {
+internal enum class NpuControlState {
+    APPLIED,
+    PENDING,
+    FAILED,
+    IDLE,
+    UNAVAILABLE,
+}
+
+internal data class NpuControlHealth(
+    val state: NpuControlState,
+    val detail: String,
+) {
+    val applied: Boolean
+        get() = state == NpuControlState.APPLIED || state == NpuControlState.IDLE
+
+    companion object {
+        fun idle() = NpuControlHealth(
+            state = NpuControlState.IDLE,
+            detail = "NPU setpoint is zero",
+        )
+
+        fun failed(detail: String) = NpuControlHealth(
+            state = NpuControlState.FAILED,
+            detail = detail,
+        )
+
+        fun unavailable(detail: String) = NpuControlHealth(
+            state = NpuControlState.UNAVAILABLE,
+            detail = detail,
+        )
+    }
+}
+
+internal interface NpuControlRequest
+
+private data class VendorNpuControlRequest(
+    val ticket: NpuControlCommandTicket,
+) : NpuControlRequest
+
+private data class ReflectionNpuControlRequest(
+    val ticket: NpuControlCommandTicket,
+) : NpuControlRequest
+
+private fun NpuControlCommandHealth.toNpuControlHealth(
+    backend: String,
+): NpuControlHealth = NpuControlHealth(
+    state = when (state) {
+        NpuControlCommandState.APPLIED -> NpuControlState.APPLIED
+        NpuControlCommandState.PENDING -> NpuControlState.PENDING
+        NpuControlCommandState.FAILED -> NpuControlState.FAILED
+    },
+    detail = "$backend · $detail",
+)
+
+internal interface NpuWorkloadAdapter : AutoCloseable {
     fun isAvailable(): Boolean
     fun setIntensity(intensity: Float)
+    fun requestLoad(
+        intensity: Float,
+        shape: LoadShape,
+        restartProfile: Boolean,
+    ): NpuControlRequest? {
+        setIntensity(intensity)
+        return null
+    }
+
+    fun awaitControl(
+        request: NpuControlRequest,
+        timeoutMs: Long,
+    ): NpuControlHealth = NpuControlHealth.failed(
+        "NPU adapter does not implement apply acknowledgment",
+    )
+
+    fun controlHealth(
+        request: NpuControlRequest,
+        pendingTimeoutMs: Long,
+    ): NpuControlHealth = NpuControlHealth.failed(
+        "NPU adapter does not implement control health",
+    )
+
     fun releaseAndConfirm(): Boolean
     fun status(): String
     fun closeWithResult(): NpuShutdownResult
@@ -1048,12 +1213,19 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
     private val closeMethod: Method?
     private val initializationCleanupUnknown: Boolean
     private val cachedStatus = AtomicReference("NPU adapter 초기화 중")
-    private val pendingIntensity = AtomicReference<Float?>(null)
+    private val controlVersion = AtomicLong(0L)
+    private val controlAcknowledgments = NpuCommandAcknowledgments()
+    private val initialControlTicket = controlAcknowledgments.recordPending(
+        version = 0L,
+        serviceSession = REFLECTION_CONTROL_SESSION,
+    )
+    private val pendingIntensity = AtomicReference<ReflectionIntensityCommand?>(null)
     private val requestedLoad = AtomicReference(
         ReflectionLoadConfig(
             baseIntensity = 0f,
             shape = LoadShape.STEADY,
             startedMs = SystemClock.elapsedRealtime(),
+            ticket = initialControlTicket,
         ),
     )
     private val lastQueuedIntensity = AtomicReference<Float?>(null)
@@ -1113,6 +1285,32 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
         )
     }
 
+    override fun requestLoad(
+        intensity: Float,
+        shape: LoadShape,
+        restartProfile: Boolean,
+    ): NpuControlRequest? =
+        setLoad(intensity, shape, restartProfile)
+            ?.let(::ReflectionNpuControlRequest)
+
+    override fun awaitControl(
+        request: NpuControlRequest,
+        timeoutMs: Long,
+    ): NpuControlHealth {
+        val ticket = (request as? ReflectionNpuControlRequest)?.ticket
+            ?: return NpuControlHealth.failed("NPU acknowledgment backend mismatch")
+        return awaitApplied(ticket, timeoutMs)
+    }
+
+    override fun controlHealth(
+        request: NpuControlRequest,
+        pendingTimeoutMs: Long,
+    ): NpuControlHealth {
+        val ticket = (request as? ReflectionNpuControlRequest)?.ticket
+            ?: return NpuControlHealth.failed("NPU health backend mismatch")
+        return controlHealth(ticket, pendingTimeoutMs)
+    }
+
     /**
      * Telemetry reads must never enqueue vendor work or wait behind a stuck control call.
      * The cache is updated by initialization and completed control commands.
@@ -1166,6 +1364,10 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
                 baseIntensity = 0f,
                 shape = LoadShape.STEADY,
                 startedMs = SystemClock.elapsedRealtime(),
+                ticket = controlAcknowledgments.recordPending(
+                    version = controlVersion.incrementAndGet(),
+                    serviceSession = REFLECTION_CONTROL_SESSION,
+                ),
             ),
         )
         waveformThread?.interrupt()
@@ -1252,11 +1454,19 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
         ).also(shutdownResult::set)
     }
 
-    fun setLoad(intensity: Float, shape: LoadShape, restartProfile: Boolean) {
-        if (instance == null || closed.get()) return
+    fun setLoad(
+        intensity: Float,
+        shape: LoadShape,
+        restartProfile: Boolean,
+    ): NpuControlCommandTicket? {
+        if (instance == null || closed.get()) return null
         val previous = requestedLoad.get()
         val safeIntensity = intensity.takeIf(Float::isFinite)?.coerceIn(0f, 1f) ?: 0f
         val profileRestarted = restartProfile || previous.shape != shape
+        val ticket = controlAcknowledgments.recordPending(
+            version = controlVersion.incrementAndGet(),
+            serviceSession = REFLECTION_CONTROL_SESSION,
+        )
         requestedLoad.set(
             ReflectionLoadConfig(
                 baseIntensity = safeIntensity,
@@ -1266,12 +1476,14 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
                 } else {
                     previous.startedMs
                 },
+                ticket = ticket,
             ),
         )
         queueCurrentWaveformIntensity(
-            force = profileRestarted || safeIntensity <= 0f,
+            force = true,
         )
         LockSupport.unpark(waveformThread)
+        return ticket
     }
 
     private fun runWaveformControl() {
@@ -1279,7 +1491,10 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
             queueCurrentWaveformIntensity(force = false)
             val load = requestedLoad.get()
             LockSupport.parkNanos(
-                if (load.baseIntensity > 0.001f && load.shape != LoadShape.STEADY) {
+                if (
+                    load.baseIntensity > MIN_EFFECTIVE_LOAD &&
+                    load.shape != LoadShape.STEADY
+                ) {
                     NPU_WAVEFORM_TICK_NANOS
                 } else {
                     IDLE_NPU_WAVEFORM_PARK_NANOS
@@ -1300,31 +1515,51 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
         val previous = lastQueuedIntensity.get()
         if (force || previous == null || kotlin.math.abs(previous - value) >= NPU_UPDATE_EPSILON) {
             lastQueuedIntensity.set(value)
-            pendingIntensity.set(value)
+            pendingIntensity.set(
+                ReflectionIntensityCommand(
+                    intensity = value,
+                    ticket = load.ticket,
+                ),
+            )
         }
         // If a bounded executor rejected the previous submission, retry even when the waveform
         // value itself did not change.
         if (pendingIntensity.get() != null) scheduleDrain()
     }
 
-    private fun scheduleDrain() {
-        if (closed.get() || !drainScheduled.compareAndSet(false, true)) return
+    private fun scheduleDrain(): Boolean {
+        if (closed.get()) return false
+        if (!drainScheduled.compareAndSet(false, true)) return true
         val accepted = runCatching {
             executor.execute {
                 try {
                     while (!closed.get()) {
-                        val intensity = pendingIntensity.getAndSet(null) ?: break
+                        val command = pendingIntensity.getAndSet(null) ?: break
+                        val intensity = command.intensity
                         val percent = (intensity * 100f).toInt().coerceIn(0, 100)
                         if (!closed.get()) {
                             cachedStatus.set("NPU adapter 제어 적용 중 · $percent%")
                         }
-                        runCatching {
-                            checkNotNull(setIntensityMethod).invoke(instance, intensity)
-                        }.onSuccess {
+                        val inFlight =
+                            controlAcknowledgments.recordStarted(command.ticket)
+                        val result = try {
+                            runCatching {
+                                checkNotNull(setIntensityMethod).invoke(instance, intensity)
+                            }
+                        } finally {
+                            controlAcknowledgments.recordFinished(inFlight)
+                        }
+                        result.onSuccess {
+                            controlAcknowledgments.recordApplied(command.ticket)
                             if (!closed.get()) {
                                 cachedStatus.set("NPU adapter 연결됨 · 최근 제어 $percent%")
                             }
                         }.onFailure { error ->
+                            controlAcknowledgments.recordFailed(
+                                command.ticket,
+                                "Reflection NPU setter failed: " +
+                                    error.javaClass.simpleName,
+                            )
                             if (!closed.get()) {
                                 cachedStatus.set(
                                     "NPU adapter 제어 실패: ${error.javaClass.simpleName}",
@@ -1340,9 +1575,61 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
         }.isSuccess
         if (!accepted) {
             drainScheduled.set(false)
-            // Preserve latest-wins state; the waveform thread or next setpoint update retries.
+            pendingIntensity.get()?.let { pending ->
+                controlAcknowledgments.recordFailed(
+                    pending.ticket,
+                    "Reflection NPU control executor rejected command",
+                )
+            }
+        }
+        return accepted
+    }
+
+    private fun awaitApplied(
+        ticket: NpuControlCommandTicket,
+        timeoutMs: Long,
+    ): NpuControlHealth {
+        val boundedTimeoutMs = timeoutMs.coerceIn(1L, MAX_REFLECTION_ACK_TIMEOUT_MS)
+        val deadlineNanos = System.nanoTime() +
+            TimeUnit.MILLISECONDS.toNanos(boundedTimeoutMs)
+        while (true) {
+            val health = controlHealth(ticket, boundedTimeoutMs)
+            if (health.state != NpuControlState.PENDING) return health
+            val remainingNanos = deadlineNanos - System.nanoTime()
+            if (remainingNanos <= 0L) {
+                return controlHealth(ticket, pendingTimeoutMs = 1L)
+            }
+            LockSupport.parkNanos(
+                remainingNanos.coerceAtMost(REFLECTION_ACK_POLL_NANOS),
+            )
+            if (Thread.interrupted()) {
+                Thread.currentThread().interrupt()
+                controlAcknowledgments.recordFailed(
+                    ticket,
+                    "Reflection NPU apply confirmation interrupted",
+                )
+                return controlHealth(ticket, pendingTimeoutMs = 1L)
+            }
         }
     }
+
+    private fun controlHealth(
+        ticket: NpuControlCommandTicket,
+        pendingTimeoutMs: Long,
+    ): NpuControlHealth =
+        controlAcknowledgments.health(
+            ticket = ticket,
+            latestDesiredVersion = requestedLoad.get().ticket.version,
+            currentServiceSession = if (isAvailable()) {
+                REFLECTION_CONTROL_SESSION
+            } else {
+                null
+            },
+            pendingTimeoutMs = pendingTimeoutMs.coerceIn(
+                1L,
+                MAX_REFLECTION_PENDING_TIMEOUT_MS,
+            ),
+        ).toNpuControlHealth("Reflection")
 
     private companion object {
         const val REFLECTION_QUEUE_DEPTH = 4
@@ -1350,8 +1637,12 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
         const val REFLECTION_RELEASE_TIMEOUT_MS = 300L
         const val REFLECTION_CLOSE_TIMEOUT_MS = 300L
         const val REFLECTION_WAVEFORM_JOIN_TIMEOUT_MS = 100L
+        const val MAX_REFLECTION_ACK_TIMEOUT_MS = 1_000L
+        const val MAX_REFLECTION_PENDING_TIMEOUT_MS = 2_000L
+        const val REFLECTION_CONTROL_SESSION = 1L
         const val NPU_WAVEFORM_TICK_NANOS = 50_000_000L
         const val IDLE_NPU_WAVEFORM_PARK_NANOS = 500_000_000L
+        const val REFLECTION_ACK_POLL_NANOS = 2_000_000L
         const val NPU_UPDATE_EPSILON = 0.005f
         const val ADAPTER_CLASS_NAME = "com.vendor.dpulayerlab.NpuStressAdapter"
         val initializationDisabled = AtomicBoolean(false)
@@ -1540,6 +1831,12 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
         val baseIntensity: Float,
         val shape: LoadShape,
         val startedMs: Long,
+        val ticket: NpuControlCommandTicket,
+    )
+
+    private data class ReflectionIntensityCommand(
+        val intensity: Float,
+        val ticket: NpuControlCommandTicket,
     )
 
     private data class ReflectionCloseOutcome(
@@ -1577,9 +1874,13 @@ private class CompositeNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapter
         !closed.get() && (vendorBridge.supportsNpu() || reflection.isAvailable())
 
     @Synchronized
-    fun applyLoad(intensity: Float, newShape: LoadShape, restartProfile: Boolean) {
-        if (closed.get()) return
-        shape = newShape
+    override fun requestLoad(
+        intensity: Float,
+        shape: LoadShape,
+        restartProfile: Boolean,
+    ): NpuControlRequest? {
+        if (closed.get()) return null
+        this.shape = shape
         val backendPinned = vendorMayBeActive || reflectionMayBeActive
         val useVendor = if (backendPinned) {
             usingVendorBackend
@@ -1596,18 +1897,44 @@ private class CompositeNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapter
         }
         if (useVendor) {
             if (intensity > 0f) vendorMayBeActive = true
-            vendorBridge.setNpuLoad(intensity, newShape)
+            return vendorBridge.requestNpuLoad(intensity, shape)
+                ?.let(::VendorNpuControlRequest)
         } else {
             if (intensity > 0f && reflection.isAvailable()) {
                 reflectionMayBeActive = true
                 reflectionKnownIdle.markNonZeroRequested()
             }
-            reflection.setLoad(intensity, newShape, restartProfile)
+            return reflection.setLoad(intensity, shape, restartProfile)
+                ?.let(::ReflectionNpuControlRequest)
         }
     }
 
     override fun setIntensity(intensity: Float) {
-        applyLoad(intensity, shape, restartProfile = false)
+        requestLoad(intensity, shape, restartProfile = false)
+    }
+
+    override fun awaitControl(
+        request: NpuControlRequest,
+        timeoutMs: Long,
+    ): NpuControlHealth = when (request) {
+        is VendorNpuControlRequest ->
+            vendorBridge.awaitNpuLoadApplied(request.ticket, timeoutMs)
+                .toNpuControlHealth("Vendor")
+        is ReflectionNpuControlRequest ->
+            reflection.awaitControl(request, timeoutMs)
+        else -> NpuControlHealth.failed("NPU acknowledgment backend mismatch")
+    }
+
+    override fun controlHealth(
+        request: NpuControlRequest,
+        pendingTimeoutMs: Long,
+    ): NpuControlHealth = when (request) {
+        is VendorNpuControlRequest ->
+            vendorBridge.npuControlHealth(request.ticket, pendingTimeoutMs)
+                .toNpuControlHealth("Vendor")
+        is ReflectionNpuControlRequest ->
+            reflection.controlHealth(request, pendingTimeoutMs)
+        else -> NpuControlHealth.failed("NPU health backend mismatch")
     }
 
     @Synchronized

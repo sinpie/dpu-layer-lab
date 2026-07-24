@@ -5,8 +5,97 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 class VendorBridgeStateTest {
+    @Test
+    fun olderCompletionCannotAcknowledgeTheLatestRapidUpdate() {
+        val nowNanos = AtomicLong(0L)
+        val acknowledgments = NpuCommandAcknowledgments(nowNanos::get)
+        val first = acknowledgments.recordPending(version = 1L, serviceSession = 7L)
+        val second = acknowledgments.recordPending(version = 2L, serviceSession = 7L)
+
+        acknowledgments.recordApplied(first)
+
+        val latest = acknowledgments.health(
+            ticket = second,
+            latestDesiredVersion = 2L,
+            currentServiceSession = 7L,
+            pendingTimeoutMs = 1_000L,
+        )
+        val superseded = acknowledgments.health(
+            ticket = first,
+            latestDesiredVersion = 2L,
+            currentServiceSession = 7L,
+            pendingTimeoutMs = 1_000L,
+        )
+
+        assertEquals(NpuControlCommandState.PENDING, latest.state)
+        assertEquals(NpuControlCommandState.FAILED, superseded.state)
+    }
+
+    @Test
+    fun stuckOlderSetterFailsNewestPendingCommandDespiteRapidUpdates() {
+        val nowNanos = AtomicLong(0L)
+        val acknowledgments = NpuCommandAcknowledgments(nowNanos::get)
+        val first = acknowledgments.recordPending(version = 10L, serviceSession = 4L)
+        acknowledgments.recordStarted(first)
+        val latest = acknowledgments.recordPending(version = 11L, serviceSession = 4L)
+        nowNanos.set(TimeUnit.MILLISECONDS.toNanos(501L))
+
+        val health = acknowledgments.health(
+            ticket = latest,
+            latestDesiredVersion = 11L,
+            currentServiceSession = 4L,
+            pendingTimeoutMs = 500L,
+        )
+
+        assertEquals(NpuControlCommandState.FAILED, health.state)
+        assertTrue(health.detail.contains("timed out"))
+    }
+
+    @Test
+    fun queuedCommandWithoutAcknowledgmentFailsAtBoundedDeadline() {
+        val nowNanos = AtomicLong(0L)
+        val acknowledgments = NpuCommandAcknowledgments(nowNanos::get)
+        val ticket = acknowledgments.recordPending(version = 15L, serviceSession = 6L)
+        nowNanos.set(TimeUnit.MILLISECONDS.toNanos(101L))
+
+        val health = acknowledgments.health(
+            ticket = ticket,
+            latestDesiredVersion = 15L,
+            currentServiceSession = 6L,
+            pendingTimeoutMs = 100L,
+        )
+
+        assertEquals(NpuControlCommandState.FAILED, health.state)
+        assertTrue(health.detail.contains("acknowledgment timed out"))
+    }
+
+    @Test
+    fun disconnectAndTerminalFailureCannotBeClearedByLateSuccess() {
+        val acknowledgments = NpuCommandAcknowledgments { 0L }
+        val ticket = acknowledgments.recordPending(version = 21L, serviceSession = 8L)
+
+        val disconnected = acknowledgments.health(
+            ticket = ticket,
+            latestDesiredVersion = 21L,
+            currentServiceSession = null,
+            pendingTimeoutMs = 1_000L,
+        )
+        acknowledgments.recordApplied(ticket)
+        val lateSuccess = acknowledgments.health(
+            ticket = ticket,
+            latestDesiredVersion = 21L,
+            currentServiceSession = 8L,
+            pendingTimeoutMs = 1_000L,
+        )
+
+        assertEquals(NpuControlCommandState.FAILED, disconnected.state)
+        assertEquals(NpuControlCommandState.FAILED, lateSuccess.state)
+    }
+
     @Test
     fun newerDesiredOrReconnectReplayCannotBeOverwrittenByOlderCompletion() {
         assertTrue(shouldPublishNpuCommand(currentVersion = null, candidateVersion = 1L))

@@ -166,6 +166,11 @@ object ReportWriter {
                 append(""""pixelRoute": ${quote(phase.pixelRoute.name)}, """)
                 append(""""bufferSize": ${quote(phase.bufferSize.name)}, """)
                 append(""""motion": ${quote(phase.motion.name)}, """)
+                append(""""motionSemantics": ${quote(phase.motion.semantics.name)}, """)
+                append(
+                    """"physicalHwcZOrderChange": """ +
+                        "${phase.motion.semantics.changesPhysicalHwcZOrder}, ",
+                )
                 append(""""alphaOverlap": ${phase.alphaOverlap}, """)
                 append(""""includeGlLayer": ${phase.includeGlLayer}, """)
                 append(""""workloads": {""")

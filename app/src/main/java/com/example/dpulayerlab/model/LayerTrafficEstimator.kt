@@ -40,6 +40,10 @@ object LayerTrafficEstimator {
     // 16 B/px covers an RGBA32F linear reference and prevents malformed public descriptors from
     // producing negative, non-finite, or effectively unbounded HUD traffic.
     private const val MAX_LINEAR_BYTES_PER_PIXEL = 16.0
+    // Validate decoder dimensions against the largest accepted linear reference. This keeps a
+    // malformed metadata pair from describing a single frame whose byte count cannot fit in the
+    // signed Long domain used by allocation and traffic-budget code elsewhere in the app.
+    private const val MAX_DECODER_PIXEL_COUNT = Long.MAX_VALUE / 16L
 
     fun estimate(
         phase: PhaseSpec,
@@ -58,6 +62,7 @@ object LayerTrafficEstimator {
                     bytesPerPixel <= MAX_LINEAR_BYTES_PER_PIXEL
             } == true
         }
+        val decoderDimensions = validatedDecoderDimensions(mediaWidthPx, mediaHeightPx)
         val logicalLayers = phase.activeLayers.coerceIn(1, MAX_RENDERED_LAYERS)
         val displaySizeKnown = displayWidthPx > 0 && displayHeightPx > 0
         val scanoutFps = measuredDisplayHz
@@ -94,6 +99,9 @@ object LayerTrafficEstimator {
         var producerDimensionsKnown = true
         var producerFormatsKnown = true
         var hasTextureOutput = false
+        val displayDimensions = ProducerDimensions(displayWidthPx, displayHeightPx)
+        val requestedPrimaryDimensions =
+            ProducerDimensions(phase.bufferSize.width, phase.bufferSize.height)
 
         repeat(logicalLayers) { index ->
             val isGlOutput = phase.includeGlLayer && index == logicalLayers - 1
@@ -107,17 +115,12 @@ object LayerTrafficEstimator {
                     phase.bufferSize != BufferSize.DISPLAY &&
                     !isGlOutput &&
                     !usesDecoderOutput
-            val width = when {
-                usesDecoderOutput && mediaWidthPx != null && mediaWidthPx > 0 -> mediaWidthPx
-                primaryUsesRequestedSize -> phase.bufferSize.width
-                else -> displayWidthPx
+            val dimensions = when {
+                usesDecoderOutput -> decoderDimensions
+                primaryUsesRequestedSize -> requestedPrimaryDimensions
+                else -> displayDimensions
             }
-            val height = when {
-                usesDecoderOutput && mediaHeightPx != null && mediaHeightPx > 0 -> mediaHeightPx
-                primaryUsesRequestedSize -> phase.bufferSize.height
-                else -> displayHeightPx
-            }
-            if (width <= 0 || height <= 0) {
+            if (dimensions == null || dimensions.width <= 0 || dimensions.height <= 0) {
                 producerDimensionsKnown = false
             } else {
                 val isTextureOutput =
@@ -135,7 +138,8 @@ object LayerTrafficEstimator {
                 if (bytesPerPixel == null) {
                     producerFormatsKnown = false
                 } else {
-                    val layerBytes = width.toDouble() * height.toDouble() * bytesPerPixel
+                    val layerBytes =
+                        dimensions.width.toDouble() * dimensions.height.toDouble() * bytesPerPixel
                     producerFrameBytes += layerBytes
                     if (isTextureOutput) {
                         hasTextureOutput = true
@@ -165,20 +169,17 @@ object LayerTrafficEstimator {
             mediaSelected = mediaSelected,
             decoderLinearReference = verifiedDecoderLinearReference,
         )
-        val decoderMediaSizeKnown =
+        val decoderPrimaryActive =
             mediaSelected &&
                 !(phase.includeGlLayer && logicalLayers == 1) &&
-                phase.pixelRoute.usesSelectedMediaDecoder() &&
-                mediaWidthPx != null &&
-                mediaWidthPx > 0 &&
-                mediaHeightPx != null &&
-                mediaHeightPx > 0
+                phase.pixelRoute.usesSelectedMediaDecoder()
         val resolutionLabel = when {
+            decoderPrimaryActive && decoderDimensions == null -> "decoder size N/A"
             !producerDimensionsKnown -> "display size pending"
-            decoderMediaSizeKnown && logicalLayers == 1 ->
-                "${mediaWidthPx}×${mediaHeightPx} decoder × 1 producer"
-            decoderMediaSizeKnown ->
-                "${mediaWidthPx}×${mediaHeightPx} decoder + " +
+            decoderPrimaryActive && decoderDimensions != null && logicalLayers == 1 ->
+                "${decoderDimensions.width}×${decoderDimensions.height} decoder × 1 producer"
+            decoderPrimaryActive && decoderDimensions != null ->
+                "${decoderDimensions.width}×${decoderDimensions.height} decoder + " +
                     "${logicalLayers - 1} display"
             phase.bufferSize == BufferSize.DISPLAY ||
                 (phase.includeGlLayer && logicalLayers == 1) ->
@@ -224,6 +225,18 @@ object LayerTrafficEstimator {
         else -> 4.0
     }
 
+    private fun validatedDecoderDimensions(
+        widthPx: Int?,
+        heightPx: Int?,
+    ): ProducerDimensions? {
+        if (widthPx == null || heightPx == null || widthPx <= 0 || heightPx <= 0) return null
+        // Int dimensions are widened before multiplication. The explicit upper bound also keeps
+        // the validation correct if the accepted descriptor B/px ceiling is applied later.
+        val pixelCount = widthPx.toLong() * heightPx.toLong()
+        if (pixelCount <= 0L || pixelCount > MAX_DECODER_PIXEL_COUNT) return null
+        return ProducerDimensions(widthPx, heightPx)
+    }
+
     private fun actualFormatLabel(
         phase: PhaseSpec,
         mediaSelected: Boolean,
@@ -265,3 +278,8 @@ object LayerTrafficEstimator {
     }
 
 }
+
+private data class ProducerDimensions(
+    val width: Int,
+    val height: Int,
+)

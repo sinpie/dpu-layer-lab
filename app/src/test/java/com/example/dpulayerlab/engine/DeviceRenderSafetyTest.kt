@@ -234,6 +234,7 @@ class DeviceRenderSafetyTest {
             bufferSize = BufferSize.DISPLAY,
             motion = MotionProfile.TRANSFORM_STORM,
             workloads = LoadSetpoints(cpu = 1f, memory = 1f, gpu = 1f, npu = 1f),
+            includeGlLayer = true,
         )
         val scenario = ScenarioSpec(
             id = "stress-scenario",
@@ -258,13 +259,15 @@ class DeviceRenderSafetyTest {
 
         assertEquals(10, scenario.phases.single().activeLayers)
         assertEquals(120f, scenario.phases.single().producerFps, 0f)
-        assertEquals(4, effective.activeLayers)
+        // The GL tail reserves both RGBA color and depth triple buffers, so the graphics budget
+        // is stricter than the raw device layer envelope.
+        assertEquals(3, effective.activeLayers)
         assertEquals(60f, effective.producerFps, 0f)
         assertEquals(0.40f, effective.workloads.cpu, 0f)
         assertEquals(0.25f, effective.workloads.memory, 0f)
         assertEquals(0.35f, effective.workloads.gpu, 0f)
         assertEquals(0.40f, effective.workloads.npu, 0f)
-        assertTrue(decision.adjustments.any { it.contains("layers 10 -> 4") })
+        assertTrue(decision.adjustments.any { it.contains("layers 10 -> 3") })
         assertTrue(decision.adjustments.any { it.contains("producer FPS 120.0 -> 60.0") })
         assertTrue(decision.adjustments.any { it.contains("workloads capped") })
     }

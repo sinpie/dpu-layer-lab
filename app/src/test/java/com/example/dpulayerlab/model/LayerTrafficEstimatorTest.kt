@@ -2,6 +2,7 @@ package com.example.dpulayerlab.model
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -236,6 +237,54 @@ class LayerTrafficEstimatorTest {
         }
     }
 
+    @Test
+    fun decoderDimensionsAreAnAtomicPairAndNeverFallBackOneAxisToDisplaySize() {
+        listOf<Pair<Int?, Int?>>(
+            null to 40,
+            80 to null,
+        ).forEach { (width, height) ->
+            val estimate = decoderEstimate(width, height)
+
+            assertTrafficUnavailable("dimensions=$width x $height", estimate)
+            assertEquals("decoder size N/A", estimate.resolutionLabel)
+        }
+    }
+
+    @Test
+    fun nonPositiveDecoderDimensionsMakeTheWholeAggregateUnavailable() {
+        listOf(
+            0 to 40,
+            -1 to 40,
+            80 to 0,
+            80 to -1,
+        ).forEach { (width, height) ->
+            val estimate = decoderEstimate(width, height)
+
+            assertTrafficUnavailable("dimensions=$width x $height", estimate)
+            assertEquals("decoder size N/A", estimate.resolutionLabel)
+        }
+    }
+
+    @Test
+    fun decoderDimensionAreaIsBoundedBeforeLinearFrameByteCalculation() {
+        // At the 16 B/px descriptor ceiling this pair remains within Long.MAX_VALUE.
+        val boundary = decoderEstimate(
+            width = Int.MAX_VALUE,
+            height = 268_435_456,
+        )
+        // One additional row would make the maximum accepted linear frame exceed Long.MAX_VALUE.
+        val overBoundary = decoderEstimate(
+            width = Int.MAX_VALUE,
+            height = 268_435_457,
+        )
+
+        assertNotNull(boundary.bytesPerFrame)
+        assertNotNull(boundary.dpuReadBytesPerSecond)
+        assertNotNull(boundary.producerWriteBytesPerSecond)
+        assertTrafficUnavailable("decoder area over addressable boundary", overBoundary)
+        assertEquals("decoder size N/A", overBoundary.resolutionLabel)
+    }
+
     private val yuv420Reference = DecoderLinearReference(
         bytesPerPixel = 1.5,
         label = "YUV420 linear reference · 1.5 B/px",
@@ -247,6 +296,28 @@ class LayerTrafficEstimatorTest {
         label = "P010 linear reference · 3 B/px",
         source = "test",
     )
+
+    private fun decoderEstimate(
+        width: Int?,
+        height: Int?,
+    ): LayerTrafficEstimate = LayerTrafficEstimator.estimate(
+        phase = phase(pixelRoute = PixelRoute.P010, activeLayers = 2),
+        displayWidthPx = 40,
+        displayHeightPx = 20,
+        mediaSelected = true,
+        mediaWidthPx = width,
+        mediaHeightPx = height,
+        decoderLinearReference = p010Reference,
+    )
+
+    private fun assertTrafficUnavailable(
+        message: String,
+        estimate: LayerTrafficEstimate,
+    ) {
+        assertNull(message, estimate.bytesPerFrame)
+        assertNull(message, estimate.dpuReadBytesPerSecond)
+        assertNull(message, estimate.producerWriteBytesPerSecond)
+    }
 
     private fun phase(
         activeLayers: Int = 1,

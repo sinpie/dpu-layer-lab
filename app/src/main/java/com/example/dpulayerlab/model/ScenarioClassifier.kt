@@ -146,10 +146,10 @@ object ScenarioClassifier {
     fun conditions(scenario: ScenarioSpec): Set<ScenarioCondition> {
         val result = linkedSetOf<ScenarioCondition>()
         val workloads = scenario.phases.map { it.workloads.normalized() }
-        val hasCpu = workloads.any { it.cpu > ACTIVE_LOAD_EPSILON }
-        val hasMemory = workloads.any { it.memory > ACTIVE_LOAD_EPSILON }
-        val hasGpu = workloads.any { it.gpu > ACTIVE_LOAD_EPSILON }
-        val hasNpu = workloads.any { it.npu > ACTIVE_LOAD_EPSILON }
+        val hasCpu = workloads.any { it.cpu > MIN_EFFECTIVE_LOAD }
+        val hasMemory = workloads.any { it.memory > MIN_EFFECTIVE_LOAD }
+        val hasGpu = workloads.any { it.gpu > MIN_EFFECTIVE_LOAD }
+        val hasNpu = workloads.any { it.npu > MIN_EFFECTIVE_LOAD }
         if (!hasCpu && !hasMemory && !hasGpu && !hasNpu) {
             result += ScenarioCondition.DISPLAY_ONLY
         }
@@ -281,5 +281,4 @@ object ScenarioClassifier {
         LoadShape.RAMP,
         LoadShape.SAW,
     )
-    private const val ACTIVE_LOAD_EPSILON = 0.001f
 }

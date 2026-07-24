@@ -179,7 +179,17 @@ class StressGlSurfaceView(
         )
         session = GlSession(running, thread)
         glSession = session
-        thread.start()
+        val threadStarted = startRendererThread(thread) { error ->
+            running.set(false)
+            if (glSession === session) glSession = null
+            restartWhenStopped.set(false)
+            onRuntimeFailure?.invoke(
+                "GL thread start ${error.javaClass.simpleName}",
+            )
+        }
+        if (!threadStarted) {
+            return
+        }
     }
 
     private fun scheduleDeferredRestart() {
@@ -334,22 +344,54 @@ class StressGlSurfaceView(
             if (error is ThreadDeath) throw error
             runtimeFailure = glRuntimeFailureReason(error)
         } finally {
+            val cleanupFailures = mutableListOf<String>()
             if (display != EGL14.EGL_NO_DISPLAY) {
-                runCatching {
+                val clearedCurrent = runCatching {
                     EGL14.eglMakeCurrent(
                         display,
                         EGL14.EGL_NO_SURFACE,
                         EGL14.EGL_NO_SURFACE,
                         EGL14.EGL_NO_CONTEXT,
                     )
+                }.getOrElse {
+                    cleanupFailures += "eglMakeCurrent=${it.javaClass.simpleName}"
+                    false
                 }
+                if (!clearedCurrent) cleanupFailures += "eglMakeCurrent=false"
                 if (eglSurface != EGL14.EGL_NO_SURFACE) {
-                    runCatching { EGL14.eglDestroySurface(display, eglSurface) }
+                    val destroyedSurface =
+                        runCatching { EGL14.eglDestroySurface(display, eglSurface) }
+                            .getOrElse {
+                                cleanupFailures +=
+                                    "eglDestroySurface=${it.javaClass.simpleName}"
+                                false
+                            }
+                    if (!destroyedSurface) cleanupFailures += "eglDestroySurface=false"
                 }
                 if (context != EGL14.EGL_NO_CONTEXT) {
-                    runCatching { EGL14.eglDestroyContext(display, context) }
+                    val destroyedContext =
+                        runCatching { EGL14.eglDestroyContext(display, context) }
+                            .getOrElse {
+                                cleanupFailures +=
+                                    "eglDestroyContext=${it.javaClass.simpleName}"
+                                false
+                            }
+                    if (!destroyedContext) cleanupFailures += "eglDestroyContext=false"
                 }
-                runCatching { EGL14.eglTerminate(display) }
+                val terminated = runCatching { EGL14.eglTerminate(display) }
+                    .getOrElse {
+                        cleanupFailures += "eglTerminate=${it.javaClass.simpleName}"
+                        false
+                    }
+                if (!terminated) cleanupFailures += "eglTerminate=false"
+            }
+            if (cleanupFailures.isNotEmpty()) {
+                RendererSafetyState.markCleanupFailure(
+                    component = "EGL native cleanup",
+                    detail = cleanupFailures.distinct().joinToString(","),
+                )
+                runtimeFailure = runtimeFailure ?: "EGL native cleanup unconfirmed"
+                post { onTeardownFailure?.invoke() }
             }
         }
         return runtimeFailure.takeIf {

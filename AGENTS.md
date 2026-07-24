@@ -8,6 +8,11 @@ Launcher와 Gradle project의 표시 이름은 `DPULayerTest`이고 canonical re
 `https://github.com/sinpie/dpu-layer-lab`이다. 제품 호환성 계약인 package
 `com.example.dpulayerlab`, automation component/action, `dpu-layer-lab-` report
 prefix, Soong module/APK 이름 `DpuLayerLab`은 별도 migration 요구 없이 바꾸지 않는다.
+현재 release version은 `20260724_111816`(`versionCode 3`), debug version은
+`20260724_111816-debug`이며 `yyyyMMdd_HHmmss`는 KST build 시각이다. release tag는
+`v20260724_111816`이다. Release asset은
+`DPULayerTest-20260724_111816-debug.apk`,
+`DPULayerTest-20260724_111816-release-unsigned.apk`, `SHA256SUMS.txt` 이름을 사용한다.
 
 ## 기본 작업 규칙
 
@@ -55,20 +60,27 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   phase의 ramp/soak window와 pulse/triangle cycle도 비례 조정하고,
   attack/hold/recovery 또는 한 cycle의 의미를 보존할 수 없으면 reject한다.
 - `FLATTENED_TEXTURE`는 display-sized RGBA 단일 physical producer다. Decoder route나
-  explicit 4K/8K buffer로 표시하지 않는다. Custom의 0 초과 GPU load는 실제 GPU-backed
-  producer를 가져야 하며, primary+GL topology가 graphics budget에 들어오지 않으면 GPU
-  부하를 조용히 제거하지 말고 reject한다.
-  Flattened 1-layer intensity도 0~8의 bounded extra hardware-canvas pass로 실제 draw
-  work를 바꿔야 하며 non-finite intensity는 0으로 처리한다.
+  explicit 4K/8K buffer로 표시하지 않는다. Custom의 `0.001` 초과 GPU load는 실제
+  GPU-backed producer를 가져야 하며, primary+GL topology가 graphics budget에 들어오지
+  않으면 GPU 부하를 조용히 제거하지 말고 reject한다.
+  Flattened 1-layer intensity도 policy-approved `0.001` 초과 값에서 1~8의 bounded
+  extra hardware-canvas pass로 실제 draw work를 바꿔야 하며 non-finite intensity는
+  0으로 처리한다.
+- 모든 workload는 정확한 0 또는 `0.001`보다 큰 값만 허용한다. `0 < load <= 0.001`은
+  표시상 양수와 실제 worker idle의 의미가 달라지므로 reject한다.
 - low-RAM/power-save cap을 우회하지 않는다.
 - `ActivityManager.MemoryInfo.lowMemory`와 thermal CRITICAL 이상은 active run을
   중단한다.
-- thermal SEVERE derating은 이후 phase에도 유지한다. Workload/display 감속 적용 중
-  하나라도 실패하면 `THERMAL_DERATE_FAILED`로 중단한다.
+- thermal SEVERE derating은 이후 phase에도 유지한다. 기존 generated/NPU load의
+  ordered zero 확인 → reduced workload ticket/acknowledgment → display 감속
+  acknowledgment 순서를 지키며, 하나라도 실패하면 `THERMAL_DERATE_FAILED`로 중단한다.
 - loop, thread, buffer allocation, codec dequeue, Binder call에는 상한이나
   cancellation 경로가 있어야 한다.
 - CPU/memory 부하는 fixed-period bounded worker와 재사용 buffer를 유지한다. NPU/vendor
   control은 bounded latest-wins로 처리하며 오래된 setpoint backlog를 만들지 않는다.
+- 양의 NPU setpoint도 latest command ticket과 acknowledgment가 일치한 뒤에만 적용
+  완료로 본다. Active phase 동안 backend health를 확인하고 apply timeout/거부/health
+  상실은 `NPU_WORKLOAD_APPLY_FAILED`로 fail-closed한다.
 - Memory workload는 measured baseline 전에 bounded working-set allocation/page-touch
   prewarm과 worker acknowledgment를 완료한다. Prewarm byte는 generated traffic에서
   제외하고 완료 뒤 counter를 reset하며, allocation/timeout/cancel/ack 실패를 저부하
@@ -111,6 +123,9 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   2 tick/hold 1 tick/recovery 2 tick을 보존할 수 없으면 reject한다. `STEP`은 fresh
   baseline과 origin producer buffer가 확인된 뒤 measured active tick에서 target을
   적용하고, post-ready tick 없이 끝난 phase는 `INCONCLUSIVE`다.
+  실행 loop는 absolute-deadline fixed period로 늦은 tick을 busy catch-up하지 않는다.
+  Runtime coverage가 ramp 중간값, staircase 전 level, pulse ON/OFF, triangle 상승/하강,
+  soak attack/hold/recovery를 관측하지 못하면 `INCONCLUSIVE`다.
 - Transition `floor`는 pulse/triangle의 반복 valley에만 허용한다. STEP/linear/
   staircase/soak에 nonzero floor가 있는 runnable plan은 reject한다. 순수 evaluator는
   hostile direct call에서만 defensive하게 0으로 지워 origin sample을 건너뛰지 않는다.
@@ -127,8 +142,10 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   Main.immediate run Job은 lazy 상태로 owner를 먼저 게시한 뒤 시작하고, finalizer는
   identity가 일치하는 자기 owner만 해제한다.
 - 실행 UI의 STOP은 compact/landscape에서도 상단 header에 항상 보여야 한다. 좌측 상단
-  HUD의 layer/DPU/CPU/GPU 숫자·그래프와 예상 DPU-read/producer-write traffic은
-  unavailable/provenance 및 pending `—P` 의미를 숨기지 않는다.
+  HUD의 build version, layer/DPU/CPU/GPU 숫자·그래프와 예상
+  DPU-read/producer-write traffic은 unavailable/provenance 및 pending `—P` 의미를
+  숨기지 않는다. Gauge source/quality를 표시하고 provenance 변경/unavailable 경계를
+  graph gap으로 유지한다.
 - SBWC route 적용/해제 결과는 모두 event로 남긴다. 활성 SBWC의 linear/default reset을
   확인하지 못하거나 adapter가 거부/timeout되면 fail-closed로 plan을 중단한다.
 - 정상 cooldown에서도 phase/target과 generated load를 먼저 제거하고 physical
@@ -197,11 +214,16 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   MIME/profile descriptor만 사용하며, bit depth/chroma가 불명확하면 aggregate를
   `N/A`로 유지한다. Descriptor B/px는 finite, 0 초과, 16 이하만 허용한다. SBWC
   compression ratio는 포함하지 않는다.
+- YUV/P010/SBWC decoder phase는 선택·pin·검증된 media와 concrete hardware codec
+  binding이 필수다. 선택 media가 없거나 binding/fingerprint가 불완전하면 procedural
+  RGBA proxy로 대체하지 않고 fail-closed한다.
 - decoder phase는 실제 track width/height/FPS metadata가 모두 있어야 한다. FPS가
-  없거나 tolerance를 포함해 요청 FPS에 미달하면 fail-closed로 거부한다.
+  없거나 tolerance를 포함해 phase target 및 reachable transition FPS에 미달하면
+  fail-closed로 거부한다. Gradual transition은 직전 FPS 전체, STEP은
+  `min(60, 직전 FPS)` boundary를 포함한다.
 - decoder capability의 size는 exact encoded dimensions, rate는
-  `max(source FPS, decoder phase FPS)`로 검사한다. 낮은 phase pacing이 고FPS source의
-  decode 요구를 숨기지 않게 한다.
+  source/decoder-phase/reachable-transition FPS의 최댓값으로 검사한다. 낮은 phase
+  pacing이 고FPS source 또는 transition origin의 decode 요구를 숨기지 않게 한다.
 - VP9 Profile 2는 10/12-bit 4:2:0을 함께 포괄하므로 profile만으로 P010을 허용하지
   않는다. Extractor의 512자 이하 canonical `vp09.02.<level>.10...` codec string에서
   bit-depth 10이 명시적으로 확인될 때만 P010 gate와 3 B/px linear reference에
@@ -226,6 +248,9 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 - SBWC REQUIRED는 실제 allocation/compression state를 확인하지 못하면 성공으로
   처리하지 않는다.
 - NPU adapter가 없을 때 CPU 연산으로 대체해 NPU 사용이라고 표시하지 않는다.
+- View/client Z-order swap은 client ordering proxy이고 physical HWC plane Z-order
+  변경의 증거가 아니다. Typed motion semantics와
+  `physicalHwcZOrderChange=false` report 의미를 유지한다.
 - counter의 monotonicity, reset/wrap, display scope, sampling interval을 test하고
   report/source에 보존한다.
 - `dpu_frequency_hz`는 명시된 제품 path의 read-only Hz counter다. 앱에 DPU frequency
@@ -270,5 +295,8 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
    generation·all-producer·teardown race, aggregate producer-rate boundary test를
    갱신했다.
 10. tracked 파일에 secret, APK, report, local path가 없다.
-11. 보고서는 internal `files/reports`만 사용하고 FileProvider로만 공유한다.
+11. 보고서는 internal `files/reports`만 사용하고 FileProvider로만 공유한다. 공유할
+    파일은 canonical internal directory 안에 실제 존재하며 managed completed
+    `dpu-layer-lab-…json` 이름을 통과해야 한다. Traversal, foreign/missing file은
+    거부한다.
 12. cloud backup/device-to-device/legacy rule에서 모든 app data domain이 제외된다.

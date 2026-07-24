@@ -36,6 +36,11 @@ data class SelectedDecoderBuffer(
     val heightPx: Int?,
 )
 
+internal fun PhaseSpec.requiresSelectedDecoderProducer(): Boolean =
+    backend != LayerBackend.FLATTENED_TEXTURE &&
+        pixelRoute.usesSelectedMediaDecoder() &&
+        !(includeGlLayer && activeLayers == 1)
+
 /**
  * Validates externally supplied scenarios and bounds their render/load cost before execution.
  *
@@ -67,6 +72,24 @@ object ScenarioSafetyPolicy {
     ): ScenarioSafetyDecision {
         validateLimits(limits)?.let { return rejected(it) }
         validateScenario(scenario)?.let { return rejected(it) }
+
+        val decoderPhase = scenario.phases.firstOrNull(PhaseSpec::requiresSelectedDecoderProducer)
+        if (decoderPhase != null && selectedDecoderBuffer == null) {
+            return rejected(
+                "Phase '${decoderPhase.id}' requires a selected, metadata-verified decoder buffer",
+            )
+        }
+        if (
+            decoderPhase != null &&
+            (
+                selectedDecoderBuffer?.widthPx?.takeIf { it > 0 } == null ||
+                    selectedDecoderBuffer.heightPx?.takeIf { it > 0 } == null
+                )
+        ) {
+            return rejected(
+                "Phase '${decoderPhase.id}' decoder dimensions must be complete and positive",
+            )
+        }
 
         if (limits.maxScenarioDurationMs < scenario.phases.size.toLong()) {
             return rejected(
@@ -281,6 +304,17 @@ object ScenarioSafetyPolicy {
             if (loadValues.any { !it.isFinite() }) {
                 return "Phase '${phase.id}' workloads must be finite"
             }
+            if (loadValues.any { it > 0f && it <= MIN_EFFECTIVE_LOAD }) {
+                return "Phase '${phase.id}' positive workloads must exceed " +
+                    "$MIN_EFFECTIVE_LOAD to produce observable work"
+            }
+            if (
+                phase.workloads.gpu > 0f &&
+                phase.backend != LayerBackend.FLATTENED_TEXTURE &&
+                !phase.includeGlLayer
+            ) {
+                return "Phase '${phase.id}' GPU load requires a flattened producer or GL layer"
+            }
             with(phase.transition) {
                 if (transitionDurationMs < 0L) {
                     return "Phase '${phase.id}' transition duration must be non-negative"
@@ -317,7 +351,7 @@ object ScenarioSafetyPolicy {
         memory = workloads.memory.coerceIn(0f, limits.memory),
         gpu = workloads.gpu.coerceIn(0f, limits.gpu),
         npu = workloads.npu.coerceIn(0f, limits.npu),
-    )
+    ).normalizedForExecution()
 
     private fun maximumLayersWithinGraphicsBudget(
         phase: PhaseSpec,
@@ -620,7 +654,28 @@ object ScenarioSafetyPolicy {
     }
 
     private fun validateEffectiveTransitions(phases: List<PhaseSpec>): String? {
-        for (phase in phases) {
+        for ((index, phase) in phases.withIndex()) {
+            val previous = phases.getOrNull(index - 1)
+            val cyclic =
+                phase.transition.mode == TransitionMode.PULSE_BURST ||
+                    phase.transition.mode == TransitionMode.TRIANGLE_WAVE
+            if (
+                previous != null &&
+                cyclic &&
+                rendererTopologyDiffers(previous, phase)
+            ) {
+                return "Phase '${phase.id}' cyclic transition cannot alternate physical " +
+                    "producer topologies"
+            }
+            if (
+                previous != null &&
+                phase.transition.mode != TransitionMode.STEP &&
+                previous.workloads.gpu > 0f &&
+                !phase.hasGpuLoadProducer()
+            ) {
+                return "Phase '${phase.id}' gradual transition cannot remove the physical GPU " +
+                    "load producer; use STEP or retain a GL/flattened producer"
+            }
             when (phase.transition.mode) {
                 TransitionMode.PULSE_BURST -> {
                     if (phase.durationMs < phase.transition.cycleMs) {
@@ -692,6 +747,14 @@ object ScenarioSafetyPolicy {
         }
         return null
     }
+
+    private fun rendererTopologyDiffers(first: PhaseSpec, second: PhaseSpec): Boolean =
+        first.activeLayers != second.activeLayers ||
+            first.backend != second.backend ||
+            first.pixelRoute != second.pixelRoute ||
+            first.bufferSize != second.bufferSize ||
+            first.includeGlLayer != second.includeGlLayer ||
+            first.alphaOverlap != second.alphaOverlap
 
     private fun rejected(reason: String) = ScenarioSafetyDecision(
         effectiveScenario = null,

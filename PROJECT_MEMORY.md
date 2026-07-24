@@ -3,10 +3,17 @@
 이 문서는 DPULayerTest의 장기 설계 맥락을 보존하는 canonical project memory입니다.
 구현을 바꾸면 코드, test, `README.md`, 이 문서를 함께 갱신합니다.
 
-0.2.0에서 launcher와 Gradle project 표시 이름은 `DPULayerTest`다. Canonical GitHub
+현재 release version은 `20260724_111816`(`versionCode 3`), debug version은
+`20260724_111816-debug`이며 `yyyyMMdd_HHmmss`는 KST build 시각이다. Launcher와
+Gradle project 표시 이름은 `DPULayerTest`다.
+release tag는 `v20260724_111816`이다. Canonical GitHub
 저장소는 `sinpie/dpu-layer-lab`이며, 기존 제품 통합과 report consumer를 위해 package
 `com.example.dpulayerlab`, automation action/component, `dpu-layer-lab-` report prefix,
 Soong module/APK 이름 `DpuLayerLab`은 stable compatibility identifier로 유지한다.
+Release asset 이름은 `DPULayerTest-20260724_111816-debug.apk`,
+`DPULayerTest-20260724_111816-release-unsigned.apk`, `SHA256SUMS.txt`다. Unsigned
+release는 secure product signing pipeline 입력이며 최종 설치 APK가 아니고 platform
+key/certificate/keystore/token은 저장소나 release에 두지 않는다.
 
 ## 목적
 
@@ -38,6 +45,9 @@ Soong module/APK 이름 `DpuLayerLab`은 stable compatibility identifier로 유�
    `floor`는 pulse/triangle 반복 valley 전용이다. STEP/linear/staircase/soak는
    nonzero floor가 있는 runnable plan을 policy에서 reject한다. 순수 evaluator는
    hostile direct call에서도 origin을 보존하도록 defensive하게 floor를 0으로 지운다.
+   실행 loop는 absolute-deadline fixed period로 늦은 tick을 busy catch-up하지 않으며,
+   runtime coverage tracker가 ramp 중간값, staircase 전 level, pulse ON/OFF, triangle
+   상승/하강, soak attack/hold/recovery를 관측하지 못하면 `INCONCLUSIVE`다.
 4. **부하 상승 뒤 recovery를 둔다.** 부하 획득과 해제를 같은 run에서 관찰한다.
    Adaptive hunt는 boundary 이후 남은 stress step 대신 명시적 recovery로 이동하고,
    recovery 자체는 boundary 판정에서 제외한다. Proxy threshold는 phase 안에서 실제
@@ -69,8 +79,9 @@ Soong module/APK 이름 `DpuLayerLab`은 stable compatibility identifier로 유�
    profile만 허용한다. VP9 Profile 2는 10/12-bit를 함께 포괄하므로 512자 이하 canonical
    `vp09.02.<level>.10...` codec string의 bit-depth 10까지 확인해야 한다. Malformed,
    12-bit 또는 서로 충돌하는 VP9 entry는 fail-closed한다. Capability는 exact encoded
-   dimensions와 `max(source FPS, phase FPS)`를 사용한다. URI/MIME/codec name,
-   encoded/visible dimensions, FPS, profile, codecs/P010 상태를 immutable fingerprint로
+   dimensions와 source/phase FPS 및 reachable transition FPS의 최댓값을 사용한다.
+   URI/MIME/codec name, encoded/visible dimensions, FPS, profile, codecs/P010 상태를
+   immutable fingerprint로
    넘기고 renderer에서 다시 확인한다. Crop은 horizontal/vertical pair를 독립 처리하고,
    한 축의 pair가 모두 없으면 그 축 전체를 사용한다. Lone key나 범위 오류는
    fail-closed한다. Provider가 연 seekable `AssetFileDescriptor`를 pin해 preflight와
@@ -83,6 +94,10 @@ Soong module/APK 이름 `DpuLayerLab`은 stable compatibility identifier로 유�
    graphics budget/output allocation guard에만 사용한다.
    Metadata/fingerprint가 없거나 바뀌고, output crop이 유효하지 않거나 visible
    resolution이 바뀌거나 allocation ceiling을 넘으면 fail-closed한다.
+   YUV/P010/SBWC decoder phase는 선택·pin·검증된 media와 concrete hardware codec
+   binding 없이 procedural RGBA proxy로 실행하지 않는다. Source/capability FPS는
+   phase target뿐 아니라 decoder topology에서 도달 가능한 transition origin까지
+   검사하며 gradual transition은 직전 FPS 전체, STEP은 `min(60, 직전 FPS)`를 포함한다.
 10. **traffic은 별도 모델이다.** hardware counter와 합치지 않고 linear full-buffer
    estimate로만 표시한다. Selected decoder primary의 B/px는 요청 route가 아니라
    extractor MIME/profile에서 검증한 8-bit YUV420(1.5) 또는 10-bit P010(3.0) descriptor를
@@ -91,13 +106,18 @@ Soong module/APK 이름 `DpuLayerLab`은 stable compatibility identifier로 유�
    확인된 경우만 3.0 B/px로 사용하고, Dolby Vision이나 4:2:2/4:4:4 계열 VP9
    Profile 3을 P010 layout으로 추정하지 않는다. SBWC ratio는 포함하지 않는다.
 11. **보고서는 내부 저장소 우선이다.** credential-encrypted `files/reports`에 JSON을
-    저장하며 사용자가 명시적으로 공유할 때만 FileProvider URI 권한을 준다. 과거
+    저장하며 사용자가 명시적으로 공유할 때만 FileProvider URI 권한을 준다. 공유는
+    canonical internal directory 안의 실제 존재하는 managed completed
+    `dpu-layer-lab-…json`만 허용하고 traversal, foreign/missing file은 거부한다. 과거
     external 보고서는 자동 import하지 않는다.
 12. **외부 자동화는 보호된 alias만 허용한다.** Explicit `AutomationActivity` Intent는
     preset ID와 bounded repeat만 전달하며 custom workload, phase 또는 safety 값을
     주입하지 못한다. Launcher `MainActivity`에 직접 보낸 control action은 무시한다.
 13. **부하 worker는 backlog를 만들지 않는다.** CPU/memory는 bounded fixed-period
     worker와 재사용 buffer를 사용하고 NPU control은 bounded latest-wins로 합친다.
+    양의 NPU setpoint는 command ticket/acknowledgment가 일치한 뒤 적용 완료로 보며
+    active phase 동안 adapter health를 확인한다. Apply timeout/거부/health 상실은
+    `NPU_WORKLOAD_APPLY_FAILED`로 fail-closed한다.
     Memory workload가 있는 plan은 계측 전에 worker별 buffer 할당/page touch를
     acknowledgment하는 bounded prewarm을 실행한다. Prewarm byte는 generated traffic에
     포함하지 않으며 allocation/timeout/cancel/ack 실패는 fail-closed다.
@@ -118,6 +138,8 @@ Soong module/APK 이름 `DpuLayerLab`은 stable compatibility identifier로 유�
   attack/hold/recovery를 표현할 수 없으면 의미가 다른 test로 실행하지 않고 reject한다.
 - 0 이하 duration/layer/FPS/Hz, NaN/무한대, 빈/중복 ID와 overflow 가능 입력은
   render 전에 reject하고, 범위를 벗어난 유한 workload는 clamp한다.
+- Workload는 정확한 0 또는 `0.001`보다 큰 값만 허용한다. `0 < load <= 0.001`은
+  표시상 양수와 실제 worker idle 사이 의미 불일치를 만들므로 reject한다.
 - 한 producer조차 graphics memory budget을 넘으면 실행하지 않는다. Multi-layer GL-tail
   phase가 1 layer로 clamp될 때는 GL-only로 바뀌지 않도록 primary를 보존한다. GL
   color와 보수적 depth attachment는 각각 triple-buffered budget에 포함한다.
@@ -125,9 +147,11 @@ Soong module/APK 이름 `DpuLayerLab`은 stable compatibility identifier로 유�
   producer이며 decoder route 또는 explicit 4K/8K buffer라고 보고하지 않는다. Custom
   입력의 incompatible route/size는 UI label/tag와 함께 DISPLAY/RGB로 정규화한다.
 - Flattened 1-layer의 GPU intensity도 실제 hardware-canvas work를 바꿔야 한다. 0은
-  기본 pass, 0 초과는 intensity에 따라 bounded 1~8 extra pass이며 NaN/무한대는 0이다.
-- Custom에서 0보다 큰 GPU load는 독립/mixed backend topology에 실제 GL producer를
-  포함한다.
+  기본 pass, policy를 통과한 `0.001` 초과 값은 intensity에 따라 bounded 1~8 extra
+  pass이며 NaN/무한대는 0이다.
+- Custom에서 `0.001`보다 큰 GPU load는 독립/mixed backend topology에 실제 GL
+  producer를 포함한다. 양수 `0.001` 이하는 앞선 minimum-effective-load 규칙으로
+  reject한다.
   Decoder/explicit-size primary와 GL이 모두 필요하면 요청 1 layer도 2 layer로 명시적으로
   승격하며, safety budget이 필수 GL producer를 제거해야 하는 경우에는 GPU load를
   수행한 것처럼 보이지 않도록 reject한다.
@@ -141,8 +165,9 @@ Soong module/APK 이름 `DpuLayerLab`은 stable compatibility identifier로 유�
   `SAFETY_ENVELOPE_CHANGED`로 중단한다. 같은 ID/physical dimensions의 축 교환은
   graphics envelope를 바꾸지 않는다.
 - thermal `SEVERE` 이후의 layer/FPS/Hz/workload derating은 다음 phase에서 원래
-  setpoint로 되돌아가지 않는다. Workload/display 감속 중 하나라도 확인되지 않으면
-  `THERMAL_DERATE_FAILED`로 중단한다.
+  setpoint로 되돌아가지 않는다. 기존 generated/NPU workload의 ordered zero 확인,
+  reduced workload의 ticket/acknowledgment, display 감속 acknowledgment 순서 중
+  하나라도 확인되지 않으면 `THERMAL_DERATE_FAILED`로 중단한다.
 - thermal `CRITICAL` 이상과 `ActivityManager.MemoryInfo.lowMemory` 감지는 run을
   중단한다.
 - 정상/중단/예외 시 CPU·memory worker, codec, Surface, GL, NPU, compression request,
@@ -172,6 +197,9 @@ Soong module/APK 이름 `DpuLayerLab`은 stable compatibility identifier로 유�
   단순 저부하 실행으로 계속하지 않는다.
 - Run 경계 NPU 해제는 backend별 single-lane ordered zero/stop acknowledgment를
   bounded 시간 안에 확인해야 한다. Enqueue 성공만으로 cleanup을 성공 처리하지 않는다.
+- 양의 NPU setpoint도 latest command ticket의 acknowledgment 전에는 phase 적용
+  성공으로 처리하지 않는다. Active phase에서 command/backend health를 확인하고
+  timeout/거부/unhealthy를 `NPU_WORKLOAD_APPLY_FAILED`로 중단한다.
 - 미확인 NPU cleanup은 process-wide latch로 후속 adapter 초기화와 새 plan을 차단한다.
   Activity close가 남긴 최종 cleanup 증거는 close 전에 시작된 release의 늦은 결과보다
   우선하며, stale `false`가 최종 확인을 다시 오염시키지 못한다. 종료 lane이 멈춰
@@ -199,7 +227,9 @@ Soong module/APK 이름 `DpuLayerLab`은 stable compatibility identifier로 유�
 - `STEP` target은 fresh baseline 뒤 origin topology의 generation-scoped buffer가
   확인된 다음 measured 100 ms control tick에서 적용한다. Duration cap 이후의 실제
   transition window가 cadence상 중간/level/cycle/attack-hold-release를 표현하지 못하면
-  실행하지 않는다.
+  실행하지 않는다. Control loop는 absolute-deadline fixed period이며, 실행 후 coverage
+  tracker가 ramp/staircase/pulse/triangle/soak의 필수 segment를 실제 관측하지 못하면
+  `INCONCLUSIVE`다.
 - Phase fidelity는 primary 하나가 아니라 generation이 승인한 모든 physical producer
   frame을 합산한다. 실제 적용한 `FPS × physical producer count` 적분값이 30 frame
   이상이고 actual이 70% 미만이면 `PRODUCER_RATE_SHORTFALL`을 남긴다.
@@ -238,6 +268,9 @@ Soong module/APK 이름 `DpuLayerLab`은 stable compatibility identifier로 유�
 - missed frame, HWC/GPU miss, producer stall은 proxy이며 exact DPU underrun으로
   승격하지 않는다.
 - NPU adapter가 없으면 `UNSUPPORTED`이며 CPU fallback을 NPU로 표시하지 않는다.
+- View/client Z-order animation은 client-side ordering proxy다. Report의 motion
+  semantics도 physical HWC Z-order change를 `false`로 유지하며, HWC plane 순서의 증거로
+  승격하지 않는다.
 - SBWC REQUIRED는 allocation/compression state를 검증할 provider가 없으면
   `UNSUPPORTED`다.
 - 모든 compression route/reset 결과를 event에 남긴다. 적용 거부/timeout 또는 활성
@@ -273,7 +306,8 @@ Soong module/APK 이름 `DpuLayerLab`은 stable compatibility identifier로 유�
 
 ## 현재 구현
 
-- DPULayerTest 0.2.0 launcher/Gradle project와 stable
+- DPULayerTest `20260724_111816` release / `20260724_111816-debug` debug
+  launcher/Gradle project, 화면/HUD/report build version과 stable
   `com.example.dpulayerlab`/`DpuLayerLab` 제품 통합 identifier
 - Compose 기반 scenario browser, system dashboard, running HUD, result 화면. 실행
   header의 STOP은 compact/landscape에서도 상단에 유지한다.
@@ -284,27 +318,33 @@ Soong module/APK 이름 `DpuLayerLab`은 stable compatibility identifier로 유�
   filtered append/replace, 중복·이동이 가능한 ordered queue, restored unknown-ID
   sanitize, repeat 1~10과 expanded 40-run cap
 - 독립 Surface, mixed Surface/Texture, flattened RGBA, app-owned EGL stress layer
-- scroll/zoom/pan/rotate/parallax/storm/Z-order animation
+- scroll/zoom/pan/rotate/parallax/storm과 physical HWC 변경으로 오해하지 않는
+  View/client Z-order proxy animation
 - RAM tier, logical core 수, emulator/`goldfish`/`ranchu`, power-save와 low-memory를
   독립적으로 합성하는 device hard envelope
 - RGB8888/RGB565 pattern과 실제 track MIME/FPS/profile을 검사하는 MediaCodec video
   Surface, VP9 codec-string bit depth까지 확인하는 selected-media P010 10-bit gate,
   seekable pinned AFD, bounded provider/parser daemon과 process-wide refcount lease,
   immutable track fingerprint, strict fixed `KEY_MAX_*` pair와 configure 전 key 제거,
-  64 px graphics/output allocation ceiling
+  reachable transition FPS preflight, 64 px graphics/output allocation ceiling.
+  YUV/P010/SBWC decoder는 선택 media/binding이 없으면 proxy 없이 fail-closed한다.
 - custom flattened DISPLAY/RGB 정규화, non-zero GPU의 실제 GL topology 및
   8K60 decoder primary + RGB overlay 6개 + GL tail의 8-layer preset
 - fixed-period bounded CPU worker, 기기 등급에 따라 1~2개의 bounded memory-copy
   worker, 측정 전 allocation/page-touch prewarm과 fail-closed acknowledgment,
-  GLES load, latest-wins vendor/reflection NPU hook
+  GLES load, positive command ticket/ack 및 active health를 확인하는 latest-wins
+  vendor/reflection NPU hook
 - telemetry/compression/NPU vendor lane 분리, reconnect desired-setpoint 복구,
   run-boundary ordered NPU zero 확인, reflection constructor/runtime-timeout process latch
 - steady/pulse/ramp/saw generator shape와 step/ramp/staircase/burst/triangle/
-  soak-recovery phase transition, 100 ms actual-window validation과 measured STEP
+  soak-recovery phase transition, absolute-deadline 100 ms loop, actual-window/runtime
+  coverage validation과 measured STEP
 - 저부하 settle 뒤 single-layer/composition/4K shock, 중간 부하 perturbation과
   `STEADY` memory plateau를 쓰는 adaptive boundary preset
-- 1초 telemetry sample과 최근 60 sample HUD. 좌측 상단에 layer/DPU/CPU/GPU
-  숫자·그래프와 linear full-buffer 예상 DPU read/producer write traffic을 표시한다.
+- 1초 telemetry sample과 최근 60 sample HUD. 좌측 상단에 build version,
+  layer/DPU/CPU/GPU 숫자·그래프와 linear full-buffer 예상 DPU read/producer write
+  traffic을 표시한다. Gauge source/quality를 노출하고 provenance/unavailable 경계에
+  graph gap을 둔다.
 - stable-provenance DPU/GPU/bus/produced FPS/HWC DEVICE·CLIENT result peak
 - Android service, kernel allowlist, SurfaceFlinger parser, vendor AIDL 계측
 - post-warmup baseline/continuity가 적용된 exact/proxy verdict
@@ -312,7 +352,8 @@ Soong module/APK 이름 `DpuLayerLab`은 stable compatibility identifier로 유�
 - ordered scenario plan/repeat 실행과 보호된 explicit `AutomationActivity`
   START/STOP/SHOW Intent 계약
 - cooldown에서 physical producer teardown을 확인한 뒤에만 compression route reset
-- schema v2 JSON report와 FileProvider 공유
+- schema v2 JSON report와 canonical internal managed completed report에만 한정한
+  FileProvider 공유
 - Binder vendor NPU/compression status는 HUD/sample/report에 보존하기 전에 256자로
   제한하고 whitespace/control/format 문자를 정규화하며, current service session도
   함께 보존
@@ -374,14 +415,10 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 .\gradlew.bat assembleRelease
 ```
 
-마지막 회귀 기준(2026-07-24)은 clean build에서 28 suite/310 test,
-failure/error/skip 0, lint error 0입니다. Lint warning 6개는 Android Gradle
-Plugin/의존성의 새 버전 알림입니다. Debug/release APK의 package/version, debug
-certificate/unsigned release, zipalign도 확인했습니다. Emulator에서는 22개 catalog
-조합/queue UI와 live HUD, explicit automation baseline 완주, 2-loop plan 실행 중 STOP의
-`ABORTED · 1/2 runs · 2 loops`, schema v2 report의 compression/session/NPU field,
-crash/ANR 0건을 확인했습니다. Exact DPU/SBWC/HWC/NPU 판정은 이 회귀 기준에 포함되지
-않으며 platform-signed target BSP에서 별도로 검증해야 합니다.
+`20260724_111816`은 host unit test 356개, `lintDebug` error 0개(도구/의존성 업데이트
+warning 6개), `assembleDebug`, `assembleRelease`를 통과했습니다. 이번 release에서는
+emulator/실기기 stress를 자동 실행하지 않았습니다. Exact DPU/SBWC/HWC/NPU 판정은
+host 회귀에 포함되지 않으며 platform-signed target BSP에서 별도로 검증해야 합니다.
 
 안전 정책 또는 renderer를 바꿨다면 최소한 다음을 추가 확인합니다.
 
@@ -392,13 +429,21 @@ crash/ANR 0건을 확인했습니다. Exact DPU/SBWC/HWC/NPU 판정은 이 회�
   transition은 reject되는지
 - STEP이 fresh baseline/origin buffer 뒤 measured tick에서 target을 적용하고 그 tick을
   실행할 시간이 없으면 `INCONCLUSIVE`인지, noncyclic transition의 floor가 0인지
+- absolute-deadline fixed-period loop가 늦은 tick을 busy catch-up하지 않고, runtime
+  coverage가 ramp 중간값/staircase 전 level/pulse ON·OFF/triangle 상승·하강/soak
+  attack·hold·recovery 중 누락을 `INCONCLUSIVE`로 만드는지
 - custom flattened 입력이 DISPLAY/RGB 단일 producer로 표시되고, non-zero GPU 요청의
   GL producer가 보존되거나 budget 부족으로 명시적으로 reject되는지, flattened
   1-layer intensity가 bounded extra draw pass를 실제로 바꾸는지
+- 모든 workload의 `0 < load <= 0.001`이 reject되고, GPU load가 허용되면 실제
+  GPU-backed producer가 끝까지 유지되는지
 - layer clamp 시 logical/producer count와 report event 일치
 - low-RAM, power-save, `MemoryInfo.lowMemory`, thermal SEVERE/CRITICAL state transition
-- runtime display identity/physical-size 변경 중단과 thermal derate 적용 실패 중단
+- runtime display identity/physical-size 변경 중단과 thermal ordered zero → reduced
+  workload acknowledgment → display acknowledgment 중 하나라도 실패할 때의 중단
 - phase 전환, 사용자 stop, exception, Activity destroy 뒤 worker/codec/NPU 해제
+- 양의 NPU command ticket/acknowledgment와 active health loss가 fail-closed event를
+  만들고 측정 성공으로 남지 않는지
 - local worker Throwable/active interrupt가 first-wins latch와
   `LOCAL_WORKER_FAILURE`/`ABORTED`를 만들고 같은 process의 후속 plan을 차단하는지
 - partial worker start 실패가 기존 worker 종료 전 same-owner retry/overlap을 막는지
@@ -408,11 +453,12 @@ crash/ANR 0건을 확인했습니다. Exact DPU/SBWC/HWC/NPU 판정은 이 회�
   중단하고 각 route 결과 event를 남기는지, physical producer teardown 뒤에만
   compression reset하는지
 - producer generation 변경 전 frame이 다음 phase startup guard를 만족하지 않는지
-- 실제 video track MIME, encoded/visible dimensions, FPS/profile/codecs/P010
+- 선택 media 없는 YUV/P010/SBWC decoder가 procedural proxy 없이 reject되는지,
+  실제 video track MIME, encoded/visible dimensions, FPS/profile/codecs/P010
   fingerprint가 runtime에도 일치하고, horizontal/vertical crop pair를 독립 검증하며,
   source `KEY_MAX_*`가 absent/exact pair인지 확인한 뒤 configure 전에 제거하는지,
-  codec rate가 max(source/phase FPS)이고 output crop/dynamic resolution/64 px
-  graphics/output allocation ceiling을 fail-closed하는지
+  codec rate가 source/phase/reachable transition FPS 최댓값을 만족하고 output
+  crop/dynamic resolution/64 px graphics/output allocation ceiling을 fail-closed하는지
 - provider open/parser timeout·cancel 뒤 daemon의 실제 `finally`까지 process-wide
   refcount lease가 다음 plan을 막고 pinned AFD가 seekable인지
 - GL color와 보수적 depth를 각각 triple buffering한 budget 경계
@@ -420,7 +466,8 @@ crash/ANR 0건을 확인했습니다. Exact DPU/SBWC/HWC/NPU 판정은 이 회�
   exact-positive 우선/그 외 `INCONCLUSIVE` 판정, flattened physical count 1
 - unpublished/pending/process-lease HUD가 fake expected `1P` 대신 `—P`인지
 - compact/landscape 실행 화면에서도 상단 STOP과 layer/DPU/CPU/GPU 그래프 및 예상
-  traffic이 보이는지
+  traffic, build version이 보이고 provenance 변경/unavailable 구간이 graph gap으로
+  유지되는지
 - Adaptive Hunt boundary가 `STEADY` memory plateau를 유지하는지
 - exact counter의 post-warmup baseline, source/quality 변화, reset/regress, 0-delta
   continuity, post-teardown terminal sample, telemetry gap과 invalid delta provenance,
@@ -429,6 +476,8 @@ crash/ANR 0건을 확인했습니다. Exact DPU/SBWC/HWC/NPU 판정은 이 회�
   resolution이 거부되며 plan/repeat 상한을 유지하는지
 - catalog facet의 OR-within/AND-across 의미, filtered append/replace 순서와 cap,
   queue move/duplicate 및 restored unknown-ID sanitize가 일치하는지
+- report 공유가 canonical internal managed completed file만 허용하고 traversal,
+  foreign/missing JSON을 거부하는지
 - vendor source가 없을 때 DPU/GPU/bus가 `N/A`이고 proxy verdict만 생성되는지
 
 실기기 stress test는 사용자가 대상 실험기와 실행 범위를 명시한 경우에만 수행합니다.

@@ -1032,7 +1032,7 @@ internal class PatternSurfaceView(
 
     private fun startDrawingLoop() {
         if (removalRequested.get() || !holder.surface.isValid || loop != null) return
-        loop = CanvasDrawingLoop(
+        val candidate = CanvasDrawingLoop(
             surface = holder.surface,
             layerIndex = layerIndex,
             fpsProvider = { targetFps },
@@ -1042,7 +1042,8 @@ internal class PatternSurfaceView(
             translucentContent = alphaSurface,
             captureFrameCommit = captureFrameCommit,
             onRuntimeFailure = onRuntimeFailure,
-        ).also { it.start() }
+        )
+        if (candidate.start()) loop = candidate
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
@@ -1114,7 +1115,7 @@ internal class PatternTextureView(
     private fun startDrawingLoop() {
         val surface = drawSurface ?: return
         if (removalRequested.get() || !surface.isValid || loop != null) return
-        loop = CanvasDrawingLoop(
+        val candidate = CanvasDrawingLoop(
             surface = surface,
             layerIndex = layerIndex,
             fpsProvider = { targetFps },
@@ -1123,7 +1124,8 @@ internal class PatternTextureView(
             logicalLayerCount = 1,
             captureFrameCommit = captureFrameCommit,
             onRuntimeFailure = onRuntimeFailure,
-        ).also { it.start() }
+        )
+        if (candidate.start()) loop = candidate
     }
 
     override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) = Unit
@@ -1205,7 +1207,7 @@ internal class MultiLayerTextureView(
     private fun startDrawingLoop() {
         val surface = drawSurface ?: return
         if (removalRequested.get() || !surface.isValid || loop != null) return
-        loop = CanvasDrawingLoop(
+        val candidate = CanvasDrawingLoop(
             surface = surface,
             layerIndex = 0,
             fpsProvider = { targetFps },
@@ -1215,7 +1217,8 @@ internal class MultiLayerTextureView(
             complexityProvider = ::currentGpuLoad,
             captureFrameCommit = captureFrameCommit,
             onRuntimeFailure = onRuntimeFailure,
-        ).also { it.start() }
+        )
+        if (candidate.start()) loop = candidate
     }
 
     override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) = Unit
@@ -1478,9 +1481,11 @@ internal class VideoSurfaceView(
                 var inputEos = false
                 var nextRenderNanos = System.nanoTime()
                 while (sessionRunning.get() && surface.isValid && isCurrent(session)) {
+                    var inputProgress = false
                     if (!inputEos) {
                         val inputIndex = activeCodec.dequeueInputBuffer(CODEC_TIMEOUT_US)
                         if (inputIndex >= 0) {
+                            inputProgress = true
                             val declaredSampleSize = activeExtractor.sampleSize
                             if (declaredSampleSize < 0L) {
                                 activeCodec.queueInputBuffer(
@@ -1492,6 +1497,9 @@ internal class VideoSurfaceView(
                                 )
                                 inputEos = true
                             } else {
+                                val codecInputFlags = mediaCodecInputFlags(
+                                    activeExtractor.sampleFlags,
+                                )
                                 check(
                                     declaredSampleSize <=
                                         selection.maxCompressedSampleBytes.toLong()
@@ -1515,7 +1523,7 @@ internal class VideoSurfaceView(
                                     0,
                                     size,
                                     activeExtractor.sampleTime.coerceAtLeast(0L),
-                                    activeExtractor.sampleFlags,
+                                    codecInputFlags,
                                 )
                                 activeExtractor.advance()
                             }
@@ -1526,6 +1534,10 @@ internal class VideoSurfaceView(
                         outputInfo,
                         CODEC_TIMEOUT_US,
                     )
+                    val outputProgress =
+                        outputIndex >= 0 ||
+                            outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ||
+                            outputIndex == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED
                     when {
                         outputIndex >= 0 -> {
                             val isEos = outputInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
@@ -1584,6 +1596,13 @@ internal class VideoSurfaceView(
                             }
                         }
                     }
+                    val parkNanos = codecNoProgressParkNanos(
+                        inputProgress = inputProgress,
+                        outputProgress = outputProgress,
+                    )
+                    if (parkNanos > 0L) {
+                        LockSupport.parkNanos(parkNanos)
+                    }
                 }
             } catch (_: InterruptedException) {
                 // Normal release path.
@@ -1599,16 +1618,45 @@ internal class VideoSurfaceView(
                     )
                 }
             } finally {
+                val cleanupFailures = mutableListOf<String>()
                 runCatching { codec?.stop() }
-                runCatching { codec?.release() }
-                runCatching { extractor?.release() }
+                codec?.let { activeCodec ->
+                    runCatching { activeCodec.release() }
+                        .onFailure {
+                            cleanupFailures +=
+                                "MediaCodec.release=${it.javaClass.simpleName}"
+                        }
+                }
+                extractor?.let { activeExtractor ->
+                    runCatching { activeExtractor.release() }
+                        .onFailure {
+                            cleanupFailures +=
+                                "MediaExtractor.release=${it.javaClass.simpleName}"
+                        }
+                }
+                if (cleanupFailures.isNotEmpty()) {
+                    RendererSafetyState.markCleanupFailure(
+                        component = "decoder native cleanup",
+                        detail = cleanupFailures.joinToString(","),
+                    )
+                    callbackHandler.post { onTeardownFailure?.invoke() }
+                }
                 sessionRunning.set(false)
                 if (decoderSession === session) decoderSession = null
             }
         }, "DpuLab-MediaCodec")
         session = DecoderSession(sessionRunning, thread)
         decoderSession = session
-        thread.start()
+        val threadStarted = startRendererThread(thread) { error ->
+            sessionRunning.set(false)
+            if (decoderSession === session) decoderSession = null
+            onRuntimeFailure?.invoke(
+                buildRuntimeFailureReason("MediaCodec thread start", error),
+            )
+        }
+        if (!threadStarted) {
+            return
+        }
     }
 
     private fun ensureSetupActive(
@@ -1658,6 +1706,55 @@ internal class VideoSurfaceView(
         private const val MAX_PACING_LAG_NANOS = 250_000_000L
     }
 }
+
+/**
+ * MediaExtractor and MediaCodec use different bit assignments after the sync/key-frame bit.
+ * Passing extractor flags through verbatim can turn an encrypted sample into CODEC_CONFIG or a
+ * partial sample into EOS. Secure input is deliberately unsupported by this deterministic lab,
+ * so encrypted and unknown flags fail closed before any bytes are queued.
+ */
+internal fun mediaCodecInputFlags(sampleFlags: Int): Int {
+    require(sampleFlags >= 0) { "Negative extractor sample flags" }
+    val knownExtractorFlags =
+        MediaExtractor.SAMPLE_FLAG_SYNC or
+            MediaExtractor.SAMPLE_FLAG_ENCRYPTED or
+            MediaExtractor.SAMPLE_FLAG_PARTIAL_FRAME
+    require(sampleFlags and knownExtractorFlags.inv() == 0) {
+        "Unknown extractor sample flags"
+    }
+    require(sampleFlags and MediaExtractor.SAMPLE_FLAG_ENCRYPTED == 0) {
+        "Encrypted media samples require secure input and are unsupported"
+    }
+    var codecFlags = 0
+    if (sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0) {
+        codecFlags = codecFlags or MediaCodec.BUFFER_FLAG_KEY_FRAME
+    }
+    if (sampleFlags and MediaExtractor.SAMPLE_FLAG_PARTIAL_FRAME != 0) {
+        codecFlags = codecFlags or MediaCodec.BUFFER_FLAG_PARTIAL_FRAME
+    }
+    return codecFlags
+}
+
+/**
+ * A synchronous codec may return TRY_AGAIN immediately on both ports despite the dequeue timeout.
+ * Yield only in that no-progress case so a stalled decoder cannot spin at a full CPU core while
+ * successful input/output work and format changes retain their original pacing.
+ */
+internal fun codecNoProgressParkNanos(
+    inputProgress: Boolean,
+    outputProgress: Boolean,
+    requestedParkNanos: Long = DEFAULT_CODEC_NO_PROGRESS_PARK_NANOS,
+): Long {
+    if (inputProgress || outputProgress) return 0L
+    return requestedParkNanos.coerceIn(
+        MIN_CODEC_NO_PROGRESS_PARK_NANOS,
+        MAX_CODEC_NO_PROGRESS_PARK_NANOS,
+    )
+}
+
+private const val MIN_CODEC_NO_PROGRESS_PARK_NANOS = 250_000L
+private const val DEFAULT_CODEC_NO_PROGRESS_PARK_NANOS = 500_000L
+private const val MAX_CODEC_NO_PROGRESS_PARK_NANOS = 1_000_000L
 
 private fun MediaFormat.mediaNumberOrNull(key: String): Number? =
     if (containsKey(key)) runCatching { getNumber(key) }.getOrNull() else null
@@ -1773,9 +1870,17 @@ private class CanvasDrawingLoop(
         PatternPainter(it, false, false, false)
     }
 
-    fun start() {
-        if (!running.compareAndSet(false, true)) return
-        thread = Thread(this, "DpuLab-Surface-$layerIndex").also { it.start() }
+    fun start(): Boolean {
+        if (!running.compareAndSet(false, true)) return true
+        val candidate = Thread(this, "DpuLab-Surface-$layerIndex")
+        thread = candidate
+        return startRendererThread(candidate) { error ->
+            running.set(false)
+            thread = null
+            onRuntimeFailure?.invoke(
+                buildRuntimeFailureReason("Canvas thread start", error),
+            )
+        }
     }
 
     fun stop(stopDeadlineNanos: Long = producerDrainDeadlineNanos()): Boolean {

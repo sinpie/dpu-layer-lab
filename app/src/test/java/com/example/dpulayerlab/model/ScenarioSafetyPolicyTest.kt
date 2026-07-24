@@ -72,6 +72,37 @@ class ScenarioSafetyPolicyTest {
     }
 
     @Test
+    fun subEffectivePositiveWorkloadIsRejectedInsteadOfReportedAsActive() {
+        assertAccepted(
+            ScenarioSafetyPolicy.evaluate(
+                scenario(phases = listOf(phase(workloads = LoadSetpoints(cpu = 0f)))),
+                limits(),
+            ),
+        )
+        assertRejected(
+            scenario(
+                phases = listOf(
+                    phase(workloads = LoadSetpoints(cpu = MIN_EFFECTIVE_LOAD)),
+                ),
+            ),
+        )
+        assertAccepted(
+            ScenarioSafetyPolicy.evaluate(
+                scenario(
+                    phases = listOf(
+                        phase(
+                            workloads = LoadSetpoints(
+                                cpu = java.lang.Math.nextUp(MIN_EFFECTIVE_LOAD),
+                            ),
+                        ),
+                    ),
+                ),
+                limits(),
+            ),
+        )
+    }
+
+    @Test
     fun malformedTransitionParametersAreRejected() {
         assertRejected(
             scenario(
@@ -352,6 +383,7 @@ class ScenarioSafetyPolicyTest {
                             gpu = 0.9f,
                             npu = 0.8f,
                         ),
+                        includeGlLayer = true,
                     ),
                 ),
             ),
@@ -545,6 +577,199 @@ class ScenarioSafetyPolicyTest {
 
         assertRejected(decision)
         assertTrue(decision.rejectionReason!!.contains("GL producer required"))
+    }
+
+    @Test
+    fun gpuLoadWithoutAnyGlProducerIsRejected() {
+        val decision = ScenarioSafetyPolicy.evaluate(
+            scenario(
+                phases = listOf(
+                    phase(
+                        workloads = LoadSetpoints(gpu = 0.5f),
+                        includeGlLayer = false,
+                    ),
+                ),
+            ),
+            limits(),
+        )
+
+        assertRejected(decision)
+        assertTrue(decision.rejectionReason!!.contains("GPU load requires"))
+    }
+
+    @Test
+    fun flattenedProducerCanCarryGpuLoadWithoutGlTailMarker() {
+        val decision = ScenarioSafetyPolicy.evaluate(
+            scenario(
+                phases = listOf(
+                    phase(
+                        backend = LayerBackend.FLATTENED_TEXTURE,
+                        workloads = LoadSetpoints(gpu = 0.5f),
+                        includeGlLayer = false,
+                    ),
+                ),
+            ),
+            limits(),
+        )
+
+        val effective = assertAccepted(decision).phases.single()
+        assertEquals(LayerBackend.FLATTENED_TEXTURE, effective.backend)
+        assertTrue(!effective.includeGlLayer)
+        assertEquals(0.5f, effective.workloads.gpu)
+    }
+
+    @Test
+    fun oneRgbGlPrimaryCanCarryGpuLoad() {
+        val decision = ScenarioSafetyPolicy.evaluate(
+            scenario(
+                phases = listOf(
+                    phase(
+                        activeLayers = 1,
+                        includeGlLayer = true,
+                        workloads = LoadSetpoints(gpu = 0.5f),
+                    ),
+                ),
+            ),
+            limits(),
+        )
+
+        val effective = assertAccepted(decision).phases.single()
+        assertEquals(1, effective.activeLayers)
+        assertTrue(effective.includeGlLayer)
+        assertEquals(0.5f, effective.workloads.gpu)
+    }
+
+    @Test
+    fun cyclicTransitionAcrossPhysicalTopologiesIsRejected() {
+        val decision = ScenarioSafetyPolicy.evaluate(
+            scenario(
+                phases = listOf(
+                    phase(
+                        id = "gl-origin",
+                        activeLayers = 2,
+                        includeGlLayer = true,
+                        workloads = LoadSetpoints(gpu = 0.5f),
+                    ),
+                    phase(
+                        id = "no-gl-cycle",
+                        activeLayers = 1,
+                        includeGlLayer = false,
+                        transition = TransitionSpec(
+                            mode = TransitionMode.PULSE_BURST,
+                            cycleMs = 500L,
+                            dutyCycle = 0.5f,
+                        ),
+                    ),
+                ),
+            ),
+            limits(),
+        )
+
+        assertRejected(decision)
+        assertTrue(decision.rejectionReason!!.contains("physical producer topologies"))
+    }
+
+    @Test
+    fun cyclicTransitionCannotAlternateOnlyThePhysicalLayerCount() {
+        val decision = ScenarioSafetyPolicy.evaluate(
+            scenario(
+                phases = listOf(
+                    phase(id = "one-layer-origin", activeLayers = 1),
+                    phase(
+                        id = "two-layer-cycle",
+                        activeLayers = 2,
+                        transition = TransitionSpec(
+                            mode = TransitionMode.TRIANGLE_WAVE,
+                            cycleMs = 500L,
+                            floor = 0.25f,
+                        ),
+                    ),
+                ),
+            ),
+            limits(),
+        )
+
+        assertRejected(decision)
+        assertTrue(decision.rejectionReason!!.contains("physical producer topologies"))
+    }
+
+    @Test
+    fun gradualGpuReleaseCannotSilentlyRemoveItsProducerButStepCan() {
+        val gradualTransitions = listOf(
+            TransitionSpec(
+                mode = TransitionMode.LINEAR_RAMP,
+                transitionDurationMs = 1_000L,
+            ),
+            TransitionSpec(
+                mode = TransitionMode.STAIRCASE,
+                transitionDurationMs = 1_000L,
+                stepCount = 4,
+            ),
+            TransitionSpec(
+                mode = TransitionMode.SOAK_RECOVERY,
+                transitionDurationMs = 1_000L,
+            ),
+        )
+        gradualTransitions.forEachIndexed { index, transition ->
+            val decision = ScenarioSafetyPolicy.evaluate(
+                scenario(
+                    phases = listOf(
+                        phase(
+                            id = "gpu-origin-$index",
+                            durationMs = 5_000L,
+                            includeGlLayer = true,
+                            workloads = LoadSetpoints(gpu = 0.8f),
+                        ),
+                        phase(
+                            id = "remove-gl-$index",
+                            durationMs = 5_000L,
+                            transition = transition,
+                        ),
+                    ),
+                ),
+                limits(),
+            )
+
+            assertRejected(decision)
+            assertTrue(decision.rejectionReason!!.contains("physical GPU load producer"))
+        }
+
+        val step = ScenarioSafetyPolicy.evaluate(
+            scenario(
+                phases = listOf(
+                    phase(
+                        id = "gpu-origin",
+                        includeGlLayer = true,
+                        workloads = LoadSetpoints(gpu = 0.8f),
+                    ),
+                    phase(
+                        id = "explicit-step-release",
+                        transition = TransitionSpec(mode = TransitionMode.STEP),
+                    ),
+                ),
+            ),
+            limits(),
+        )
+        assertAccepted(step)
+    }
+
+    @Test
+    fun everyDecoderRouteRequiresASelectedVerifiedBuffer() {
+        listOf(
+            PixelRoute.YUV_420,
+            PixelRoute.P010,
+            PixelRoute.SBWC_AUTO,
+            PixelRoute.SBWC_REQUIRED,
+        ).forEach { route ->
+            val decision = ScenarioSafetyPolicy.evaluate(
+                scenario(phases = listOf(phase(pixelRoute = route))),
+                limits(),
+                selectedDecoderBuffer = null,
+            )
+
+            assertRejected(decision)
+            assertTrue(decision.rejectionReason!!.contains("selected"))
+        }
     }
 
     @Test

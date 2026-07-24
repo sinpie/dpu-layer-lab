@@ -92,6 +92,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.example.dpulayerlab.BuildConfig
 import com.example.dpulayerlab.engine.LabController
 import com.example.dpulayerlab.engine.ScenarioCatalog
 import com.example.dpulayerlab.engine.GaugePeak
@@ -151,13 +152,14 @@ private enum class AppSection(val label: String, val glyph: String) {
 
 private data class RunningHudSample(
     val layerCount: Float,
-    val dpuBusy: Float?,
-    val cpuBusy: Float?,
-    val gpuBusy: Float?,
+    val dpuBusy: Gauge,
+    val cpuBusy: Gauge,
+    val gpuBusy: Gauge,
 )
 
 private data class LiveHudMetricSpec(
     val label: String,
+    val provenance: String,
     val value: Float?,
     val valueText: String,
     val history: List<Float?>,
@@ -204,7 +206,7 @@ fun DpuLayerLabApp(controller: LabController) {
     val planProgress = controller.planProgress
     val error = controller.errorMessage
     val mediaPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        controller.setMediaUri(uri)
+        uri?.let(controller::setMediaUri)
     }
 
     LaunchedEffect(progress.stage, planProgress.state) {
@@ -279,16 +281,19 @@ fun DpuLayerLabApp(controller: LabController) {
                             Column {
                                 Text("DPULayerTest", style = MaterialTheme.typography.titleLarge)
                                 Text(
-                                    when {
-                                        controller.telemetry.exactUnderruns != null ->
-                                            "direct underrun counter connected"
-                                        controller.hasDumpPermission ->
-                                            "privileged composition · proxy mode"
-                                        else ->
-                                            "portable telemetry · proxy mode"
-                                    },
+                                    "${visibleAppVersion(BuildConfig.VERSION_NAME)} · " +
+                                        when {
+                                            controller.telemetry.exactUnderruns != null ->
+                                                "direct underrun counter connected"
+                                            controller.hasDumpPermission ->
+                                                "privileged composition · proxy mode"
+                                            else ->
+                                                "portable telemetry · proxy mode"
+                                        },
                                     style = MaterialTheme.typography.labelLarge,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
                                 )
                             }
                         }
@@ -302,12 +307,13 @@ fun DpuLayerLabApp(controller: LabController) {
                     modifier = Modifier.navigationBarsPadding(),
                     containerColor = MaterialTheme.colorScheme.surface,
                 ) {
-                    listOf(
-                        AppSection.DASHBOARD,
-                        AppSection.CATALOG,
-                        AppSection.BUILDER,
-                        AppSection.SYSTEM,
-                    ).forEach { item ->
+                    buildList {
+                        add(AppSection.DASHBOARD)
+                        add(AppSection.CATALOG)
+                        add(AppSection.BUILDER)
+                        add(AppSection.SYSTEM)
+                        if (controller.lastSummary != null) add(AppSection.RESULT)
+                    }.forEach { item ->
                         NavigationBarItem(
                             selected = section == item,
                             onClick = { section = item },
@@ -664,8 +670,12 @@ private fun MetricCard(
 
 @Composable
 private fun TrendCard(controller: LabController) {
-    val cpu = controller.telemetryHistory.mapNotNull { it.cpu.value }
-    val memory = controller.telemetryHistory.mapNotNull { it.memoryUsed.value }
+    val cpu = controller.telemetryHistory.map {
+        it.cpu.value?.takeIf(Float::isFinite)
+    }
+    val memory = controller.telemetryHistory.map {
+        it.memoryUsed.value?.takeIf(Float::isFinite)
+    }
     val gridColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.28f)
     val memoryColor = MaterialTheme.colorScheme.secondary
     val cpuColor = MaterialTheme.colorScheme.primary
@@ -684,15 +694,33 @@ private fun TrendCard(controller: LabController) {
                     .fillMaxWidth()
                     .height(90.dp),
             ) {
-                fun line(values: List<Float>, color: Color) {
-                    if (values.size < 2) return
+                fun line(values: List<Float?>, color: Color) {
+                    if (values.isEmpty()) return
                     val path = Path()
+                    var previousWasValue = false
+                    var hasValue = false
                     values.forEachIndexed { index, value ->
-                        val x = index.toFloat() / (values.size - 1) * size.width
+                        if (value == null) {
+                            previousWasValue = false
+                            return@forEachIndexed
+                        }
+                        val x = if (values.size == 1) {
+                            size.width
+                        } else {
+                            index.toFloat() / (values.size - 1) * size.width
+                        }
                         val y = size.height - value.coerceIn(0f, 100f) / 100f * size.height
-                        if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                        if (previousWasValue) path.lineTo(x, y) else path.moveTo(x, y)
+                        previousWasValue = true
+                        hasValue = true
                     }
-                    drawPath(path, color, style = Stroke(width = 3.dp.toPx(), cap = StrokeCap.Round))
+                    if (hasValue) {
+                        drawPath(
+                            path,
+                            color,
+                            style = Stroke(width = 3.dp.toPx(), cap = StrokeCap.Round),
+                        )
+                    }
                 }
                 drawLine(
                     gridColor,
@@ -1640,6 +1668,14 @@ private fun BuilderScreen(controller: LabController, modifier: Modifier) {
                 EnumSelector("Pixel route", route, PixelRoute.entries) { route = it }
                 EnumSelector("Buffer size", size, BufferSize.entries) { size = it }
                 EnumSelector("Motion", motion, MotionProfile.entries) { motion = it }
+                if (motion == MotionProfile.Z_ORDER_SWAP) {
+                    Text(
+                        "View translationZ 기반 client proxy입니다. physical Surface/HWC " +
+                            "Z-order 변경이나 HWC capability의 exact 판정으로 사용하지 않습니다.",
+                        color = MaterialTheme.colorScheme.tertiary,
+                        style = MaterialTheme.typography.labelMedium,
+                    )
+                }
             }
         }
         item {
@@ -1914,13 +1950,14 @@ private fun RunningScreen(controller: LabController) {
 
     LaunchedEffect(renderStage, progress.producerGeneration) {
         if (!renderStage && progress.producerGeneration > 0L) {
-            stageView?.release()
+            val stopped = stageView?.release() ?: true
             stageView = null
             // Stage removal and producer-thread termination are independent facts. Always
             // acknowledge removal; the process-wide lease remains authoritative while a bounded
             // controller barrier polls a producer that is still draining.
-            controller.frameTracker.markProducerTeardownComplete(
-                progress.producerGeneration,
+            controller.onRendererStageRemoved(
+                generation = progress.producerGeneration,
+                stopped = stopped,
             )
         }
     }
@@ -1937,9 +1974,9 @@ private fun RunningScreen(controller: LabController) {
         hudSamples = (
             hudSamples + RunningHudSample(
                 layerCount = activePhase.activeLayers.toFloat(),
-                dpuBusy = telemetry.dpuBusy.value,
-                cpuBusy = telemetry.cpu.value,
-                gpuBusy = telemetry.gpuBusy.value,
+                dpuBusy = telemetry.dpuBusy,
+                cpuBusy = telemetry.cpu,
+                gpuBusy = telemetry.gpuBusy,
             )
             ).takeLast(60)
     }
@@ -1965,18 +2002,7 @@ private fun RunningScreen(controller: LabController) {
                         onProducerTeardownFailure =
                             controller.frameTracker::markProducerTeardownFailure,
                         onProducerRuntimeFailure = controller::onProducerRuntimeFailure,
-                        onStageRemoved = { generation, _ ->
-                            controller.frameTracker.markProducerTeardownComplete(generation)
-                            // Lifecycle stop can race a just-published generation before AndroidView
-                            // receives its update. In that case the detached stage is also proof
-                            // that no producer for the newer generation remains attached.
-                            val publishedGeneration = controller.progress.producerGeneration
-                            if (publishedGeneration > 0L && publishedGeneration != generation) {
-                                controller.frameTracker.markProducerTeardownComplete(
-                                    publishedGeneration,
-                                )
-                            }
-                        },
+                        onStageRemoved = controller::onRendererStageRemoved,
                     )
                 },
                 modifier = Modifier
@@ -2004,8 +2030,14 @@ private fun RunningScreen(controller: LabController) {
     }
     DisposableEffect(Unit) {
         onDispose {
-            stageView?.release()
-            stageView = null
+            try {
+                stageView?.release()
+            } finally {
+                stageView = null
+                // This also clears the close-time lifecycle token when disposal happened before
+                // AndroidView.factory created a stage. Live native workers keep their own leases.
+                controller.onRendererContainerDisposed()
+            }
         }
     }
 }
@@ -2063,12 +2095,19 @@ private fun RunningHud(
         }
     } ?: 0f
     val layerHistory = remember(history) { history.map { it.layerCount } }
-    val dpuHistory = remember(history) { history.map { it.dpuBusy } }
-    val cpuHistory = remember(history) { history.map { it.cpuBusy } }
-    val gpuHistory = remember(history) { history.map { it.gpuBusy } }
+    val dpuHistory = remember(history) {
+        segmentedGaugeHistory(history.map { it.dpuBusy })
+    }
+    val cpuHistory = remember(history) {
+        segmentedGaugeHistory(history.map { it.cpuBusy })
+    }
+    val gpuHistory = remember(history) {
+        segmentedGaugeHistory(history.map { it.gpuBusy })
+    }
     val liveMetrics = listOf(
         LiveHudMetricSpec(
             label = "LAYERS",
+            provenance = "PHYSICAL",
             value = phase?.activeLayers?.toFloat(),
             valueText = phase?.let {
                 "${it.activeLayers}L · " +
@@ -2083,6 +2122,7 @@ private fun RunningHud(
         ),
         LiveHudMetricSpec(
             label = "DPU",
+            provenance = gaugeProvenanceLabel(telemetry.dpuBusy),
             value = telemetry.dpuBusy.value,
             valueText = telemetry.dpuBusy.display(),
             history = dpuHistory,
@@ -2091,6 +2131,7 @@ private fun RunningHud(
         ),
         LiveHudMetricSpec(
             label = "CPU",
+            provenance = gaugeProvenanceLabel(telemetry.cpu),
             value = telemetry.cpu.value,
             valueText = telemetry.cpu.display(),
             history = cpuHistory,
@@ -2099,6 +2140,7 @@ private fun RunningHud(
         ),
         LiveHudMetricSpec(
             label = "GPU",
+            provenance = gaugeProvenanceLabel(telemetry.gpuBusy),
             value = telemetry.gpuBusy.value,
             valueText = telemetry.gpuBusy.display(),
             history = gpuHistory,
@@ -2144,6 +2186,12 @@ private fun RunningHud(
                             style = MaterialTheme.typography.labelMedium,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            visibleAppVersion(BuildConfig.VERSION_NAME),
+                            color = Color(0xFF8FA9A1),
+                            fontSize = 8.sp,
+                            maxLines = 1,
                         )
                     }
                     Surface(color = Color(0xFF0F332C), shape = RoundedCornerShape(100.dp)) {
@@ -2207,6 +2255,7 @@ private fun RunningHud(
                                 columnMetrics.forEach { metric ->
                                     LiveHudMetric(
                                         label = metric.label,
+                                        provenance = metric.provenance,
                                         value = metric.value,
                                         valueText = metric.valueText,
                                         history = metric.history,
@@ -2221,6 +2270,7 @@ private fun RunningHud(
                     liveMetrics.forEach { metric ->
                         LiveHudMetric(
                             label = metric.label,
+                            provenance = metric.provenance,
                             value = metric.value,
                             valueText = metric.valueText,
                             history = metric.history,
@@ -2320,6 +2370,11 @@ private fun RunningHud(
     }
 }
 
+internal fun visibleAppVersion(versionName: String): String {
+    val normalized = versionName.trim().take(MAX_VISIBLE_VERSION_CHARS)
+    return "BUILD ${normalized.ifEmpty { "N/A" }}"
+}
+
 internal fun producerCountDisplay(observed: Int, expected: Int): String {
     val safeObserved = observed.coerceAtLeast(0)
     return if (expected > 0) {
@@ -2328,6 +2383,8 @@ internal fun producerCountDisplay(observed: Int, expected: Int): String {
         "$safeObserved/\u2014P"
     }
 }
+
+private const val MAX_VISIBLE_VERSION_CHARS = 64
 
 @Composable
 private fun HudProgressLine(
@@ -2550,6 +2607,7 @@ private fun RunTransitionStatus(
 @Composable
 private fun LiveHudMetric(
     label: String,
+    provenance: String,
     value: Float?,
     valueText: String,
     history: List<Float?>,
@@ -2559,16 +2617,25 @@ private fun LiveHudMetric(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .height(31.dp),
+            .height(35.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(
-            label,
-            modifier = Modifier.width(50.dp),
-            color = Color(0xFF86A39A),
-            fontWeight = FontWeight.SemiBold,
-            fontSize = 9.sp,
-        )
+        Column(Modifier.width(78.dp)) {
+            Text(
+                label,
+                color = Color(0xFF86A39A),
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 9.sp,
+                maxLines = 1,
+            )
+            Text(
+                provenance,
+                color = Color(0xFF5F8177),
+                fontSize = 7.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
         Text(
             valueText,
             modifier = Modifier.width(58.dp),
@@ -2774,7 +2841,10 @@ private fun ResultScreen(controller: LabController, modifier: Modifier, onDone: 
                 )
             }
             items(planResults, key = { "${it.runIndex}-${it.scenario.id}" }) { result ->
-                PlanResultCard(result)
+                PlanResultCard(
+                    result = result,
+                    shareReport = { controller.shareReport(result.reportPath) },
+                )
             }
             item {
                 Text(
@@ -3038,7 +3108,10 @@ private fun PlanCountMetric(
 }
 
 @Composable
-private fun PlanResultCard(result: PlanRunResult) {
+private fun PlanResultCard(
+    result: PlanRunResult,
+    shareReport: () -> Unit,
+) {
     val verdictColor = when (result.verdict) {
         RunVerdict.CLEAN -> MaterialTheme.colorScheme.primary
         RunVerdict.UNDERRUN_DETECTED -> MaterialTheme.colorScheme.error
@@ -3109,18 +3182,26 @@ private fun PlanResultCard(result: PlanRunResult) {
                     style = MaterialTheme.typography.labelSmall,
                 )
             }
-            Surface(
-                color = verdictColor.copy(alpha = 0.14f),
-                shape = RoundedCornerShape(100.dp),
-            ) {
-                Text(
-                    result.verdict.label,
-                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
-                    color = verdictColor,
-                    fontWeight = FontWeight.SemiBold,
-                    fontSize = 9.sp,
-                    maxLines = 1,
-                )
+            Column(horizontalAlignment = Alignment.End) {
+                Surface(
+                    color = verdictColor.copy(alpha = 0.14f),
+                    shape = RoundedCornerShape(100.dp),
+                ) {
+                    Text(
+                        result.verdict.label,
+                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
+                        color = verdictColor,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 9.sp,
+                        maxLines = 1,
+                    )
+                }
+                TextButton(
+                    onClick = shareReport,
+                    enabled = !result.reportPath.isNullOrBlank(),
+                ) {
+                    Text("JSON 공유", fontSize = 10.sp)
+                }
             }
         }
     }
@@ -3419,6 +3500,54 @@ private fun qualityColor(quality: MetricQuality): Color = when (quality) {
     MetricQuality.PROXY,
     -> MaterialTheme.colorScheme.tertiary
     MetricQuality.UNAVAILABLE -> MaterialTheme.colorScheme.outline
+}
+
+/**
+ * Keeps the HUD time axis intact while preventing a line from joining samples that came from
+ * different measurement domains. The first sample after an explicit N/A can be drawn because the
+ * N/A itself already creates a gap; a direct provenance switch consumes one sample as the gap.
+ */
+internal fun segmentedGaugeHistory(samples: List<Gauge>): List<Float?> {
+    var previousProvenance: Pair<MetricQuality, String>? = null
+    return samples.map { gauge ->
+        val value = gauge.value?.takeIf(Float::isFinite)
+        val source = gauge.source.trim()
+        if (
+            value == null ||
+            gauge.quality == MetricQuality.UNAVAILABLE ||
+            source.isEmpty()
+        ) {
+            previousProvenance = null
+            null
+        } else {
+            val provenance = gauge.quality to source
+            if (previousProvenance != null && previousProvenance != provenance) {
+                previousProvenance = provenance
+                null
+            } else {
+                previousProvenance = provenance
+                value
+            }
+        }
+    }
+}
+
+internal fun gaugeProvenanceLabel(gauge: Gauge): String {
+    val quality = when (gauge.quality) {
+        MetricQuality.HARDWARE_COUNTER -> "HW"
+        MetricQuality.KERNEL -> "KRN"
+        MetricQuality.SYSTEM_SERVICE -> "SYS"
+        MetricQuality.MEASURED -> "MEAS"
+        MetricQuality.ESTIMATED -> "EST"
+        MetricQuality.PROXY -> "PROXY"
+        MetricQuality.UNAVAILABLE -> "N/A"
+    }
+    if (gauge.quality == MetricQuality.UNAVAILABLE) return quality
+    val source = gauge.source
+        .trim()
+        .replace(Regex("\\s+"), " ")
+        .take(18)
+    return if (source.isEmpty()) quality else "$quality · $source"
 }
 
 private fun Gauge.provenanceLabel(): String =

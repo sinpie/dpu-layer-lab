@@ -349,7 +349,10 @@ object ScenarioCatalog {
     private fun dvfsVideoShock() = ScenarioSpec(
         id = "dvfs-video-shock",
         name = "Idle → 4K Video Shock",
-        description = "RGB 1-layer settle에서 4K decoder-to-Surface와 RGB overlay로 즉시 전환해 codec/DPU/DRAM 동시 ramp를 확인합니다. 영상이 없으면 visual proxy로 실행됩니다.",
+        description =
+            "RGB 1-layer settle에서 4K decoder-to-Surface와 RGB overlay로 즉시 전환해 " +
+                "codec/DPU/DRAM 동시 ramp를 확인합니다. 검증된 로컬 영상이 없으면 " +
+                "proxy로 대체하지 않고 실행 전에 거부합니다.",
         category = ScenarioCategory.VIDEO_FORMAT,
         risk = RiskLevel.HIGH,
         tags = setOf("DVFS", "4K", "YUV", "decoder", "overlay"),
@@ -457,7 +460,9 @@ object ScenarioCatalog {
     private fun transformStorm() = ScenarioSpec(
         id = "transform-storm",
         name = "Transform Storm",
-        description = "12개 layer가 서로 다른 위상으로 확대/축소/스크롤/회전/Z-order 전환합니다.",
+        description = "12개 layer가 서로 다른 위상으로 확대/축소/스크롤/회전하고 " +
+            "View/client Z-order proxy를 실행합니다. Z proxy는 translationZ 기반이며 " +
+            "physical Surface/HWC Z-order 전환 또는 HWC 능력의 exact 증거가 아닙니다.",
         category = ScenarioCategory.TRANSFORM,
         risk = RiskLevel.HIGH,
         tags = setOf("zoom", "scroll", "rotate", "120Hz"),
@@ -474,7 +479,15 @@ object ScenarioCatalog {
                 motion = MotionProfile.TRANSFORM_STORM,
                 alpha = true,
             ),
-            phase("z", "Z-order swap", 8, 12, 90f, 90f, motion = MotionProfile.Z_ORDER_SWAP),
+            phase(
+                "z",
+                "View/client Z proxy (not physical HWC)",
+                8,
+                12,
+                90f,
+                90f,
+                motion = MotionProfile.Z_ORDER_SWAP,
+            ),
             phase("cool", "Static recovery", 5, 2, 60f, 60f),
         ),
     )
@@ -482,7 +495,9 @@ object ScenarioCatalog {
     private fun mixed4k() = ScenarioSpec(
         id = "4k-mixed",
         name = "4K YUV + RGB Overlay",
-        description = "4K decoder-to-Surface 경로와 RGB overlay, memory pulse를 함께 실행합니다. 영상 미선택 시 YUV proxy입니다.",
+        description =
+            "4K decoder-to-Surface 경로와 RGB overlay, memory pulse를 함께 실행합니다. " +
+                "검증된 로컬 영상이 없으면 YUV proxy로 대체하지 않고 실행 전에 거부합니다.",
         category = ScenarioCategory.VIDEO_FORMAT,
         risk = RiskLevel.HIGH,
         tags = setOf("4K", "YUV", "overlay", "memory"),

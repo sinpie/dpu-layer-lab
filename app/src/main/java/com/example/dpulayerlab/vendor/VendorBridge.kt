@@ -19,6 +19,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.locks.LockSupport
 
 data class VendorSnapshot(
     val apiVersion: Int,
@@ -45,6 +46,23 @@ data class VendorCompressionControlResult(
     val serviceSession: Long?,
 )
 
+internal enum class NpuControlCommandState {
+    APPLIED,
+    PENDING,
+    FAILED,
+}
+
+internal data class NpuControlCommandHealth(
+    val state: NpuControlCommandState,
+    val detail: String,
+)
+
+internal data class NpuControlCommandTicket(
+    val version: Long,
+    val serviceSession: Long?,
+    val submittedAtNanos: Long,
+)
+
 class VendorBridge private constructor(private val context: Context) : AutoCloseable {
     private val connectionLock = Any()
     @Volatile
@@ -65,8 +83,15 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
     private val bindingGeneration = AtomicLong(0L)
     private val serviceGeneration = AtomicLong(0L)
     private val npuCommandVersion = AtomicLong(0L)
+    private val npuCommandAcknowledgments = NpuCommandAcknowledgments()
+    private val initialNpuCommandTicket =
+        npuCommandAcknowledgments.recordPending(version = 0L, serviceSession = null)
     private val desiredNpuCommand = AtomicReference(
-        NpuCommand(intensity = 0f, shape = LoadShape.STEADY, version = 0L),
+        NpuCommand(
+            intensity = 0f,
+            shape = LoadShape.STEADY,
+            ticket = initialNpuCommandTicket,
+        ),
     )
     private val pendingNpuCommand = AtomicReference<NpuCommand?>(null)
     private val npuDrainScheduled = AtomicBoolean(false)
@@ -149,7 +174,14 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
 
             override fun onServiceDisconnected(name: ComponentName) {
                 if (!clearCurrentService(this, generation)) return
-                publishPendingNpuCommand(desiredNpuCommand.get())
+                val desired = desiredNpuCommand.get()
+                if (desired.intensity > 0f) {
+                    npuCommandAcknowledgments.recordFailed(
+                        desired.ticket,
+                        "Vendor NPU service disconnected",
+                    )
+                }
+                publishPendingNpuCommand(desired)
                 binding.set(false)
                 // This binding remains registered; Android will reconnect it automatically.
             }
@@ -280,16 +312,76 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
                 )
 
     fun setNpuLoad(intensity: Float, shape: LoadShape) {
-        if (closed.get()) return
+        requestNpuLoad(intensity, shape)
+    }
+
+    internal fun requestNpuLoad(
+        intensity: Float,
+        shape: LoadShape,
+    ): NpuControlCommandTicket? {
+        if (closed.get()) return null
+        val version = npuCommandVersion.incrementAndGet()
+        val ticket = npuCommandAcknowledgments.recordPending(
+            version = version,
+            serviceSession = currentServiceSession(),
+        )
         val command = NpuCommand(
             intensity = intensity.takeIf(Float::isFinite)?.coerceIn(0f, 1f) ?: 0f,
             shape = shape,
-            version = npuCommandVersion.incrementAndGet(),
+            ticket = ticket,
         )
         val latestDesired = publishDesiredNpuCommand(command)
         publishPendingNpuCommand(latestDesired)
-        scheduleNpuDrain()
+        if (!scheduleNpuDrain() && latestDesired.ticket == ticket) {
+            npuCommandAcknowledgments.recordFailed(
+                ticket,
+                "Vendor NPU control executor rejected command",
+            )
+        }
+        return ticket
     }
+
+    internal fun awaitNpuLoadApplied(
+        ticket: NpuControlCommandTicket,
+        timeoutMs: Long,
+    ): NpuControlCommandHealth {
+        val boundedTimeoutMs = timeoutMs.coerceIn(1L, MAX_NPU_APPLY_ACK_TIMEOUT_MS)
+        val deadlineNanos = System.nanoTime() +
+            TimeUnit.MILLISECONDS.toNanos(boundedTimeoutMs)
+        while (true) {
+            val health = npuControlHealth(ticket, boundedTimeoutMs)
+            if (health.state != NpuControlCommandState.PENDING) return health
+            val remainingNanos = deadlineNanos - System.nanoTime()
+            if (remainingNanos <= 0L) {
+                return npuControlHealth(ticket, pendingTimeoutMs = 1L)
+            }
+            LockSupport.parkNanos(
+                remainingNanos.coerceAtMost(NPU_ACK_POLL_NANOS),
+            )
+            if (Thread.interrupted()) {
+                Thread.currentThread().interrupt()
+                npuCommandAcknowledgments.recordFailed(
+                    ticket,
+                    "Vendor NPU apply confirmation interrupted",
+                )
+                return npuControlHealth(ticket, pendingTimeoutMs = 1L)
+            }
+        }
+    }
+
+    internal fun npuControlHealth(
+        ticket: NpuControlCommandTicket,
+        pendingTimeoutMs: Long,
+    ): NpuControlCommandHealth =
+        npuCommandAcknowledgments.health(
+            ticket = ticket,
+            latestDesiredVersion = desiredNpuCommand.get().version,
+            currentServiceSession = currentServiceSession(),
+            pendingTimeoutMs = pendingTimeoutMs.coerceIn(
+                1L,
+                MAX_NPU_PENDING_TIMEOUT_MS,
+            ),
+        )
 
     /**
      * Ordered run-boundary zero. The confirmation task shares the NPU lane, so success means all
@@ -366,11 +458,15 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
         reconnectScheduled.set(false)
         cancelCapabilityRetry(resetAttempt = false)
         val brokerWasConnected = service != null
+        val closeTicket = npuCommandAcknowledgments.recordPending(
+            version = npuCommandVersion.incrementAndGet(),
+            serviceSession = currentServiceSession(),
+        )
         desiredNpuCommand.set(
             NpuCommand(
                 intensity = 0f,
                 shape = LoadShape.STEADY,
-                version = npuCommandVersion.incrementAndGet(),
+                ticket = closeTicket,
             ),
         )
         pendingNpuCommand.set(null)
@@ -451,8 +547,9 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
      * product Binder call may be slower. Keeping at most one pending command prevents an
      * unbounded executor queue and ensures release-to-zero supersedes stale ramp values.
      */
-    private fun scheduleNpuDrain() {
-        if (closed.get() || !npuDrainScheduled.compareAndSet(false, true)) return
+    private fun scheduleNpuDrain(): Boolean {
+        if (closed.get()) return false
+        if (!npuDrainScheduled.compareAndSet(false, true)) return true
         var accepted = runCatching {
             npuExecutor.execute(::drainNpuCommands)
         }.isSuccess
@@ -470,28 +567,61 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
             // Keep the latest command so a later setpoint update can retry scheduling. In
             // particular, never erase a release-to-zero merely because telemetry filled the
             // bounded queue.
+            pendingNpuCommand.get()?.let { pending ->
+                npuCommandAcknowledgments.recordFailed(
+                    pending.ticket,
+                    "Vendor NPU control executor rejected command",
+                )
+            }
         }
+        return accepted
     }
 
     private fun drainNpuCommands() {
         var failedCommandVersion: Long? = null
+        var failedCommand: NpuCommand? = null
         var allowSameVersionRetry = false
         try {
             while (!closed.get()) {
-                val remote = service ?: break
+                val target = synchronized(connectionLock) {
+                    val remote = service ?: return@synchronized null
+                    RemoteCallTarget(
+                        remote = remote,
+                        binder = serviceBinder,
+                        serviceSession = serviceGeneration.get(),
+                    )
+                } ?: break
                 if (npuSupported != true) {
                     pendingNpuCommand.set(null)
                     break
                 }
                 val command = pendingNpuCommand.getAndSet(null) ?: break
-                val applied = runCatching {
-                    if (command.intensity <= 0f) {
-                        remote.stopNpuLoad()
-                    } else {
-                        remote.setNpuLoad(command.intensity, command.shape.wireValue())
-                    }
-                }.isSuccess
-                if (!applied) {
+                if (command.ticket.serviceSession != target.serviceSession) {
+                    npuCommandAcknowledgments.recordFailed(
+                        command.ticket,
+                        "Vendor NPU service session changed before apply",
+                    )
+                    continue
+                }
+                val inFlight = npuCommandAcknowledgments.recordStarted(command.ticket)
+                val applied = try {
+                    runCatching {
+                        if (command.intensity <= 0f) {
+                            target.remote.stopNpuLoad()
+                        } else {
+                            target.remote.setNpuLoad(
+                                command.intensity,
+                                command.shape.wireValue(),
+                            )
+                        }
+                    }.isSuccess &&
+                        isCurrentRemoteCallTarget(target, allowClosed = false)
+                } finally {
+                    npuCommandAcknowledgments.recordFinished(inFlight)
+                }
+                if (applied) {
+                    npuCommandAcknowledgments.recordApplied(command.ticket)
+                } else {
                     // Preserve the newest desired setpoint for the next connection/setpoint
                     // event. A command posted while this Binder call was in flight, especially
                     // release-to-zero, must be drained immediately. Retry suppression applies
@@ -499,6 +629,7 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
                     val desired = desiredNpuCommand.get()
                     publishPendingNpuCommand(desired)
                     failedCommandVersion = command.version
+                    failedCommand = command
                     // A vendor setter is idempotent. One bounded retry improves load fidelity for
                     // transient Binder/provider failures without creating a backlog or retry loop.
                     allowSameVersionRetry =
@@ -523,7 +654,21 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
                 service != null &&
                 npuSupported == true
             ) {
-                scheduleNpuDrain()
+                if (!scheduleNpuDrain()) {
+                    pending?.let {
+                        npuCommandAcknowledgments.recordFailed(
+                            it.ticket,
+                            "Vendor NPU retry executor rejected command",
+                        )
+                    }
+                }
+            } else {
+                failedCommand?.let { failed ->
+                    npuCommandAcknowledgments.recordFailed(
+                        failed.ticket,
+                        "Vendor NPU setter failed after bounded retry",
+                    )
+                }
             }
         }
     }
@@ -619,6 +764,13 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
                         scheduleNpuDrain()
                     } else {
                         pendingNpuCommand.set(null)
+                        val desired = desiredNpuCommand.get()
+                        if (desired.intensity > 0f) {
+                            npuCommandAcknowledgments.recordFailed(
+                                desired.ticket,
+                                "Vendor service reported NPU workload control unsupported",
+                            )
+                        }
                     }
                 }
                 if (merged.complete) {
@@ -694,7 +846,14 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
                 runCatching { context.unbindService(connection) }
             }
         }
-        publishPendingNpuCommand(desiredNpuCommand.get())
+        val desired = desiredNpuCommand.get()
+        if (desired.intensity > 0f) {
+            npuCommandAcknowledgments.recordFailed(
+                desired.ticket,
+                "Vendor NPU Binder registration lost",
+            )
+        }
+        publishPendingNpuCommand(desired)
         if (!closed.get()) scheduleReconnect()
     }
 
@@ -753,6 +912,15 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
         generation: Long,
     ) {
         val detachedCurrent = abandonUnregisteredBinding(connection, generation)
+        if (detachedCurrent) {
+            val desired = desiredNpuCommand.get()
+            if (desired.intensity > 0f) {
+                npuCommandAcknowledgments.recordFailed(
+                    desired.ticket,
+                    "Vendor NPU service binding failed",
+                )
+            }
+        }
         if (shouldScheduleReconnectAfterBindFailure(detachedCurrent, closed.get())) {
             scheduleReconnect()
         }
@@ -950,7 +1118,11 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
     private fun replayDesiredNpuCommand() {
         while (true) {
             val current = desiredNpuCommand.get()
-            val replay = current.copy(version = npuCommandVersion.incrementAndGet())
+            val replayTicket = npuCommandAcknowledgments.recordPending(
+                version = npuCommandVersion.incrementAndGet(),
+                serviceSession = currentServiceSession(),
+            )
+            val replay = current.copy(ticket = replayTicket)
             if (desiredNpuCommand.compareAndSet(current, replay)) {
                 publishPendingNpuCommand(replay)
                 return
@@ -1059,6 +1231,8 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
         const val SHUTDOWN_RESET_ATTEMPTS = 2
         const val NPU_QUIESCE_TIMEOUT_MS = 500L
         const val NPU_RELEASE_TIMEOUT_MS = 500L
+        const val MAX_NPU_APPLY_ACK_TIMEOUT_MS = 1_000L
+        const val MAX_NPU_PENDING_TIMEOUT_MS = 2_000L
         const val REMOTE_LANE_QUIESCE_TIMEOUT_MS = 200L
         const val INITIAL_RECONNECT_DELAY_MS = 250L
         const val MAX_RECONNECT_DELAY_MS = 4_000L
@@ -1066,6 +1240,7 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
         const val INITIAL_CAPABILITY_RETRY_DELAY_MS = 100L
         const val MAX_CAPABILITY_RETRY_DELAY_MS = 800L
         const val STEADY_CAPABILITY_RETRY_DELAY_MS = 4_000L
+        private const val NPU_ACK_POLL_NANOS = 2_000_000L
 
         private fun newRemoteExecutor(threadName: String) = ThreadPoolExecutor(
             1,
@@ -1127,8 +1302,11 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
     private data class NpuCommand(
         val intensity: Float,
         val shape: LoadShape,
-        val version: Long,
-    )
+        val ticket: NpuControlCommandTicket,
+    ) {
+        val version: Long
+            get() = ticket.version
+    }
 
     private data class RemoteResetResult(
         val npuStopConfirmed: Boolean = false,
@@ -1256,6 +1434,162 @@ internal fun shouldRetryPendingNpuCommand(
  */
 internal fun isNewerSequence(candidate: Long, current: Long): Boolean =
     candidate != current && candidate - current > 0L
+
+/**
+ * Versioned apply evidence shared by the Binder and reflection NPU backends. A later request
+ * replaces the observable record, and completion of an older call is therefore unable to make
+ * the latest request look applied. The in-flight timestamp belongs to the serialized control
+ * lane, so a stream of newer 100 ms setpoints cannot hide one setter that stopped returning.
+ */
+internal class NpuCommandAcknowledgments(
+    private val monotonicNowNanos: () -> Long = System::nanoTime,
+) {
+    private val latest = AtomicReference<NpuCommandRecord?>(null)
+    private val inFlight = AtomicReference<NpuInFlightCommand?>(null)
+
+    fun recordPending(
+        version: Long,
+        serviceSession: Long?,
+    ): NpuControlCommandTicket {
+        val ticket = NpuControlCommandTicket(
+            version = version,
+            serviceSession = serviceSession,
+            submittedAtNanos = monotonicNowNanos(),
+        )
+        while (true) {
+            val current = latest.get()
+            if (
+                current != null &&
+                !shouldPublishNpuCommand(current.ticket.version, ticket.version)
+            ) {
+                return ticket
+            }
+            val candidate = NpuCommandRecord(
+                ticket = ticket,
+                state = NpuControlCommandState.PENDING,
+                detail = "NPU apply acknowledgment pending",
+            )
+            if (latest.compareAndSet(current, candidate)) return ticket
+        }
+    }
+
+    fun recordStarted(ticket: NpuControlCommandTicket): NpuInFlightCommand {
+        val command = NpuInFlightCommand(
+            ticket = ticket,
+            startedAtNanos = monotonicNowNanos(),
+        )
+        inFlight.set(command)
+        return command
+    }
+
+    fun recordFinished(command: NpuInFlightCommand) {
+        inFlight.compareAndSet(command, null)
+    }
+
+    fun recordApplied(ticket: NpuControlCommandTicket) {
+        updateMatching(
+            ticket = ticket,
+            state = NpuControlCommandState.APPLIED,
+            detail = "NPU apply acknowledged",
+        )
+    }
+
+    fun recordFailed(ticket: NpuControlCommandTicket, detail: String) {
+        updateMatching(
+            ticket = ticket,
+            state = NpuControlCommandState.FAILED,
+            detail = detail,
+        )
+    }
+
+    fun health(
+        ticket: NpuControlCommandTicket,
+        latestDesiredVersion: Long,
+        currentServiceSession: Long?,
+        pendingTimeoutMs: Long,
+    ): NpuControlCommandHealth {
+        if (latestDesiredVersion != ticket.version) {
+            return NpuControlCommandHealth(
+                state = NpuControlCommandState.FAILED,
+                detail = "NPU setpoint was superseded before confirmation",
+            )
+        }
+        if (
+            ticket.serviceSession == null ||
+            currentServiceSession != ticket.serviceSession
+        ) {
+            recordFailed(ticket, "NPU control service session is unavailable or changed")
+        }
+        val boundedTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(
+            pendingTimeoutMs.coerceIn(1L, MAX_TRACKED_NPU_TIMEOUT_MS),
+        )
+        val nowNanos = monotonicNowNanos()
+        val active = inFlight.get()
+        if (
+            active != null &&
+            elapsedNanos(nowNanos, active.startedAtNanos) >= boundedTimeoutNanos
+        ) {
+            recordFailed(
+                ticket,
+                "NPU control lane timed out while applying version ${active.ticket.version}",
+            )
+        }
+        var record = latest.get()
+        if (record?.ticket?.version != ticket.version) {
+            return NpuControlCommandHealth(
+                state = NpuControlCommandState.FAILED,
+                detail = "NPU apply evidence is unavailable for the latest setpoint",
+            )
+        }
+        if (
+            record.state == NpuControlCommandState.PENDING &&
+            elapsedNanos(nowNanos, ticket.submittedAtNanos) >= boundedTimeoutNanos
+        ) {
+            recordFailed(ticket, "NPU apply acknowledgment timed out")
+            record = latest.get()
+        }
+        return NpuControlCommandHealth(
+            state = record?.state ?: NpuControlCommandState.FAILED,
+            detail = record?.detail ?: "NPU apply evidence is unavailable",
+        )
+    }
+
+    private fun updateMatching(
+        ticket: NpuControlCommandTicket,
+        state: NpuControlCommandState,
+        detail: String,
+    ) {
+        while (true) {
+            val current = latest.get() ?: return
+            if (current.ticket.version != ticket.version) return
+            if (current.state == NpuControlCommandState.FAILED) return
+            val candidate = NpuCommandRecord(
+                ticket = current.ticket,
+                state = state,
+                detail = detail,
+            )
+            if (latest.compareAndSet(current, candidate)) return
+        }
+    }
+
+    internal data class NpuInFlightCommand(
+        val ticket: NpuControlCommandTicket,
+        val startedAtNanos: Long,
+    )
+
+    private data class NpuCommandRecord(
+        val ticket: NpuControlCommandTicket,
+        val state: NpuControlCommandState,
+        val detail: String,
+    )
+
+    private companion object {
+        const val MAX_TRACKED_NPU_TIMEOUT_MS = 60_000L
+
+        fun elapsedNanos(nowNanos: Long, startedAtNanos: Long): Long =
+            (nowNanos - startedAtNanos).coerceAtLeast(0L)
+    }
+}
 
 internal fun reconnectDelayMs(attempt: Long): Long {
     val shift = attempt.coerceIn(0L, 4L).toInt()

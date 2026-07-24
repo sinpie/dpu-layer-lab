@@ -177,6 +177,29 @@ class LoadTransitionEvaluatorTest {
     }
 
     @Test
+    fun removingGlTopologyDropsGpuLoadBeforeTheNewTopologyRuns() {
+        val previous = phase(
+            layers = 2,
+            fps = 60f,
+            loads = LoadSetpoints(gpu = 0.8f),
+        ).copy(includeGlLayer = true)
+        val target = phase(
+            layers = 1,
+            fps = 60f,
+            loads = LoadSetpoints(),
+            transition = TransitionSpec(TransitionMode.LINEAR_RAMP),
+        )
+
+        val origin = LoadTransitionEvaluator.interpolate(previous, target, 0f)
+        val switched = LoadTransitionEvaluator.interpolate(previous, target, 0.01f)
+
+        assertTrue(origin.hasGpuLoadProducer())
+        assertEquals(0.8f, origin.workloads.gpu)
+        assertTrue(!switched.hasGpuLoadProducer())
+        assertEquals(0f, switched.workloads.gpu)
+    }
+
+    @Test
     fun floorKeepsRecoveryAboveConfiguredMinimum() {
         val spec = TransitionSpec(
             mode = TransitionMode.TRIANGLE_WAVE,

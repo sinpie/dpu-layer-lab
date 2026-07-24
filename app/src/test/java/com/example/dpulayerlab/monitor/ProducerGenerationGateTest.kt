@@ -230,6 +230,20 @@ class ProducerGenerationGateTest {
         assertTrue(
             gate.readiness(generation, nowMs = 4_001L).topologyPublishedAtMs == 2_300L,
         )
+        assertEquals(1L, gate.readiness(generation, nowMs = 4_001L).topologyRevision)
+    }
+
+    @Test
+    fun topologyRevisionChangesOnlyWhenTheCommittedProducerSetChanges() {
+        val gate = ProducerGenerationGate()
+        val generation = gate.begin(nowMs = 0L)
+
+        assertTrue(gate.expect(generation, setOf(5L), nowMs = 10L))
+        assertEquals(1L, gate.readiness(generation, nowMs = 11L).topologyRevision)
+        assertTrue(gate.expect(generation, setOf(5L), nowMs = 20L))
+        assertEquals(1L, gate.readiness(generation, nowMs = 21L).topologyRevision)
+        assertTrue(gate.expect(generation, setOf(6L), nowMs = 30L))
+        assertEquals(2L, gate.readiness(generation, nowMs = 31L).topologyRevision)
     }
 
     @Test

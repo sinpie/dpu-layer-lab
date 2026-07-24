@@ -1,7 +1,10 @@
 # System / BSP 통합
 
-사용자에게 보이는 launcher/Gradle project 이름은 **DPULayerTest 0.2.0**이고 canonical
-source remote는 `sinpie/dpu-layer-lab`입니다. 아래 `DpuLayerLab` directory/Soong module,
+사용자에게 보이는 launcher/Gradle project 이름은 **DPULayerTest**이고 release version은
+`20260724_111816`(`versionCode 3`), debug version은 `20260724_111816-debug`입니다.
+`yyyyMMdd_HHmmss`는 KST build 시각입니다. 앱 상단·실행 HUD·보고서에 같은 version이
+표시됩니다. release tag는 `v20260724_111816`이고 canonical source remote는
+`sinpie/dpu-layer-lab`입니다. 아래 `DpuLayerLab` directory/Soong module,
 package `com.example.dpulayerlab`, automation action/component, vendor action/AIDL과
 `dpu-layer-lab-` report prefix는 기존 제품 이미지·harness·consumer 호환성을 위한 stable
 identifier입니다. 표시 이름에 맞춰 이 계약들을 일괄 rename하지 마세요.
@@ -37,12 +40,13 @@ Product image
 
 샘플 `Android.bp`는 Soong이 platform certificate로 다시 서명하는 구성입니다. 외부에서 이미 platform key로 서명한 APK를 쓴다면 `certificate: "PRESIGNED"`로 바꿉니다.
 
-GitHub의 0.2.0 debug APK는 Android debug key로 서명된 lab-only 산출물이며 debug
-manifest가 automation alias의 `CONTROL_TESTS` permission을 제거합니다. 제품 이미지에
-넣지 마세요. `DPULayerTest-v0.2.0-release-unsigned.apk`는 Soong 또는 secure signing
+GitHub의 `DPULayerTest-20260724_111816-debug.apk`는 Android debug key로 서명된
+lab-only 산출물이며 debug manifest가 automation alias의 `CONTROL_TESTS` permission을
+제거합니다. 제품 이미지에 넣지 마세요.
+`DPULayerTest-20260724_111816-release-unsigned.apk`는 Soong 또는 secure signing
 pipeline 입력용이며 그대로 설치하는 최종 제품 APK가 아닙니다. Platform key,
 certificate, keystore, password/token은 저장소, GitHub Release, `dist/`에 두지 않고
-제품 보안 환경에서만 사용합니다.
+제품 보안 환경에서만 사용합니다. Release에는 두 APK와 `SHA256SUMS.txt`만 배포합니다.
 
 현재 APK가 요청하는 privileged permission은 SurfaceFlinger 진단 snapshot용 `DUMP`
 하나이며 APK와 같은 partition의 allowlist에 선언해야 합니다. portable refresh 경로는
@@ -152,6 +156,18 @@ client process death, Binder disconnect, thermal/low-memory emergency 또는 lea
 기간의 bounded lease로 취급하세요. 제품용 계약에서는 `begin/renew/end` token과
 `linkToDeath`를 추가해 긴 phase가 명시적으로 lease를 갱신하도록 하는 편이 안전합니다.
 
+앱은 양의 NPU setpoint도 request enqueue만으로 적용됐다고 보지 않습니다. Latest
+command ticket과 acknowledgment가 일치한 뒤에만 measured phase를 진행하고 실행 중
+backend health를 확인합니다. Provider는 ticket이 가리키는 setpoint가 실제 accelerator에
+적용됐는지 또는 명시적으로 거부됐는지를 bounded하게 반환해야 합니다. Timeout, 거부,
+ticket 불일치나 health 상실은 앱에서 `NPU_WORKLOAD_APPLY_FAILED`로 fail-closed합니다.
+
+Thermal `SEVERE` derating은 기존 generated/NPU load의 ordered zero 확인, 축소된
+workload의 ticket/acknowledgment, display 감속 acknowledgment 순서입니다. Provider가
+zero 또는 reduced positive setpoint를 확인하지 못하면 앱은 일부 derating 상태로
+계속하지 않고 `THERMAL_DERATE_FAILED`로 중단합니다. `CRITICAL` 이상에서는 즉시
+안전값으로 복구해야 합니다.
+
 ### 값 계약
 
 - `getDpuUnderrunCount()`: boot 이후 monotonic 누적값, 미지원이면 `-1`
@@ -233,6 +249,11 @@ quiesce된 뒤에 온 stop 응답만 최종 확인으로 인정합니다. Quiesc
 plan을 차단합니다. 종료 lane이 interruption을 무시해 closed bridge가 process 안에
 격리되면, 그 bridge의 과거 stop/reset 응답은 이후 controller의 cleanup 증거로
 재사용하지 않습니다. Provider lease/watchdog는 여전히 최종 안전망이어야 합니다.
+
+Positive phase 적용에도 같은 lane의 command ticket/acknowledgment를 사용합니다.
+Acknowledgment 이전에는 적용 성공이나 measured NPU load로 보고하지 않으며 active
+phase의 health poll이 실패하면 그 phase와 남은 plan을 중단합니다. 이 계약은 ordered
+zero cleanup과 별개로 둘 다 만족해야 합니다.
 
 Reflection adapter constructor가 200 ms 안에 끝나지 않고 interruption도 무시하면 Java
 프로세스가 그 thread를 강제 종료할 수 없습니다. 앱은 같은 프로세스에서 후속
@@ -363,6 +384,12 @@ HUD, telemetry sample, JSON report에 넣기 전에 UTF-16 기준 256자로 제�
 whitespace/control/format 문자를 정규화합니다. 제품 broker도 작은 enum/typed state를
 우선 사용하고 비정상적으로 큰 문자열을 반환하지 않아야 합니다.
 
+실행 HUD에는 build version과 layer/DPU/CPU/GPU 숫자·graph가 함께 표시됩니다. 각
+gauge는 source와 `MetricQuality`를 보존하며 provenance가 바뀌거나 unavailable인
+sample 앞뒤를 한 선으로 연결하지 않고 gap으로 표시합니다. BSP adapter는 source
+문자열을 동적으로 바꾸어 서로 다른 counter를 하나의 연속 추세처럼 보이게 해서는 안
+됩니다.
+
 Result peak도 provenance 계약을 따릅니다. CPU/memory/generated traffic과
 DPU/GPU/bus/produced FPS/HWC DEVICE·CLIENT는 유효 범위의 sample이 같은 quality/source를
 유지할 때만 집계하며, 도중 source가 바뀌면 서로 다른 계측을 합친 peak 대신 `N/A`를
@@ -373,9 +400,29 @@ sample에서 결과 UI가 계산합니다.
 발행한 뒤 `dpu-layer-lab-` prefix와 앱 파일명
 형식이 확인된 완료 `.json` 최근 200개를 process-serialized best-effort로 보존합니다.
 방금 발행한 파일은 prune에서 보호하고 `.part`나 unrelated `.json`은 자동 삭제하지
-않습니다. FileProvider의 internal `files-path`만 공유하며 과거 external 보고서는 자동
-import하지 않습니다. Cloud/D2D/legacy backup rule은 report뿐 아니라
+않습니다. FileProvider의 internal `files-path` 중 canonical `files/reports` 안에
+실제로 존재하고 managed completed `dpu-layer-lab-…json` 이름을 통과한 파일만
+공유합니다. Traversal, 외부/foreign JSON과 누락 파일은 거부하며 과거 external
+보고서는 자동 import하지 않습니다. Cloud/D2D/legacy backup rule은 report뿐 아니라
 `probe_paths.conf`를 포함한 모든 app data domain을 제외합니다.
+
+## Workload / composition 의미
+
+Workload setpoint는 정확한 0 또는 `0.001`보다 큰 값만 허용합니다. `0 < load <= 0.001`은
+표시상 양수와 실제 worker idle이 달라질 수 있어 실행 전에 거부합니다. 양의 GPU load는
+flattened GPU-backed producer 또는 독립 GL producer가 실제 topology에 있어야 하며,
+graphics budget 때문에 이를 제거해야 하면 load를 0으로 낮춰 성공처럼 보이지 않고
+plan을 거부합니다.
+
+Transition controller는 absolute-deadline 100 ms fixed period를 사용하고 늦은 tick을
+busy catch-up하지 않습니다. Preflight window 검증과 별도로 runtime coverage가 ramp
+중간값, staircase의 모든 level, pulse ON/OFF, triangle 상승/하강, soak
+attack/hold/recovery를 실제로 보지 못하면 `INCONCLUSIVE`입니다.
+
+`Z_ORDER_SWAP`은 Android View/client ordering을 움직이는 proxy입니다. Report의 typed
+motion semantics는 이를 physical HWC plane Z-order 변경으로 표시하지 않으며
+`physicalHwcZOrderChange=false`를 유지합니다. 실제 plane 순서는 vendor/HWC typed
+snapshot에서 별도로 확인해야 합니다.
 
 ## 4K/8K 자산
 
@@ -399,10 +446,12 @@ Capability와 phase 사전 검증에는 `MediaMetadataRetriever`의 container MI
 visible dimensions, FPS, profile과 codec string을 사용합니다. Crop의 horizontal
 left/right pair와 vertical top/bottom pair는 독립 처리합니다. 한 축의 pair가 모두
 없으면 encoded frame의 그 축 전체를 사용하고, pair 중 lone key나 범위 오류는
-fail-closed합니다. Source FPS metadata가 없거나 허용 오차를 포함해 phase 요구보다
-낮으면 거부합니다. Codec capability의 size는 exact encoded dimensions, rate는
-`max(source FPS, decoder phase FPS)`로 확인합니다. 선택 영상을 쓰는 P010 decoder
-phase는 extractor가 HEVC Main10 계열,
+fail-closed합니다. Source FPS metadata가 없거나 허용 오차를 포함해 phase target과
+reachable transition FPS 요구보다 낮으면 거부합니다. Codec capability의 size는 exact
+encoded dimensions, rate는 source/decoder-phase/reachable-transition FPS의 최댓값으로
+확인합니다. Gradual transition은 직전 phase FPS 전체, STEP boundary는
+`min(60, 직전 FPS)`를 포함합니다. 선택 영상을 쓰는 P010 decoder phase는 extractor가
+HEVC Main10 계열,
 AV1 Main10 계열 또는 AVC High10을 확인해야 합니다. VP9 Profile 2는 10/12-bit
 4:2:0을 함께 포괄하므로 `MediaFormat.KEY_CODECS_STRING`이 512자 이하이고 canonical
 `vp09.02.<level>.10...` 형식으로 bit-depth 10을 명시한 경우에만 허용합니다. 여러
@@ -411,11 +460,12 @@ oversized/malformed이면 `N/A`/거부로 fail-closed합니다. Profile/필수 c
 bit depth가 미확인되거나 8-bit/12-bit 입력이면 실행하지 않습니다. 4:2:2/4:4:4
 계열인 VP9 Profile 3과 `KEY_PROFILE`만으로 정확한 10/12-bit Surface layout을 확정할
 수 없는 Dolby Vision은 P010 gate 또는 3 B/px linear reference의 근거로 사용하지
-않습니다. 영상 미선택 P010은 RGBA visual proxy이므로 실제 P010 allocation 검증으로
-사용하면 안 됩니다.
+않습니다. 영상 미선택 YUV/P010/SBWC decoder는 RGBA visual proxy로 대체하지 않고
+preflight에서 fail-closed합니다.
 
-선택 영상이 있는 YUV/P010/SBWC route는 동일한 codec-to-Surface primary 계약을
-사용합니다. `SBWC_REQUIRED`는 decoder 콘텐츠를 사용하더라도 compression route를 먼저
+YUV/P010/SBWC decoder route는 선택·pin·검증된 영상과 concrete codec binding이
+필수이며 동일한 codec-to-Surface primary 계약을 사용합니다. `SBWC_REQUIRED`는
+decoder 콘텐츠를 사용하더라도 compression route를 먼저
 vendor adapter로 적용·검증해야 하며, 거부/timeout 또는 reset 미확인은 기존처럼
 fail-closed입니다.
 
@@ -477,6 +527,9 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   acknowledgment가 compression reset보다 먼저인지
 - NPU/SBWC lease expiry, client death와 provider watchdog이 load/default state를
   복구하는지
+- 양의 NPU command ticket/acknowledgment와 active health failure가
+  `NPU_WORKLOAD_APPLY_FAILED`로 fail-closed하고, thermal SEVERE에서 ordered zero →
+  reduced workload acknowledgment → display acknowledgment 순서를 지키는지
 - local CPU/memory worker의 예상하지 못한 `Throwable` 또는 active external interrupt가
   first-wins process latch, `LOCAL_WORKER_FAILURE`, `ABORTED`를 만들고 process 재시작
   전까지 후속 worker/plan을 차단하는지, partial start 뒤 same-owner overlap도 막는지
@@ -487,7 +540,8 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 - 100 ms cadence에서 실제 transition window가 중간 tick/각 step/한 cycle/
   attack-hold-recovery를 보존하고, STEP target이 fresh baseline과 origin buffer 뒤의
   measured tick에서만 적용되는지, noncyclic nonzero floor plan이 reject되고 pure
-  evaluator의 defensive fallback도 origin을 건너뛰지 않는지
+  evaluator의 defensive fallback도 origin을 건너뛰지 않는지, absolute-deadline loop와
+  runtime coverage 누락이 `INCONCLUSIVE`인지
 - aggregate physical producer actual/expected가 30 frame 이상에서 70% 미만이면
   `PRODUCER_RATE_SHORTFALL`과 exact-positive 우선/그 외 `INCONCLUSIVE`를 만드는지,
   flattened count가 1인지, topology-pending callback 경계에서 적분과 교차 부하가
@@ -496,11 +550,18 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   후속 plan이 현재 전원 상태로 다시 검증되는지
 - display identity/physical-size 변경과 thermal workload/display derate 적용 실패가
   fail-closed로 중단되는지
-- flattened 1-layer GPU intensity가 bounded extra hardware-canvas work를 바꾸는지
+- `0 < workload <= 0.001`이 reject되고, 양의 GPU load가 실제 GPU producer를 요구하며
+  flattened 1-layer GPU intensity가 bounded extra hardware-canvas work를 바꾸는지
 - 과대/제어문자/양방향 제어문자를 포함한 broker status가 256자 안에서 정규화되는지
-- 4K/8K/P010 자산의 encoded/visible dimensions·FPS·profile·codecs fingerprint,
+- 선택 media 없는 YUV/P010/SBWC decoder가 proxy 없이 거부되는지, 4K/8K/P010 자산의
+  encoded/visible dimensions·FPS·profile·codecs fingerprint,
   horizontal/vertical crop pair, absent/exact source `KEY_MAX_*` pair와 configure 전
-  제거, max(source/phase FPS) codec capability, 64 px graphics/output ceiling
+  제거, source/phase/reachable-transition FPS 최대 codec capability, 64 px
+  graphics/output ceiling
 - provider open 5초/parser 10초 timeout·cancel 뒤 worker `finally`까지 preflight
   refcount lease가 후속 plan을 차단하고 pinned AFD가 seekable인지
 - GL color/depth triple-buffer budget 경계와 Adaptive Hunt의 `STEADY` memory plateau
+- HUD build version과 gauge source/quality, provenance/unavailable graph gap,
+  View/client Z-order proxy가 physical HWC 증거로 표시되지 않는지
+- report share가 canonical internal managed completed file만 허용하고 traversal,
+  foreign/missing JSON을 거부하는지

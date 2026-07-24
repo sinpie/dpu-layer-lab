@@ -140,7 +140,7 @@ object LoadTransitionEvaluator {
             memory = lerp(previous.memory, target.memory, safeFraction),
             gpu = lerp(previous.gpu, target.gpu, safeFraction),
             npu = lerp(previous.npu, target.npu, safeFraction),
-        ).normalized()
+        ).normalizedForExecution()
     }
 
     fun interpolate(
@@ -187,6 +187,16 @@ object LoadTransitionEvaluator {
         } else {
             target.activeLayers.coerceAtLeast(1)
         }
+        val interpolatedWorkloads = interpolate(
+            previous.workloads,
+            target.workloads,
+            safeFraction,
+        ).let { workloads ->
+            // Once the target topology is selected, never claim GPU work without a real GL or
+            // flattened producer. Removing a GL tail therefore releases GPU load discretely
+            // instead of silently dropping an interpolated positive setpoint.
+            if (target.hasGpuLoadProducer()) workloads else workloads.copy(gpu = 0f)
+        }
         return target.copy(
             // A different topology has only been memory-validated at the target layer count.
             // Reusing the previous count could transiently exceed the target graphics budget.
@@ -197,7 +207,7 @@ object LoadTransitionEvaluator {
                 target.requestedDisplayHz,
                 safeFraction,
             ),
-            workloads = interpolate(previous.workloads, target.workloads, safeFraction),
+            workloads = interpolatedWorkloads,
         )
     }
 
@@ -262,3 +272,6 @@ object LoadTransitionEvaluator {
         val segment: TransitionSegment,
     )
 }
+
+internal fun PhaseSpec.hasGpuLoadProducer(): Boolean =
+    backend == LayerBackend.FLATTENED_TEXTURE || includeGlLayer

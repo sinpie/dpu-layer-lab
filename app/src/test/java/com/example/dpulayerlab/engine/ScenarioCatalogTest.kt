@@ -136,6 +136,19 @@ class ScenarioCatalogTest {
     }
 
     @Test
+    fun transformStormLabelsViewZOrderAsAProxyRatherThanPhysicalHwcCapability() {
+        val scenario = ScenarioCatalog.byId("transform-storm")!!
+        val zOrderPhase = scenario.phases.single {
+            it.motion == MotionProfile.Z_ORDER_SWAP
+        }
+
+        assertTrue(scenario.description.contains("translationZ"))
+        assertTrue(scenario.description.contains("exact 증거가 아닙니다"))
+        assertTrue(zOrderPhase.label.contains("proxy", ignoreCase = true))
+        assertTrue(!zOrderPhase.motion.semantics.changesPhysicalHwcZOrder)
+    }
+
+    @Test
     fun dvfsPresetsSettleThenIncreaseLoadAndRecover() {
         val dvfsIds = setOf(
             "dvfs-single-layer-wake",

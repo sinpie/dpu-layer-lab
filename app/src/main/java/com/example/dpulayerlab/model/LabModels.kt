@@ -3,6 +3,8 @@ package com.example.dpulayerlab.model
 import android.os.Build
 import kotlin.math.roundToInt
 
+const val MIN_EFFECTIVE_LOAD = 0.001f
+
 enum class ScenarioCategory(val label: String) {
     LAYER_HWC("Layer / HWC"),
     TRANSFORM("Transform"),
@@ -30,7 +32,7 @@ enum class LayerBackend(val label: String) {
 enum class PixelRoute(val label: String, val detail: String) {
     RGB_8888("RGB 8888", "Canvas → RGBA BufferQueue"),
     RGB_565("RGB 565", "16-bit RGB BufferQueue"),
-    YUV_420("YUV 420", "선택 영상은 decoder-to-Surface, 없으면 YUV 패턴 proxy"),
+    YUV_420("YUV 420", "선택·검증된 영상의 hardware decoder-to-Surface"),
     P010("YUV P010", "10-bit decoder 콘텐츠 필요"),
     SBWC_AUTO("SBWC Auto", "벤더 allocator/codec이 선택할 때만 검증 가능"),
     SBWC_REQUIRED("SBWC Required", "벤더 adapter 없이는 실행 불가"),
@@ -62,14 +64,25 @@ enum class BufferSize(val label: String, val width: Int, val height: Int) {
     UHD_8K("8K", 7680, 4320),
 }
 
-enum class MotionProfile(val label: String) {
+enum class MotionSemantics(val changesPhysicalHwcZOrder: Boolean) {
+    VIEW_TRANSFORM(false),
+    VIEW_CLIENT_Z_ORDER_PROXY(false),
+}
+
+enum class MotionProfile(
+    val label: String,
+    val semantics: MotionSemantics = MotionSemantics.VIEW_TRANSFORM,
+) {
     STATIC("Static"),
     SCROLL("Scroll"),
     ZOOM_PAN("Zoom + Pan"),
     ROTATE("Rotate"),
     PARALLAX("Parallax"),
     TRANSFORM_STORM("Storm"),
-    Z_ORDER_SWAP("Z swap"),
+    Z_ORDER_SWAP(
+        label = "View/client Z proxy",
+        semantics = MotionSemantics.VIEW_CLIENT_Z_ORDER_PROXY,
+    ),
 }
 
 enum class LoadShape(val label: String) {
@@ -210,6 +223,18 @@ data class LoadSetpoints(
         npu = npu.finiteUnitValue(),
     )
 
+    /**
+     * Normalizes values at the last execution boundary and represents sub-observable duty cycles
+     * as an explicit zero. This keeps renderer/HUD/report setpoints aligned with workers, which
+     * deliberately idle at or below [MIN_EFFECTIVE_LOAD].
+     */
+    fun normalizedForExecution() = copy(
+        cpu = cpu.finiteEffectiveLoad(),
+        memory = memory.finiteEffectiveLoad(),
+        gpu = gpu.finiteEffectiveLoad(),
+        npu = npu.finiteEffectiveLoad(),
+    )
+
     fun summary(): String {
         fun pct(value: Float) = (value.finiteUnitValue() * 100).roundToInt()
         return "CPU ${pct(cpu)}% · MEM ${pct(memory)}% · " +
@@ -219,6 +244,9 @@ data class LoadSetpoints(
 
 private fun Float.finiteUnitValue(): Float =
     takeIf(Float::isFinite)?.coerceIn(0f, 1f) ?: 0f
+
+private fun Float.finiteEffectiveLoad(): Float =
+    finiteUnitValue().takeIf { it > MIN_EFFECTIVE_LOAD } ?: 0f
 
 data class PhaseSpec(
     val id: String,

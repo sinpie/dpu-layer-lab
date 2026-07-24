@@ -10,7 +10,11 @@ Android AP의 DPU underrun 재현·검출과 Hardware Composer 합성 한계 탐
 service를 연결하면 DPU·DDR·HWC·SBWC·NPU와 같은 제품 전용 기능을 추가로 사용할 수
 있습니다.
 
-현재 launcher/Gradle project 표시 이름과 앱 버전은 **DPULayerTest 0.2.0**입니다.
+현재 launcher/Gradle project 표시 이름과 release 앱 버전은
+**DPULayerTest 20260724_111816**(`versionCode 3`)입니다. Debug 변형은 화면과
+보고서에 `20260724_111816-debug`로 표시됩니다. Version name은 KST build 시각을
+`yyyyMMdd_HHmmss`로 고정한 형식입니다. 앱 상단과 실행 HUD에 같은 build version을
+노출해 결과를 만든 바이너리를 현장에서 바로 식별할 수 있습니다.
 소스 저장소는 계속 [sinpie/dpu-layer-lab](https://github.com/sinpie/dpu-layer-lab)을
 사용합니다. 기존 제품 이미지와 자동화 harness를 깨지 않기 위해 package
 `com.example.dpulayerlab`, START/STOP/SHOW action, `dpu-layer-lab-` report prefix,
@@ -27,7 +31,8 @@ Soong module/APK 통합 이름 `DpuLayerLab`은 이름을 바꾸지 않는 호�
 
 - 최대 20개의 독립 `SurfaceView` BufferQueue layer
 - 독립 Surface / Surface+Texture 혼합 / GPU flattened composition A/B
-- layer별 scroll, zoom, pan, 임의 회전, parallax, alpha overlap, Z-order swap
+- layer별 scroll, zoom, pan, 임의 회전, parallax, alpha overlap, View/client Z-order
+  swap proxy(physical HWC Z-order 변경의 증거는 아님)
 - producer 30~120 fps 및 display 60/90/120 Hz 요청·실제 Hz 동시 기록
 - RGB 8888/565, YUV/P010/SBWC selected-media decoder-to-Surface, SBWC vendor hook
 - SAF로 선택한 로컬 4K/8K H.264/HEVC/AV1 영상을 `MediaExtractor` +
@@ -40,8 +45,10 @@ Soong module/APK 통합 이름 `DpuLayerLab`은 이름을 바꾸지 않는 호�
   올렸다가 해제
 - vendor AIDL 또는 제품 classpath adapter를 통한 NPU workload
 - CPU, app CPU, memory/PSS, producer FPS, display Hz, thermal, GPU/bus/DPU dashboard
-- 실행 중 좌측 상단 layer/DPU/CPU/GPU 숫자·점유율·60-sample 그래프
-  (`observed/—P`는 topology commit 대기, `observed/expected P`는 commit 완료)
+- 실행 중 좌측 상단 build version, layer/DPU/CPU/GPU 숫자·점유율·60-sample 그래프
+  (`observed/—P`는 topology commit 대기, `observed/expected P`는 commit 완료).
+  각 gauge는 source/quality를 함께 표시하고 provenance 변경이나 unavailable 구간에서는
+  선을 연결하지 않습니다.
 - 결과 화면의 DPU/GPU/bus/produced FPS와 HWC DEVICE/CLIENT peak
 - format·buffer size·layer 수·scanout Hz 기반 예상 traffic
 - HWC DEVICE/CLIENT layer 파싱(`DUMP` 권한이 있을 때)
@@ -59,6 +66,10 @@ Safety policy는 100 ms control cadence에서 실제 적용될 transition window
 attack/hold/release, pulse/triangle에는 최소 한 cycle이 있어야 합니다. `STEP`은 fresh
 baseline 뒤 origin producer buffer를 generation 안에서 먼저 확인하고 다음 measured
 active tick에서 target을 적용하며, 그 tick까지 실행할 시간이 없으면 `INCONCLUSIVE`입니다.
+실행 loop도 이전 tick이 늦어졌을 때 busy catch-up하지 않는 absolute-deadline
+fixed-period cadence를 사용합니다. Runtime coverage가 ramp 중간값, staircase의 모든
+level, pulse ON/OFF, triangle 상승/하강, soak attack/hold/recovery를 실제로 관측하지
+못하면 완료처럼 보이지 않고 `INCONCLUSIVE`입니다.
 `floor`는 반복 파형인 pulse/triangle의 valley에만 적용합니다. STEP/linear/staircase/
 soak 같은 one-shot transition에 0이 아닌 `floor`를 넣은 runnable plan은 의미가
 모호하므로 safety policy가 거부합니다. 순수 evaluator의 defensive bounding만 잘못된
@@ -72,6 +83,9 @@ soak 같은 one-shot transition에 0이 아닌 `floor`를 넣은 runnable plan�
 - 비정상 입력: 빈/중복·과도하게 긴 ID/label, 0 이하 duration/layer/FPS/Hz,
   NaN/무한대, 128개를 넘는 phase는 실행 전에 거부합니다. 범위를 벗어난 유한
   workload는 0과 device 상한 사이로 clamp합니다.
+- Workload setpoint는 정확한 0 또는 `0.001`보다 큰 값이어야 합니다.
+  `0 < load <= 0.001`은 UI/보고서에는 양수지만 worker가 사실상 유휴가 되는 모호한 test가 되므로
+  실행 전에 거부합니다.
 - 기본 시간 상한: phase당 10분, scenario 전체 30분
 - scenario 전체 시간 상한을 넘으면 앞쪽 phase만 남기는 방식으로 자르지 않습니다.
   모든 phase에 최소 1 ms를 예약하고 나머지를 phase당 상한이 먼저 반영된 duration에
@@ -105,8 +119,10 @@ soak 같은 one-shot transition에 0이 아닌 `floor`를 넣은 runnable plan�
   중단합니다. 확인된 buffer는 run 동안 pin해 5초가 넘는 idle/settle 뒤에도 measured
   phase에서 재할당되지 않으며, run 종료·low-memory·명시적 drop에서만 해제합니다.
 - thermal `SEVERE`부터 layer/FPS/Hz와 CPU·memory·GPU·NPU 부하를 줄이며, 이
-  derating은 뒤 phase에도 유지됩니다. Workload 또는 display 감속 적용을 확인하지
-  못하면 일부만 감속된 상태로 계속하지 않고 `THERMAL_DERATE_FAILED`로 중단합니다.
+  derating은 뒤 phase에도 유지됩니다. Derating은 기존 generated/NPU load의 ordered
+  zero를 먼저 확인하고, 축소된 workload의 ticket/acknowledgment를 받은 뒤 display
+  감속 acknowledgment를 확인하는 순서입니다. 어느 단계든 실패하면 일부만 감속된
+  상태로 계속하지 않고 `THERMAL_DERATE_FAILED`로 중단합니다.
 - thermal `CRITICAL` 이상이면 test를 즉시 중단합니다.
 - 시작 시 Battery Saver가 켜져 있으면 보수적인 power-save envelope를 적용합니다.
   더 넓은 envelope로 실행 중 Battery Saver가 새로 켜지면 기존 메모리/layer/FPS
@@ -202,6 +218,16 @@ soak 같은 one-shot transition에 0이 아닌 `floor`를 넣은 runnable plan�
   close 경계로 결과 게시를 fence합니다. 종료 lane이 멈춰 격리한 closed vendor bridge를
   새 controller가 받더라도 이전 controller의 stop/reset 응답은 새 run의 cleanup
   증거로 재사용하지 않습니다.
+- 양의 NPU setpoint도 enqueue만으로 적용됐다고 보지 않습니다. 최신 명령 ticket과
+  acknowledgment가 일치한 뒤에만 measured phase를 진행하고, 실행 중 adapter health를
+  계속 확인합니다. Positive apply timeout/거부/health 상실은
+  `NPU_WORKLOAD_APPLY_FAILED`로 fail-closed합니다.
+- YUV/P010/SBWC decoder phase는 선택·pin·검증된 media와 concrete hardware codec
+  binding이 필수입니다. 선택 media가 없거나 fingerprint/binding이 불완전하면 RGBA
+  procedural proxy로 대체하지 않고 실행 전에 거부합니다. Decoder source/capability
+  FPS는 phase target뿐 아니라 직전 phase에서 transition 중 decoder topology에 도달할
+  수 있는 FPS까지 검사합니다. Gradual transition은 직전 FPS 전체를, STEP 경계는
+  `min(60, 직전 FPS)` 이상을 요구합니다.
 
 이 정책의 memory 계산은 stride, allocator metadata, decoder private buffer, GPU tile
 storage를 완전히 알 수 없으므로 보수적 휴리스틱입니다. “허용됨”은 해당 SoC가 지속적으로
@@ -209,7 +235,7 @@ storage를 완전히 알 수 없으므로 보수적 휴리스틱입니다. “�
 
 ## 시나리오
 
-0.2.0 catalog에는 다음 **22개 preset**이 있습니다. Custom은 catalog preset 수에
+`20260724_111816` catalog에는 다음 **22개 preset**이 있습니다. Custom은 catalog preset 수에
 포함하지 않습니다.
 
 | 카테고리 | 대표 테스트 |
@@ -254,10 +280,12 @@ FPS/Hz, motion, alpha와 외부 workload를 고정하고 backend만 바꿉니다
 Custom에서 `Flattened Texture`를 고르면 logical layer를 한 개의 display-sized RGBA
 physical producer에서 합성합니다. 이 backend에 고른 YUV/P010/SBWC 또는 4K/8K 입력은
 decoder/buffer 부하로 가장하지 않고 DISPLAY/RGB로 정규화하며 UI label/tag에 남깁니다.
-Flattened 1-layer에서도 GPU slider는 0이면 기본 draw만, 0 초과면 intensity에 따라
-1~8개의 bounded hardware-canvas 추가 pass를 실행하므로 1%와 100%가 같은 부하가 아닙니다.
-독립/mixed backend에서 GPU load가 0보다 크면 크기와 관계없이 실제 GL producer를
-구성합니다. Decoder 또는 explicit-size primary와 GL이 함께 필요한 1-layer 요청은
+Flattened 1-layer에서도 GPU slider는 0이면 기본 draw만, `0.001` 초과면 intensity에
+따라 1~8개의 bounded hardware-canvas 추가 pass를 실행하므로 1%와 100%가 같은 부하가
+아닙니다.
+독립/mixed backend에서 GPU load가 `0.001`보다 크면 크기와 관계없이 실제 GL producer를
+구성합니다. 양수이지만 `0.001` 이하인 값은 거부합니다. Decoder 또는 explicit-size
+primary와 GL이 함께 필요한 1-layer 요청은
 2-layer(primary + GL)로 명시적으로 승격하고, graphics budget이 필수 GL producer를
 수용하지 못하면 GPU 부하를 조용히 제거하지 않고 test를 거부합니다.
 Adaptive hunt는 첫 boundary를 기록하면 남은 stress step을 건너뛰고 명시적인
@@ -276,7 +304,8 @@ DVFS preset의 settle 구간은 작은 layer/FPS/Hz 부하를 유지해 governor
 
 1. **시스템** 탭에서 display mode, HardwareBuffer, 4K/8K decoder, direct sensor와 vendor
    adapter 연결 상태를 확인합니다.
-2. YUV/P010/4K/8K test라면 **시나리오** 탭에서 실험용 로컬 영상을 선택합니다.
+2. YUV/P010/SBWC/4K/8K decoder test라면 **시나리오** 탭에서 실험용 로컬 영상을
+   선택합니다. 선택·pin·preflight된 media가 없으면 decoder preset은 실행되지 않습니다.
 3. **카테고리 · 부하 · 조건 조합**에서 카테고리, 변화 파형, 예상 강도와
    부하/조건을 고릅니다. 같은 행의 복수 선택은 OR, 서로 다른 행은 AND입니다.
    부하/조건에는 CPU/memory/GPU/NPU, RGB/YUV/P010/SBWC, 4K/8K,
@@ -293,8 +322,10 @@ DVFS preset의 settle 구간은 작은 layer/FPS/Hz 부하를 유지해 governor
    좁힙니다. 최대 부하에서만 찾지 말고 `Paired Mid-load Perturbation Matrix`로 중간
    부하와 DVFS ramp 지연도 확인합니다.
 8. 실행 화면의 queue/repeat 위치, phase transition, safety event와 좌측 상단 HUD를
-   함께 봅니다. HUD는 현재 logical/observed·expected physical layer, DPU/CPU/GPU
-   숫자와 60-sample 그래프, DPU read/producer write 예상 traffic을 표시합니다.
+   함께 봅니다. HUD는 앱 build version, 현재 logical/observed·expected physical
+   layer, DPU/CPU/GPU 숫자와 60-sample 그래프, DPU read/producer write 예상 traffic을
+   표시합니다. 숫자에는 source/quality가 붙고 provenance 전환·unavailable 구간은
+   graph gap으로 보존됩니다.
    `STOP`은 작은 화면/landscape의 스크롤 아래로 숨지 않도록 상단 실행 header에 항상
    표시됩니다.
 9. 종료 후 run별 결과와 report를 확인하고 안전 clamp/reject/derate/abort event가
@@ -302,8 +333,9 @@ DVFS preset의 settle 구간은 작은 layer/FPS/Hz 부하를 유지해 governor
 10. `Exact underrun Δ`가 값이면 직접 counter 판정입니다. `Suspected proxy`만 증가한
    경우 DPU underrun으로 확정하면 안 됩니다.
 
-영상이 선택되지 않은 YUV 시나리오는 `PROXY_FALLBACK` event를 기록합니다. SBWC
-`REQUIRED`와 NPU 시나리오는 실제 vendor adapter가 없으면 `UNSUPPORTED`로 끝납니다.
+영상이 선택되지 않은 YUV/P010/SBWC decoder 시나리오는 proxy로 실행하지 않고
+preflight에서 거부합니다. SBWC `REQUIRED`와 NPU 시나리오는 실제 vendor adapter가
+없으면 `UNSUPPORTED`로 끝납니다.
 
 정확한 장시간 실험에서는 화면 녹화, 미러링, 무선 display와 개발자 GPU overlay를
 끄세요. 이 기능들 자체가 composition 및 bus 부하를 바꿉니다.
@@ -365,8 +397,8 @@ Extra는 `START`에서만 읽으므로 잘못 직렬화된 START payload가 뒤�
 처리를 막지 않습니다.
 
 앱 표시 이름이 DPULayerTest로 바뀌어도 위 component와
-`com.example.dpulayerlab.action.START`, `.STOP`, `.SHOW` action 문자열은 0.2.0에서
-그대로입니다. 제품 harness는 launcher label을 파싱하지 말고 이 stable contract를
+`com.example.dpulayerlab.action.START`, `.STOP`, `.SHOW` action 문자열은 버전과
+무관하게 그대로입니다. 제품 harness는 launcher label을 파싱하지 말고 이 stable contract를
 사용해야 합니다.
 
 Cold start에서 신뢰된 vendor broker가 아직 bind/capability 조회 중이면 최대 2초 동안
@@ -456,8 +488,9 @@ descriptor의 B/px가 유한한 양수가 아니거나 16 B/px를 넘으면 무�
 없으면 decoder primary를
 포함한 aggregate bytes/frame·bytes/s는 `N/A`입니다. 같은 영상 descriptor는 route가
 달라도 같은 base linear bytes를 사용하며 SBWC 압축률은 별도로 제외합니다.
-영상이 없는 YUV/P010 procedural 화면과 `TextureView`, alpha procedural Surface, GL
-출력은 실제 BufferQueue 형식대로 RGBA 4 B/px로 계산합니다. mixed backend의 TextureView 여러 장은
+`TextureView`, alpha procedural Surface와 GL 출력은 실제 BufferQueue 형식대로 RGBA
+4 B/px로 계산합니다. YUV/P010/SBWC decoder phase는 선택 media가 없으면 실행되지
+않으므로 RGBA proxy traffic을 표시하지 않습니다. mixed backend의 TextureView 여러 장은
 한 개의 display-sized RGBA client target read로, flattened backend는 논리 layer 수와
 별개로 한 개의 RGBA producer로 계산합니다. explicit 4K/8K 크기는 현재 renderer와
 같이 primary producer에 적용합니다. HUD/control layer와 시스템 UI traffic은 제외합니다.
@@ -502,8 +535,10 @@ FPS, codec profile/string을 사용합니다. Crop은 horizontal pair와 vertica
 독립 처리합니다. 한 축의 pair가 모두 없으면 encoded frame의 그 축 전체를 사용하고,
 각 pair 내부의 key가 하나만 있거나 좌표가 범위를 벗어나면 fail-closed합니다. 알려진
 source FPS가 phase 요청 FPS보다 낮거나 FPS metadata가 없으면 실행하지 않습니다.
-Hardware codec의 size/rate capability는 exact encoded dimensions와
-`max(source FPS, decoder phase FPS)`로 검사하므로, 낮은 output pacing을 선택해도 고FPS
+Hardware codec의 size/rate capability는 exact encoded dimensions와 source FPS,
+decoder phase target 및 직전 transition origin에서 decoder topology가 실제 도달할 수
+있는 FPS의 최댓값으로 검사합니다. Gradual transition은 직전 FPS 전체를, STEP은
+`min(60, 직전 FPS)`의 boundary 요구를 포함하므로 낮은 output pacing을 선택해도 고FPS
 source decode 요구를 숨기지 않습니다. 선택 영상을 실제
 decoder path로 쓰는 P010 phase는 HEVC Main10, AV1 Main10, AVC High10처럼 코드가
 명시적으로 인정하는 10-bit profile을 extractor가 확인해야 합니다. VP9 Profile 2는
@@ -513,10 +548,9 @@ decoder path로 쓰는 P010 phase는 HEVC Main10, AV1 Main10, AVC High10처럼 �
 8-bit/12-bit/malformed/conflicting 입력이면 거부합니다.
 Dolby Vision은 `KEY_PROFILE`만으로 정확한 10/12-bit Surface layout을 확정할 수 없어
 P010/3 B/px 근거로 사용하지 않습니다.
-영상 미선택 시의 P010 화면은 앞서
-설명한 RGBA visual proxy입니다. 이
-검증도 decoder의 지속 thermal 성능이나 실제 output allocation이 P010/SBWC라는
-사실까지 보장하지는 않습니다.
+영상 미선택 시 P010/YUV/SBWC decoder 화면을 RGBA visual proxy로 대체하지 않습니다.
+선택 media 검증도 decoder의 지속 thermal 성능이나 실제 output allocation이
+P010/SBWC라는 사실까지 보장하지는 않습니다.
 
 Precheck는 위 size/rate를 만족하는 hardware decoder의 구체적인 codec name을
 결정합니다. P010 phase가 있을 때만 extractor profile을 codec의 advertised
@@ -568,35 +602,29 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 - debug: `app/build/outputs/apk/debug/app-debug.apk`
 - release: `app/build/outputs/apk/release/app-release-unsigned.apk`
 
-### 0.2.0 릴리스 산출물의 의미
+### `20260724_111816` 릴리스 산출물의 의미
 
-- `DPULayerTest-v0.2.0-debug.apk`는 Android debug key로 서명되어 바로 설치 가능한
+- release tag는 `v20260724_111816`입니다.
+- `DPULayerTest-20260724_111816-debug.apk`는 Android debug key로 서명되어 바로 설치 가능한
   **전용 lab/개발용** APK입니다. Explicit automation alias에는 debug manifest에서
   `CONTROL_TESTS` permission이 제거되어 있으므로 ADB 사용이 쉽지만, 신뢰 경계가 열린
   이 동작을 제품 release 보안으로 간주하거나 일반 사용자 단말에 배포하면 안 됩니다.
-- `DPULayerTest-v0.2.0-release-unsigned.apk`는 제품 빌드/서명 파이프라인 입력을 위한
-  **서명되지 않은 통합 산출물**입니다. 그대로 설치 가능한 최종 제품 APK가 아닙니다.
+- `DPULayerTest-20260724_111816-release-unsigned.apk`는 제품 빌드/서명 파이프라인
+  입력을 위한 **서명되지 않은 통합 산출물**입니다. 그대로 설치 가능한 최종 제품
+  APK가 아닙니다.
 - 실제 제품 APK는 secure product build 환경에서 platform/product key로 서명하고
   `priv-app` permission allowlist와 SELinux/Binder 정책을 함께 검증해야 합니다.
   Platform signing만으로 vendor node 접근 권한이 생기지는 않습니다.
-- GitHub Release나 저장소에는 platform key, certificate, keystore, password 또는
+- GitHub Release에는 위 두 APK와 `SHA256SUMS.txt`만 올립니다. 저장소나 release에는
+  platform key, certificate, keystore, password 또는
   signing token을 넣지 않습니다. 배포한 APK와 `SHA256SUMS.txt`만 공개 검증
   산출물로 취급합니다.
 
-2026-07-24 기준으로 `clean testDebugUnitTest lintDebug assembleDebug assembleRelease`를
-한 번에 실행해 28 suite/310 test가 failure/error/skip 없이 통과했습니다. Lint error는
-0개이며 warning 6개는 빌드 도구/의존성의 새 버전 알림뿐입니다. Debug APK는
-`com.example.dpulayerlab.debug`/`0.2.0-debug`와 Android debug certificate를,
-release APK는 `com.example.dpulayerlab`/`0.2.0`과 unsigned 상태를 확인했으며 두 APK
-모두 zipalign 검증을 통과했습니다.
-
-Android emulator 스모크에서는 `DPULayerTest` cold launch, 대시보드와 22개 catalog
-조합/queue UI, 실시간 layer·DPU·CPU·GPU 그래프와 예상 traffic HUD를 확인했습니다.
-Debug 전용 explicit automation alias로 baseline 완주와 `resource-pulse` 2-loop plan
-실행 중 `STOP`의 `ABORTED · 1/2 runs · 2 loops` 전환, schema v2 internal report의
-compression/session/NPU field, process crash/ANR 0건을 확인했습니다. Emulator 결과의
-`SUSPECTED / PROXY`는 exact DPU counter가 없는 환경에서 의도된 판정이며 실기기
-underrun 검증을 대체하지 않습니다.
+이 timestamp build에서 host unit test **356개**가 모두 통과했고, `lintDebug`는 error
+0개(도구/의존성 업데이트 알림 warning 6개)로 통과했습니다. `assembleDebug`와
+`assembleRelease`도 성공했습니다. 이번 작업에서는 emulator/실기기 stress를 자동
+실행하지 않았으며, host 결과는 exact DPU counter가 있는 실기기 underrun 검증을
+대체하지 않습니다.
 
 Debug build는 package suffix가 `.debug`이므로 제품의 release privapp allowlist와
 동일하게 취급되지 않습니다. 실제 system integration 검증은 release package로
@@ -630,7 +658,9 @@ SELinux 접근이 생기지 않습니다. 최소 권한의 system broker와 type
   Android 10의 legacy external-storage 앱도 직접 읽거나 바꿀 수 없습니다. 이전 개발
   버전이 external app-scoped `reports/`에 만든 파일은 자동 import하지 않습니다.
 - 앱에는 network upload 경로가 없으며, 사용자가 **공유**를 누른 경우에만 선택한 앱에
-  임시 read URI 권한을 줍니다.
+  임시 read URI 권한을 줍니다. 공유 대상은 canonical internal `files/reports` 안에
+  실제 존재하고 앱의 완료 파일명(`dpu-layer-lab-…json`) 검증을 통과한 managed
+  report로 제한합니다. Traversal, 외부/foreign JSON과 누락 파일은 거부합니다.
 - JSON에는 제조사/모델/device, Android 버전, **build fingerprint**, 실행 시각,
   telemetry, event가 들어갑니다.
 - 선택한 영상의 표시 이름, MIME, codec profile/string, 해상도, FPS, 길이 같은
@@ -688,8 +718,8 @@ MainActivity
 
 ## 알려진 한계
 
-- 실제 YUV/P010 경로는 선택 영상의 codec과 decoder가 해당 output을 지원해야 합니다.
-  영상이 없을 때 procedural 화면은 시각적 proxy입니다.
+- YUV/P010/SBWC decoder 경로는 선택·pin·검증된 영상과 concrete hardware codec
+  binding이 필요하며, 영상이 없을 때 procedural proxy로 대체하지 않습니다.
 - codec capability 선언은 동시 instance, 지속 thermal 성능 또는 특정 8K stream의
   정상 재생을 보장하지 않습니다.
 - SBWC 선택·검증은 vendor gralloc/codec adapter가 필요합니다.
@@ -697,6 +727,9 @@ MainActivity
   NPU로 표시하지 않습니다.
 - 20 layer는 앱의 hard cap이지 SoC의 overlay plane 수가 아닙니다. 실제 DEVICE/CLIENT
   배치는 HWC 정책, format, transform, alpha, scale, secure/HDR 조건에 따라 달라집니다.
+- View/client Z-order swap은 앱 content의 client-side ordering proxy이며 physical HWC
+  plane의 Z-order가 바뀌었다는 증거가 아닙니다. 실제 배치는 typed vendor/HWC snapshot으로
+  확인해야 합니다.
 - requested refresh는 힌트/선호 mode이며, 실제 display Hz는 패널 mode와 시스템 정책에
   의해 달라질 수 있습니다.
 - DPU frequency는 명시된 제품 counter에서 읽기만 하며 앱이 governor frequency를

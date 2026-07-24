@@ -14,8 +14,19 @@ import com.example.dpulayerlab.model.RunVerdict
 import com.example.dpulayerlab.model.RunnerStage
 import com.example.dpulayerlab.model.ScenarioRunPlan
 import com.example.dpulayerlab.model.TelemetrySnapshot
+import com.example.dpulayerlab.model.TransitionMode
+import com.example.dpulayerlab.model.TransitionSample
+import com.example.dpulayerlab.model.TransitionSegment
+import com.example.dpulayerlab.model.TransitionSpec
 import com.example.dpulayerlab.monitor.CompressionControlResult
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.yield
+import java.io.File
+import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -23,6 +34,29 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class LabControllerMathTest {
+    @Test
+    fun mediaPreflightLatchWaitIsCancellableAndCompletionWinsAtZeroTimeout() =
+        runBlocking {
+            val completed = CountDownLatch(0)
+            assertTrue(awaitLatchCancellable(completed, timeoutMs = 0L))
+
+            val blocked = CountDownLatch(1)
+            val job = launch {
+                awaitLatchCancellable(
+                    latch = blocked,
+                    timeoutMs = 60_000L,
+                    pollMs = 10L,
+                )
+            }
+            yield()
+            val cancelStarted = System.nanoTime()
+            job.cancelAndJoin()
+            val cancelElapsedMs = (System.nanoTime() - cancelStarted) / 1_000_000L
+
+            assertTrue("cancellation took ${cancelElapsedMs}ms", cancelElapsedMs < 500L)
+            assertTrue(blocked.count == 1L)
+        }
+
     @Test
     fun enteringPowerSaveInvalidatesOnlyAnUnconstrainedRunEnvelope() {
         assertTrue(
@@ -331,8 +365,13 @@ class LabControllerMathTest {
             ),
         )
         assertNull(vp9BitDepthFromCodecsString("vp09.02.10"))
+        assertNull(vp9BitDepthFromCodecsString("vp09.02.BAD.10"))
+        assertNull(vp9BitDepthFromCodecsString("vp09.02.99.10"))
         assertNull(vp9BitDepthFromCodecsString("vp09.03.10.10.03.09.16.09.01"))
         assertNull(vp9BitDepthFromCodecsString("vp09.02.10.08.01.09.16.09.01"))
+        assertNull(vp9BitDepthFromCodecsString("vp09.02.10.10.04.09.16.09.01"))
+        assertNull(vp9BitDepthFromCodecsString("vp09.02.10.10.01.09.16.09.02"))
+        assertNull(vp9BitDepthFromCodecsString("vp09.02.10.10.01.09.16.09.01.00"))
         assertNull(
             vp9BitDepthFromCodecsString(
                 "vp09.02.10.10.01, vp09.02.10.12.01",
@@ -438,6 +477,15 @@ class LabControllerMathTest {
         assertTrue(assessProducerRate(actualFrames = 209L, expectedFrames = 300.0).materialShortfall)
         // Tiny phases do not have enough observations for a stable rate verdict.
         assertFalse(assessProducerRate(actualFrames = 0L, expectedFrames = 29.9).materialShortfall)
+        assertFalse(
+            assessProducerRate(actualFrames = null, expectedFrames = 29.9).materialShortfall,
+        )
+        assertFalse(
+            assessProducerRate(actualFrames = -1L, expectedFrames = 29.9).materialShortfall,
+        )
+        assertTrue(
+            assessProducerRate(actualFrames = null, expectedFrames = 30.0).materialShortfall,
+        )
         assertTrue(
             assessProducerRate(
                 actualFrames = 1L,
@@ -539,20 +587,30 @@ class LabControllerMathTest {
     fun thermalDerateFailsClosedWhenEitherRuntimeActionIsUnconfirmed() {
         assertFalse(
             thermalDerateActionFailed(
+                orderedZeroConfirmed = true,
                 workloadApplied = true,
                 displayApplied = true,
             ),
         )
         assertTrue(
             thermalDerateActionFailed(
+                orderedZeroConfirmed = true,
                 workloadApplied = false,
                 displayApplied = true,
             ),
         )
         assertTrue(
             thermalDerateActionFailed(
+                orderedZeroConfirmed = true,
                 workloadApplied = true,
                 displayApplied = false,
+            ),
+        )
+        assertTrue(
+            thermalDerateActionFailed(
+                orderedZeroConfirmed = false,
+                workloadApplied = true,
+                displayApplied = true,
             ),
         )
     }
@@ -746,6 +804,25 @@ class LabControllerMathTest {
         assertEquals(linearTarget.bufferSize, safeReverse.bufferSize)
         assertEquals(linearTarget.activeLayers, safeReverse.activeLayers)
         assertEquals(sbwcOrigin.producerFps, safeReverse.producerFps, 0f)
+
+        val gpuOrigin = sbwcOrigin.copy(
+            includeGlLayer = true,
+            workloads = LoadSetpoints(gpu = 0.8f),
+        )
+        val noGlLinearTarget = linearTarget.copy(
+            includeGlLayer = false,
+            workloads = LoadSetpoints(),
+        )
+        val safeGpuRelease = allocationRouteSafePhase(
+            initial = LoadTransitionEvaluator.interpolate(
+                previous = gpuOrigin,
+                target = noGlLinearTarget,
+                fraction = 0f,
+            ),
+            target = noGlLinearTarget,
+        )
+        assertFalse(safeGpuRelease.includeGlLayer)
+        assertEquals(0f, safeGpuRelease.workloads.gpu, 0f)
     }
 
     @Test
@@ -1393,4 +1470,149 @@ class LabControllerMathTest {
         assertEquals(1, compressedSampleSafetyLimit(8L))
         assertNull(compressedSampleSafetyLimit(7L))
     }
+
+    @Test
+    fun managedReportResolverRejectsTraversalForeignAndMissingFiles() {
+        val root = Files.createTempDirectory("dpu-report-test").toFile()
+        try {
+            val reports = File(root, "reports").apply { mkdirs() }
+            val managed = File(
+                reports,
+                "dpu-layer-lab-20260724-111816-123-scenario.json",
+            ).apply { writeText("{}") }
+            val foreign = File(reports, "foreign.json").apply { writeText("{}") }
+            val outside = File(root, managed.name).apply { writeText("{}") }
+
+            assertEquals(managed.canonicalFile, resolveManagedReportFile(reports, managed.path))
+            assertNull(resolveManagedReportFile(reports, foreign.path))
+            assertNull(resolveManagedReportFile(reports, outside.path))
+            assertNull(
+                resolveManagedReportFile(
+                    reports,
+                    File(
+                        reports,
+                        "dpu-layer-lab-20260724-111816-123-missing.json",
+                    ).path,
+                ),
+            )
+            assertNull(resolveManagedReportFile(reports, managed.name))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun decoderSourceRateIncludesReachableNonDecoderBoundaryRate() {
+        val rgb120 = decoderRatePhase(
+            id = "rgb-120",
+            route = PixelRoute.RGB_8888,
+            fps = 120f,
+        )
+        val yuv30Ramp = decoderRatePhase(
+            id = "yuv-30-ramp",
+            route = PixelRoute.YUV_420,
+            fps = 30f,
+            transition = TransitionSpec(
+                mode = TransitionMode.LINEAR_RAMP,
+                transitionDurationMs = 1_000L,
+            ),
+        )
+        val yuv30Step = yuv30Ramp.copy(
+            id = "yuv-30-step",
+            transition = TransitionSpec(mode = TransitionMode.STEP),
+        )
+
+        assertEquals(120f, requiredDecoderSourceFps(listOf(rgb120, yuv30Ramp)))
+        assertEquals(60f, requiredDecoderSourceFps(listOf(rgb120, yuv30Step)))
+        assertEquals(
+            60f,
+            requiredDecoderSourceFps(
+                listOf(
+                    decoderRatePhase("yuv-30", PixelRoute.YUV_420, 30f),
+                    decoderRatePhase("p010-60", PixelRoute.P010, 60f),
+                ),
+            ),
+        )
+        assertNull(requiredDecoderSourceFps(listOf(rgb120)))
+    }
+
+    @Test
+    fun transitionCoverageRejectsSkippedStaircaseLevelWithoutCatchUpLoop() {
+        val complete = TransitionCoverageTracker(
+            TransitionSpec(mode = TransitionMode.STAIRCASE, stepCount = 4),
+        )
+        listOf(0f, 1f / 3f, 2f / 3f, 1f).forEach { fraction ->
+            complete.observe(
+                TransitionSample(fraction, TransitionSegment.STEP_UP),
+            )
+        }
+        assertNull(complete.failureReason())
+
+        val skipped = TransitionCoverageTracker(
+            TransitionSpec(mode = TransitionMode.STAIRCASE, stepCount = 4),
+        )
+        listOf(0f, 2f / 3f, 1f).forEach { fraction ->
+            skipped.observe(
+                TransitionSample(fraction, TransitionSegment.STEP_UP),
+            )
+        }
+        assertTrue(skipped.failureReason()!!.contains("1"))
+    }
+
+    @Test
+    fun transitionCoverageRequiresBothPulseWindowsAndAllSoakSegments() {
+        val pulse = TransitionCoverageTracker(
+            TransitionSpec(mode = TransitionMode.PULSE_BURST),
+        )
+        pulse.observe(TransitionSample(1f, TransitionSegment.BURST_ON), phaseElapsedMs = 0L)
+        assertTrue(pulse.failureReason()!!.contains("OFF"))
+        pulse.observe(TransitionSample(0f, TransitionSegment.BURST_OFF), phaseElapsedMs = 2_500L)
+        assertNull(pulse.failureReason())
+
+        val soak = TransitionCoverageTracker(
+            TransitionSpec(mode = TransitionMode.SOAK_RECOVERY),
+        )
+        soak.observe(TransitionSample(0f, TransitionSegment.RAMP_UP))
+        soak.observe(TransitionSample(0.5f, TransitionSegment.RAMP_UP))
+        soak.observe(TransitionSample(1f, TransitionSegment.HOLD))
+        soak.observe(TransitionSample(0.5f, TransitionSegment.RAMP_DOWN))
+        soak.observe(TransitionSample(0f, TransitionSegment.RAMP_DOWN))
+        assertNull(soak.failureReason())
+    }
+
+    @Test
+    fun transitionCoverageDoesNotCombineSegmentsFromDifferentCycles() {
+        val pulse = TransitionCoverageTracker(
+            TransitionSpec(mode = TransitionMode.PULSE_BURST, cycleMs = 1_000L),
+        )
+        pulse.observe(
+            TransitionSample(1f, TransitionSegment.BURST_ON),
+            phaseElapsedMs = 100L,
+        )
+        pulse.observe(
+            TransitionSample(0f, TransitionSegment.BURST_OFF),
+            phaseElapsedMs = 1_700L,
+        )
+
+        assertTrue(pulse.failureReason()!!.contains("동일 cycle"))
+    }
+
+    private fun decoderRatePhase(
+        id: String,
+        route: PixelRoute,
+        fps: Float,
+        transition: TransitionSpec = TransitionSpec(),
+    ) = com.example.dpulayerlab.model.PhaseSpec(
+        id = id,
+        label = id,
+        durationMs = 5_000L,
+        activeLayers = 1,
+        producerFps = fps,
+        requestedDisplayHz = 60f,
+        backend = LayerBackend.INDEPENDENT_SURFACES,
+        pixelRoute = route,
+        bufferSize = BufferSize.DISPLAY,
+        motion = MotionProfile.STATIC,
+        transition = transition,
+    )
 }

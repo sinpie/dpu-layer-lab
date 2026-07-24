@@ -168,6 +168,7 @@ internal class ProducerGenerationGate {
     private var topologyPending = false
     private var activated = false
     private var topologyPublishedMs = -1L
+    private var topologyRevision = 0L
     private val expectedSinceMs = LongTimestampMap()
     private val lastObservedMs = LongTimestampMap()
     private var generationStartedMs = 0L
@@ -184,6 +185,7 @@ internal class ProducerGenerationGate {
         topologyPending = false
         activated = false
         topologyPublishedMs = -1L
+        topologyRevision = 0L
         expectedSinceMs.clear()
         lastObservedMs.clear()
         generationStartedMs = nowMs.coerceAtLeast(0L)
@@ -223,6 +225,8 @@ internal class ProducerGenerationGate {
         // stage-removal acknowledgement; only a later terminal removal may complete the barrier.
         teardownCompleted = false
         if (!normalized.contentEquals(expectedProducerIds)) {
+            topologyRevision =
+                if (topologyRevision == Long.MAX_VALUE) 1L else topologyRevision + 1L
             for (id in expectedProducerIds) {
                 if (!normalized.containsId(id) && !lastObservedMs.contains(id)) {
                     topologyMissed = true
@@ -364,6 +368,7 @@ internal class ProducerGenerationGate {
             topologyPublished = topologyDeclared,
             topologyPending = topologyPending,
             topologyPublishedAtMs = topologyPublishedMs.takeIf { it >= 0L },
+            topologyRevision = topologyRevision,
             topologyMissed = topologyMissed,
             teardownFailed = teardownFailed,
             teardownCompleted = teardownCompleted,
@@ -473,6 +478,7 @@ data class ProducerReadiness(
     val topologyPublished: Boolean = false,
     val topologyPending: Boolean = false,
     val topologyPublishedAtMs: Long? = null,
+    val topologyRevision: Long = 0L,
     val topologyMissed: Boolean = false,
     val teardownFailed: Boolean = false,
     val teardownCompleted: Boolean = false,

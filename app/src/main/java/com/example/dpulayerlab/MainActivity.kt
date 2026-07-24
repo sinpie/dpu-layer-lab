@@ -51,6 +51,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        lastDisplayEnvelopeIdentity = currentDisplayEnvelopeIdentity()
         controller.start()
         activityStarted = true
         drainPendingAutomation()
@@ -70,8 +71,20 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
-        val previous = lastDisplayEnvelopeIdentity
         super.onConfigurationChanged(newConfig)
+        validateCurrentDisplayEnvelope()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        // Activity has no public onMovedToDisplay callback. A moved window regains focus on its
+        // destination display, covering equal-size display moves that configuration deltas alone
+        // cannot identify; onStart provides the second lifecycle boundary check.
+        if (hasFocus) validateCurrentDisplayEnvelope()
+    }
+
+    private fun validateCurrentDisplayEnvelope() {
+        val previous = lastDisplayEnvelopeIdentity
         val current = currentDisplayEnvelopeIdentity()
         lastDisplayEnvelopeIdentity = current
         if (controller.isRunning && displaySafetyEnvelopeChanged(previous, current)) {
@@ -84,12 +97,13 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         pendingAutomation.clear()
-        // Request UI disposal first. This is not a synchronous producer-teardown proof, so
-        // LabController.close() deliberately never resets compression from this lifecycle path.
+        // Publish the process-wide stage-removal token before Compose disposal can detach its
+        // AndroidView. The later stage callback clears the token; native worker leases remain
+        // authoritative if any thread outlives the bounded join.
         try {
-            super.onDestroy()
-        } finally {
             controller.close()
+        } finally {
+            super.onDestroy()
         }
     }
 
@@ -201,30 +215,33 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    private fun requestDisplayRefresh(targetHz: Float) {
+    private fun requestDisplayRefresh(targetHz: Float): Boolean = runCatching {
         if (!targetHz.isFinite() || targetHz <= 0f) {
-            if (lastPreferredModeId == 0 && lastPreferredRefreshRate == 0f) return
+            if (lastPreferredModeId == 0 && lastPreferredRefreshRate == 0f) {
+                return@runCatching true
+            }
             val attributes = window.attributes
             attributes.preferredDisplayModeId = 0
             attributes.preferredRefreshRate = 0f
             window.attributes = attributes
             lastPreferredModeId = 0
             lastPreferredRefreshRate = 0f
-            return
+            return@runCatching true
         }
-        val currentDisplay = currentDisplayCompat() ?: return
+        val currentDisplay = currentDisplayCompat() ?: return@runCatching false
         val currentMode = currentDisplay.mode
         val sameResolution = currentDisplay.supportedModes.filter {
             it.physicalWidth == currentMode.physicalWidth &&
                 it.physicalHeight == currentMode.physicalHeight
         }
         val candidates = sameResolution.ifEmpty { currentDisplay.supportedModes.toList() }
-        val chosen = candidates.minByOrNull { abs(it.refreshRate - targetHz) } ?: return
+        val chosen = candidates.minByOrNull { abs(it.refreshRate - targetHz) }
+            ?: return@runCatching false
         if (
             chosen.modeId == lastPreferredModeId &&
             abs(chosen.refreshRate - lastPreferredRefreshRate) < 0.01f
         ) {
-            return
+            return@runCatching true
         }
         val attributes = window.attributes
         attributes.preferredDisplayModeId = chosen.modeId
@@ -232,7 +249,8 @@ class MainActivity : ComponentActivity() {
         window.attributes = attributes
         lastPreferredModeId = chosen.modeId
         lastPreferredRefreshRate = chosen.refreshRate
-    }
+        true
+    }.getOrDefault(false)
 
     @Suppress("DEPRECATION")
     private fun currentDisplayEnvelopeIdentity(): DisplayEnvelopeIdentity {

@@ -28,6 +28,21 @@ class LabModelsTest {
     }
 
     @Test
+    fun executionNormalizationMakesWorkerCutoffExplicit() {
+        val effective = LoadSetpoints(
+            cpu = MIN_EFFECTIVE_LOAD,
+            memory = Math.nextDown(MIN_EFFECTIVE_LOAD),
+            gpu = Math.nextUp(MIN_EFFECTIVE_LOAD),
+            npu = Float.NaN,
+        ).normalizedForExecution()
+
+        assertEquals(0f, effective.cpu)
+        assertEquals(0f, effective.memory)
+        assertEquals(Math.nextUp(MIN_EFFECTIVE_LOAD), effective.gpu)
+        assertEquals(0f, effective.npu)
+    }
+
+    @Test
     fun gaugeUnavailableDoesNotInventAValue() {
         assertEquals("N/A", Gauge().display())
         assertEquals("N/A", Gauge(Float.NaN, "%").display())
@@ -49,6 +64,15 @@ class LabModelsTest {
         )
         assertTrue(!PixelRoute.RGB_8888.usesSelectedMediaDecoder())
         assertTrue(!PixelRoute.RGB_565.usesSelectedMediaDecoder())
+    }
+
+    @Test
+    fun zOrderMotionIsTypedAsAClientProxyAndNeverPhysicalHwcEvidence() {
+        val motion = MotionProfile.Z_ORDER_SWAP
+
+        assertEquals(MotionSemantics.VIEW_CLIENT_Z_ORDER_PROXY, motion.semantics)
+        assertTrue(!motion.semantics.changesPhysicalHwcZOrder)
+        assertTrue(motion.label.contains("proxy", ignoreCase = true))
     }
 
     @Test
