@@ -580,10 +580,34 @@ layer를 1개로 clamp할 때는 실험이 GL-only로 바뀌지 않도록 primar
 
 요구 환경:
 
+- Android Studio Narwhal Feature Drop 2025.1.2 이상 또는 AGP 8.12를 지원하는 후속 버전
 - JDK 17
 - Android SDK 36
 - Android Gradle Plugin 8.12.2
 - Gradle wrapper 8.13
+
+### Android Studio 프로젝트
+
+저장소 루트를 Android Studio에서 열면 `settings.gradle.kts`의 `DPULayerTest` 프로젝트와
+`:app` 모듈을 Gradle wrapper로 가져옵니다. SDK/JDK 절대 경로, `local.properties`,
+사용자별 `.idea` 상태는 저장소에 포함하지 않습니다. Android Studio의 Gradle JDK는
+JDK 17로 설정하고 SDK 36을 설치한 뒤 Sync합니다.
+
+VCS에 공유되는 Run/Debug configuration은 다음 두 개입니다.
+
+- `DPULayerTest - Debug APK`: `:app:assembleDebug`
+- `DPULayerTest - Release APK (unsigned)`: `:app:assembleRelease`
+
+두 configuration은 Android Studio 상단 configuration 목록에서 선택해 같은 Gradle
+task를 재현합니다. Debug 결과는 Android debug key로 자동 서명되며
+`app/build/outputs/apk/debug/app-debug.apk`에 생성됩니다. Release configuration은
+제품 키를 참조하지 않고 의도적으로
+`app/build/outputs/apk/release/app-release-unsigned.apk`만 생성합니다. 따라서 Release
+구성을 기기에 직접 Run/Install하는 구성으로 바꾸거나 저장소에 signing 경로·암호를
+추가하지 마세요. 앱을 실행·디버깅할 때는 Build Variants에서 `debug`를 선택하고
+Android Studio가 만든 `app` Android App configuration을 사용합니다. Android App
+configuration은 현재 선택한 build variant를 사용하므로, 공유된 두 Gradle
+configuration이 변형별 APK 생성을 명확히 고정합니다.
 
 Windows PowerShell 예:
 

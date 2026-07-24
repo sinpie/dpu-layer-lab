@@ -32,6 +32,11 @@ prefix, Soong module/APK 이름 `DpuLayerLab`은 별도 migration 요구 없이 
 ## 빌드
 
 기준 환경은 JDK 17, SDK 36, AGP 8.12.2, Gradle wrapper 8.13이다.
+Android Studio는 Narwhal Feature Drop 2025.1.2 이상 또는 AGP 8.12를 지원하는 후속
+버전을 사용한다. VCS-shared `DPULayerTest - Debug APK`와
+`DPULayerTest - Release APK (unsigned)` configuration은 각각
+`:app:assembleDebug`, `:app:assembleRelease`를 실행한다. Release configuration에
+local/platform signing 경로나 credential을 추가하지 않는다.
 
 ```powershell
 $env:JAVA_HOME='<JDK_17_HOME>'

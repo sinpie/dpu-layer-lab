@@ -14,6 +14,12 @@ Release asset 이름은 `DPULayerTest-20260724_111816-debug.apk`,
 `DPULayerTest-20260724_111816-release-unsigned.apk`, `SHA256SUMS.txt`다. Unsigned
 release는 secure product signing pipeline 입력이며 최종 설치 APK가 아니고 platform
 key/certificate/keystore/token은 저장소나 release에 두지 않는다.
+Android Studio project는 Gradle wrapper를 authority로 사용한다. AGP 8.12.2 때문에
+Narwhal Feature Drop 2025.1.2 이상 또는 AGP 8.12 지원 후속 Studio가 필요하다.
+VCS-shared configuration은 `DPULayerTest - Debug APK`(`:app:assembleDebug`)와
+`DPULayerTest - Release APK (unsigned)`(`:app:assembleRelease`)이며 사용자별
+`.idea`/SDK/JDK 경로는 추적하지 않는다. Release configuration은 secure product
+signing과 분리된 unsigned 산출물만 만든다.
 
 ## 목적
 

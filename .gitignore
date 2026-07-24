@@ -1,6 +1,10 @@
 # IDE / local SDK
 *.iml
-.idea/
+.idea/*
+!.idea/runConfigurations/
+.idea/runConfigurations/*
+!.idea/runConfigurations/DPULayerTest_Debug.xml
+!.idea/runConfigurations/DPULayerTest_Release.xml
 local.properties
 
 # Gradle / Android build output
