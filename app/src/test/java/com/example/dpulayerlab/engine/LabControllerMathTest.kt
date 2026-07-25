@@ -5,6 +5,7 @@ import com.example.dpulayerlab.model.BufferSize
 import com.example.dpulayerlab.model.Gauge
 import com.example.dpulayerlab.model.HwcCompositionExpectation
 import com.example.dpulayerlab.model.LayerBackend
+import com.example.dpulayerlab.model.LayerSizeProfile
 import com.example.dpulayerlab.model.LoadTransitionEvaluator
 import com.example.dpulayerlab.model.LoadSetpoints
 import com.example.dpulayerlab.model.MetricQuality
@@ -24,6 +25,7 @@ import com.example.dpulayerlab.model.TransitionMode
 import com.example.dpulayerlab.model.TransitionSample
 import com.example.dpulayerlab.model.TransitionSegment
 import com.example.dpulayerlab.model.TransitionSpec
+import com.example.dpulayerlab.model.requiredCoverageMask
 import com.example.dpulayerlab.model.terminalReason
 import com.example.dpulayerlab.monitor.CompressionControlResult
 import com.example.dpulayerlab.monitor.SurfaceFlingerProbePolicy
@@ -55,6 +57,7 @@ class LabControllerMathTest {
             pixelRoute = PixelRoute.RGB_8888,
             bufferSize = BufferSize.DISPLAY,
             motion = MotionProfile.TRANSFORM_STORM,
+            layerSizeProfile = LayerSizeProfile.ABRUPT_SMALL_FULL,
             alphaOverlap = true,
             includeGlLayer = true,
             workloads = LoadSetpoints(cpu = 1f, memory = 1f, gpu = 1f, npu = 1f),
@@ -67,6 +70,7 @@ class LabControllerMathTest {
         assertEquals(LayerBackend.INDEPENDENT_SURFACES, warmup.backend)
         assertEquals(PixelRoute.RGB_8888, warmup.pixelRoute)
         assertEquals(BufferSize.DISPLAY, warmup.bufferSize)
+        assertEquals(LayerSizeProfile.FULL_SCREEN, warmup.layerSizeProfile)
         assertEquals(LoadSetpoints(), warmup.workloads)
         assertFalse(warmup.alphaOverlap)
         assertFalse(warmup.includeGlLayer)
@@ -1153,6 +1157,7 @@ class LabControllerMathTest {
             backend = LayerBackend.MIXED_SURFACE_TEXTURE,
             pixelRoute = PixelRoute.SBWC_REQUIRED,
             bufferSize = BufferSize.UHD_4K,
+            layerSizeProfile = LayerSizeProfile.MIXED_SIZES,
             alphaOverlap = true,
             includeGlLayer = true,
             hwcCompositionExpectation = HwcCompositionExpectation.CLIENT_REQUIRED,
@@ -1163,6 +1168,7 @@ class LabControllerMathTest {
         assertEquals(LayerBackend.INDEPENDENT_SURFACES, warmup.backend)
         assertEquals(PixelRoute.RGB_8888, warmup.pixelRoute)
         assertEquals(BufferSize.DISPLAY, warmup.bufferSize)
+        assertEquals(LayerSizeProfile.FULL_SCREEN, warmup.layerSizeProfile)
         assertFalse(warmup.alphaOverlap)
         assertFalse(warmup.includeGlLayer)
         assertEquals(HwcCompositionExpectation.NONE, warmup.hwcCompositionExpectation)
@@ -1183,6 +1189,7 @@ class LabControllerMathTest {
         assertEquals(target.backend, safeInitial.backend)
         assertEquals(target.pixelRoute, safeInitial.pixelRoute)
         assertEquals(target.bufferSize, safeInitial.bufferSize)
+        assertEquals(priorRuntime.layerSizeProfile, safeInitial.layerSizeProfile)
         assertEquals(target.alphaOverlap, safeInitial.alphaOverlap)
         assertEquals(target.includeGlLayer, safeInitial.includeGlLayer)
         assertEquals(priorRuntime.producerFps, safeInitial.producerFps, 0f)
@@ -1201,6 +1208,7 @@ class LabControllerMathTest {
             assertEquals(target.backend, safeRuntime.backend)
             assertEquals(target.pixelRoute, safeRuntime.pixelRoute)
             assertEquals(target.bufferSize, safeRuntime.bufferSize)
+            assertEquals(interpolated.layerSizeProfile, safeRuntime.layerSizeProfile)
             assertEquals(target.alphaOverlap, safeRuntime.alphaOverlap)
             assertEquals(target.includeGlLayer, safeRuntime.includeGlLayer)
             assertEquals(interpolated.producerFps, safeRuntime.producerFps, 0f)
@@ -1223,6 +1231,7 @@ class LabControllerMathTest {
         assertEquals(PixelRoute.RGB_8888, safeReverse.pixelRoute)
         assertEquals(linearTarget.backend, safeReverse.backend)
         assertEquals(linearTarget.bufferSize, safeReverse.bufferSize)
+        assertEquals(reverseOrigin.layerSizeProfile, safeReverse.layerSizeProfile)
         assertEquals(linearTarget.activeLayers, safeReverse.activeLayers)
         assertEquals(sbwcOrigin.producerFps, safeReverse.producerFps, 0f)
 
@@ -1244,6 +1253,187 @@ class LabControllerMathTest {
         )
         assertFalse(safeGpuRelease.includeGlLayer)
         assertEquals(0f, safeGpuRelease.workloads.gpu, 0f)
+    }
+
+    @Test
+    fun activeLayerSizeProfileArmsOnceAndStaysPinnedAcrossCyclicValleys() {
+        val origin = checkNotNull(ScenarioCatalog.byId("baseline-display-modes"))
+            .phases.first()
+            .copy(layerSizeProfile = LayerSizeProfile.FULL_SCREEN)
+        val target = origin.copy(
+            id = "dynamic-target",
+            layerSizeProfile = LayerSizeProfile.ABRUPT_SMALL_FULL,
+        )
+        val valley = LoadTransitionEvaluator.interpolate(
+            previous = origin,
+            target = target,
+            fraction = 0f,
+        )
+        val peak = LoadTransitionEvaluator.interpolate(
+            previous = origin,
+            target = target,
+            fraction = 1f,
+        )
+
+        assertEquals(
+            LayerSizeProfile.FULL_SCREEN,
+            layerSizeProfileForActiveTransition(
+                interpolated = valley,
+                target = target,
+                transitionStarted = false,
+            ).layerSizeProfile,
+        )
+        listOf(valley, peak, valley).forEach { cyclicSample ->
+            assertEquals(
+                LayerSizeProfile.ABRUPT_SMALL_FULL,
+                layerSizeProfileForActiveTransition(
+                    interpolated = cyclicSample,
+                    target = target,
+                    transitionStarted = true,
+                ).layerSizeProfile,
+            )
+        }
+    }
+
+    @Test
+    fun producerRecoveryDiscardsPendingDynamicGeometryBeforePreparationCanBlockRepublish() {
+        val dynamicProfile = LayerSizeProfile.ABRUPT_SMALL_FULL
+        val pending = PendingControlCoverage(
+            sample = TransitionSample(0.5f, TransitionSegment.HOLD),
+            phaseElapsedMs = 6_000L,
+            expectedProducerCount = 8,
+            expectedTopologyRevision = 3L,
+            expectedLayerSizeProfileOrdinal = dynamicProfile.ordinal,
+        )
+        val acknowledgedTarget =
+            com.example.dpulayerlab.monitor.ProducerReadiness(
+                expectedCount = 8,
+                ready = true,
+                topologyRevision = 3L,
+                geometryRequestedRevision = 9L,
+                geometryAppliedRevision = 9L,
+                geometryRequestedProfileOrdinal = dynamicProfile.ordinal,
+                geometryAppliedProfileOrdinal = dynamicProfile.ordinal,
+                geometryReady = true,
+            )
+        val recoveryPreparation = acknowledgedTarget.copy(
+            geometryRequestedRevision = 10L,
+            geometryAppliedRevision = 10L,
+            geometryRequestedProfileOrdinal = LayerSizeProfile.SMALL_UNIFORM.ordinal,
+            geometryAppliedProfileOrdinal = LayerSizeProfile.SMALL_UNIFORM.ordinal,
+        )
+
+        assertTrue(pending.isAcknowledgedBy(acknowledgedTarget))
+        assertFalse(pending.isAcknowledgedBy(recoveryPreparation))
+        assertNull(discardPendingControlCoverageForProducerRecovery(pending))
+    }
+
+    @Test
+    fun layerGeometryCoverageFailsClosedOnPendingWrongProfileOrMissingSteps() {
+        val profile = LayerSizeProfile.GRADUAL_SMALL_TO_FULL
+        val complete = com.example.dpulayerlab.monitor.ProducerReadiness(
+            expectedCount = 4,
+            observedCount = 4,
+            ready = true,
+            topologyPublished = true,
+            geometryRequestedRevision = 4L,
+            geometryAppliedRevision = 4L,
+            geometryRequestedProfileOrdinal = profile.ordinal,
+            geometryAppliedProfileOrdinal = profile.ordinal,
+            geometryCoverageMask = profile.requiredCoverageMask(),
+            geometryReady = true,
+        )
+
+        assertTrue(layerGeometryCoverageSatisfied(complete, profile))
+        assertFalse(
+            layerGeometryCoverageSatisfied(
+                complete.copy(
+                    geometryAppliedRevision = 3L,
+                    geometryReady = false,
+                ),
+                profile,
+            ),
+        )
+        assertFalse(
+            layerGeometryCoverageSatisfied(
+                complete.copy(
+                    geometryAppliedProfileOrdinal = LayerSizeProfile.SMALL_UNIFORM.ordinal,
+                ),
+                profile,
+            ),
+        )
+        assertFalse(
+            layerGeometryCoverageSatisfied(
+                complete.copy(topologyPending = true),
+                profile,
+            ),
+        )
+        assertFalse(
+            layerGeometryCoverageSatisfied(
+                complete.copy(observedCount = complete.expectedCount - 1),
+                profile,
+            ),
+        )
+        assertFalse(
+            layerGeometryCoverageSatisfied(
+                complete.copy(ready = false),
+                profile,
+            ),
+        )
+        assertFalse(
+            layerGeometryCoverageSatisfied(
+                complete.copy(topologyMissed = true),
+                profile,
+            ),
+        )
+        assertFalse(
+            layerGeometryCoverageSatisfied(
+                complete.copy(teardownFailed = true),
+                profile,
+            ),
+        )
+        assertFalse(
+            layerGeometryCoverageSatisfied(
+                complete.copy(teardownCompleted = true),
+                profile,
+            ),
+        )
+        assertFalse(
+            layerGeometryCoverageSatisfied(
+                complete.copy(geometryCoverageMask = 0b011),
+                profile,
+            ),
+        )
+    }
+
+    @Test
+    fun rendererPreparationFreezesDynamicLayerGeometryAtSmallOrigin() {
+        listOf(
+            LayerSizeProfile.GRADUAL_SMALL_TO_FULL,
+            LayerSizeProfile.ABRUPT_SMALL_FULL,
+        ).forEach { dynamicProfile ->
+            val dynamic = ScenarioCatalog.presets.first().phases.first().copy(
+                id = "dynamic",
+                layerSizeProfile = dynamicProfile,
+                motion = MotionProfile.TRANSFORM_STORM,
+            )
+
+            assertEquals(
+                LayerSizeProfile.SMALL_UNIFORM,
+                preparationLayerSizeProfile(dynamicProfile),
+            )
+            assertEquals(
+                LayerSizeProfile.SMALL_UNIFORM,
+                rendererPreparationPhase(dynamic).layerSizeProfile,
+            )
+        }
+        listOf(
+            LayerSizeProfile.FULL_SCREEN,
+            LayerSizeProfile.SMALL_UNIFORM,
+            LayerSizeProfile.MIXED_SIZES,
+        ).forEach { staticProfile ->
+            assertEquals(staticProfile, preparationLayerSizeProfile(staticProfile))
+        }
     }
 
     @Test
@@ -2532,6 +2722,9 @@ class LabControllerMathTest {
             topologyPending: Boolean = false,
             processLeaseActive: Boolean = false,
             pendingBoundaryExists: Boolean = false,
+            topologyMissed: Boolean = false,
+            teardownFailed: Boolean = false,
+            teardownCompleted: Boolean = false,
             observedProducerCount: Int = 4,
             observedTopologyRevision: Long = 9L,
         ) = hwcCompositionTargetReadyForArm(
@@ -2540,7 +2733,9 @@ class LabControllerMathTest {
             topologyPending = topologyPending,
             processLeaseActive = processLeaseActive,
             pendingBoundaryExists = pendingBoundaryExists,
-            teardownFailed = false,
+            topologyMissed = topologyMissed,
+            teardownFailed = teardownFailed,
+            teardownCompleted = teardownCompleted,
             runtimeFailurePresent = false,
             expectedProducerCount = 4,
             observedProducerCount = observedProducerCount,
@@ -2552,6 +2747,9 @@ class LabControllerMathTest {
         assertFalse(ready(topologyPending = true))
         assertFalse(ready(processLeaseActive = true))
         assertFalse(ready(pendingBoundaryExists = true))
+        assertFalse(ready(topologyMissed = true))
+        assertFalse(ready(teardownFailed = true))
+        assertFalse(ready(teardownCompleted = true))
         assertFalse(ready(observedProducerCount = 3))
         assertFalse(ready(observedTopologyRevision = 8L))
     }
@@ -2573,6 +2771,12 @@ class LabControllerMathTest {
             workloads = requested.workloads.copy(gpu = 0.4f),
         )
         assertTrue(hwcCompositionContractPreserved(requested, requested))
+        assertFalse(
+            hwcCompositionContractPreserved(
+                requested,
+                requested.copy(layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM),
+            ),
+        )
         assertFalse(hwcCompositionContractPreserved(requested, reduced))
         assertTrue(
             hwcCompositionContractPreserved(

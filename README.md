@@ -10,11 +10,13 @@ Android AP의 DPU underrun 재현·검출과 Hardware Composer 합성 한계 탐
 service를 연결하면 DPU·DDR·HWC·SBWC·NPU와 같은 제품 전용 기능을 추가로 사용할 수
 있습니다.
 
-현재 launcher/Gradle project 표시 이름과 release 앱 버전은
-**DPULayerTest 20260725_090252**(`versionCode 4`)입니다. Debug 변형은 화면과
-보고서에 `20260725_090252-debug`로 표시됩니다. Version name은 KST build 시각을
-`yyyyMMdd_HHmmss`로 고정한 형식입니다. 앱 상단과 실행 HUD에 같은 build version을
-노출해 결과를 만든 바이너리를 현장에서 바로 식별할 수 있습니다.
+현재 launcher/Gradle project 표시 이름은 **DPULayerTest**입니다. 저장소의 미배포
+source candidate는 `20260725_095708`(`versionCode 5`), debug는
+`20260725_095708-debug`입니다. 최신 공개 release는
+[`v20260725_090252`](https://github.com/sinpie/dpu-layer-lab/releases/tag/v20260725_090252)
+(`versionCode 4`)입니다. Version name은 KST build 시각을 `yyyyMMdd_HHmmss`로 고정한
+형식입니다. 앱 상단과 실행 HUD에 실제 build version을 노출해 결과를 만든 바이너리를
+현장에서 바로 식별할 수 있습니다.
 소스 저장소는 계속 [sinpie/dpu-layer-lab](https://github.com/sinpie/dpu-layer-lab)을
 사용합니다. 기존 제품 이미지와 자동화 harness를 깨지 않기 위해 package
 `com.example.dpulayerlab`, START/STOP/SHOW action, `dpu-layer-lab-` report prefix,
@@ -27,10 +29,29 @@ Soong module/APK 통합 이름 `DpuLayerLab`은 이름을 바꾸지 않는 호�
 > 사용해야 합니다. 앱의 safety cap은 우발적인 과부하를 줄이는 방어선이지, BSP·PMIC·패널
 > 또는 실리콘의 안전을 보증하는 장치가 아닙니다.
 
+## 문서 지도
+
+| 문서 | Authority |
+|---|---|
+| [README.md](README.md) | 시험자 관점의 기능, UI, 빠른 시작과 제한 |
+| [AGENTS.md](AGENTS.md) | 수정 규칙, 안전 불변식, 금지사항과 완료 정의 |
+| [PLAN.md](PLAN.md) | 현재·다음 작업의 상태와 acceptance criteria |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | component, 실행 흐름, 상태와 resource ownership |
+| [PROJECT_MEMORY.md](PROJECT_MEMORY.md) | 장기 설계 결정과 이유 |
+| [Scenario 계약](docs/SCENARIOS.md) | catalog, phase, transition, facet와 custom test |
+| [Metric 계약](docs/METRICS.md) | source/quality, exact/proxy, verdict와 report schema |
+| [Build와 검증](docs/TESTING.md) | host/device gate와 test-to-contract 지도 |
+| [Release 절차](docs/RELEASE.md) | version, artifact, signing과 publish |
+| [Repository 복구](docs/RECONSTRUCTION.md) | 코드 유실 시 dependency별 재구축 순서 |
+| [System/BSP 통합](docs/SYSTEM_INTEGRATION.md) | AIDL, permission, SELinux와 vendor provider |
+
 ## 주요 기능
 
 - 최대 20개의 독립 `SurfaceView` BufferQueue layer
 - 독립 Surface / Surface+Texture 혼합 / GPU flattened composition A/B
+- `FULL_SCREEN`(기본), `SMALL_UNIFORM`, `MIXED_SIZES`,
+  `GRADUAL_SMALL_TO_FULL`, `ABRUPT_SMALL_FULL` destination 크기 profile.
+  Source buffer와 physical producer 수는 유지한 채 layer의 화면 footprint만 바꿉니다.
 - layer별 scroll, zoom, pan, 임의 회전, parallax, alpha overlap, View/client Z-order
   swap proxy(physical HWC Z-order 변경의 증거는 아님)
 - producer 30~120 fps 및 display 60/90/120 Hz 요청·실제 Hz 동시 기록
@@ -52,6 +73,12 @@ Soong module/APK 통합 이름 `DpuLayerLab`은 이름을 바꾸지 않는 호�
   (`observed/—P`는 topology commit 대기, `observed/expected P`는 commit 완료).
   각 gauge는 source/quality를 함께 표시하고 provenance 변경이나 unavailable 구간에서는
   선을 연결하지 않습니다.
+- 실행 HUD의 destination screen-equivalent footprint. 일반 phase는
+  `LayerSizeProfile`의 base scale만 합하고, `CAPACITY_TILES`는 명시적인 예외로 crop
+  union 1 screen-equivalent와 평균 `100 / producer count`%를 표시합니다. HUD는
+  estimator의 scope label을 그대로 보여주며 motion scale, overlap, crop과 clipping은
+  제외하고,
+  conservative full-buffer 예상 traffic이나 실측 bus 점유율을 줄여 표시하지 않습니다.
 - 결과 화면의 DPU/GPU/bus/produced FPS와 HWC DEVICE/CLIENT peak
 - format·buffer size·layer 수·scanout Hz 기반 예상 traffic
 - HWC DEVICE/CLIENT layer 파싱(`DUMP` 권한이 있을 때)
@@ -59,6 +86,8 @@ Soong module/APK 통합 이름 `DpuLayerLab`은 이름을 바꾸지 않는 호�
 - thermal·low-memory·graphics-memory budget 기반 런타임 안전 정책
 - 카테고리·변화 파형·예상 강도·부하/조건을 조합하는 시나리오 필터와 순서가 보존되는
   queue, plan 반복 및 실행/결과 진행률
+- 목적 중심 빠른 선택(`급격한 DPU 부하`, `DEVICE 후보 유지`, `CLIENT 전환 목표`)과
+  small/mixed/full size A/B, 점진 확대, 급격 toggle, size+layer+FPS burst preset
 - phase/event/telemetry를 포함한 로컬 JSON 결과와 명시적 공유
 
 Backend/pixel route/buffer size 같은 topology가 바뀌는 경계는 검증된 target topology와
@@ -77,6 +106,40 @@ level, pulse ON/OFF, triangle 상승/하강, soak attack/hold/recovery를 실제
 soak 같은 one-shot transition에 0이 아닌 `floor`를 넣은 runnable plan은 의미가
 모호하므로 safety policy가 거부합니다. 순수 evaluator의 defensive bounding만 잘못된
 직접 호출이 origin을 건너뛰지 않도록 floor를 0으로 지웁니다.
+
+Dynamic layer-size phase도 같은 100 ms cadence에서 의미를 검증합니다.
+`GRADUAL_SMALL_TO_FULL`은 최소 2개 control window, `ABRUPT_SMALL_FULL`은 small/full
+8 step 전체를 위한 8개 window를 duration cap 뒤에도 확보해야 하며 부족하면
+거부합니다. Controller의 pause-aware `phaseElapsedMs`가 size progress의 authority이며,
+renderer는 topology 준비/복구에서 같은 elapsed anchor로 다시 연결하므로 producer
+generation이 바뀌어도 waveform을 0부터 재시작하지 않습니다. 준비 중에는 dynamic
+waveform을 진행시키지 않고 static measured origin을 고정합니다. 명시적인 prior static
+origin이 없을 때만 두 dynamic profile의 0 지점과 같은 `SMALL_UNIFORM`을 사용하며,
+prior full/small/mixed origin과 allocation route 전환의 size edge는 baseline 전에
+소비하지 않습니다. 같은 producer generation에서 이 `SMALL_UNIFORM` geometry의
+applied acknowledgment가 확인되면 controller는 geometry 동등성을 근거로 target
+dynamic profile의 origin coverage bit 하나만 seed합니다. Mid/end 또는 abrupt의
+나머지 step을 대신하지는 않습니다. Fresh baseline과 origin producer readiness 뒤 첫
+active tick에서 cyclic fraction이 0이어도 target size profile을 arm하고, 이후
+`PULSE_BURST`/
+`TRIANGLE_WAVE` valley에서도 이전 profile로 돌아가지 않습니다. Dynamic transform은
+producer FPS가 낮아도 최대 100 ms
+간격으로 적용하고 phase 끝의 fraction 1 sample은 cadence와 무관하게 강제합니다.
+자세한 계약은
+[Scenario 계약](docs/SCENARIOS.md)을 참고하세요.
+Fresh composition evidence 동안 target geometry가 바뀌지 않도록 typed
+`DEVICE_ONLY`/`CLIENT_REQUIRED` phase에는 dynamic size profile을 허용하지 않습니다.
+
+실제 base geometry를 View에 적용할 때마다 generation 안에서 bounded geometry revision을
+요청하고, 이후 두 번의 `Choreographer` callback/traversal 기회가 지난 matching
+revision/profile만 applied로 인정합니다. Producer activation과 typed HWC target arm은 이
+acknowledgment를 기다립니다. 이는 앱이 destination transform을 적용했다는 증거이지
+physical HWC plane 합성의 증거는 아닙니다. Dynamic phase는 위의 matching
+preparation-equivalent origin bit와 실제 active profile acknowledgment를 합쳐
+small origin·중간·끝(gradual) 또는 8개 step 전체(abrupt)를 충족해야 합니다.
+누락되면 `LAYER_SIZE_COVERAGE_MISSING`과 `INCONCLUSIVE`, 충족되면
+`LAYER_SIZE_COVERAGE` event를 남깁니다. 좁은 화면의 centered scale-aware stagger도 각
+layer가 수평으로 최소 1 px 보이도록 제한합니다.
 
 ### 테스트 전체 화면과 HWC layer
 
@@ -365,12 +428,13 @@ Battery Saver exact restore 순서를 조합해 확인합니다. Host 검증은 
 
 ## 시나리오
 
-`20260725_090252` catalog에는 다음 **25개 preset**이 있습니다. Custom은 catalog preset 수에
-포함하지 않습니다.
+현재 source candidate catalog에는 다음 **32개 preset**이 있습니다. Custom은 catalog
+preset 수에 포함하지 않습니다.
 
 | 카테고리 | 대표 테스트 |
 |---|---|
 | Layer / HWC | HWC Plane Staircase, backend만 바꾸는 HWC ↔ GPU Composition Pivot, 4L DEVICE Candidate Burst, 20L CLIENT Fallback Candidate |
+| Layer size | Small-layer Density, Small/Mixed/Full Matrix, Gradual Expansion, Abrupt Toggle, Size+Layer+FPS Burst, Sized DEVICE/CLIENT |
 | Transform | 12-layer Transform Storm |
 | Video / Format | 4K YUV + RGB Overlay, 8K30 YUV / 8K60 P010 Decoder Pressure, Linear ↔ SBWC |
 | Refresh | 60 → 90 → 120 Hz baseline, mixed producer pacing |

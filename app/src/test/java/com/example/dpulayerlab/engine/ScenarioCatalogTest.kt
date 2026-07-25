@@ -3,6 +3,7 @@ package com.example.dpulayerlab.engine
 import com.example.dpulayerlab.model.BufferSize
 import com.example.dpulayerlab.model.HwcCompositionExpectation
 import com.example.dpulayerlab.model.LayerBackend
+import com.example.dpulayerlab.model.LayerSizeProfile
 import com.example.dpulayerlab.model.LoadSetpoints
 import com.example.dpulayerlab.model.LoadShape
 import com.example.dpulayerlab.model.LoadTransitionEvaluator
@@ -13,6 +14,7 @@ import com.example.dpulayerlab.model.RenderSafetyLimits
 import com.example.dpulayerlab.model.RiskLevel
 import com.example.dpulayerlab.model.ScenarioCategory
 import com.example.dpulayerlab.model.ScenarioSafetyPolicy
+import com.example.dpulayerlab.model.ScenarioSpec
 import com.example.dpulayerlab.model.SelectedDecoderBuffer
 import com.example.dpulayerlab.model.TransitionMode
 import com.example.dpulayerlab.model.TransitionSpec
@@ -26,12 +28,19 @@ class ScenarioCatalogTest {
     fun presetIdsAreUniqueAndPhasesAreRunnable() {
         val presets = ScenarioCatalog.presets
         assertEquals(presets.size, presets.map { it.id }.distinct().size)
-        assertEquals(25, presets.size)
+        assertEquals(32, presets.size)
         assertTrue(
             setOf(
                 "dpu-device-envelope-burst",
                 "dpu-client-fallback-burst",
                 "dpu-only-repeat-shock",
+                "small-layer-density",
+                "mixed-layer-size-matrix",
+                "gradual-layer-size-expansion",
+                "abrupt-layer-size-toggle",
+                "layer-size-fps-burst",
+                "layer-size-device-candidate",
+                "layer-size-client-pressure",
                 "resource-pulse",
                 "instant-isolated-contention",
                 "gradual-load-transitions",
@@ -115,6 +124,13 @@ class ScenarioCatalogTest {
             "dpu-device-envelope-burst",
             "dpu-client-fallback-burst",
             "dpu-only-repeat-shock",
+            "small-layer-density",
+            "mixed-layer-size-matrix",
+            "gradual-layer-size-expansion",
+            "abrupt-layer-size-toggle",
+            "layer-size-fps-burst",
+            "layer-size-device-candidate",
+            "layer-size-client-pressure",
             "mid-load-perturbation",
             "dvfs-video-shock",
             "mixed-soak",
@@ -266,7 +282,23 @@ class ScenarioCatalogTest {
                 }
             }
             .mapTo(mutableSetOf()) { it.id }
-        assertEquals(setOf(device.id, client.id), typedExpectationOwners)
+        assertEquals(
+            setOf(
+                device.id,
+                client.id,
+                "layer-size-device-candidate",
+                "layer-size-client-pressure",
+            ),
+            typedExpectationOwners,
+        )
+        assertTrue(
+            ScenarioCatalog.presets
+                .flatMap(ScenarioSpec::phases)
+                .filter {
+                    it.hwcCompositionExpectation != HwcCompositionExpectation.NONE
+                }
+                .all { !it.layerSizeProfile.changesOverTime },
+        )
     }
 
     @Test
@@ -322,11 +354,178 @@ class ScenarioCatalogTest {
             activeLayers = 12,
             producerFps = 120f,
             requestedDisplayHz = 120f,
+            layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
         )
         burstIndices.forEach { index ->
             assertEquals(stableVector, scenario.phases[index].experimentVector())
         }
         assertEquals(low.experimentVector(), scenario.phases.last().experimentVector())
+    }
+
+    @Test
+    fun layerSizePresetsCoverDensityMixedGradualAbruptAndCombinedBursts() {
+        val sizePresetIds = setOf(
+            "small-layer-density",
+            "mixed-layer-size-matrix",
+            "gradual-layer-size-expansion",
+            "abrupt-layer-size-toggle",
+            "layer-size-fps-burst",
+            "layer-size-device-candidate",
+            "layer-size-client-pressure",
+        )
+        val scenarios = ScenarioCatalog.presets.filter { it.id in sizePresetIds }
+        assertEquals(sizePresetIds, scenarios.mapTo(mutableSetOf()) { it.id })
+        assertEquals(
+            LayerSizeProfile.entries.toSet(),
+            scenarios.flatMap(ScenarioSpec::phases)
+                .mapTo(mutableSetOf(), PhaseSpec::layerSizeProfile),
+        )
+
+        val density = checkNotNull(ScenarioCatalog.byId("small-layer-density"))
+        assertEquals(20, density.maxLayers)
+        assertTrue(
+            density.phases.filter { it.activeLayers > 1 }.all {
+                it.layerSizeProfile == LayerSizeProfile.SMALL_UNIFORM
+            },
+        )
+
+        val mixed = checkNotNull(ScenarioCatalog.byId("mixed-layer-size-matrix"))
+        assertTrue(mixed.phases.any {
+            it.layerSizeProfile == LayerSizeProfile.MIXED_SIZES
+        })
+        assertTrue(mixed.phases.any {
+            it.layerSizeProfile == LayerSizeProfile.FULL_SCREEN
+        })
+
+        val gradual = checkNotNull(ScenarioCatalog.byId("gradual-layer-size-expansion"))
+        assertTrue(gradual.phases.any {
+            it.layerSizeProfile == LayerSizeProfile.GRADUAL_SMALL_TO_FULL
+        })
+        val abrupt = checkNotNull(ScenarioCatalog.byId("abrupt-layer-size-toggle"))
+        assertEquals(
+            2,
+            abrupt.phases.count {
+                it.layerSizeProfile == LayerSizeProfile.ABRUPT_SMALL_FULL
+            },
+        )
+
+        val combined = checkNotNull(ScenarioCatalog.byId("layer-size-fps-burst"))
+        val first = combined.phases.first()
+        val firstBurst = combined.phases.single { it.id == "sb-full-burst" }
+        val peak = combined.phases.maxBy { it.activeLayers }
+        assertEquals(LayerSizeProfile.SMALL_UNIFORM, first.layerSizeProfile)
+        assertEquals(1, first.activeLayers)
+        assertEquals(30f, first.producerFps)
+        assertEquals(14, firstBurst.activeLayers)
+        assertEquals(120f, firstBurst.producerFps)
+        assertEquals(LayerSizeProfile.FULL_SCREEN, firstBurst.layerSizeProfile)
+        assertEquals(18, peak.activeLayers)
+        assertEquals(120f, peak.producerFps)
+        assertEquals(LayerSizeProfile.MIXED_SIZES, peak.layerSizeProfile)
+    }
+
+    @Test
+    fun legacyAndCustomDefaultsRemainFullScreenUnlessVisibilityIsExplicit() {
+        val baseline = checkNotNull(ScenarioCatalog.byId("baseline-display-modes"))
+        assertTrue(
+            baseline.phases.all {
+                it.layerSizeProfile == LayerSizeProfile.FULL_SCREEN
+            },
+        )
+        val custom = ScenarioCatalog.custom(
+            layers = 1,
+            durationSeconds = 10,
+            producerFps = 60f,
+            requestedHz = 60f,
+            backend = LayerBackend.INDEPENDENT_SURFACES,
+            pixelRoute = PixelRoute.RGB_8888,
+            bufferSize = BufferSize.DISPLAY,
+            motion = MotionProfile.STATIC,
+            loads = LoadSetpoints(),
+        )
+        assertEquals(
+            LayerSizeProfile.FULL_SCREEN,
+            custom.phases.single().layerSizeProfile,
+        )
+    }
+
+    @Test
+    fun opaquePlaneAndDeviceCandidatesUseVisibleNonFullGeometry() {
+        val device = checkNotNull(ScenarioCatalog.byId("dpu-device-envelope-burst"))
+        val deviceTargets = device.phases.filter {
+            it.activeLayers > 1 &&
+                it.hwcCompositionExpectation == HwcCompositionExpectation.DEVICE_ONLY
+        }
+        assertTrue(deviceTargets.isNotEmpty())
+        assertTrue(deviceTargets.all {
+            it.layerSizeProfile != LayerSizeProfile.FULL_SCREEN
+        })
+
+        val staircase = checkNotNull(ScenarioCatalog.byId("plane-staircase"))
+        assertTrue(
+            staircase.phases.filter { it.activeLayers > 1 }.all {
+                it.layerSizeProfile == LayerSizeProfile.SMALL_UNIFORM
+            },
+        )
+
+        val repeatedShock = checkNotNull(ScenarioCatalog.byId("dpu-only-repeat-shock"))
+        assertTrue(
+            repeatedShock.phases.filter { it.activeLayers > 1 }.all {
+                it.layerSizeProfile == LayerSizeProfile.SMALL_UNIFORM
+            },
+        )
+
+        val midLoad = checkNotNull(ScenarioCatalog.byId("mid-load-perturbation"))
+        assertTrue(midLoad.phases.all {
+            it.layerSizeProfile == LayerSizeProfile.SMALL_UNIFORM
+        })
+    }
+
+    @Test
+    fun sizedHwcCandidatesKeepTypedDurationAndCompositionContracts() {
+        val device = checkNotNull(ScenarioCatalog.byId("layer-size-device-candidate"))
+        val client = checkNotNull(ScenarioCatalog.byId("layer-size-client-pressure"))
+
+        device.phases.filter {
+            it.hwcCompositionExpectation == HwcCompositionExpectation.DEVICE_ONLY
+        }.forEach { phase ->
+            assertTrue(
+                phase.durationMs >=
+                    ScenarioSafetyPolicy.minimumHwcExpectationPhaseDurationMs(
+                        HwcCompositionExpectation.DEVICE_ONLY,
+                    ),
+            )
+            assertEquals(LayerBackend.INDEPENDENT_SURFACES, phase.backend)
+            assertTrue(!phase.alphaOverlap)
+            assertTrue(!phase.includeGlLayer)
+            assertEquals(LoadSetpoints(), phase.workloads)
+            assertTrue(phase.layerSizeProfile != LayerSizeProfile.FULL_SCREEN)
+            assertTrue(!phase.layerSizeProfile.changesOverTime)
+        }
+
+        val clientTargets = client.phases.filter {
+            it.hwcCompositionExpectation == HwcCompositionExpectation.CLIENT_REQUIRED
+        }
+        assertEquals(2, clientTargets.size)
+        clientTargets.forEach { phase ->
+            assertTrue(
+                phase.durationMs >=
+                    ScenarioSafetyPolicy.minimumHwcExpectationPhaseDurationMs(
+                        HwcCompositionExpectation.CLIENT_REQUIRED,
+                    ),
+            )
+            assertEquals(20, phase.activeLayers)
+            assertEquals(120f, phase.producerFps)
+            assertEquals(LayerBackend.MIXED_SURFACE_TEXTURE, phase.backend)
+            assertTrue(phase.alphaOverlap)
+            assertTrue(phase.includeGlLayer)
+            assertEquals(LoadSetpoints(), phase.workloads)
+            assertTrue(!phase.layerSizeProfile.changesOverTime)
+        }
+        assertEquals(
+            listOf(LayerSizeProfile.FULL_SCREEN, LayerSizeProfile.MIXED_SIZES),
+            clientTargets.map(PhaseSpec::layerSizeProfile),
+        )
     }
 
     @Test
@@ -393,6 +592,7 @@ class ScenarioCatalogTest {
             pixelRoute = PixelRoute.YUV_420,
             bufferSize = BufferSize.UHD_4K,
             motion = MotionProfile.ROTATE,
+            layerSizeProfile = LayerSizeProfile.MIXED_SIZES,
             loads = LoadSetpoints(cpu = 0.5f, memory = 0.8f, gpu = 0.3f),
             transition = TransitionSpec(
                 mode = TransitionMode.LINEAR_RAMP,
@@ -406,6 +606,7 @@ class ScenarioCatalogTest {
         assertEquals(90f, phase.producerFps)
         assertEquals(BufferSize.UHD_4K, phase.bufferSize)
         assertEquals(PixelRoute.YUV_420, phase.pixelRoute)
+        assertEquals(LayerSizeProfile.MIXED_SIZES, phase.layerSizeProfile)
         assertEquals(TransitionMode.LINEAR_RAMP, phase.transition.mode)
         assertEquals(RiskLevel.HIGH, custom.risk)
     }
@@ -555,15 +756,19 @@ class ScenarioCatalogTest {
             pixelRoute = PixelRoute.P010,
             bufferSize = BufferSize.UHD_8K,
             motion = MotionProfile.TRANSFORM_STORM,
+            layerSizeProfile = LayerSizeProfile.MIXED_SIZES,
             loads = LoadSetpoints(gpu = 0.5f),
         )
 
         val phase = custom.phases.single()
         assertEquals(PixelRoute.RGB_8888, phase.pixelRoute)
         assertEquals(BufferSize.DISPLAY, phase.bufferSize)
+        assertEquals(LayerSizeProfile.FULL_SCREEN, phase.layerSizeProfile)
         assertTrue(!phase.includeGlLayer)
         assertTrue(custom.description.contains("decoder 또는 4K/8K BufferQueue 부하가 아닙니다"))
         assertTrue("input normalized" in custom.tags)
+        assertTrue("size profile normalized" in custom.tags)
+        assertTrue(custom.description.contains("physical producer가 1개"))
         assertTrue(phase.label.contains("normalization"))
     }
 
@@ -616,7 +821,7 @@ class ScenarioCatalogTest {
         val scenarios = ScenarioCatalog.presets.filter {
             it.category == ScenarioCategory.TRANSITION
         }
-        assertEquals(6, scenarios.size)
+        assertEquals(9, scenarios.size)
         assertEquals(
             setOf(
                 "instant-isolated-contention",
@@ -625,6 +830,9 @@ class ScenarioCatalogTest {
                 "continuous-crossload-ramp",
                 "wave-soak-recovery",
                 "dpu-only-repeat-shock",
+                "gradual-layer-size-expansion",
+                "abrupt-layer-size-toggle",
+                "layer-size-fps-burst",
             ),
             scenarios.mapTo(mutableSetOf()) { it.id },
         )
@@ -904,6 +1112,11 @@ class ScenarioCatalogTest {
             selectedMediaComparisonRoutes,
         )
         assertTrue(selectedMediaComparisonRoutes.all { it.usesSelectedMediaDecoder() })
+        assertTrue(
+            sbwc.phases
+                .filter { it.id == "linear" || it.id == "yuv" || it.id == "sbwc" }
+                .all { it.layerSizeProfile == LayerSizeProfile.MIXED_SIZES },
+        )
     }
 
     @Test
@@ -1011,6 +1224,7 @@ class ScenarioCatalogTest {
         val pixelRoute: PixelRoute,
         val bufferSize: BufferSize,
         val motion: MotionProfile,
+        val layerSizeProfile: LayerSizeProfile,
         val alphaOverlap: Boolean,
         val includeGlLayer: Boolean,
     )
@@ -1023,6 +1237,7 @@ class ScenarioCatalogTest {
         pixelRoute = pixelRoute,
         bufferSize = bufferSize,
         motion = motion,
+        layerSizeProfile = layerSizeProfile,
         alphaOverlap = alphaOverlap,
         includeGlLayer = includeGlLayer,
     )
@@ -1035,6 +1250,7 @@ class ScenarioCatalogTest {
         val pixelRoute: PixelRoute,
         val bufferSize: BufferSize,
         val motion: MotionProfile,
+        val layerSizeProfile: LayerSizeProfile,
         val workloads: LoadSetpoints,
         val alphaOverlap: Boolean,
         val includeGlLayer: Boolean,
@@ -1049,6 +1265,7 @@ class ScenarioCatalogTest {
         pixelRoute = pixelRoute,
         bufferSize = bufferSize,
         motion = motion,
+        layerSizeProfile = layerSizeProfile,
         workloads = workloads,
         alphaOverlap = alphaOverlap,
         includeGlLayer = includeGlLayer,

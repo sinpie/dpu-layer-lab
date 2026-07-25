@@ -52,6 +52,9 @@ enum class ScenarioCondition(val label: String) {
     DPU_BURST("DPU 저→고 burst"),
     HWC_DEVICE_ONLY("DEVICE 유지 목표"),
     HWC_CLIENT_REQUIRED("CLIENT 전환 목표"),
+    SMALL_LAYER_GEOMETRY("작은 layer"),
+    MIXED_LAYER_GEOMETRY("Mixed layer size"),
+    LAYER_SIZE_CHANGE("Layer 크기 전환"),
 }
 
 data class ScenarioSelectionFilter(
@@ -113,7 +116,8 @@ object ScenarioClassifier {
         val explicitInstant =
             phases.any {
                 it.transition.mode == TransitionMode.PULSE_BURST ||
-                    it.workloads.shape == LoadShape.PULSE
+                    it.workloads.shape == LoadShape.PULSE ||
+                    it.layerSizeProfile == LayerSizeProfile.ABRUPT_SMALL_FULL
             } ||
                 phases.zipWithNext().any { (from, to) ->
                     to.transition.mode == TransitionMode.STEP &&
@@ -131,14 +135,16 @@ object ScenarioClassifier {
         val gradual = phases.any {
             it.transition.mode in GRADUAL_TRANSITIONS ||
                 it.workloads.shape == LoadShape.RAMP ||
-                it.workloads.shape == LoadShape.SAW
+                it.workloads.shape == LoadShape.SAW ||
+                it.layerSizeProfile == LayerSizeProfile.GRADUAL_SMALL_TO_FULL
         }
         if (gradual) result += ScenarioChangePattern.GRADUAL
 
         val cyclic = phases.any {
             it.transition.mode == TransitionMode.PULSE_BURST ||
                 it.transition.mode == TransitionMode.TRIANGLE_WAVE ||
-                it.workloads.shape in CYCLIC_LOAD_SHAPES
+                it.workloads.shape in CYCLIC_LOAD_SHAPES ||
+                it.layerSizeProfile == LayerSizeProfile.ABRUPT_SMALL_FULL
         }
         if (cyclic) result += ScenarioChangePattern.CYCLIC
 
@@ -233,6 +239,28 @@ object ScenarioClassifier {
         ) {
             result += ScenarioCondition.HWC_CLIENT_REQUIRED
         }
+        if (
+            scenario.phases.any {
+                it.layerSizeProfile == LayerSizeProfile.SMALL_UNIFORM
+            }
+        ) {
+            result += ScenarioCondition.SMALL_LAYER_GEOMETRY
+        }
+        if (
+            scenario.phases.any {
+                it.layerSizeProfile == LayerSizeProfile.MIXED_SIZES
+            }
+        ) {
+            result += ScenarioCondition.MIXED_LAYER_GEOMETRY
+        }
+        if (
+            scenario.phases.any {
+                it.layerSizeProfile == LayerSizeProfile.GRADUAL_SMALL_TO_FULL ||
+                    it.layerSizeProfile == LayerSizeProfile.ABRUPT_SMALL_FULL
+            }
+        ) {
+            result += ScenarioCondition.LAYER_SIZE_CHANGE
+        }
         return result
     }
 
@@ -246,6 +274,7 @@ object ScenarioClassifier {
             BufferSize.UHD_4K -> 0.75f
             BufferSize.UHD_8K -> 1f
         }
+        val visibleAreaFactor = representativeDestinationAreaFactor(phase)
         val crossLoadFactor = phase.workloads.normalized().let {
             maxOf(it.cpu, it.memory, it.gpu, it.npu)
         }
@@ -260,7 +289,10 @@ object ScenarioClassifier {
                 layerFactor * 0.25f +
                     fpsFactor * 0.15f +
                     hzFactor * 0.10f +
-                    resolutionFactor * 0.25f +
+                    // Source allocation/write pressure remains tied to the full producer buffer.
+                    // Destination footprint is a separate, smaller composition-geometry signal.
+                    resolutionFactor * 0.20f +
+                    visibleAreaFactor * 0.05f +
                     crossLoadFactor * 0.20f +
                     complexityFactor * 0.05f
                 ) * 100f
@@ -272,6 +304,7 @@ object ScenarioClassifier {
             from.backend != to.backend ||
             from.pixelRoute != to.pixelRoute ||
             from.bufferSize != to.bufferSize ||
+            from.layerSizeProfile != to.layerSizeProfile ||
             from.includeGlLayer != to.includeGlLayer ||
             from.alphaOverlap != to.alphaOverlap
 
@@ -307,6 +340,90 @@ object ScenarioClassifier {
 
     private fun Float.finiteOrZero(): Float = takeIf(Float::isFinite) ?: 0f
 
+    internal fun representativeDestinationAreaFactor(phase: PhaseSpec): Float {
+        val physicalLayerCount = if (phase.backend == LayerBackend.FLATTENED_TEXTURE) {
+            1
+        } else {
+            phase.activeLayers.coerceIn(1, MAX_CLASSIFIED_LAYERS)
+        }
+        if (phase.motion == MotionProfile.CAPACITY_TILES) {
+            return 1f / physicalLayerCount.toFloat()
+        }
+        return when (phase.layerSizeProfile) {
+            LayerSizeProfile.GRADUAL_SMALL_TO_FULL -> {
+                // Width and height scales are linear in phase time, so area is quadratic.
+                // Simpson's rule is exact for that polynomial and remains tied to the canonical
+                // profile evaluator if its endpoints change.
+                val start = averageDestinationArea(
+                    profile = phase.layerSizeProfile,
+                    layerCount = physicalLayerCount,
+                    phaseFraction = 0f,
+                )
+                val midpoint = averageDestinationArea(
+                    profile = phase.layerSizeProfile,
+                    layerCount = physicalLayerCount,
+                    phaseFraction = 0.5f,
+                )
+                val end = averageDestinationArea(
+                    profile = phase.layerSizeProfile,
+                    layerCount = physicalLayerCount,
+                    phaseFraction = 1f,
+                )
+                (start + 4f * midpoint + end) / 6f
+            }
+
+            LayerSizeProfile.ABRUPT_SMALL_FULL -> {
+                // Every abrupt step occupies an equal fraction of the phase. Sampling each
+                // midpoint avoids boundary ambiguity and remains correct if the step pattern is
+                // changed while its bounded step count is preserved.
+                var total = 0f
+                var step = 0
+                while (step < ABRUPT_LAYER_SIZE_PROFILE_STEPS) {
+                    total += averageDestinationArea(
+                        profile = phase.layerSizeProfile,
+                        layerCount = physicalLayerCount,
+                        phaseFraction =
+                            (step + 0.5f) / ABRUPT_LAYER_SIZE_PROFILE_STEPS.toFloat(),
+                    )
+                    step++
+                }
+                total / ABRUPT_LAYER_SIZE_PROFILE_STEPS.toFloat()
+            }
+
+            LayerSizeProfile.FULL_SCREEN,
+            LayerSizeProfile.SMALL_UNIFORM,
+            LayerSizeProfile.MIXED_SIZES,
+            -> averageDestinationArea(
+                profile = phase.layerSizeProfile,
+                layerCount = physicalLayerCount,
+                phaseFraction = 0f,
+            )
+        }.takeIf(Float::isFinite)
+            ?.coerceIn(0f, 1f)
+            ?: 1f
+    }
+
+    private fun averageDestinationArea(
+        profile: LayerSizeProfile,
+        layerCount: Int,
+        phaseFraction: Float,
+    ): Float {
+        var total = 0f
+        var index = 0
+        while (index < layerCount) {
+            total += profile.normalizedSizeForLayer(
+                layerIndex = index,
+                layerCount = layerCount,
+                phaseFraction = phaseFraction,
+            ).areaScale
+            index++
+        }
+        return (total / layerCount.toFloat())
+            .takeIf(Float::isFinite)
+            ?.coerceIn(0f, 1f)
+            ?: 1f
+    }
+
     private val GRADUAL_TRANSITIONS = setOf(
         TransitionMode.LINEAR_RAMP,
         TransitionMode.STAIRCASE,
@@ -321,4 +438,5 @@ object ScenarioClassifier {
 
     private const val MIN_DPU_BURST_TARGET_LAYERS = 4
     private const val MIN_DPU_BURST_LAYER_DELTA = 3
+    private const val MAX_CLASSIFIED_LAYERS = 20
 }

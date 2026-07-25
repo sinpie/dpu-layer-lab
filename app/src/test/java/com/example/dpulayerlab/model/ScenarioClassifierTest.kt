@@ -107,6 +107,161 @@ class ScenarioClassifierTest {
     }
 
     @Test
+    fun layerSizeProfilesExposeTypedConditionsAndChangePatterns() {
+        val small = scenario(
+            "small",
+            phase("small").copy(
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
+            ),
+        )
+        val mixed = scenario(
+            "mixed",
+            phase("mixed").copy(
+                layerSizeProfile = LayerSizeProfile.MIXED_SIZES,
+            ),
+        )
+        val gradual = scenario(
+            "gradual-size",
+            phase("gradual-size").copy(
+                layerSizeProfile = LayerSizeProfile.GRADUAL_SMALL_TO_FULL,
+            ),
+        )
+        val abrupt = scenario(
+            "abrupt-size",
+            phase("abrupt-size").copy(
+                layerSizeProfile = LayerSizeProfile.ABRUPT_SMALL_FULL,
+            ),
+        )
+
+        assertTrue(
+            ScenarioCondition.SMALL_LAYER_GEOMETRY in ScenarioClassifier.conditions(small),
+        )
+        assertTrue(
+            ScenarioCondition.MIXED_LAYER_GEOMETRY in ScenarioClassifier.conditions(mixed),
+        )
+        listOf(gradual, abrupt).forEach { scenario ->
+            assertTrue(
+                ScenarioCondition.LAYER_SIZE_CHANGE in ScenarioClassifier.conditions(scenario),
+            )
+        }
+        assertTrue(
+            ScenarioChangePattern.GRADUAL in ScenarioClassifier.changePatterns(gradual),
+        )
+        val abruptPatterns = ScenarioClassifier.changePatterns(abrupt)
+        assertTrue(ScenarioChangePattern.INSTANT in abruptPatterns)
+        assertTrue(ScenarioChangePattern.CYCLIC in abruptPatterns)
+    }
+
+    @Test
+    fun sizeOnlyStepIsAnInstantControlChangeAndVisibleAreaRefinesIntensity() {
+        val full = phase("full").copy(
+            layerSizeProfile = LayerSizeProfile.FULL_SCREEN,
+        )
+        val small = full.copy(
+            id = "small",
+            layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
+        )
+        val mixed = full.copy(
+            id = "mixed",
+            layerSizeProfile = LayerSizeProfile.MIXED_SIZES,
+        )
+        val small8k = small.copy(
+            id = "small-8k",
+            bufferSize = BufferSize.UHD_8K,
+        )
+        val sizeStep = scenario("size-step", full).copy(
+            phases = listOf(full, small),
+        )
+
+        assertTrue(
+            ScenarioChangePattern.INSTANT in ScenarioClassifier.changePatterns(sizeStep),
+        )
+        assertTrue(
+            ScenarioClassifier.intensityScore(small) <
+                ScenarioClassifier.intensityScore(mixed),
+        )
+        assertTrue(
+            ScenarioClassifier.intensityScore(mixed) <
+                ScenarioClassifier.intensityScore(full),
+        )
+        assertTrue(
+            "source-buffer resolution must remain load-bearing for small destinations",
+            ScenarioClassifier.intensityScore(small) <
+            ScenarioClassifier.intensityScore(small8k),
+        )
+    }
+
+    @Test
+    fun dynamicLayerSizeRepresentativeAreaUsesTimeWeightedWaveforms() {
+        val base = phase("dynamic-area").copy(
+            backend = LayerBackend.INDEPENDENT_SURFACES,
+            activeLayers = 20,
+        )
+        val gradual = base.copy(
+            layerSizeProfile = LayerSizeProfile.GRADUAL_SMALL_TO_FULL,
+        )
+        val abrupt = base.copy(
+            layerSizeProfile = LayerSizeProfile.ABRUPT_SMALL_FULL,
+        )
+
+        assertEquals(
+            (0.09f + 4f * 0.4225f + 1f) / 6f,
+            ScenarioClassifier.representativeDestinationAreaFactor(gradual),
+            0.000_001f,
+        )
+        assertEquals(
+            (0.09f + 1f) / 2f,
+            ScenarioClassifier.representativeDestinationAreaFactor(abrupt),
+            0.000_001f,
+        )
+    }
+
+    @Test
+    fun flattenedDestinationAreaUsesOnePhysicalProducer() {
+        val logicalMixed = phase("flattened-mixed").copy(
+            activeLayers = 20,
+            backend = LayerBackend.FLATTENED_TEXTURE,
+            layerSizeProfile = LayerSizeProfile.MIXED_SIZES,
+            alphaOverlap = false,
+            includeGlLayer = false,
+        )
+        val independentMixed = logicalMixed.copy(
+            backend = LayerBackend.INDEPENDENT_SURFACES,
+        )
+
+        assertEquals(
+            1f,
+            ScenarioClassifier.representativeDestinationAreaFactor(logicalMixed),
+            0f,
+        )
+        assertTrue(
+            ScenarioClassifier.representativeDestinationAreaFactor(independentMixed) < 1f,
+        )
+    }
+
+    @Test
+    fun capacityTileAreaUsesOneScreenCropUnionAcrossPhysicalProducers() {
+        val tiled = phase("capacity-tiles").copy(
+            activeLayers = 20,
+            motion = MotionProfile.CAPACITY_TILES,
+            layerSizeProfile = LayerSizeProfile.FULL_SCREEN,
+        )
+
+        assertEquals(
+            0.05f,
+            ScenarioClassifier.representativeDestinationAreaFactor(tiled),
+            0.000_001f,
+        )
+        assertEquals(
+            1f,
+            ScenarioClassifier.representativeDestinationAreaFactor(
+                tiled.copy(backend = LayerBackend.FLATTENED_TEXTURE),
+            ),
+            0f,
+        )
+    }
+
+    @Test
     fun routeResolutionMotionAndRefreshConditionsAreDiscoverable() {
         val sbwc8k = scenario(
             "sbwc-8k",

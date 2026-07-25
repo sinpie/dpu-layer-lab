@@ -148,6 +148,7 @@ class LoadTransitionEvaluatorTest {
         val differentTopology = sameTopology.copy(
             activeLayers = 1,
             bufferSize = BufferSize.UHD_8K,
+            layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
         )
         val safeTopologyChange = LoadTransitionEvaluator.interpolate(
             previous,
@@ -157,6 +158,7 @@ class LoadTransitionEvaluatorTest {
         assertEquals(previous.activeLayers, safeTopologyChange.activeLayers)
         assertEquals(previous.bufferSize, safeTopologyChange.bufferSize)
         assertEquals(previous.backend, safeTopologyChange.backend)
+        assertEquals(previous.layerSizeProfile, safeTopologyChange.layerSizeProfile)
 
         val switchedTopology = LoadTransitionEvaluator.interpolate(
             previous,
@@ -165,6 +167,7 @@ class LoadTransitionEvaluatorTest {
         )
         assertEquals(1, switchedTopology.activeLayers)
         assertEquals(BufferSize.UHD_8K, switchedTopology.bufferSize)
+        assertEquals(LayerSizeProfile.SMALL_UNIFORM, switchedTopology.layerSizeProfile)
 
         val malformedStep = differentTopology.copy(
             activeLayers = Int.MIN_VALUE,

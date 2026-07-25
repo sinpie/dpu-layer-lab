@@ -173,6 +173,7 @@ object LoadTransitionEvaluator {
                 pixelRoute = previous.pixelRoute,
                 bufferSize = previous.bufferSize,
                 motion = previous.motion,
+                layerSizeProfile = previous.layerSizeProfile,
                 workloads = previous.workloads,
                 alphaOverlap = previous.alphaOverlap,
                 includeGlLayer = previous.includeGlLayer,

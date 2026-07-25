@@ -2,15 +2,19 @@
 
 이 파일은 사람과 coding agent가 DPULayerTest를 수정할 때 따르는 canonical repository
 instruction입니다. 장기 설계 맥락은 `PROJECT_MEMORY.md`, 사용자-facing 설명은
-`README.md`를 먼저 확인합니다.
+`README.md`를 먼저 확인합니다. 현재 구조와 실행 흐름은 `ARCHITECTURE.md`, 작업
+상태는 `PLAN.md`, 복구 순서는 `docs/RECONSTRUCTION.md`, scenario/metric/test/release
+계약은 각각 `docs/SCENARIOS.md`, `docs/METRICS.md`, `docs/TESTING.md`,
+`docs/RELEASE.md`가 authority다.
 
 Launcher와 Gradle project의 표시 이름은 `DPULayerTest`이고 canonical remote는
 `https://github.com/sinpie/dpu-layer-lab`이다. 제품 호환성 계약인 package
 `com.example.dpulayerlab`, automation component/action, `dpu-layer-lab-` report
 prefix, Soong module/APK 이름 `DpuLayerLab`은 별도 migration 요구 없이 바꾸지 않는다.
-현재 release version은 `20260725_090252`(`versionCode 4`), debug version은
-`20260725_090252-debug`이며 `yyyyMMdd_HHmmss`는 KST build 시각이다. release tag는
-`v20260725_090252`이다. Release asset은
+현재 미배포 source candidate는 `20260725_095708`(`versionCode 5`), debug version은
+`20260725_095708-debug`이다. 최신 공개 release는
+`20260725_090252`(`versionCode 4`), tag는 `v20260725_090252`이다.
+`yyyyMMdd_HHmmss`는 KST build 시각이다. 공개 Release asset은
 `DPULayerTest-20260725_090252-debug.apk`,
 `DPULayerTest-20260725_090252-release-unsigned.apk`, `SHA256SUMS.txt` 이름을 사용한다.
 
@@ -171,6 +175,12 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   frame budget을 즉시 정산·pause하고 교차 부하를 0으로 내린다. 다음 controller
   poll까지 이전 producer count를 계속 적분하거나 부하를 유지하지 않으며
   commit/restart 뒤에만 resume한다.
+- `topologyMissed`, `teardownFailed`, `teardownCompleted`는 현재 generation의 producer
+  readiness, geometry acknowledgment/coverage와 typed HWC evidence를 fail-closed로
+  무효화한다. `topologyMissed`/`teardownFailed`는 새 generation 없이는 복구하지 않는다.
+  정상 teardown 뒤 reattach도 topology pending → 새 geometry revision/profile
+  acknowledgment → expected topology 재게시 → activation → 모든 producer의 fresh
+  first buffer 순서를 다시 거친 뒤 fresh HWC evidence를 수집해야 한다.
 - Transition은 duration cap 반영 뒤 실제 window를 100 ms control cadence로 검증한다.
   Ramp 중간 tick, staircase의 각 level, pulse/triangle 한 cycle, soak의 최소 attack
   2 tick/hold 1 tick/recovery 2 tick을 보존할 수 없으면 reject한다. `STEP`은 fresh
@@ -179,10 +189,50 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   실행 loop는 absolute-deadline fixed period로 늦은 tick을 busy catch-up하지 않는다.
   Runtime coverage가 ramp 중간값, staircase 전 level, pulse ON/OFF, triangle 상승/하강,
   soak attack/hold/recovery를 관측하지 못하면 `INCONCLUSIVE`다.
+- `LayerSizeProfile`은 source buffer가 아닌 destination transform/crop 계약이다.
+  `FULL_SCREEN`이 기본이고 small/mixed/dynamic profile도 physical producer의 full
+  source allocation과 conservative full-buffer traffic budget을 줄이지 않는다.
+  Controller-owned pause-aware `phaseElapsedMs`를 dynamic size clock의 authority로
+  사용하고 preparation/recovery 및 producer generation rebuild는 그 elapsed anchor로
+  re-anchor해 진행률을 이어간다. Topology preparation은 dynamic waveform을 진행시키지
+  않고 static measured origin을 고정한다. Prior explicit static origin이 없을 때만
+  `SMALL_UNIFORM`을 두 dynamic profile의 fraction-zero equivalent로 사용하고, prior
+  full/small/mixed origin과 allocation route preparation의 measured size edge는 baseline
+  전에 소비하지 않는다. Fresh baseline과 origin producer readiness 뒤 첫 active
+  tick에서 cyclic fraction이 0이어도 target size profile을 arm하고, 이후
+  pulse/triangle valley에서도 이전 profile로 되돌리지 않는다. Duration cap 뒤
+  `GRADUAL_SMALL_TO_FULL`은 최소 2×100 ms window,
+  `ABRUPT_SMALL_FULL`은 8 step 전체의 8×100 ms window가 없으면 reject한다.
+  Dynamic transform apply cadence는 producer FPS와 독립적으로 최대 100 ms이고 final
+  fraction 1 sample은 강제한다.
+  실제 base geometry apply마다 generation-scoped bounded revision을 request하고 두 번의
+  후속 Choreographer callback/traversal opportunity 뒤 matching revision/profile만
+  acknowledge한다. 한 revision의 acknowledgment가 끝날 때까지 last-applied base-size
+  fraction을 고정하되 controller clock과 latest desired fraction은 계속 진행한다.
+  Acknowledgment 뒤 다음 apply 기회에는 중간값 backlog를 재생하지 않고 최신 desired만
+  적용한다. Gradual revision key는 origin/mid/exact endpoint 3개로 제한하고 abrupt는
+  8개 step key를 유지해 최소 200 ms gradual window에서도 30/60/120 fps의 required
+  coverage를 보존한다. Producer activation과 typed HWC arm은 이를 요구하지만 app-side
+  geometry apply evidence를 physical HWC composition proof로 표현하지 않는다.
+  같은 generation에서 applied가 확인된 `SMALL_UNIFORM` preparation은 두 dynamic
+  profile의 fraction-zero와 실제 geometry가 같을 때에만 해당 dynamic profile의 origin
+  coverage bit 하나를 equivalent evidence로 seed할 수 있다. Mid/end 또는 abrupt의
+  나머지 step coverage를 대체하지 않는다.
+  Active coverage는 gradual의 origin/mid/end, abrupt의 8 step 전체를 요구한다.
+  누락은 `LAYER_SIZE_COVERAGE_MISSING` event와 `INCONCLUSIVE`, 성공은
+  `LAYER_SIZE_COVERAGE` event로 남긴다. 좁은 stage의 centered scale-aware horizontal
+  stagger는 각 layer의 최소 1 px visibility를 보존한다.
+  HUD의 destination screen-equivalent footprint는 `LayerSizeProfile`의 base scale만
+  합하고 MotionProfile scale, overlap, crop/clipping과 off-screen loss를 제외한다.
+  단 `CAPACITY_TILES`는 explicit crop-union scope로 합계 1 screen-equivalent와 평균
+  `100 / physical producer count`%를 보고한다.
+  이를 measured bus나 full-buffer read/write traffic으로 표현하지 않는다.
 - Transition `floor`는 pulse/triangle의 반복 valley에만 허용한다. STEP/linear/
   staircase/soak에 nonzero floor가 있는 runnable plan은 reject한다. 순수 evaluator는
   hostile direct call에서만 defensive하게 0으로 지워 origin sample을 건너뛰지 않는다.
 - Typed `DEVICE_ONLY`/`CLIENT_REQUIRED` phase는 관측 계약이며 HWC 경로 강제가 아니다.
+  Fresh composition evidence 동안 target geometry가 고정돼야 하므로 dynamic
+  `LayerSizeProfile`을 함께 사용한 typed phase는 reject한다.
   Safety clamp가 계약 phase의 layer topology, producer FPS, display pacing, GL producer
   또는 GPU pressure를 바꾸면 다른 실험으로 축소하지 말고 reject한다. 3초 first-buffer
   readiness, 최대 4초 pre-target periodic sample mutex drain, probe당 4초 bounded fresh

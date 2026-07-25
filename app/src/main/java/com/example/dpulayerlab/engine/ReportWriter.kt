@@ -166,6 +166,7 @@ object ReportWriter {
                 append(""""pixelRoute": ${quote(phase.pixelRoute.name)}, """)
                 append(""""bufferSize": ${quote(phase.bufferSize.name)}, """)
                 append(""""motion": ${quote(phase.motion.name)}, """)
+                append(""""layerSizeProfile": ${quote(phase.layerSizeProfile.name)}, """)
                 append(""""motionSemantics": ${quote(phase.motion.semantics.name)}, """)
                 append(
                     """"physicalHwcZOrderChange": """ +

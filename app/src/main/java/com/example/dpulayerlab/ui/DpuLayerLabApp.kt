@@ -102,6 +102,7 @@ import com.example.dpulayerlab.model.DecoderLinearReference
 import com.example.dpulayerlab.model.Gauge
 import com.example.dpulayerlab.model.HwcCompositionExpectation
 import com.example.dpulayerlab.model.LayerBackend
+import com.example.dpulayerlab.model.LayerSizeProfile
 import com.example.dpulayerlab.model.LayerTrafficEstimate
 import com.example.dpulayerlab.model.LayerTrafficEstimator
 import com.example.dpulayerlab.model.LoadTransitionEvaluator
@@ -141,6 +142,7 @@ import com.example.dpulayerlab.render.LayerStageView
 import com.example.dpulayerlab.render.ProducerFrameCallback
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.util.Locale
 import kotlin.math.roundToInt
 
 private enum class AppSection(val label: String, val glyph: String) {
@@ -1554,7 +1556,8 @@ private fun QueuePlanCard(
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 Text(
-                                    "#${index + 1} ${scenario.name}",
+                                    "#${index + 1} ${scenario.name} · " +
+                                        scenarioLayerSizeProfileSummary(scenario),
                                     modifier = Modifier.widthIn(max = 210.dp),
                                     style = MaterialTheme.typography.labelLarge,
                                     fontWeight = FontWeight.SemiBold,
@@ -1846,6 +1849,13 @@ private fun ScenarioCard(
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
             )
+            Text(
+                "Layer 크기 · ${scenarioLayerSizeProfileSummary(scenario)}",
+                color = MaterialTheme.colorScheme.primary,
+                style = MaterialTheme.typography.labelLarge,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
             ScenarioValidationPreview(
                 preview = validationPreview,
                 hwcExpectations = hwcExpectations,
@@ -2083,7 +2093,8 @@ private fun CompactScenarioCard(
                 )
                 Text(scenario.name, style = MaterialTheme.typography.titleMedium)
                 Text(
-                    "${formatDuration(scenario.durationMs)} · ${scenario.maxHz.toInt()}Hz",
+                    "${formatDuration(scenario.durationMs)} · ${scenario.maxHz.toInt()}Hz · " +
+                        scenarioLayerSizeProfileSummary(scenario),
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     style = MaterialTheme.typography.labelLarge,
                 )
@@ -2112,6 +2123,9 @@ private fun BuilderScreen(controller: LabController, modifier: Modifier) {
     var backend by rememberSaveable { mutableStateOf(LayerBackend.MIXED_SURFACE_TEXTURE) }
     var route by rememberSaveable { mutableStateOf(PixelRoute.RGB_8888) }
     var size by rememberSaveable { mutableStateOf(BufferSize.DISPLAY) }
+    var layerSizeProfile by rememberSaveable {
+        mutableStateOf(LayerSizeProfile.FULL_SCREEN)
+    }
     var motion by rememberSaveable { mutableStateOf(MotionProfile.TRANSFORM_STORM) }
     var shape by rememberSaveable { mutableStateOf(LoadShape.STEADY) }
     var transitionMode by rememberSaveable { mutableStateOf(TransitionMode.STEP) }
@@ -2147,6 +2161,27 @@ private fun BuilderScreen(controller: LabController, modifier: Modifier) {
                 EnumSelector("합성 경로", backend, LayerBackend.entries) { backend = it }
                 EnumSelector("Pixel route", route, PixelRoute.entries) { route = it }
                 EnumSelector("Buffer size", size, BufferSize.entries) { size = it }
+                EnumSelector(
+                    "Layer 표시 크기",
+                    layerSizeProfile,
+                    LayerSizeProfile.entries,
+                ) { layerSizeProfile = it }
+                Text(
+                    when {
+                        backend == LayerBackend.FLATTENED_TEXTURE &&
+                            layerSizeProfile == LayerSizeProfile.MIXED_SIZES ->
+                            "Flattened Texture는 physical producer가 1개이므로 Mixed sizes는 " +
+                                "실행 시 Full screen으로 명시적으로 정규화됩니다."
+                        layerSizeProfile == LayerSizeProfile.FULL_SCREEN ->
+                            "Full screen은 기본값입니다. 여러 불투명 static layer는 서로 완전히 " +
+                                "가릴 수 있으므로 plane visibility 비교에는 Small/Mixed를 사용하세요."
+                        else ->
+                            "표시 geometry만 선택하며 physical producer 수와 buffer 안전 예산은 " +
+                                "layer 수·Buffer size 설정을 그대로 따릅니다."
+                    },
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelMedium,
+                )
                 EnumSelector(
                     "Motion",
                     motion,
@@ -2292,6 +2327,7 @@ private fun BuilderScreen(controller: LabController, modifier: Modifier) {
                 pixelRoute = route,
                 bufferSize = size,
                 motion = motion,
+                layerSizeProfile = layerSizeProfile,
                 loads = LoadSetpoints(cpu, memory, gpu, npu, shape),
                 transition = TransitionSpec(
                     mode = transitionMode,
@@ -2378,6 +2414,7 @@ private fun enumLabel(value: Any?): String = when (value) {
     is LayerBackend -> value.label
     is PixelRoute -> value.label
     is BufferSize -> value.label
+    is LayerSizeProfile -> layerSizeProfileUiLabel(value)
     is MotionProfile -> value.label
     is LoadShape -> value.label
     is TransitionMode -> value.label
@@ -2474,6 +2511,27 @@ private fun RunningScreen(controller: LabController) {
             controller.onProducerTopologyPending(generation)
         }
     }
+    val layerGeometryRequestedCallback: (Long, Long, Int) -> Unit =
+        remember(controller) {
+            { generation, revision, profileOrdinal ->
+                controller.frameTracker.requestLayerGeometry(
+                    generation = generation,
+                    revision = revision,
+                    profileOrdinal = profileOrdinal,
+                )
+            }
+        }
+    val layerGeometryAppliedCallback: (Long, Long, Int, Int) -> Unit =
+        remember(controller) {
+            { generation, revision, profileOrdinal, coverageBit ->
+                controller.frameTracker.acknowledgeLayerGeometry(
+                    generation = generation,
+                    revision = revision,
+                    profileOrdinal = profileOrdinal,
+                    coverageBit = coverageBit,
+                )
+            }
+        }
     var hudSamples by remember(
         progress.scenario?.id,
         planProgress.repeatIndex,
@@ -2538,9 +2596,12 @@ private fun RunningScreen(controller: LabController) {
                         selectedMedia = controller.selectedMediaUri,
                         selectedDecoder = controller.selectedVideoDecoder,
                         newProducerGeneration = progress.producerGeneration,
+                        newPhaseElapsedMs = progress.phaseElapsedMs,
                         onProducerFrame = producerFrameCallback,
                         onExpectedProducers = expectedProducersCallback,
                         onProducerTopologyPending = producerTopologyPendingCallback,
+                        onLayerGeometryRequested = layerGeometryRequestedCallback,
+                        onLayerGeometryApplied = layerGeometryAppliedCallback,
                         onProducerTeardownFailure =
                             controller.frameTracker::markProducerTeardownFailure,
                         onProducerRuntimeFailure = controller::onProducerRuntimeFailure,
@@ -2605,6 +2666,15 @@ private fun RunningHud(
         configuration.screenHeightDp < 720 -> 132.dp
         else -> 168.dp
     }
+    val phaseFraction = phase?.let {
+        if (it.durationMs > 0L) {
+            (progress.phaseElapsedMs.toDouble() / it.durationMs.toDouble())
+                .coerceIn(0.0, 1.0)
+                .toFloat()
+        } else {
+            0f
+        }
+    } ?: 0f
     val traffic = phase?.let {
         LayerTrafficEstimator.estimate(
             phase = it,
@@ -2615,6 +2685,7 @@ private fun RunningHud(
             mediaWidthPx = mediaWidthPx,
             mediaHeightPx = mediaHeightPx,
             decoderLinearReference = decoderLinearReference,
+            phaseFraction = phaseFraction,
         )
     }
     val layerScale = maxOf(
@@ -2622,15 +2693,6 @@ private fun RunningHud(
         progress.scenario?.maxLayers ?: 1,
         phase?.activeLayers ?: 1,
     ).toFloat()
-    val phaseFraction = phase?.let {
-        if (it.durationMs > 0L) {
-            (progress.phaseElapsedMs.toDouble() / it.durationMs.toDouble())
-                .coerceIn(0.0, 1.0)
-                .toFloat()
-        } else {
-            0f
-        }
-    } ?: 0f
     val layerHistory = remember(history) { history.map { it.layerCount } }
     val dpuHistory = remember(history) {
         segmentedGaugeHistory(history.map { it.dpuBusy })
@@ -2721,6 +2783,18 @@ private fun RunningHud(
                                 "${planProgress.repeatCount} · ${progress.stage.displayLabel()}",
                             color = Color(0xFFB8CBC5),
                             style = MaterialTheme.typography.labelMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            "LAYER SIZE · " +
+                                (
+                                    phase?.layerSizeProfile?.let {
+                                        layerSizeProfileUiLabel(it, compact = true)
+                                    } ?: "준비 중"
+                                    ),
+                            color = Color(0xFF8FA9A1),
+                            fontSize = 8.sp,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
@@ -2909,7 +2983,8 @@ private fun RunningHud(
                             )
                             Text(
                                 progress.phase?.let {
-                                    "${it.backend.label} · ${it.pixelRoute.label} · " +
+                                    "${layerSizeProfileUiLabel(it.layerSizeProfile)} · " +
+                                        "${it.backend.label} · ${it.pixelRoute.label} · " +
                                         "${it.motion.label} · ${it.requestedDisplayHz.toInt()}Hz"
                                 } ?: "부하 없음",
                                 color = Color(0xFFB8CBC5),
@@ -3006,7 +3081,9 @@ private fun RunTransitionStatus(
     val nextPhase = progress.scenario?.phases?.getOrNull(progress.phaseIndex + 1)
     val nextPhaseText = nextPhase?.let {
         "다음 phase · ${it.label} · ${it.activeLayers}L / " +
-            "${it.producerFps.toInt()}fps · ${it.workloads.peakSummary()}"
+            "${it.producerFps.toInt()}fps · " +
+            "${layerSizeProfileUiLabel(it.layerSizeProfile, compact = true)} · " +
+            it.workloads.peakSummary()
     } ?: "다음 phase · 현재 scenario cooldown"
     val nextScenarioText = planProgress.nextScenario?.let {
         "다음 scenario · ${it.name}"
@@ -3106,6 +3183,12 @@ private fun RunTransitionStatus(
                             "${targetPhase?.activeLayers ?: phase.activeLayers}L · " +
                             "${phase.producerFps.toInt()}→" +
                             "${(targetPhase?.producerFps ?: phase.producerFps).toInt()}fps · " +
+                            "크기 ${layerSizeProfileUiLabel(phase.layerSizeProfile, compact = true)}→" +
+                            layerSizeProfileUiLabel(
+                                targetPhase?.layerSizeProfile ?: phase.layerSizeProfile,
+                                compact = true,
+                            ) +
+                            " · " +
                             workloadTransitionSummary(
                                 current = phase.workloads,
                                 target = targetPhase?.workloads ?: phase.workloads,
@@ -3345,6 +3428,13 @@ private fun TrafficHud(traffic: LayerTrafficEstimate?, compact: Boolean) {
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
+        Text(
+            sizeProfileFootprintSummary(traffic),
+            color = Color(0xFFFFC857),
+            fontSize = 9.sp,
+            maxLines = if (compact) 1 else 2,
+            overflow = TextOverflow.Ellipsis,
+        )
         if (!compact) {
             Text(
                 traffic?.resolutionLabel ?: "linear full-buffer read/write estimate",
@@ -3355,6 +3445,24 @@ private fun TrafficHud(traffic: LayerTrafficEstimate?, compact: Boolean) {
             )
         }
     }
+}
+
+internal fun sizeProfileFootprintSummary(traffic: LayerTrafficEstimate?): String {
+    if (traffic == null) return "SIZE PROFILE FOOTPRINT N/A · base scale only · traffic과 별도"
+    val screenEquivalents = traffic.destinationFootprintScreenEquivalents
+        .takeIf { it.isFinite() && it >= 0.0 }
+        ?: return "SIZE PROFILE FOOTPRINT N/A · base scale only · traffic과 별도"
+    val averagePercent = traffic.destinationFootprintAveragePercent
+        .takeIf { it.isFinite() && it >= 0.0 }
+        ?: return "SIZE PROFILE FOOTPRINT N/A · base scale only · traffic과 별도"
+    val scope = traffic.destinationFootprintLabel
+        .trim()
+        .ifEmpty { "scope N/A" }
+        .take(MAX_DESTINATION_PROFILE_LABEL_CHARS)
+    return "SIZE PROFILE FOOTPRINT " +
+        "${"%.2f".format(Locale.US, screenEquivalents)}× screen · " +
+        "avg ${"%.0f".format(Locale.US, averagePercent)}%/producer · " +
+        "$scope · traffic과 별도"
 }
 
 private fun Double?.formatFrameBytes(): String =
@@ -4352,6 +4460,9 @@ internal fun scenarioSelectionPreview(
     val hzValues = phases.mapNotNull { phase ->
         phase.requestedDisplayHz.finitePositiveOrNull()?.roundToInt()
     }
+    val sizeProfileSummary = layerSizeProfileSummary(
+        phases.map(PhaseSpec::layerSizeProfile),
+    )
     val patterns = ScenarioChangePattern.entries.filter { pattern ->
         scenarios.any { pattern in ScenarioClassifier.changePatterns(it) }
     }
@@ -4401,6 +4512,7 @@ internal fun scenarioSelectionPreview(
             integerRangeSummary(layerValues, "L"),
             integerRangeSummary(fpsValues, "fps"),
             integerRangeSummary(hzValues, "Hz"),
+            "크기 $sizeProfileSummary",
             patternSummary.ifBlank { "고정" },
             resourceSummary,
             topologyPressureSummary,
@@ -4542,6 +4654,20 @@ private fun ScenarioSpec.overview(): ScenarioOverview {
         transitionModes.forEach { mode ->
             add(mode.catalogLabel())
         }
+        if (
+            phases.any {
+                it.layerSizeProfile == LayerSizeProfile.GRADUAL_SMALL_TO_FULL
+            }
+        ) {
+            add("크기 점진")
+        }
+        if (
+            phases.any {
+                it.layerSizeProfile == LayerSizeProfile.ABRUPT_SMALL_FULL
+            }
+        ) {
+            add("크기 급변")
+        }
         if (isEmpty()) {
             if (phases.any { it.workloads.shape == LoadShape.PULSE }) add("Worker 펄스")
             if (phases.any { it.workloads.shape == LoadShape.RAMP }) add("Worker 램프")
@@ -4564,6 +4690,13 @@ private fun ScenarioSpec.overview(): ScenarioOverview {
     val sequence = sequencePhases.mapIndexed { index, phase ->
         val token = buildString {
             append("${phase.activeLayers}L·${phase.producerFps.toInt()}f")
+            append(
+                "·" +
+                    layerSizeProfileUiLabel(
+                        phase.layerSizeProfile,
+                        compact = true,
+                    ),
+            )
             phase.workloads.peakPercent()
                 .takeIf { it > 0 }
                 ?.let { append("·$it%") }
@@ -4580,6 +4713,43 @@ private fun ScenarioSpec.overview(): ScenarioOverview {
         phaseSequence = sequence.ifBlank { "phase 없음" },
     )
 }
+
+internal fun layerSizeProfileUiLabel(
+    profile: LayerSizeProfile,
+    compact: Boolean = false,
+): String = when (profile) {
+    LayerSizeProfile.FULL_SCREEN ->
+        if (compact) "Full 기본" else "Full screen (기본)"
+    LayerSizeProfile.SMALL_UNIFORM ->
+        if (compact) "Small" else "Small uniform"
+    LayerSizeProfile.MIXED_SIZES ->
+        if (compact) "Mixed S/M/L" else "Mixed small/medium/large"
+    LayerSizeProfile.GRADUAL_SMALL_TO_FULL ->
+        if (compact) "Small→Full" else "Small → Full 점진"
+    LayerSizeProfile.ABRUPT_SMALL_FULL ->
+        if (compact) "Small↔Full" else "Small ↔ Full 급격"
+}
+
+internal fun layerSizeProfileSummary(
+    profiles: List<LayerSizeProfile>,
+): String {
+    val uniqueProfiles = profiles.distinct()
+    if (uniqueProfiles.isEmpty()) return "N/A"
+    val visibleProfiles = uniqueProfiles.take(MAX_VISIBLE_SIZE_PROFILES)
+    val visible = visibleProfiles
+        .joinToString(" / ") { layerSizeProfileUiLabel(it, compact = true) }
+    return if (uniqueProfiles.size > visibleProfiles.size) {
+        "$visible +${uniqueProfiles.size - visibleProfiles.size}"
+    } else {
+        visible
+    }
+}
+
+private fun scenarioLayerSizeProfileSummary(scenario: ScenarioSpec): String =
+    layerSizeProfileSummary(scenario.phases.map(PhaseSpec::layerSizeProfile))
+
+private const val MAX_VISIBLE_SIZE_PROFILES = 3
+private const val MAX_DESTINATION_PROFILE_LABEL_CHARS = 96
 
 private fun LoadSetpoints.peakPercent(): Int = normalized().let {
     (maxOf(it.cpu, it.memory, it.gpu, it.npu) * 100f).roundToInt()

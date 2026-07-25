@@ -166,13 +166,11 @@ class ReportWriterMathTest {
 
         val json = ReportWriter.toJson(summary, TEST_DEVICE)
 
+        assertTrue(json.contains(""""motion": "Z_ORDER_SWAP""""))
         assertTrue(
-            json.contains(
-                """"motion": "Z_ORDER_SWAP", """ +
-                    """"motionSemantics": "VIEW_CLIENT_Z_ORDER_PROXY", """ +
-                    """"physicalHwcZOrderChange": false""",
-            ),
+            json.contains(""""motionSemantics": "VIEW_CLIENT_Z_ORDER_PROXY""""),
         )
+        assertTrue(json.contains(""""physicalHwcZOrderChange": false"""))
         assertTrue(
             json.contains(
                 """"hwcCompositionExpectation": "CLIENT_REQUIRED"""",
@@ -202,6 +200,31 @@ class ReportWriterMathTest {
 
         assertTrue(json.contains(""""hwcCompositionExpectation": "DEVICE_ONLY""""))
         assertTrue(json.contains(""""hwcCompositionExpectation": "CLIENT_REQUIRED""""))
+    }
+
+    @Test
+    fun reportPreservesTypedLayerSizeProfile() {
+        val summary = RunSummary(
+            scenario = ScenarioCatalog.byId("gradual-layer-size-expansion")!!,
+            startedEpochMs = 1_000L,
+            finishedEpochMs = 2_000L,
+            verdict = RunVerdict.INCONCLUSIVE,
+            exactUnderrunDelta = null,
+            exactUnderrunSource = null,
+            exactUnderrunQuality = MetricQuality.UNAVAILABLE,
+            suspectedUnderrunDelta = 0L,
+            peakCpu = null,
+            peakMemoryUsed = null,
+            peakGeneratedBandwidth = null,
+            events = emptyList(),
+            samples = emptyList(),
+        )
+
+        val json = ReportWriter.toJson(summary, TEST_DEVICE)
+
+        assertTrue(json.contains(""""layerSizeProfile": "SMALL_UNIFORM""""))
+        assertTrue(json.contains(""""layerSizeProfile": "GRADUAL_SMALL_TO_FULL""""))
+        assertTrue(json.contains(""""layerSizeProfile": "FULL_SCREEN""""))
     }
 
     @Test

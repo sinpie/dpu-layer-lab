@@ -187,6 +187,18 @@ class ScenarioSafetyPolicyTest {
                         ),
                     ),
                 )
+                assertRejected(
+                    scenario(
+                        phases = listOf(
+                            phase(
+                                durationMs = minimumDurationMs,
+                                layerSizeProfile =
+                                    LayerSizeProfile.ABRUPT_SMALL_FULL,
+                                hwcCompositionExpectation = expectation,
+                            ),
+                        ),
+                    ),
+                )
             }
     }
 
@@ -1207,6 +1219,68 @@ class ScenarioSafetyPolicyTest {
     }
 
     @Test
+    fun dynamicLayerSizeProfilesMustRemainObservableAfterDurationCaps() {
+        val gradualTooShort = ScenarioSafetyPolicy.evaluate(
+            scenario(
+                phases = listOf(
+                    phase(
+                        durationMs = LOAD_CONTROL_CADENCE_MS * 2L - 1L,
+                        layerSizeProfile = LayerSizeProfile.GRADUAL_SMALL_TO_FULL,
+                    ),
+                ),
+            ),
+            limits(),
+        )
+        val abruptTooShort = ScenarioSafetyPolicy.evaluate(
+            scenario(
+                phases = listOf(
+                    phase(
+                        durationMs =
+                            LOAD_CONTROL_CADENCE_MS *
+                                ABRUPT_LAYER_SIZE_PROFILE_STEPS - 1L,
+                        layerSizeProfile = LayerSizeProfile.ABRUPT_SMALL_FULL,
+                    ),
+                ),
+            ),
+            limits(),
+        )
+        val abruptAtBoundary = ScenarioSafetyPolicy.evaluate(
+            scenario(
+                phases = listOf(
+                    phase(
+                        durationMs =
+                            LOAD_CONTROL_CADENCE_MS *
+                                ABRUPT_LAYER_SIZE_PROFILE_STEPS,
+                        layerSizeProfile = LayerSizeProfile.ABRUPT_SMALL_FULL,
+                    ),
+                ),
+            ),
+            limits(),
+        )
+        val cappedBelowBoundary = ScenarioSafetyPolicy.evaluate(
+            scenario(
+                phases = listOf(
+                    phase(
+                        durationMs = 10_000L,
+                        layerSizeProfile = LayerSizeProfile.ABRUPT_SMALL_FULL,
+                    ),
+                ),
+            ),
+            limits(
+                maxPhaseDurationMs =
+                    LOAD_CONTROL_CADENCE_MS *
+                        ABRUPT_LAYER_SIZE_PROFILE_STEPS - 1L,
+            ),
+        )
+
+        listOf(gradualTooShort, abruptTooShort, cappedBelowBoundary).forEach { decision ->
+            assertRejected(decision)
+            assertTrue(decision.rejectionReason!!.contains("layer-size waveform"))
+        }
+        assertAccepted(abruptAtBoundary)
+    }
+
+    @Test
     fun pulseOnAndOffWindowsMustEachSpanAControlTick() {
         val undersampled = ScenarioSafetyPolicy.evaluate(
             scenario(
@@ -1300,6 +1374,7 @@ class ScenarioSafetyPolicyTest {
         includeGlLayer: Boolean = false,
         transition: TransitionSpec = TransitionSpec(),
         pixelRoute: PixelRoute = PixelRoute.RGB_8888,
+        layerSizeProfile: LayerSizeProfile = LayerSizeProfile.FULL_SCREEN,
         hwcCompositionExpectation: HwcCompositionExpectation =
             HwcCompositionExpectation.NONE,
     ) = PhaseSpec(
@@ -1313,6 +1388,7 @@ class ScenarioSafetyPolicyTest {
         pixelRoute = pixelRoute,
         bufferSize = bufferSize,
         motion = MotionProfile.STATIC,
+        layerSizeProfile = layerSizeProfile,
         workloads = workloads,
         includeGlLayer = includeGlLayer,
         transition = transition,

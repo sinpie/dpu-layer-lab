@@ -7,9 +7,11 @@ package com.example.dpulayerlab.model
  * display refresh and one full-buffer write per producer frame. A selected decoder uses only the
  * metadata-verified [DecoderLinearReference]; the requested YUV/P010/SBWC route does not force a
  * MediaCodec Surface allocation. Canvas/TextureView visual proxies are RGBA buffers. Tiling,
- * crop/occlusion, cache
- * effects, HWC client-target fallback, compression metadata, and vendor-specific compression ratios
- * are not knowable from the portable app surface and therefore are not folded into the number.
+ * destination scaling/crop/occlusion, cache effects, HWC client-target fallback, compression
+ * metadata, and vendor-specific compression ratios are not knowable from the portable app surface
+ * and therefore are not folded into the traffic number. [destinationFootprintScreenEquivalents]
+ * separately describes the requested destination geometry; it is never presented as measured bus
+ * traffic or used to reduce the conservative full-buffer source read/write estimate.
  */
 data class LayerTrafficEstimate(
     val logicalLayerCount: Int,
@@ -21,6 +23,15 @@ data class LayerTrafficEstimate(
     val formatLabel: String,
     val resolutionLabel: String,
     val compressionRatioExcluded: Boolean,
+    /**
+     * Sum of base [LayerSizeProfile] areas before MotionProfile scaling, overlap, clipping,
+     * rotation, or off-screen loss. [MotionProfile.CAPACITY_TILES] is the explicit exception:
+     * its non-overlapping crop union is one screen and is reported as such.
+     */
+    val destinationFootprintScreenEquivalents: Double,
+    /** Mean per-producer base size-profile area, expressed as a percentage of the display. */
+    val destinationFootprintAveragePercent: Double,
+    val destinationFootprintLabel: String,
 )
 
 /**
@@ -54,6 +65,7 @@ object LayerTrafficEstimator {
         mediaWidthPx: Int? = null,
         mediaHeightPx: Int? = null,
         decoderLinearReference: DecoderLinearReference? = null,
+        phaseFraction: Float = 0f,
     ): LayerTrafficEstimate {
         val verifiedDecoderLinearReference = decoderLinearReference?.takeIf { reference ->
             reference.bytesPerPixel?.let { bytesPerPixel ->
@@ -70,6 +82,18 @@ object LayerTrafficEstimator {
             ?: phase.requestedDisplayHz.takeIf { it.isFinite() && it > 0f }
             ?: 60f
         val producerFps = phase.producerFps.takeIf { it.isFinite() && it > 0f } ?: 1f
+        val physicalProducerCount =
+            if (phase.backend == LayerBackend.FLATTENED_TEXTURE) 1 else logicalLayers
+        val footprint = destinationFootprint(
+            phase = phase,
+            physicalProducerCount = physicalProducerCount,
+            phaseFraction = phaseFraction,
+        )
+        val footprintLabel = if (phase.motion == MotionProfile.CAPACITY_TILES) {
+            "Capacity tiles · explicit crop union; size profile bypassed"
+        } else {
+            "${phase.layerSizeProfile.label} · base profile only; motion/overlap/crop excluded"
+        }
 
         if (phase.backend == LayerBackend.FLATTENED_TEXTURE) {
             val frameBytes = if (displaySizeKnown) {
@@ -91,6 +115,9 @@ object LayerTrafficEstimator {
                     "display size pending"
                 },
                 compressionRatioExcluded = false,
+                destinationFootprintScreenEquivalents = footprint,
+                destinationFootprintAveragePercent = footprint * 100.0,
+                destinationFootprintLabel = footprintLabel,
             )
         }
 
@@ -204,7 +231,37 @@ object LayerTrafficEstimator {
                 PixelRoute.SBWC_AUTO,
                 PixelRoute.SBWC_REQUIRED,
             ),
+            destinationFootprintScreenEquivalents = footprint,
+            destinationFootprintAveragePercent =
+                footprint * 100.0 / physicalProducerCount.toDouble(),
+            destinationFootprintLabel = footprintLabel,
         )
+    }
+
+    private fun destinationFootprint(
+        phase: PhaseSpec,
+        physicalProducerCount: Int,
+        phaseFraction: Float,
+    ): Double {
+        val count = physicalProducerCount.coerceIn(1, MAX_RENDERED_LAYERS)
+        if (phase.motion == MotionProfile.CAPACITY_TILES) return 1.0
+        var total = 0.0
+        var index = 0
+        while (index < count) {
+            total += phase.layerSizeProfile
+                .normalizedSizeForLayer(
+                    layerIndex = index,
+                    layerCount = count,
+                    phaseFraction = phaseFraction,
+                )
+                .areaScale
+                .toDouble()
+            index++
+        }
+        return total
+            .takeIf(Double::isFinite)
+            ?.coerceIn(0.0, count.toDouble())
+            ?: count.toDouble()
     }
 
     private fun actualOutputBytesPerPixel(

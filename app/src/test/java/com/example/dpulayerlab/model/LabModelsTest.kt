@@ -6,6 +6,27 @@ import org.junit.Test
 
 class LabModelsTest {
     @Test
+    fun dynamicLayerSizeCoverageRequiresEverySemanticRegion() {
+        val gradual = LayerSizeProfile.GRADUAL_SMALL_TO_FULL
+        val gradualMask =
+            gradual.coverageBitAt(0f) or
+                gradual.coverageBitAt(0.5f) or
+                gradual.coverageBitAt(1f)
+        assertEquals(gradual.requiredCoverageMask(), gradualMask)
+
+        val abrupt = LayerSizeProfile.ABRUPT_SMALL_FULL
+        var abruptMask = 0
+        repeat(ABRUPT_LAYER_SIZE_PROFILE_STEPS) { step ->
+            abruptMask = abruptMask or abrupt.coverageBitAt(
+                (step + 0.5f) / ABRUPT_LAYER_SIZE_PROFILE_STEPS,
+            )
+        }
+        assertEquals(ABRUPT_SIZE_REQUIRED_MASK, abruptMask)
+        assertEquals(abrupt.requiredCoverageMask(), abruptMask)
+        assertEquals(0, gradual.coverageBitAt(Float.NaN))
+    }
+
+    @Test
     fun loadSetpointsAreClamped() {
         val normalized = LoadSetpoints(cpu = -1f, memory = 1.7f, gpu = 0.5f, npu = 4f).normalized()
         assertEquals(0f, normalized.cpu)

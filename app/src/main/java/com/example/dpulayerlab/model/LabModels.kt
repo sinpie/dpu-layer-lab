@@ -101,6 +101,162 @@ enum class MotionProfile(
     ),
 }
 
+/**
+ * Bounded physical child geometry applied independently from [MotionProfile].
+ *
+ * The default intentionally preserves a full-stage producer for every existing phase. Dynamic
+ * profiles use normalized phase progress so renderer, traffic, and safety code can evaluate the
+ * same geometry without depending on Android View state.
+ */
+enum class LayerSizeProfile(
+    val label: String,
+    val changesOverTime: Boolean = false,
+) {
+    FULL_SCREEN("Full screen"),
+    SMALL_UNIFORM("Small uniform"),
+    MIXED_SIZES("Mixed sizes"),
+    GRADUAL_SMALL_TO_FULL("Gradual small → full", changesOverTime = true),
+    ABRUPT_SMALL_FULL("Abrupt small ↔ full", changesOverTime = true),
+}
+
+/**
+ * Allocation-free pair of normalized physical width/height scales.
+ *
+ * Construction is kept inside [normalizedSizeForLayer], which guarantees finite values in
+ * [MIN_LAYER_SIZE_SCALE]..1. The packed representation lets the renderer sample this value on its
+ * frame path without allocating a data object for every physical child.
+ */
+@JvmInline
+value class NormalizedLayerSize private constructor(
+    private val packed: Long,
+) {
+    val widthScale: Float
+        get() = Float.fromBits((packed ushr 32).toInt())
+
+    val heightScale: Float
+        get() = Float.fromBits(packed.toInt())
+
+    val areaScale: Float
+        get() = widthScale * heightScale
+
+    internal companion object {
+        fun bounded(widthScale: Float, heightScale: Float): NormalizedLayerSize {
+            val safeWidth = if (widthScale.isFinite()) {
+                widthScale.coerceIn(MIN_LAYER_SIZE_SCALE, 1f)
+            } else {
+                1f
+            }
+            val safeHeight = if (heightScale.isFinite()) {
+                heightScale.coerceIn(MIN_LAYER_SIZE_SCALE, 1f)
+            } else {
+                1f
+            }
+            return NormalizedLayerSize(
+                (safeWidth.toRawBits().toLong() shl 32) or
+                    (safeHeight.toRawBits().toLong() and 0xffff_ffffL),
+            )
+        }
+    }
+}
+
+/**
+ * Returns the deterministic physical size for one layer.
+ *
+ * Invalid topology input and non-finite progress return full-screen geometry. This is a
+ * conservative failure value for graphics-memory and traffic safety calculations: malformed input
+ * must never make the estimated producer allocation smaller.
+ */
+fun LayerSizeProfile.normalizedSizeForLayer(
+    layerIndex: Int,
+    layerCount: Int,
+    phaseFraction: Float,
+): NormalizedLayerSize {
+    if (layerCount !in 1..MAX_PROFILE_LAYER_COUNT || layerIndex !in 0 until layerCount) {
+        return FULL_NORMALIZED_LAYER_SIZE
+    }
+    if (!phaseFraction.isFinite()) return FULL_NORMALIZED_LAYER_SIZE
+    val fraction = phaseFraction.coerceIn(0f, 1f)
+    return when (this) {
+        LayerSizeProfile.FULL_SCREEN -> FULL_NORMALIZED_LAYER_SIZE
+        LayerSizeProfile.SMALL_UNIFORM ->
+            NormalizedLayerSize.bounded(SMALL_LAYER_SCALE, SMALL_LAYER_SCALE)
+        LayerSizeProfile.MIXED_SIZES -> when (layerIndex % MIXED_SIZE_VARIANTS) {
+            0 -> FULL_NORMALIZED_LAYER_SIZE
+            1 -> NormalizedLayerSize.bounded(0.72f, 0.56f)
+            2 -> NormalizedLayerSize.bounded(0.56f, 0.72f)
+            3 -> NormalizedLayerSize.bounded(0.46f, 0.46f)
+            else -> NormalizedLayerSize.bounded(0.30f, 0.38f)
+        }
+        LayerSizeProfile.GRADUAL_SMALL_TO_FULL -> {
+            val scale = SMALL_LAYER_SCALE + (1f - SMALL_LAYER_SCALE) * fraction
+            NormalizedLayerSize.bounded(scale, scale)
+        }
+        LayerSizeProfile.ABRUPT_SMALL_FULL -> {
+            val step = abruptLayerSizeStep(fraction)
+            if (step % 2 == 0) {
+                NormalizedLayerSize.bounded(SMALL_LAYER_SCALE, SMALL_LAYER_SCALE)
+            } else {
+                FULL_NORMALIZED_LAYER_SIZE
+            }
+        }
+    }
+}
+
+internal fun LayerSizeProfile.coverageBitAt(phaseFraction: Float): Int {
+    if (!phaseFraction.isFinite()) return 0
+    val fraction = phaseFraction.coerceIn(0f, 1f)
+    return when (this) {
+        LayerSizeProfile.GRADUAL_SMALL_TO_FULL -> when {
+            fraction <= GRADUAL_ORIGIN_MAX_FRACTION -> GRADUAL_SIZE_ORIGIN_BIT
+            fraction in GRADUAL_MID_MIN_FRACTION..GRADUAL_MID_MAX_FRACTION ->
+                GRADUAL_SIZE_MID_BIT
+            fraction >= GRADUAL_END_MIN_FRACTION -> GRADUAL_SIZE_END_BIT
+            else -> 0
+        }
+
+        LayerSizeProfile.ABRUPT_SMALL_FULL -> 1 shl abruptLayerSizeStep(fraction)
+
+        LayerSizeProfile.FULL_SCREEN,
+        LayerSizeProfile.SMALL_UNIFORM,
+        LayerSizeProfile.MIXED_SIZES,
+        -> STATIC_SIZE_APPLIED_BIT
+    }
+}
+
+internal fun LayerSizeProfile.requiredCoverageMask(): Int =
+    when (this) {
+        LayerSizeProfile.GRADUAL_SMALL_TO_FULL -> GRADUAL_SIZE_REQUIRED_MASK
+        LayerSizeProfile.ABRUPT_SMALL_FULL -> ABRUPT_SIZE_REQUIRED_MASK
+        LayerSizeProfile.FULL_SCREEN,
+        LayerSizeProfile.SMALL_UNIFORM,
+        LayerSizeProfile.MIXED_SIZES,
+        -> STATIC_SIZE_APPLIED_BIT
+    }
+
+private fun abruptLayerSizeStep(fraction: Float): Int =
+    (fraction.coerceIn(0f, 1f) * ABRUPT_LAYER_SIZE_PROFILE_STEPS)
+        .toInt()
+        .coerceIn(0, ABRUPT_LAYER_SIZE_PROFILE_STEPS - 1)
+
+private val FULL_NORMALIZED_LAYER_SIZE = NormalizedLayerSize.bounded(1f, 1f)
+private const val MIN_LAYER_SIZE_SCALE = 0.25f
+private const val SMALL_LAYER_SCALE = 0.30f
+private const val MAX_PROFILE_LAYER_COUNT = 20
+private const val MIXED_SIZE_VARIANTS = 5
+internal const val ABRUPT_LAYER_SIZE_PROFILE_STEPS = 8
+private const val STATIC_SIZE_APPLIED_BIT = 1
+private const val GRADUAL_SIZE_ORIGIN_BIT = 1
+private const val GRADUAL_SIZE_MID_BIT = 1 shl 1
+private const val GRADUAL_SIZE_END_BIT = 1 shl 2
+internal const val GRADUAL_SIZE_REQUIRED_MASK =
+    GRADUAL_SIZE_ORIGIN_BIT or GRADUAL_SIZE_MID_BIT or GRADUAL_SIZE_END_BIT
+internal const val ABRUPT_SIZE_REQUIRED_MASK =
+    (1 shl ABRUPT_LAYER_SIZE_PROFILE_STEPS) - 1
+private const val GRADUAL_ORIGIN_MAX_FRACTION = 0.125f
+internal const val GRADUAL_MID_MIN_FRACTION = 0.375f
+private const val GRADUAL_MID_MAX_FRACTION = 0.625f
+private const val GRADUAL_END_MIN_FRACTION = 0.875f
+
 enum class LoadShape(val label: String) {
     STEADY("Steady"),
     PULSE("Pulse"),
@@ -275,6 +431,7 @@ data class PhaseSpec(
     val pixelRoute: PixelRoute,
     val bufferSize: BufferSize,
     val motion: MotionProfile,
+    val layerSizeProfile: LayerSizeProfile = LayerSizeProfile.FULL_SCREEN,
     val workloads: LoadSetpoints = LoadSetpoints(),
     val alphaOverlap: Boolean = false,
     val includeGlLayer: Boolean = false,

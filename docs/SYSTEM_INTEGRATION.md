@@ -1,13 +1,21 @@
 # System / BSP 통합
 
-사용자에게 보이는 launcher/Gradle project 이름은 **DPULayerTest**이고 release version은
-`20260725_090252`(`versionCode 4`), debug version은 `20260725_090252-debug`입니다.
-`yyyyMMdd_HHmmss`는 KST build 시각입니다. 앱 상단·실행 HUD·보고서에 같은 version이
-표시됩니다. release tag는 `v20260725_090252`이고 canonical source remote는
-`sinpie/dpu-layer-lab`입니다. 아래 `DpuLayerLab` directory/Soong module,
+사용자에게 보이는 launcher/Gradle project 이름은 **DPULayerTest**입니다. 저장소의
+미배포 source candidate는 `20260725_095708`(`versionCode 5`), debug version은
+`20260725_095708-debug`입니다. 최신 공개 release는
+`20260725_090252`(`versionCode 4`), tag는 `v20260725_090252`입니다.
+`yyyyMMdd_HHmmss`는 KST build 시각이며 앱 상단·실행 HUD·보고서에는 실제 build
+version이 표시됩니다. Canonical source remote는 `sinpie/dpu-layer-lab`입니다.
+아래 `DpuLayerLab` directory/Soong module,
 package `com.example.dpulayerlab`, automation action/component, vendor action/AIDL과
 `dpu-layer-lab-` report prefix는 기존 제품 이미지·harness·consumer 호환성을 위한 stable
 identifier입니다. 표시 이름에 맞춰 이 계약들을 일괄 rename하지 마세요.
+
+앱 구조와 runtime ownership은 [ARCHITECTURE.md](../ARCHITECTURE.md), scenario 의미는
+[SCENARIOS.md](SCENARIOS.md), metric의 app-side source/quality/verdict 의미는
+[METRICS.md](METRICS.md), host 검증과 release 절차는 각각
+[TESTING.md](TESTING.md), [RELEASE.md](RELEASE.md)를 참고하세요. 이 문서는
+provider/BSP 측 deployment, AIDL, permission과 SELinux 계약만 소유합니다.
 
 ## 권장 배치
 
@@ -42,7 +50,7 @@ Product image
 
 샘플 `Android.bp`는 Soong이 platform certificate로 다시 서명하는 구성입니다. 외부에서 이미 platform key로 서명한 APK를 쓴다면 `certificate: "PRESIGNED"`로 바꿉니다.
 
-GitHub의 `DPULayerTest-20260725_090252-debug.apk`는 Android debug key로 서명된
+최신 공개 GitHub Release의 `DPULayerTest-20260725_090252-debug.apk`는 Android debug key로 서명된
 lab-only 산출물이며 debug manifest가 automation alias의 `CONTROL_TESTS` permission을
 제거합니다. 제품 이미지에 넣지 마세요.
 `DPULayerTest-20260725_090252-release-unsigned.apk`는 Soong 또는 secure signing
@@ -562,7 +570,9 @@ plan을 거부합니다.
 DEVICE/CLIENT 원자 쌍으로 확인할 관측 계약입니다. Runtime safety policy가 계약
 phase의 layer topology, producer FPS, display pacing, GL producer 또는 GPU pressure를
 clamp해야 하면 축소된 topology로 우연히 조건을 통과시키지 않고 preflight에서
-거부합니다. 3초 first-buffer readiness, 최대 4초의 pre-target periodic sample mutex
+거부합니다. Fresh probe batch 동안 같은 target geometry를 관측해야 하므로 dynamic
+`LayerSizeProfile`을 결합한 typed phase도 preflight에서 거부합니다.
+3초 first-buffer readiness, 최대 4초의 pre-target periodic sample mutex
 drain, probe당 4초 bounded telemetry와 post-target 관측 tick을 포함하도록 한 번의
 fresh evidence가 필요한 `DEVICE_ONLY`는 최소 12초, 서로 다른 fresh evidence 2회가
 필요한 `CLIENT_REQUIRED`는 최소 16초를 유지해야 합니다.
@@ -572,6 +582,19 @@ serialized ownership에서 수행하며 각 sample 사이에 cancellation, therm
 fresh producer count와 topology revision을 재검증합니다. 각 forced sample은 전체
 safety/exact telemetry를 함께 갱신하고, terminal/cancel/error/phase-finally에서는
 matching priority owner를 반드시 해제합니다.
+
+여기서 target geometry readiness는 renderer가 실제 base transform apply 시 요청한
+generation-scoped revision/profile과 두 번의 후속 `Choreographer` callback/traversal
+opportunity 뒤 acknowledgment가 일치한다는 app-side 증거입니다. Producer activation과
+typed HWC arm은 latest matching revision/profile을 요구하지만 이를 physical HWC plane
+composition 증거로 해석하지 않습니다. Dynamic profile은 controller-owned
+`phaseElapsedMs`로 recovery/rebuild 뒤 re-anchor합니다. Preparation은 prior explicit
+static origin을 보존하고 없을 때만 dynamic fraction-zero `SMALL_UNIFORM`을 사용합니다.
+Fresh baseline과 origin producer readiness 뒤 첫 active cyclic fraction 0에서 target
+profile을 arm하고 이후 pulse/triangle valley에서도 유지합니다. Gradual
+origin/mid/end 또는 abrupt 8 step
+applied coverage가 빠지면 `LAYER_SIZE_COVERAGE_MISSING`과 `INCONCLUSIVE`이며,
+충족되면 `LAYER_SIZE_COVERAGE` event를 남깁니다.
 
 START plan은 첫 scenario 전에 전체 queue/repeat가 공유하는 capacity 관측을 한 번
 수행합니다. Safety/graphics budget이 승인한 최대 20개의 30fps opaque RGB Surface를

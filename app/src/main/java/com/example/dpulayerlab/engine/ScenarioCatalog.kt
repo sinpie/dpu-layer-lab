@@ -3,6 +3,7 @@ package com.example.dpulayerlab.engine
 import com.example.dpulayerlab.model.BufferSize
 import com.example.dpulayerlab.model.HwcCompositionExpectation
 import com.example.dpulayerlab.model.LayerBackend
+import com.example.dpulayerlab.model.LayerSizeProfile
 import com.example.dpulayerlab.model.LoadSetpoints
 import com.example.dpulayerlab.model.LoadShape
 import com.example.dpulayerlab.model.MotionProfile
@@ -26,6 +27,13 @@ object ScenarioCatalog {
         dpuDeviceEnvelopeBurst(),
         dpuClientFallbackBurst(),
         dpuOnlyRepeatShock(),
+        smallLayerDensity(),
+        mixedLayerSizeMatrix(),
+        gradualLayerSizeExpansion(),
+        abruptLayerSizeToggle(),
+        layerSizeFpsBurst(),
+        layerSizeDeviceCandidate(),
+        layerSizeClientPressure(),
         midLoadPerturbation(),
         dvfsVideoShock(),
         planeStaircase(),
@@ -59,6 +67,7 @@ object ScenarioCatalog {
         bufferSize: BufferSize,
         motion: MotionProfile,
         loads: LoadSetpoints,
+        layerSizeProfile: LayerSizeProfile = LayerSizeProfile.FULL_SCREEN,
         transition: TransitionSpec = TransitionSpec(),
     ): ScenarioSpec {
         val normalizedLoads = loads.normalized()
@@ -77,6 +86,14 @@ object ScenarioCatalog {
             BufferSize.DISPLAY
         } else {
             bufferSize
+        }
+        val flattenedSizeProfileNormalized =
+            backend == LayerBackend.FLATTENED_TEXTURE &&
+                layerSizeProfile == LayerSizeProfile.MIXED_SIZES
+        val effectiveLayerSizeProfile = if (flattenedSizeProfileNormalized) {
+            LayerSizeProfile.FULL_SCREEN
+        } else {
+            layerSizeProfile
         }
         // Any explicitly requested GPU load needs a GPU-backed producer. Treating a small,
         // non-zero value as zero made the custom control look accepted while independent
@@ -115,12 +132,23 @@ object ScenarioCatalog {
         } else {
             emptySet()
         }
+        val sizeProfileNote = if (flattenedSizeProfileNormalized) {
+            " Flattened Texture는 physical producer가 1개라 Mixed sizes 분포를 만들 수 " +
+                "없으므로 Full screen으로 명시적으로 정규화했습니다."
+        } else {
+            ""
+        }
+        val sizeProfileTags = if (flattenedSizeProfileNormalized) {
+            setOf("size Full screen", "size profile normalized")
+        } else {
+            setOf("size ${effectiveLayerSizeProfile.label}")
+        }
 
         return ScenarioSpec(
             id = "custom-${System.currentTimeMillis()}-${customIdSequence.incrementAndGet()}",
             name = "Custom Lab",
             description =
-                "사용자가 지정한 단일 phase 테스트.$topologyNote$flattenedNote",
+                "사용자가 지정한 단일 phase 테스트.$topologyNote$flattenedNote$sizeProfileNote",
             category = ScenarioCategory.MIXED,
             risk = if (
                 maxOf(
@@ -144,15 +172,15 @@ object ScenarioCatalog {
                 "custom",
                 "${effectiveLayers}L",
                 "${producerFps.toInt()}fps",
-            ) + topologyTags + flattenedTags,
+            ) + topologyTags + flattenedTags + sizeProfileTags,
             phases = listOf(
                 phase(
                     id = "custom",
                     label = when {
                         promotedToPrimaryAndGlTail ->
                             "Custom workload · requested 1L → 2L primary + GL tail"
-                        flattenedInputNormalized ->
-                            "Custom workload · flattened DISPLAY/RGB normalization"
+                        flattenedInputNormalized || flattenedSizeProfileNormalized ->
+                            "Custom workload · flattened input normalization"
                         else -> "Custom workload"
                     },
                     seconds = durationSeconds,
@@ -163,6 +191,7 @@ object ScenarioCatalog {
                     route = effectivePixelRoute,
                     size = effectiveBufferSize,
                     motion = motion,
+                    layerSizeProfile = effectiveLayerSizeProfile,
                     loads = normalizedLoads,
                     alpha = backend != LayerBackend.INDEPENDENT_SURFACES,
                     gl = includeGlTail,
@@ -309,6 +338,7 @@ object ScenarioCatalog {
                 4,
                 120f,
                 120f,
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
                 hwcExpectation = HwcCompositionExpectation.DEVICE_ONLY,
             ),
             phase(
@@ -328,6 +358,7 @@ object ScenarioCatalog {
                 120f,
                 120f,
                 motion = MotionProfile.ZOOM_PAN,
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
                 hwcExpectation = HwcCompositionExpectation.DEVICE_ONLY,
             ),
             phase("de-recover", "DEVICE probe recovery", 7, 1, 30f, 60f),
@@ -429,12 +460,377 @@ object ScenarioCatalog {
         ),
         phases = listOf(
             phase("dr-settle", "DPU low-load settle · 1L/30fps", 10, 1, 30f, 60f),
-            phase("dr-burst-1", "DPU-only burst 1 · 12L/120fps", 5, 12, 120f, 120f),
+            phase(
+                "dr-burst-1",
+                "DPU-only burst 1 · 12L/120fps",
+                5,
+                12,
+                120f,
+                120f,
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
+            ),
             phase("dr-release-1", "DPU-only release 1", 6, 1, 30f, 60f),
-            phase("dr-burst-2", "DPU-only burst 2 · 12L/120fps", 5, 12, 120f, 120f),
+            phase(
+                "dr-burst-2",
+                "DPU-only burst 2 · 12L/120fps",
+                5,
+                12,
+                120f,
+                120f,
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
+            ),
             phase("dr-release-2", "DPU-only release 2", 6, 1, 30f, 60f),
-            phase("dr-burst-3", "DPU-only burst 3 · 12L/120fps", 5, 12, 120f, 120f),
+            phase(
+                "dr-burst-3",
+                "DPU-only burst 3 · 12L/120fps",
+                5,
+                12,
+                120f,
+                120f,
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
+            ),
             phase("dr-recover", "DPU-only final recovery", 8, 1, 30f, 60f),
+        ),
+    )
+
+    private fun smallLayerDensity() = ScenarioSpec(
+        id = "small-layer-density",
+        name = "Small-layer Density Sweep",
+        description =
+            "동일한 display에서 작은 destination rectangle의 독립 Surface를 1→12→20장으로 늘려 " +
+                "full-screen overlap과 구분되는 plane-count·visible-area 조합을 관찰합니다. " +
+                "물리 producer 수와 buffer 할당 안전 예산은 작은 표시 면적과 별도로 유지됩니다.",
+        category = ScenarioCategory.LAYER_HWC,
+        risk = RiskLevel.MEDIUM,
+        tags = setOf("small layers", "density", "plane count", "display-only"),
+        phases = listOf(
+            phase("sd-base", "Full-screen 1L reference", 6, 1, 30f, 60f),
+            phase(
+                "sd-small-12",
+                "12 small independent layers",
+                10,
+                12,
+                60f,
+                60f,
+                motion = MotionProfile.PARALLAX,
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
+            ),
+            phase(
+                "sd-small-20",
+                "20 small layers at high pacing",
+                8,
+                20,
+                90f,
+                120f,
+                motion = MotionProfile.SCROLL,
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
+            ),
+            phase("sd-recover", "Density recovery", 6, 1, 30f, 60f),
+        ),
+    )
+
+    private fun mixedLayerSizeMatrix() = ScenarioSpec(
+        id = "mixed-layer-size-matrix",
+        name = "Small / Mixed / Full Size Matrix",
+        description =
+            "10L·90fps·120Hz와 opaque 독립 Surface를 고정하고 layer geometry만 " +
+                "small uniform→small/medium/large mixed→full-screen→mixed로 바꿔 " +
+                "크기 분포의 영향을 A/B 방식으로 비교합니다.",
+        category = ScenarioCategory.LAYER_HWC,
+        risk = RiskLevel.MEDIUM,
+        tags = setOf("size matrix", "small", "medium", "large", "A/B"),
+        phases = listOf(
+            phase(
+                "sm-small-ref",
+                "10L small-size reference",
+                6,
+                10,
+                90f,
+                120f,
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
+            ),
+            phase(
+                "sm-mixed-a",
+                "10L mixed small/medium/large",
+                10,
+                10,
+                90f,
+                120f,
+                layerSizeProfile = LayerSizeProfile.MIXED_SIZES,
+            ),
+            phase("sm-full", "10L full-screen reference", 8, 10, 90f, 120f),
+            phase(
+                "sm-mixed-b",
+                "10L mixed-size repeat",
+                10,
+                10,
+                90f,
+                120f,
+                layerSizeProfile = LayerSizeProfile.MIXED_SIZES,
+            ),
+            phase("sm-recover", "Size matrix recovery", 6, 2, 60f, 60f),
+        ),
+    )
+
+    private fun gradualLayerSizeExpansion() = ScenarioSpec(
+        id = "gradual-layer-size-expansion",
+        name = "Gradual Small → Full Expansion",
+        description =
+            "8개 layer의 수와 backend를 유지한 채 small geometry에서 full-screen까지 " +
+                "천천히 확대합니다. Layer/FPS burst와 분리해 크기 변화 자체의 점진적 " +
+                "composition footprint와 plane scaling 응답을 관찰합니다. Source full-buffer " +
+                "traffic 추정값은 destination 면적으로 줄이지 않습니다.",
+        category = ScenarioCategory.TRANSITION,
+        risk = RiskLevel.MEDIUM,
+        tags = setOf("size transition", "gradual", "small→full", "display-only"),
+        phases = listOf(
+            phase(
+                "gs-small",
+                "Small-size steady origin",
+                6,
+                8,
+                90f,
+                120f,
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
+            ),
+            phase(
+                "gs-expand",
+                "Gradual small-to-full expansion",
+                16,
+                8,
+                90f,
+                120f,
+                layerSizeProfile = LayerSizeProfile.GRADUAL_SMALL_TO_FULL,
+            ),
+            phase("gs-full", "Full-screen steady target", 6, 8, 90f, 120f),
+            phase("gs-recover", "Expansion recovery", 6, 2, 60f, 60f),
+        ),
+    )
+
+    private fun abruptLayerSizeToggle() = ScenarioSpec(
+        id = "abrupt-layer-size-toggle",
+        name = "Abrupt Small ↔ Full Toggle",
+        description =
+            "8L topology와 cross-load를 고정하고 small/full geometry를 급격하게 반복 " +
+                "전환합니다. Producer 수가 아닌 visible composition 면적의 순간 변화와 " +
+                "회복 응답을 분리해 관찰합니다.",
+        category = ScenarioCategory.TRANSITION,
+        risk = RiskLevel.HIGH,
+        tags = setOf("size transition", "abrupt", "small↔full", "repeat"),
+        phases = listOf(
+            phase(
+                "as-small-a",
+                "Small-size steady origin",
+                6,
+                8,
+                60f,
+                120f,
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
+            ),
+            phase(
+                "as-toggle-a",
+                "Abrupt small/full toggles",
+                12,
+                8,
+                120f,
+                120f,
+                layerSizeProfile = LayerSizeProfile.ABRUPT_SMALL_FULL,
+            ),
+            phase(
+                "as-small-b",
+                "Small-size release reference",
+                6,
+                8,
+                60f,
+                120f,
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
+            ),
+            phase(
+                "as-toggle-b",
+                "Abrupt toggle repeat",
+                12,
+                8,
+                120f,
+                120f,
+                layerSizeProfile = LayerSizeProfile.ABRUPT_SMALL_FULL,
+            ),
+            phase("as-recover", "Toggle recovery", 6, 2, 60f, 60f),
+        ),
+    )
+
+    private fun layerSizeFpsBurst() = ScenarioSpec(
+        id = "layer-size-fps-burst",
+        name = "Size + Layer + FPS Step Burst",
+        description =
+            "1L·30fps small geometry로 governor를 안정화한 뒤 14L·120fps·120Hz와 " +
+                "full-screen geometry를 같은 phase 경계에서 동시에 STEP 인가합니다. 두 번째 burst는 " +
+                "18L mixed size를 사용해 크기·layer·pacing 축의 조합을 비교합니다.",
+        category = ScenarioCategory.TRANSITION,
+        risk = RiskLevel.HIGH,
+        tags = setOf("DPU low→high", "idle→burst", "size + layer + FPS", "step"),
+        requirements = setOf("DPU busy/frequency 또는 HWC telemetry 권장"),
+        phases = listOf(
+            phase(
+                "sb-settle-a",
+                "Small 1L/30fps governor settle",
+                10,
+                1,
+                30f,
+                60f,
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
+            ),
+            phase(
+                "sb-full-burst",
+                "14L/120fps full-size step burst",
+                8,
+                14,
+                120f,
+                120f,
+                layerSizeProfile = LayerSizeProfile.FULL_SCREEN,
+            ),
+            phase(
+                "sb-release",
+                "Return to small 1L/30fps",
+                8,
+                1,
+                30f,
+                60f,
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
+            ),
+            phase(
+                "sb-mixed-burst",
+                "18L/120fps mixed-size burst",
+                8,
+                18,
+                120f,
+                120f,
+                layerSizeProfile = LayerSizeProfile.MIXED_SIZES,
+            ),
+            phase("sb-recover", "Combined burst recovery", 8, 1, 30f, 60f),
+        ),
+    )
+
+    private fun layerSizeDeviceCandidate() = ScenarioSpec(
+        id = "layer-size-device-candidate",
+        name = "Sized 4L DEVICE Candidate",
+        description =
+            "불투명 RGB 독립 Surface를 보수적인 4L candidate 안에서 small·mixed size로 " +
+                "변화시킵니다. DEVICE 합성을 강제하거나 보장하지 않으며 각 target의 fresh " +
+                "vendor DEVICE/CLIENT 원자 쌍이 없거나 DEVICE-only가 아니면 INCONCLUSIVE입니다.",
+        category = ScenarioCategory.LAYER_HWC,
+        risk = RiskLevel.MEDIUM,
+        tags = setOf("size profile", "DEVICE intent", "opaque RGB", "4L"),
+        requirements = setOf(
+            "expectation 검증용 fresh vendor HWC DEVICE/CLIENT telemetry 필수(미가용 시 INCONCLUSIVE)",
+        ),
+        phases = listOf(
+            phase(
+                "sc-device-base",
+                "Small 1L DEVICE baseline",
+                12,
+                1,
+                30f,
+                60f,
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
+                hwcExpectation = HwcCompositionExpectation.DEVICE_ONLY,
+            ),
+            phase(
+                "sc-device-mixed",
+                "4L mixed-size DEVICE candidate",
+                12,
+                4,
+                120f,
+                120f,
+                layerSizeProfile = LayerSizeProfile.MIXED_SIZES,
+                hwcExpectation = HwcCompositionExpectation.DEVICE_ONLY,
+            ),
+            phase(
+                "sc-device-small",
+                "4L small-size DEVICE candidate",
+                12,
+                4,
+                120f,
+                120f,
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
+                hwcExpectation = HwcCompositionExpectation.DEVICE_ONLY,
+            ),
+            phase(
+                "sc-device-return",
+                "Return to small 1L DEVICE baseline",
+                12,
+                1,
+                30f,
+                60f,
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
+                hwcExpectation = HwcCompositionExpectation.DEVICE_ONLY,
+            ),
+            phase("sc-device-recover", "Sized DEVICE recovery", 7, 1, 30f, 60f),
+        ),
+    )
+
+    private fun layerSizeClientPressure() = ScenarioSpec(
+        id = "layer-size-client-pressure",
+        name = "Sized 20L CLIENT Pressure",
+        description =
+            "small 1L DEVICE baseline에서 full-screen 또는 mixed-size alpha/GL 20L로 " +
+                "phase 경계에서 즉시 전환합니다. 판정 phase 내부 geometry는 고정해 " +
+                "CLIENT 합성 관측 원인을 격리하며, target마다 distinct fresh vendor 원자 " +
+                "쌍에서 CLIENT>0이 확인되지 않으면 INCONCLUSIVE입니다.",
+        category = ScenarioCategory.LAYER_HWC,
+        risk = RiskLevel.HIGH,
+        tags = setOf("size profile", "CLIENT fallback intent", "20L", "alpha", "GL"),
+        requirements = setOf(
+            "expectation 검증용 fresh vendor HWC DEVICE/CLIENT telemetry 필수(미가용 시 INCONCLUSIVE)",
+            "runtime safety policy 필수(20L/120fps/GL target clamp 시 실행 거부)",
+        ),
+        phases = listOf(
+            phase(
+                "sp-client-base-a",
+                "Small 1L DEVICE baseline",
+                12,
+                1,
+                30f,
+                60f,
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
+                hwcExpectation = HwcCompositionExpectation.DEVICE_ONLY,
+            ),
+            phase(
+                "sp-client-full",
+                "20L full-screen CLIENT pressure",
+                16,
+                20,
+                120f,
+                120f,
+                backend = LayerBackend.MIXED_SURFACE_TEXTURE,
+                layerSizeProfile = LayerSizeProfile.FULL_SCREEN,
+                alpha = true,
+                gl = true,
+                hwcExpectation = HwcCompositionExpectation.CLIENT_REQUIRED,
+            ),
+            phase(
+                "sp-client-base-b",
+                "Return to small 1L DEVICE baseline",
+                12,
+                1,
+                30f,
+                60f,
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
+                hwcExpectation = HwcCompositionExpectation.DEVICE_ONLY,
+            ),
+            phase(
+                "sp-client-mixed",
+                "20L mixed-size CLIENT pressure",
+                16,
+                20,
+                120f,
+                120f,
+                backend = LayerBackend.MIXED_SURFACE_TEXTURE,
+                layerSizeProfile = LayerSizeProfile.MIXED_SIZES,
+                alpha = true,
+                gl = true,
+                hwcExpectation = HwcCompositionExpectation.CLIENT_REQUIRED,
+            ),
+            phase("sp-client-recover", "Sized CLIENT recovery", 7, 1, 30f, 60f),
         ),
     )
 
@@ -515,7 +911,12 @@ object ScenarioCatalog {
             ),
             phase("mp-bus-ref-c", "Memory reference recovery", 5, 6, 60f, 60f),
             phase("mp-recover", "Reference recovery", 6, 4, 60f, 60f),
-        ),
+        ).map { phase ->
+            // This A/B matrix assumes every logical layer remains visible while one control axis
+            // changes. Explicit geometry prevents opaque static full-screen siblings from being
+            // trivially occluded or culled.
+            phase.copy(layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM)
+        },
     )
 
     private fun dvfsVideoShock() = ScenarioSpec(
@@ -584,6 +985,7 @@ object ScenarioCatalog {
                 60f,
                 120f,
                 motion = MotionProfile.PARALLAX,
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
             )
         },
     )
@@ -1313,9 +1715,39 @@ object ScenarioCatalog {
         tags = setOf("SBWC", "compression", "A/B"),
         requirements = setOf("SBWC vendor adapter", "4K local media 권장"),
         phases = listOf(
-            phase("linear", "RGB linear reference", 8, 6, 60f, 120f, route = PixelRoute.RGB_8888, size = BufferSize.UHD_4K),
-            phase("yuv", "YUV codec reference", 8, 6, 60f, 120f, route = PixelRoute.YUV_420, size = BufferSize.UHD_4K),
-            phase("sbwc", "SBWC required", 8, 6, 60f, 120f, route = PixelRoute.SBWC_REQUIRED, size = BufferSize.UHD_4K),
+            phase(
+                "linear",
+                "RGB linear reference",
+                8,
+                6,
+                60f,
+                120f,
+                route = PixelRoute.RGB_8888,
+                size = BufferSize.UHD_4K,
+                layerSizeProfile = LayerSizeProfile.MIXED_SIZES,
+            ),
+            phase(
+                "yuv",
+                "YUV codec reference",
+                8,
+                6,
+                60f,
+                120f,
+                route = PixelRoute.YUV_420,
+                size = BufferSize.UHD_4K,
+                layerSizeProfile = LayerSizeProfile.MIXED_SIZES,
+            ),
+            phase(
+                "sbwc",
+                "SBWC required",
+                8,
+                6,
+                60f,
+                120f,
+                route = PixelRoute.SBWC_REQUIRED,
+                size = BufferSize.UHD_4K,
+                layerSizeProfile = LayerSizeProfile.MIXED_SIZES,
+            ),
             phase("restore", "Linear recovery", 6, 4, 60f, 60f),
         ),
     )
@@ -1361,6 +1793,7 @@ object ScenarioCatalog {
         route: PixelRoute = PixelRoute.RGB_8888,
         size: BufferSize = BufferSize.DISPLAY,
         motion: MotionProfile = MotionProfile.STATIC,
+        layerSizeProfile: LayerSizeProfile = LayerSizeProfile.FULL_SCREEN,
         loads: LoadSetpoints = LoadSetpoints(),
         alpha: Boolean = false,
         gl: Boolean = false,
@@ -1377,6 +1810,7 @@ object ScenarioCatalog {
         pixelRoute = route,
         bufferSize = size,
         motion = motion,
+        layerSizeProfile = layerSizeProfile,
         workloads = loads,
         alphaOverlap = alpha,
         includeGlLayer = gl,

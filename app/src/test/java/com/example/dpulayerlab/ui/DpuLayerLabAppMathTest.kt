@@ -3,6 +3,8 @@ package com.example.dpulayerlab.ui
 import com.example.dpulayerlab.engine.ScenarioCatalog
 import com.example.dpulayerlab.model.Gauge
 import com.example.dpulayerlab.model.HwcCompositionExpectation
+import com.example.dpulayerlab.model.LayerSizeProfile
+import com.example.dpulayerlab.model.LayerTrafficEstimate
 import com.example.dpulayerlab.model.MetricQuality
 import com.example.dpulayerlab.model.ScenarioCategory
 import com.example.dpulayerlab.model.ScenarioClassifier
@@ -20,10 +22,10 @@ import org.junit.Test
 
 class DpuLayerLabAppMathTest {
     @Test
-    fun visibleVersionKeepsReleaseTimestampAndVariantSuffix() {
+    fun visibleVersionKeepsSourceCandidateTimestampAndVariantSuffix() {
         assertEquals(
-            "BUILD 20260725_090252-debug",
-            visibleAppVersion("20260725_090252-debug"),
+            "BUILD 20260725_095708-debug",
+            visibleAppVersion("20260725_095708-debug"),
         )
     }
 
@@ -100,11 +102,17 @@ class DpuLayerLabAppMathTest {
         assertTrue(client.any { it.id == "dpu-client-fallback-burst" })
         assertTrue(burst.any { it.id == "dpu-only-repeat-shock" })
         assertEquals(
-            listOf("dpu-device-envelope-burst"),
+            listOf(
+                "dpu-device-envelope-burst",
+                "layer-size-device-candidate",
+            ),
             device.map { it.id },
         )
         assertEquals(
-            listOf("dpu-client-fallback-burst"),
+            listOf(
+                "dpu-client-fallback-burst",
+                "layer-size-client-pressure",
+            ),
             client.map { it.id },
         )
         assertFalse(device.any { candidate ->
@@ -217,6 +225,71 @@ class DpuLayerLabAppMathTest {
         val preview = scenarioSelectionPreview(listOf(baseline))
 
         assertEquals("HWC 자동 배정/검증 목표 없음", preview.compositionTarget)
+    }
+
+    @Test
+    fun layerSizeLabelsKeepFullScreenDefaultAndBoundMixedQueueSummary() {
+        assertEquals(
+            "Full screen (기본)",
+            layerSizeProfileUiLabel(LayerSizeProfile.FULL_SCREEN),
+        )
+        assertEquals(
+            "Full 기본",
+            layerSizeProfileUiLabel(LayerSizeProfile.FULL_SCREEN, compact = true),
+        )
+        assertEquals(
+            "Full 기본 / Small / Mixed S/M/L +2",
+            layerSizeProfileSummary(LayerSizeProfile.entries),
+        )
+        assertEquals("N/A", layerSizeProfileSummary(emptyList()))
+    }
+
+    @Test
+    fun sizeProfileFootprintSummaryIsSeparateFromTrafficAndDisclosesScope() {
+        val estimate = LayerTrafficEstimate(
+            logicalLayerCount = 4,
+            producerLayerCount = 4,
+            bytesPerFrame = 10.0,
+            dpuReadBytesPerSecond = 20.0,
+            producerWriteBytesPerSecond = 30.0,
+            scanoutFps = 60f,
+            formatLabel = "RGBA",
+            resolutionLabel = "display",
+            compressionRatioExcluded = false,
+            destinationFootprintScreenEquivalents = 1.375,
+            destinationFootprintAveragePercent = 34.375,
+            destinationFootprintLabel =
+                "Mixed sizes · destination only; overlap/crop excluded",
+        )
+
+        assertEquals(
+            "SIZE PROFILE FOOTPRINT 1.38× screen · avg 34%/producer · " +
+                "Mixed sizes · destination only; overlap/crop excluded · traffic과 별도",
+            sizeProfileFootprintSummary(estimate),
+        )
+        assertEquals(
+            "SIZE PROFILE FOOTPRINT N/A · base scale only · traffic과 별도",
+            sizeProfileFootprintSummary(null),
+        )
+        assertEquals(
+            "SIZE PROFILE FOOTPRINT N/A · base scale only · traffic과 별도",
+            sizeProfileFootprintSummary(
+                estimate.copy(destinationFootprintScreenEquivalents = Double.NaN),
+            ),
+        )
+    }
+
+    @Test
+    fun queuePreviewMakesLayerSizeProfilesVisible() {
+        val gradual = checkNotNull(
+            ScenarioCatalog.byId("gradual-layer-size-expansion"),
+        )
+
+        val preview = scenarioSelectionPreview(listOf(gradual))
+
+        assertTrue(preview.inputChange.contains("크기"))
+        assertTrue(preview.inputChange.contains("Small→Full"))
+        assertTrue(preview.inputChange.contains("Full 기본"))
     }
 
     @Test

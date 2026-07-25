@@ -1,5 +1,6 @@
 package com.example.dpulayerlab.monitor
 
+import com.example.dpulayerlab.model.LayerSizeProfile
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -7,6 +8,97 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProducerGenerationGateTest {
+    @Test
+    fun geometryRevisionRequiresMatchingPostFrameAckAndIsGenerationScoped() {
+        val gate = ProducerGenerationGate()
+        val generation = gate.begin(nowMs = 100L)
+        val profile = LayerSizeProfile.MIXED_SIZES.ordinal
+
+        assertFalse(
+            gate.requestLayerGeometry(
+                candidate = generation + 1L,
+                revision = 1L,
+                profileOrdinal = profile,
+                nowMs = 110L,
+            ),
+        )
+        assertTrue(
+            gate.requestLayerGeometry(
+                candidate = generation,
+                revision = 1L,
+                profileOrdinal = profile,
+                nowMs = 120L,
+            ),
+        )
+        val pending = gate.readiness(generation, nowMs = 150L)
+        assertFalse(pending.geometryReady)
+        assertEquals(30L, pending.geometryPendingForMs)
+        assertEquals(1L, pending.geometryRequestedRevision)
+        assertEquals(0L, pending.geometryAppliedRevision)
+
+        assertFalse(
+            gate.acknowledgeLayerGeometry(
+                candidate = generation,
+                revision = 2L,
+                profileOrdinal = profile,
+                coverageBit = 1,
+            ),
+        )
+        assertTrue(
+            gate.acknowledgeLayerGeometry(
+                candidate = generation,
+                revision = 1L,
+                profileOrdinal = profile,
+                coverageBit = 1,
+            ),
+        )
+        val applied = gate.readiness(generation, nowMs = 151L)
+        assertTrue(applied.geometryReady)
+        assertEquals(profile, applied.geometryAppliedProfileOrdinal)
+        assertEquals(1, applied.geometryCoverageMask)
+
+        val next = gate.begin(nowMs = 200L)
+        assertFalse(gate.readiness(next, nowMs = 201L).geometryReady)
+        assertEquals(0, gate.readiness(next, nowMs = 201L).geometryCoverageMask)
+        assertFalse(
+            gate.acknowledgeLayerGeometry(
+                candidate = generation,
+                revision = 1L,
+                profileOrdinal = profile,
+                coverageBit = 1,
+            ),
+        )
+    }
+
+    @Test
+    fun geometryCoverageIsRetainedPerProfileAcrossRecoveryPreparation() {
+        val gate = ProducerGenerationGate()
+        val generation = gate.begin(nowMs = 0L)
+        val dynamic = LayerSizeProfile.GRADUAL_SMALL_TO_FULL.ordinal
+        val preparation = LayerSizeProfile.SMALL_UNIFORM.ordinal
+
+        assertTrue(
+            gate.recordEquivalentLayerGeometryCoverage(
+                candidate = generation,
+                profileOrdinal = dynamic,
+                coverageBit = 0b001,
+            ),
+        )
+        assertTrue(gate.requestLayerGeometry(generation, 1L, dynamic, nowMs = 1L))
+        assertTrue(gate.acknowledgeLayerGeometry(generation, 1L, dynamic, 0b010))
+        assertEquals(0b011, gate.readiness(generation, nowMs = 3L).geometryCoverageMask)
+
+        assertTrue(gate.requestLayerGeometry(generation, 2L, preparation, nowMs = 4L))
+        assertTrue(gate.acknowledgeLayerGeometry(generation, 2L, preparation, 0b001))
+        assertEquals(0b001, gate.readiness(generation, nowMs = 5L).geometryCoverageMask)
+
+        assertTrue(gate.requestLayerGeometry(generation, 3L, dynamic, nowMs = 6L))
+        assertTrue(gate.acknowledgeLayerGeometry(generation, 3L, dynamic, 0b100))
+        val resumed = gate.readiness(generation, nowMs = 7L)
+        assertTrue(resumed.geometryReady)
+        assertEquals(0b111, resumed.geometryCoverageMask)
+    }
+
     @Test
     fun staleProducerCannotSatisfyNewGeneration() {
         val gate = ProducerGenerationGate()
@@ -98,12 +190,21 @@ class ProducerGenerationGateTest {
     fun removingNeverProducedPeakMarksTopologyMissed() {
         val gate = ProducerGenerationGate()
         val generation = gate.begin(nowMs = 0L)
+        val profile = LayerSizeProfile.FULL_SCREEN.ordinal
         assertTrue(gate.expect(generation, setOf(1L, 2L), nowMs = 10L))
-        assertTrue(gate.activate(generation, nowMs = 10L))
+        assertTrue(gate.requestLayerGeometry(generation, 1L, profile, nowMs = 11L))
+        assertTrue(gate.acknowledgeLayerGeometry(generation, 1L, profile, coverageBit = 1))
+        assertTrue(gate.activate(generation, nowMs = 12L))
         assertTrue(gate.accept(generation, 1L, nowMs = 20L))
         assertTrue(gate.expect(generation, setOf(1L), nowMs = 100L))
 
-        assertTrue(gate.readiness(generation, nowMs = 110L).topologyMissed)
+        val missed = gate.readiness(generation, nowMs = 110L)
+        assertTrue(missed.topologyMissed)
+        assertFalse(missed.ready)
+        assertFalse(missed.geometryReady)
+        assertEquals(0, missed.geometryCoverageMask)
+        assertFalse(gate.activate(generation, nowMs = 111L))
+        assertFalse(gate.accept(generation, 1L, nowMs = 112L))
     }
 
     @Test
@@ -120,19 +221,26 @@ class ProducerGenerationGateTest {
     }
 
     @Test
-    fun producerHeartbeatAndTeardownFailureRemainVisible() {
+    fun teardownFailureMakesTheGenerationTerminalAndUnready() {
         val gate = ProducerGenerationGate()
         val generation = gate.begin(nowMs = 0L)
+        val profile = LayerSizeProfile.FULL_SCREEN.ordinal
         assertTrue(gate.expect(generation, setOf(7L), nowMs = 10L))
-        assertTrue(gate.activate(generation, nowMs = 10L))
+        assertTrue(gate.requestLayerGeometry(generation, 1L, profile, nowMs = 11L))
+        assertTrue(gate.acknowledgeLayerGeometry(generation, 1L, profile, coverageBit = 1))
+        assertTrue(gate.activate(generation, nowMs = 12L))
         assertTrue(gate.accept(generation, 7L, nowMs = 20L))
         assertTrue(gate.markTeardownFailure(generation))
 
         val readiness = gate.readiness(generation, nowMs = 3_020L)
-        assertTrue(readiness.ready)
+        assertFalse(readiness.ready)
         assertTrue(readiness.oldestFrameAgeMs == 3_000L)
-        assertTrue(readiness.observedCount == 1)
+        assertEquals(0, readiness.observedCount)
+        assertFalse(readiness.geometryReady)
+        assertEquals(0, readiness.geometryCoverageMask)
         assertTrue(readiness.teardownFailed)
+        assertFalse(gate.activate(generation, nowMs = 3_021L))
+        assertFalse(gate.accept(generation, 7L, nowMs = 3_022L))
     }
 
     @Test
@@ -154,15 +262,50 @@ class ProducerGenerationGateTest {
     }
 
     @Test
-    fun producerReattachRevokesEarlierStageRemovalAcknowledgement() {
+    fun detachedStageEvidenceCannotRecoverBeforeRepublishActivationAndFreshBuffer() {
         val gate = ProducerGenerationGate()
         val generation = gate.begin(nowMs = 0L)
+        val profile = LayerSizeProfile.MIXED_SIZES.ordinal
+        assertTrue(gate.expect(generation, setOf(7L), nowMs = 1L))
+        assertTrue(gate.requestLayerGeometry(generation, 1L, profile, nowMs = 2L))
+        assertTrue(gate.acknowledgeLayerGeometry(generation, 1L, profile, coverageBit = 1))
+        assertTrue(gate.activate(generation, nowMs = 3L))
+        assertTrue(gate.accept(generation, 7L, nowMs = 4L))
+        val attached = gate.readiness(generation, nowMs = 5L)
+        assertTrue(attached.ready)
+        assertTrue(attached.geometryReady)
+
         assertTrue(gate.markTeardownComplete(generation))
-        assertTrue(gate.readiness(generation, nowMs = 1L).teardownCompleted)
+        val detached = gate.readiness(generation, nowMs = 6L)
+        assertTrue(detached.teardownCompleted)
+        assertFalse(detached.ready)
+        assertEquals(0, detached.observedCount)
+        assertFalse(detached.geometryReady)
+        assertEquals(0, detached.geometryCoverageMask)
+        assertFalse(gate.accept(generation, 7L, nowMs = 7L))
+        assertFalse(gate.requestLayerGeometry(generation, 2L, profile, nowMs = 7L))
+        assertFalse(gate.acknowledgeLayerGeometry(generation, 1L, profile, coverageBit = 1))
 
-        assertTrue(gate.expect(generation, setOf(99L), nowMs = 2L))
+        // A replacement stage first announces a pending transaction and prepares fresh geometry.
+        assertTrue(gate.markTopologyPending(generation))
+        assertTrue(gate.requestLayerGeometry(generation, 2L, profile, nowMs = 8L))
+        assertTrue(gate.acknowledgeLayerGeometry(generation, 2L, profile, coverageBit = 1))
+        assertTrue(gate.expect(generation, setOf(99L), nowMs = 9L))
 
-        assertFalse(gate.readiness(generation, nowMs = 3L).teardownCompleted)
+        val republished = gate.readiness(generation, nowMs = 10L)
+        assertFalse(republished.teardownCompleted)
+        assertFalse(republished.ready)
+        assertTrue(republished.geometryReady)
+        assertEquals(0, republished.observedCount)
+        assertFalse(gate.accept(generation, 7L, nowMs = 11L))
+
+        assertTrue(gate.activate(generation, nowMs = 12L))
+        assertFalse(gate.readiness(generation, nowMs = 13L).ready)
+        assertTrue(gate.accept(generation, 99L, nowMs = 14L))
+        val recovered = gate.readiness(generation, nowMs = 15L)
+        assertTrue(recovered.ready)
+        assertTrue(recovered.geometryReady)
+        assertEquals(1, recovered.observedCount)
     }
 
     @Test

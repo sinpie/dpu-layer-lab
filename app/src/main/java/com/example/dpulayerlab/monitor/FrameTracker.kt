@@ -52,6 +52,45 @@ class FrameTracker : Choreographer.FrameCallback {
         )
     }
 
+    fun requestLayerGeometry(
+        generation: Long,
+        revision: Long,
+        profileOrdinal: Int,
+    ) {
+        producerGeneration.requestLayerGeometry(
+            candidate = generation,
+            revision = revision,
+            profileOrdinal = profileOrdinal,
+            nowMs = SystemClock.elapsedRealtime(),
+        )
+    }
+
+    fun acknowledgeLayerGeometry(
+        generation: Long,
+        revision: Long,
+        profileOrdinal: Int,
+        coverageBit: Int,
+    ) {
+        producerGeneration.acknowledgeLayerGeometry(
+            candidate = generation,
+            revision = revision,
+            profileOrdinal = profileOrdinal,
+            coverageBit = coverageBit,
+        )
+    }
+
+    fun recordEquivalentLayerGeometryCoverage(
+        generation: Long,
+        profileOrdinal: Int,
+        coverageBit: Int,
+    ) {
+        producerGeneration.recordEquivalentLayerGeometryCoverage(
+            candidate = generation,
+            profileOrdinal = profileOrdinal,
+            coverageBit = coverageBit,
+        )
+    }
+
     fun markProducerTopologyPending(generation: Long): Boolean =
         producerGeneration.markTopologyPending(generation)
 
@@ -169,6 +208,12 @@ internal class ProducerGenerationGate {
     private var activated = false
     private var topologyPublishedMs = -1L
     private var topologyRevision = 0L
+    private var geometryRequestedRevision = 0L
+    private var geometryAppliedRevision = 0L
+    private var geometryRequestedProfileOrdinal = -1
+    private var geometryAppliedProfileOrdinal = -1
+    private val geometryCoverageMasks = IntArray(MAX_LAYER_SIZE_PROFILE_COUNT)
+    private var geometryRequestedMs = -1L
     private val expectedSinceMs = LongTimestampMap()
     private val lastObservedMs = LongTimestampMap()
     private var generationStartedMs = 0L
@@ -186,6 +231,12 @@ internal class ProducerGenerationGate {
         activated = false
         topologyPublishedMs = -1L
         topologyRevision = 0L
+        geometryRequestedRevision = 0L
+        geometryAppliedRevision = 0L
+        geometryRequestedProfileOrdinal = -1
+        geometryAppliedProfileOrdinal = -1
+        geometryCoverageMasks.fill(0)
+        geometryRequestedMs = -1L
         expectedSinceMs.clear()
         lastObservedMs.clear()
         generationStartedMs = nowMs.coerceAtLeast(0L)
@@ -245,6 +296,85 @@ internal class ProducerGenerationGate {
     }
 
     @Synchronized
+    fun requestLayerGeometry(
+        candidate: Long,
+        revision: Long,
+        profileOrdinal: Int,
+        nowMs: Long,
+    ): Boolean {
+        if (
+            candidate != generation ||
+            activeEvidenceTerminal() ||
+            revision <= 0L ||
+            profileOrdinal !in geometryCoverageMasks.indices ||
+            revision < geometryRequestedRevision
+        ) {
+            return false
+        }
+        if (
+            revision == geometryRequestedRevision &&
+            profileOrdinal != geometryRequestedProfileOrdinal
+        ) {
+            return false
+        }
+        geometryRequestedRevision = revision
+        geometryRequestedProfileOrdinal = profileOrdinal
+        geometryRequestedMs = nowMs.coerceAtLeast(0L)
+        return true
+    }
+
+    @Synchronized
+    fun acknowledgeLayerGeometry(
+        candidate: Long,
+        revision: Long,
+        profileOrdinal: Int,
+        coverageBit: Int,
+    ): Boolean {
+        if (
+            candidate != generation ||
+            activeEvidenceTerminal() ||
+            revision <= 0L ||
+            revision > geometryRequestedRevision ||
+            revision < geometryAppliedRevision ||
+            profileOrdinal !in geometryCoverageMasks.indices
+        ) {
+            return false
+        }
+        if (
+            revision == geometryRequestedRevision &&
+            profileOrdinal != geometryRequestedProfileOrdinal
+        ) {
+            return false
+        }
+        geometryAppliedRevision = revision
+        geometryAppliedProfileOrdinal = profileOrdinal
+        if (coverageBit > 0) {
+            geometryCoverageMasks[profileOrdinal] =
+                geometryCoverageMasks[profileOrdinal] or coverageBit
+        }
+        return true
+    }
+
+    @Synchronized
+    fun recordEquivalentLayerGeometryCoverage(
+        candidate: Long,
+        profileOrdinal: Int,
+        coverageBit: Int,
+    ): Boolean {
+        if (
+            candidate != generation ||
+            activeEvidenceTerminal() ||
+            profileOrdinal !in geometryCoverageMasks.indices ||
+            coverageBit <= 0
+        ) {
+            return false
+        }
+        geometryCoverageMasks[profileOrdinal] =
+            geometryCoverageMasks[profileOrdinal] or coverageBit
+        return true
+    }
+
+    @Synchronized
     fun markTopologyPending(candidate: Long): Boolean {
         if (candidate != generation) return false
         topologyPending = true
@@ -259,7 +389,14 @@ internal class ProducerGenerationGate {
      */
     @Synchronized
     fun activate(candidate: Long, nowMs: Long): Boolean {
-        if (candidate != generation || !topologyDeclared || topologyPending) return false
+        if (
+            candidate != generation ||
+            !topologyDeclared ||
+            topologyPending ||
+            activeEvidenceTerminal()
+        ) {
+            return false
+        }
         activated = true
         resetObservationWindow(nowMs)
         return true
@@ -271,7 +408,13 @@ internal class ProducerGenerationGate {
      */
     @Synchronized
     fun restartObservation(candidate: Long, nowMs: Long): Boolean {
-        if (candidate != generation || !activated || !topologyDeclared || topologyPending) {
+        if (
+            candidate != generation ||
+            !activated ||
+            !topologyDeclared ||
+            topologyPending ||
+            activeEvidenceTerminal()
+        ) {
             return false
         }
         resetObservationWindow(nowMs)
@@ -284,7 +427,13 @@ internal class ProducerGenerationGate {
         producerId: Long = 0L,
         nowMs: Long = 0L,
     ): Boolean {
-        if (candidate != generation || !activated || !topologyDeclared || topologyPending) {
+        if (
+            candidate != generation ||
+            !activated ||
+            !topologyDeclared ||
+            topologyPending ||
+            activeEvidenceTerminal()
+        ) {
             return false
         }
         if (expectedProducerIds.isNotEmpty() && !expectedProducerIds.containsId(producerId)) {
@@ -298,6 +447,8 @@ internal class ProducerGenerationGate {
     fun markTeardownFailure(candidate: Long): Boolean {
         if (candidate != generation) return false
         teardownFailed = true
+        activated = false
+        invalidateGeometryEvidence()
         return true
     }
 
@@ -305,6 +456,8 @@ internal class ProducerGenerationGate {
     fun markTeardownComplete(candidate: Long): Boolean {
         if (candidate != generation) return false
         teardownCompleted = true
+        activated = false
+        invalidateGeometryEvidence()
         return true
     }
 
@@ -345,11 +498,13 @@ internal class ProducerGenerationGate {
                 if (missingMs > longestMissingMs) longestMissingMs = missingMs
             }
         }
+        val evidenceTerminal = activeEvidenceTerminal()
         val ready = topologyDeclared &&
             !topologyPending &&
             activated &&
             expected.isNotEmpty() &&
             everObservedCount == expected.size &&
+            !evidenceTerminal &&
             runtimeFailureReason == null
         val missingForMs = if (ready) {
             0L
@@ -360,8 +515,8 @@ internal class ProducerGenerationGate {
         }
         return ProducerReadiness(
             expectedCount = expected.size,
-            observedCount = observedCount,
-            everObservedCount = everObservedCount,
+            observedCount = if (activated) observedCount else 0,
+            everObservedCount = if (activated) everObservedCount else 0,
             ready = ready,
             unreadyForMs = missingForMs,
             oldestFrameAgeMs = oldestFrameAgeMs,
@@ -369,6 +524,32 @@ internal class ProducerGenerationGate {
             topologyPending = topologyPending,
             topologyPublishedAtMs = topologyPublishedMs.takeIf { it >= 0L },
             topologyRevision = topologyRevision,
+            geometryRequestedRevision = geometryRequestedRevision,
+            geometryAppliedRevision = geometryAppliedRevision,
+            geometryRequestedProfileOrdinal = geometryRequestedProfileOrdinal,
+            geometryAppliedProfileOrdinal = geometryAppliedProfileOrdinal,
+            geometryCoverageMask = if (evidenceTerminal) {
+                0
+            } else {
+                geometryRequestedProfileOrdinal
+                    .takeIf { it in geometryCoverageMasks.indices }
+                    ?.let { geometryCoverageMasks[it] }
+                    ?: 0
+            },
+            geometryReady =
+                !evidenceTerminal &&
+                    geometryRequestedRevision > 0L &&
+                    geometryAppliedRevision == geometryRequestedRevision &&
+                    geometryAppliedProfileOrdinal == geometryRequestedProfileOrdinal,
+            geometryPendingForMs = if (
+                !evidenceTerminal &&
+                geometryRequestedRevision > 0L &&
+                geometryAppliedRevision != geometryRequestedRevision
+            ) {
+                (normalizedNow - geometryRequestedMs.coerceAtLeast(0L)).coerceAtLeast(0L)
+            } else {
+                0L
+            },
             topologyMissed = topologyMissed,
             teardownFailed = teardownFailed,
             teardownCompleted = teardownCompleted,
@@ -386,9 +567,22 @@ internal class ProducerGenerationGate {
         generationStartedMs = normalizedNow
     }
 
+    private fun activeEvidenceTerminal(): Boolean =
+        topologyMissed || teardownFailed || teardownCompleted
+
+    private fun invalidateGeometryEvidence() {
+        geometryRequestedRevision = 0L
+        geometryAppliedRevision = 0L
+        geometryRequestedProfileOrdinal = -1
+        geometryAppliedProfileOrdinal = -1
+        geometryCoverageMasks.fill(0)
+        geometryRequestedMs = -1L
+    }
+
     private companion object {
         const val PRODUCER_FRESHNESS_WINDOW_MS = 3_000L
         const val MAX_RUNTIME_FAILURE_REASON_CHARS = 240
+        const val MAX_LAYER_SIZE_PROFILE_COUNT = 16
     }
 }
 
@@ -479,6 +673,13 @@ data class ProducerReadiness(
     val topologyPending: Boolean = false,
     val topologyPublishedAtMs: Long? = null,
     val topologyRevision: Long = 0L,
+    val geometryRequestedRevision: Long = 0L,
+    val geometryAppliedRevision: Long = 0L,
+    val geometryRequestedProfileOrdinal: Int = -1,
+    val geometryAppliedProfileOrdinal: Int = -1,
+    val geometryCoverageMask: Int = 0,
+    val geometryReady: Boolean = false,
+    val geometryPendingForMs: Long = 0L,
     val topologyMissed: Boolean = false,
     val teardownFailed: Boolean = false,
     val teardownCompleted: Boolean = false,

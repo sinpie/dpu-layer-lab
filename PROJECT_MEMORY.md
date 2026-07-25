@@ -3,10 +3,11 @@
 이 문서는 DPULayerTest의 장기 설계 맥락을 보존하는 canonical project memory입니다.
 구현을 바꾸면 코드, test, `README.md`, 이 문서를 함께 갱신합니다.
 
-현재 release version은 `20260725_090252`(`versionCode 4`), debug version은
-`20260725_090252-debug`이며 `yyyyMMdd_HHmmss`는 KST build 시각이다. Launcher와
-Gradle project 표시 이름은 `DPULayerTest`다.
-release tag는 `v20260725_090252`이다. Canonical GitHub
+현재 미배포 source candidate는 `20260725_095708`(`versionCode 5`), debug version은
+`20260725_095708-debug`이다. 최신 공개 release는
+`20260725_090252`(`versionCode 4`), tag는 `v20260725_090252`이다.
+`yyyyMMdd_HHmmss`는 KST build 시각이며 Launcher와 Gradle project 표시 이름은
+`DPULayerTest`다. Canonical GitHub
 저장소는 `sinpie/dpu-layer-lab`이며, 기존 제품 통합과 report consumer를 위해 package
 `com.example.dpulayerlab`, automation action/component, `dpu-layer-lab-` report prefix,
 Soong module/APK 이름 `DpuLayerLab`은 stable compatibility identifier로 유지한다.
@@ -20,6 +21,24 @@ VCS-shared configuration은 `DPULayerTest - Debug APK`(`:app:assembleDebug`)와
 `DPULayerTest - Release APK (unsigned)`(`:app:assembleRelease`)이며 사용자별
 `.idea`/SDK/JDK 경로는 추적하지 않는다. Release configuration은 secure product
 signing과 분리된 unsigned 산출물만 만든다.
+
+## 문서 authority
+
+| 문서 | 장기 역할 |
+|---|---|
+| `AGENTS.md` | 규범적 수정 규칙, 안전 불변식과 완료 정의 |
+| `PLAN.md` | 현재·다음 작업의 상태; 완료된 설계 사실의 authority가 아님 |
+| `ARCHITECTURE.md` | 현재 component, 실행 흐름과 resource ownership |
+| `PROJECT_MEMORY.md` | 장기간 유지할 결정, 이유와 알려진 한계 |
+| `docs/SCENARIOS.md` | scenario/phase/catalog 의미 |
+| `docs/METRICS.md` | metric provenance, exact/proxy, verdict와 report |
+| `docs/TESTING.md` | 검증 명령과 test-to-contract map |
+| `docs/RELEASE.md` | version, artifact, signing과 publish 절차 |
+| `docs/RECONSTRUCTION.md` | source 유실 시 dependency별 복구 절차 |
+| `docs/SYSTEM_INTEGRATION.md` | product/BSP/AIDL/SELinux 계약 |
+
+한 사실은 해당 authority 문서 한 곳에서 상세히 설명하고 다른 문서는 요약과 링크만
+유지한다. `PLAN.md`가 기존 안전·제품·계측 계약을 덮어쓰지 않는다.
 
 ## 목적
 
@@ -158,6 +177,50 @@ signing과 분리된 unsigned 산출물만 만든다.
     실패는 callback detach → 전체 stop request → shared bounded deadline 순서로
     rollback한다. 네이티브 Canvas/EGL call을 가로질러 capture된 completion token도
     relay update/disable에서 callback을 분리해 Activity/controller를 보유하지 않는다.
+    `topologyMissed`, `teardownFailed`, `teardownCompleted`는 현재 generation의
+    readiness, geometry와 typed HWC evidence를 모두 무효화한다. Miss/failure는 새
+    generation이 필요하고, 정상 teardown 뒤 reattach도 새 topology·geometry
+    acknowledgment·activation·fresh producer buffer와 fresh HWC observation을 모두
+    다시 요구한다.
+18. **Layer 표시 크기는 source allocation과 분리한다.** `LayerSizeProfile`은
+    `FULL_SCREEN` 기본값과 `SMALL_UNIFORM`, `MIXED_SIZES`,
+    `GRADUAL_SMALL_TO_FULL`, `ABRUPT_SMALL_FULL`의 typed destination
+    transform/crop 계약이다. Physical producer와 full source buffer allocation은
+    유지하므로 graphics budget과 linear full-buffer traffic estimate를 표시 면적에
+    맞춰 줄이지 않는다. HUD의 destination screen-equivalent footprint는 일반 phase에서
+    `LayerSizeProfile` base scale만 합하고 motion scale, overlap, crop/clipping과
+    off-screen loss를 제외한 별도 `ESTIMATED` 값이며 measured bus가 아니다.
+    `CAPACITY_TILES`만 explicit crop-union scope로 1 screen-equivalent와 producer당
+    `100 / count`%를 보고한다.
+    Dynamic progress authority는 controller의 pause-aware `phaseElapsedMs`다. Topology
+    준비는 static measured origin을 고정한다. Prior explicit static origin이 없을 때만
+    `SMALL_UNIFORM`을 dynamic fraction-zero equivalent로 사용하고, prior
+    full/small/mixed origin과 allocation route의 measured size edge를 baseline 전에
+    소비하지 않는다. Recovery나 producer generation rebuild에서는 frozen elapsed로
+    re-anchor해 waveform을 재시작하지 않는다. Fresh baseline과 origin producer readiness
+    뒤 첫 active tick에서 cyclic fraction 0도 target profile을 arm하며, 이후
+    pulse/triangle valley에서도 되돌리지 않는다. Dynamic
+    transform은 producer FPS와 무관하게 최대 100 ms cadence와 forced final sample을
+    가진다. Duration cap 뒤 `GRADUAL_SMALL_TO_FULL`은 최소
+    2×100 ms control window, `ABRUPT_SMALL_FULL`은 8 step 전체의
+    8×100 ms window를 확보하지 못하면 의미가 다른 test로 축소하지 않고 reject한다.
+    실제 base transform apply마다 generation-scoped bounded revision을 요청하고 두 번의
+    후속 Choreographer callback/traversal opportunity 뒤 matching profile/revision을
+    acknowledge한다. Pending revision 동안 last-applied base-size fraction을 고정하고
+    controller clock의 latest desired는 계속 진행시켜, acknowledgment 뒤 stale
+    intermediate backlog 없이 최신값 하나만 적용한다. Gradual revision key는
+    origin/mid/exact endpoint 3개, abrupt는 8 step으로 bounded해 최소 200 ms
+    gradual window에서도 30/60/120 fps coverage를 보존한다. Activation과 typed HWC
+    arm은 이를 기다리지만 이 evidence는
+    app-side apply 확인일 뿐 physical HWC composition proof가 아니다. 같은 generation의
+    applied `SMALL_UNIFORM` preparation이 dynamic fraction-zero와 실제 geometry가
+    동일하면 controller는 해당 dynamic profile의 origin bit 하나만 equivalent
+    coverage로 seed한다. Mid/end 또는 abrupt의 나머지 step은 실제 dynamic profile
+    apply acknowledgment가 필요하다. Gradual origin/mid/end와 abrupt 8 step required
+    coverage가 빠지면
+    `LAYER_SIZE_COVERAGE_MISSING`/`INCONCLUSIVE`, 충족되면 `LAYER_SIZE_COVERAGE`를
+    남긴다. Narrow stage horizontal stagger는 scale-aware bound로 최소 1 px visibility를
+    유지한다.
 
 ## 반드시 유지할 불변식
 
@@ -284,6 +347,11 @@ signing과 분리된 unsigned 산출물만 만든다.
   Controller의 다음 100 ms poll 경계까지 이전 producer count를 적분하거나 부하를
   유지해서는 안 되며, commit/restart 뒤에만 resume한다. Unpublished/topology-pending/
   process-lease 상태의 HUD expected count는 0(`—P`)이고 committed count와 분리한다.
+- topology miss, teardown failure 또는 completed teardown 뒤에는 같은 generation의
+  producer readiness, geometry revision/profile/coverage와 typed HWC evidence를
+  재사용하지 않는다. Miss/failure는 새 generation에서만 복구하며, clean reattach도
+  topology pending → 새 geometry acknowledgment → topology publish → activation →
+  모든 fresh first buffer → fresh HWC observation의 전체 barrier를 다시 통과한다.
 - `STEP` target은 fresh baseline 뒤 origin topology의 generation-scoped buffer가
   확인된 다음 measured 100 ms control tick에서 적용한다. Duration cap 이후의 실제
   transition window가 cadence상 중간/level/cycle/attack-hold-release를 표현하지 못하면
@@ -378,6 +446,8 @@ signing과 분리된 unsigned 산출물만 만든다.
   `INCONCLUSIVE`다.
 - Typed HWC expectation은 관측 대상 target의 layer topology, producer FPS, display
   pacing, GL producer와 GPU pressure를 safety clamp 뒤에도 그대로 보존해야 한다.
+  Fresh evidence가 한 target geometry를 나타내도록 dynamic `LayerSizeProfile`을 결합한
+  typed phase도 preflight에서 거부한다.
   하나라도 바뀌면 다른 실험으로 축소하지 않고 preflight에서 거부한다. 3초
   first-buffer readiness, 최대 4초의 pre-target periodic sample mutex drain, probe당
   4초 bounded telemetry와 post-target 관측 tick을 포함하기 위해 `DEVICE_ONLY`
@@ -446,12 +516,12 @@ signing과 분리된 unsigned 산출물만 만든다.
 
 ## 현재 구현
 
-- DPULayerTest `20260725_090252` release / `20260725_090252-debug` debug
+- DPULayerTest source candidate `20260725_095708` / `20260725_095708-debug`
   launcher/Gradle project, 화면/HUD/report build version과 stable
   `com.example.dpulayerlab`/`DpuLayerLab` 제품 통합 identifier
 - Compose 기반 scenario browser, system dashboard, running HUD, result 화면. 실행
   header의 STOP은 compact/landscape에서도 상단에 유지한다.
-- 25개 catalog preset 및 custom phase. 4L DEVICE candidate/CLIENT plane-overflow의 typed
+- 32개 catalog preset 및 custom phase. 4L DEVICE candidate/CLIENT plane-overflow의 typed
   HWC 관측 probe와 cross-load 없는 repeated DPU step shock, fixed-topology resource isolation,
   instant isolated contention, continuous cross-load ramp, paired mid-load reference,
   backend-only composition pivot과 다변수 adaptive hunt의 용도를 구분한다.

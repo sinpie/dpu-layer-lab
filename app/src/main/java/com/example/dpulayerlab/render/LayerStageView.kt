@@ -28,13 +28,18 @@ import android.view.TextureView
 import android.view.View
 import android.widget.FrameLayout
 import androidx.core.graphics.withSave
+import com.example.dpulayerlab.model.ABRUPT_LAYER_SIZE_PROFILE_STEPS
 import com.example.dpulayerlab.model.BufferSize
+import com.example.dpulayerlab.model.GRADUAL_MID_MIN_FRACTION
 import com.example.dpulayerlab.model.LayerBackend
+import com.example.dpulayerlab.model.LayerSizeProfile
 import com.example.dpulayerlab.model.LoadShape
 import com.example.dpulayerlab.model.LoadShapeEvaluator
 import com.example.dpulayerlab.model.MotionProfile
 import com.example.dpulayerlab.model.PhaseSpec
 import com.example.dpulayerlab.model.PixelRoute
+import com.example.dpulayerlab.model.coverageBitAt
+import com.example.dpulayerlab.model.normalizedSizeForLayer
 import com.example.dpulayerlab.model.usesSelectedMediaDecoder
 import java.util.IdentityHashMap
 import java.util.concurrent.CountDownLatch
@@ -65,12 +70,19 @@ class LayerStageView @JvmOverloads constructor(
     private var topology: LayerTopology? = null
     private var startNanos = 0L
     private var lastTransformNanos = 0L
+    private var layerSizeClockAnchorNanos = 0L
+    private var layerSizeElapsedAtAnchorNanos = 0L
+    private var layerSizeAuthoritativeElapsedMs = Long.MIN_VALUE
+    private var lastAppliedLayerSizeFraction = -1f
     private var attached = false
     private var frameCallbackPosted = false
     private val animatedChildren = mutableListOf<View>()
+    private val childCropBounds = IdentityHashMap<View, Rect>()
     private var producerFrameCallback: ProducerFrameCallback? = null
     private var expectedProducersCallback: ((Long, Set<Long>) -> Unit)? = null
     private var producerTopologyPendingCallback: ((Long) -> Unit)? = null
+    private var layerGeometryRequestedCallback: ((Long, Long, Int) -> Unit)? = null
+    private var layerGeometryAppliedCallback: ((Long, Long, Int, Int) -> Unit)? = null
     private var producerTeardownFailureCallback: ((Long) -> Unit)? = null
     private var producerRuntimeFailureCallback: ((Long, String) -> Unit)? = null
     private var stageRemovalCallback: ((Long, Boolean) -> Unit)? = null
@@ -82,6 +94,18 @@ class LayerStageView @JvmOverloads constructor(
     private var expectedPublishSuppressed = false
     private var expectedTopologyDirty = true
     private var forceExpectedProducerRepublish = false
+    private var layerGeometryRevision = 0L
+    private var layerGeometryKeyGeneration = Long.MIN_VALUE
+    private var layerGeometryKeyPhaseId: String? = null
+    private var layerGeometryKeyProfileOrdinal = -1
+    private var layerGeometryKeySample = -1
+    private var layerGeometryKeyLayerCount = -1
+    private var layerGeometryKeyWidth = -1
+    private var layerGeometryKeyHeight = -1
+    private var pendingLayerGeometryRevision = 0L
+    private var pendingLayerGeometryProfileOrdinal = -1
+    private var pendingLayerGeometryCoverageBit = 0
+    private var pendingLayerGeometryAckFrames = 0
     private var lastPublishedExpectedGeneration = Long.MIN_VALUE
     private var lastPublishedProducerIds: Set<Long> = emptySet()
     private var lastPublishedExpectedCallback: ((Long, Set<Long>) -> Unit)? = null
@@ -101,9 +125,19 @@ class LayerStageView @JvmOverloads constructor(
         selectedMedia: Uri?,
         selectedDecoder: VideoDecoderSelection?,
         newProducerGeneration: Long,
+        newPhaseElapsedMs: Long,
         onProducerFrame: ProducerFrameCallback? = null,
         onExpectedProducers: ((generation: Long, producerIds: Set<Long>) -> Unit)? = null,
         onProducerTopologyPending: ((generation: Long) -> Unit)? = null,
+        onLayerGeometryRequested:
+            ((generation: Long, revision: Long, profileOrdinal: Int) -> Unit)? = null,
+        onLayerGeometryApplied:
+            ((
+                generation: Long,
+                revision: Long,
+                profileOrdinal: Int,
+                coverageBit: Int,
+            ) -> Unit)? = null,
         onProducerTeardownFailure: ((generation: Long) -> Unit)? = null,
         onProducerRuntimeFailure: ((generation: Long, reason: String) -> Unit)? = null,
         onStageRemoved: ((generation: Long, producersStopped: Boolean) -> Unit)? = null,
@@ -113,14 +147,33 @@ class LayerStageView @JvmOverloads constructor(
         producerFrameCallback = onProducerFrame
         expectedProducersCallback = onExpectedProducers
         producerTopologyPendingCallback = onProducerTopologyPending
+        layerGeometryRequestedCallback = onLayerGeometryRequested
+        layerGeometryAppliedCallback = onLayerGeometryApplied
         producerTeardownFailureCallback = onProducerTeardownFailure
         producerRuntimeFailureCallback = onProducerRuntimeFailure
         stageRemovalCallback = onStageRemoved
         val previousPhaseId = phase?.id
         val previousMotion = phase?.motion
+        val previousLayerSizeProfile = phase?.layerSizeProfile
         val newTopology = topologyFor(newPhase, selectedMedia, selectedDecoder)
         val phaseChanged = previousPhaseId != newPhase.id
         val generationChanged = producerGeneration != newProducerGeneration
+        val layerSizeProfileChanged = previousLayerSizeProfile != newPhase.layerSizeProfile
+        val nowNanos = System.nanoTime()
+        if (generationChanged) {
+            resetLayerGeometryTracking()
+        } else if (phaseChanged || layerSizeProfileChanged) {
+            // A pending acknowledgment belongs to the previous semantic geometry identity.
+            // Cancel it before applying the new phase/profile so it cannot be reported as proof
+            // for a View transform which has already been replaced.
+            invalidateLayerGeometryKey()
+        }
+        syncLayerSizePhaseClock(
+            phase = newPhase,
+            authoritativeElapsedMs = newPhaseElapsedMs,
+            anchorNanos = nowNanos,
+            force = phaseChanged || generationChanged || layerSizeProfileChanged,
+        )
         if (generationChanged || expectedCallbackChanged) expectedTopologyDirty = true
         if (generationChanged) {
             failedTopologyGeneration = Long.MIN_VALUE
@@ -186,7 +239,7 @@ class LayerStageView @JvmOverloads constructor(
                 }
             }
             if (phaseChanged || generationChanged) {
-                startNanos = System.nanoTime()
+                startNanos = nowNanos
                 lastTransformNanos = 0L
             }
             updateRuntimeControls(
@@ -199,10 +252,12 @@ class LayerStageView @JvmOverloads constructor(
             if (newPhase.motion == MotionProfile.CAPACITY_TILES) {
                 // Publish the non-occluded crop before a very fast producer can satisfy the
                 // controller's all-first-buffer gate under the previous/full-overlap geometry.
-                capacityGeometryReady = applyCapacityTileGeometryAndTrackRecovery()
+                applyTransformsAt(newPhase, System.nanoTime())
                 if (!capacityGeometryReady) {
                     producerTopologyPendingCallback?.invoke(producerGeneration)
                 }
+            } else {
+                applyTransformsAt(newPhase, System.nanoTime())
             }
             scheduleFrame()
         } finally {
@@ -229,6 +284,8 @@ class LayerStageView @JvmOverloads constructor(
         producerFrameCallback = null
         expectedProducersCallback = null
         producerTopologyPendingCallback = null
+        layerGeometryRequestedCallback = null
+        layerGeometryAppliedCallback = null
         producerTeardownFailureCallback = null
         producerRuntimeFailureCallback = null
         stageRemovalCallback = null
@@ -239,6 +296,7 @@ class LayerStageView @JvmOverloads constructor(
         lastPublishedExpectedGeneration = Long.MIN_VALUE
         lastPublishedProducerIds = emptySet()
         lastPublishedExpectedCallback = null
+        resetLayerGeometryTracking()
         return stopped
     }
 
@@ -264,10 +322,12 @@ class LayerStageView @JvmOverloads constructor(
                 beginDeferredTopologyApply()
             } else {
                 if (current.motion == MotionProfile.CAPACITY_TILES) {
-                    capacityGeometryReady = applyCapacityTileGeometryAndTrackRecovery()
+                    applyTransformsAt(current, System.nanoTime())
                     if (!capacityGeometryReady) {
                         producerTopologyPendingCallback?.invoke(producerGeneration)
                     }
+                } else {
+                    applyTransformsAt(current, System.nanoTime())
                 }
                 publishExpectedProducers()
             }
@@ -285,6 +345,7 @@ class LayerStageView @JvmOverloads constructor(
         if (producerGeneration != Long.MIN_VALUE) {
             stageRemovalCallback?.invoke(producerGeneration, stopped)
         }
+        invalidateLayerGeometryKey()
         topology = null
         super.onDetachedFromWindow()
     }
@@ -292,14 +353,35 @@ class LayerStageView @JvmOverloads constructor(
     override fun doFrame(frameTimeNanos: Long) {
         frameCallbackPosted = false
         val current = phase
-        if (attached && current != null) {
+        if (
+            attached &&
+            current != null &&
+            topology != null &&
+            deferredTopologyApply == null
+        ) {
+            acknowledgeLayerGeometryAfterFrame()
             val safeFps = current.producerFps
                 .takeIf { it.isFinite() }
                 ?.coerceIn(1f, 120f)
                 ?: 60f
-            val interval = (1_000_000_000L / safeFps).toLong()
-            if (frameTimeNanos - lastTransformNanos >= interval) {
-                animateTransforms(current, (frameTimeNanos - startNanos) / 1_000_000_000f)
+            val phaseFraction = currentLayerSizePhaseFraction(
+                phase = current,
+                frameTimeNanos = frameTimeNanos,
+            )
+            val dynamicLayerSize = current.layerSizeProfile.changesOverTime
+            val transformInterval = layerTransformIntervalNanos(
+                producerFps = safeFps,
+                dynamicLayerSize = dynamicLayerSize,
+            )
+            if (shouldApplyLayerTransform(
+                    elapsedSinceLastNanos = frameTimeNanos - lastTransformNanos,
+                    transformIntervalNanos = transformInterval,
+                    dynamicLayerSize = dynamicLayerSize,
+                    phaseFraction = phaseFraction,
+                    lastAppliedPhaseFraction = lastAppliedLayerSizeFraction,
+                )
+            ) {
+                applyTransformsAt(current, frameTimeNanos)
                 lastTransformNanos = frameTimeNanos
             }
             if (
@@ -307,7 +389,12 @@ class LayerStageView @JvmOverloads constructor(
                     current.motion != MotionProfile.STATIC &&
                         current.motion != MotionProfile.CAPACITY_TILES
                 ) ||
-                current.alphaOverlap
+                current.alphaOverlap ||
+                (
+                    current.layerSizeProfile.changesOverTime &&
+                        phaseFraction < 1f
+                    ) ||
+                pendingLayerGeometryRevision > 0L
             ) {
                 scheduleFrame()
             }
@@ -317,16 +404,22 @@ class LayerStageView @JvmOverloads constructor(
     override fun onSizeChanged(width: Int, height: Int, oldWidth: Int, oldHeight: Int) {
         super.onSizeChanged(width, height, oldWidth, oldHeight)
         if (width == oldWidth && height == oldHeight) return
+        // The previous revision names the old stage dimensions and can no longer be acknowledged.
+        invalidateLayerGeometryKey()
         val current = phase
         if (current?.motion == MotionProfile.CAPACITY_TILES && topology != null) {
-            capacityGeometryReady = applyCapacityTileGeometryAndTrackRecovery()
+            applyTransformsAt(current, System.nanoTime())
             if (capacityGeometryReady) {
                 publishExpectedProducers()
             } else {
                 producerTopologyPendingCallback?.invoke(producerGeneration)
             }
-        } else {
             scheduleFrame()
+        } else {
+            if (current != null && topology != null && deferredTopologyApply == null) {
+                applyTransformsAt(current, System.nanoTime())
+                scheduleFrame()
+            }
         }
     }
 
@@ -361,6 +454,7 @@ class LayerStageView @JvmOverloads constructor(
 
     private fun rebuildLayers(desiredTopology: LayerTopology): Boolean {
         expectedTopologyDirty = true
+        invalidateLayerGeometryKey()
         if (!removeAndReleaseChildren()) {
             topology = null
             return false
@@ -490,6 +584,7 @@ class LayerStageView @JvmOverloads constructor(
         view: View,
         index: Int = animatedChildren.size,
     ) {
+        childCropBounds[view] = Rect()
         val params = LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
         addView(view, index, params)
         animatedChildren.add(index, view)
@@ -645,6 +740,7 @@ class LayerStageView @JvmOverloads constructor(
                 }
             }
             animatedChildren.remove(child)
+            childCropBounds.remove(child)
             try {
                 if (child.parent === this) removeView(child)
             } catch (error: Throwable) {
@@ -701,6 +797,9 @@ class LayerStageView @JvmOverloads constructor(
 
     private fun reconcileLayerCount(current: PhaseSpec): Boolean {
         expectedTopologyDirty = true
+        // Layer count is part of the geometry revision identity. Do not let an in-flight
+        // acknowledgment from the old physical child set survive reconciliation.
+        invalidateLayerGeometryKey()
         val targetCount = current.activeLayers.coerceIn(1, MAX_LAYERS)
         val keepsGlTail = current.includeGlLayer
         if (keepsGlTail && animatedChildren.lastOrNull() !is StressGlSurfaceView) {
@@ -746,12 +845,14 @@ class LayerStageView @JvmOverloads constructor(
         producerRelays.values.forEach(ProducerFrameRelay::disable)
         producerRelays.clear()
         animatedChildren.clear()
+        childCropBounds.clear()
         removeAllViews()
         return stopped
     }
 
     private fun replacePrimaryProducer(current: PhaseSpec): Boolean {
         expectedTopologyDirty = true
+        invalidateLayerGeometryKey()
         if (current.backend == LayerBackend.FLATTENED_TEXTURE) {
             return rebuildLayers()
         }
@@ -889,10 +990,12 @@ class LayerStageView @JvmOverloads constructor(
         updateProducerRelays()
         val current = phase
         if (current?.motion == MotionProfile.CAPACITY_TILES) {
-            capacityGeometryReady = applyCapacityTileGeometryAndTrackRecovery()
+            applyTransformsAt(current, System.nanoTime())
             if (!capacityGeometryReady) {
                 producerTopologyPendingCallback?.invoke(producerGeneration)
             }
+        } else if (current != null) {
+            applyTransformsAt(current, System.nanoTime())
         }
         publishExpectedProducers()
     }
@@ -1000,7 +1103,149 @@ class LayerStageView @JvmOverloads constructor(
         }
     }
 
-    private fun animateTransforms(current: PhaseSpec, time: Float) {
+    private fun applyTransformsAt(current: PhaseSpec, frameTimeNanos: Long) {
+        if (width <= 0 || height <= 0) return
+        val motionElapsedNanos = elapsedSince(startNanos, frameTimeNanos)
+        val desiredPhaseFraction = currentLayerSizePhaseFraction(current, frameTimeNanos)
+        val phaseFraction = layerSizeFractionForGeometryCommit(
+            desiredPhaseFraction = desiredPhaseFraction,
+            lastAppliedPhaseFraction = lastAppliedLayerSizeFraction,
+            dynamicLayerSize = current.layerSizeProfile.changesOverTime,
+            geometryRevisionPending = pendingLayerGeometryRevision > 0L,
+        )
+        animateTransforms(
+            current = current,
+            time = (motionElapsedNanos.toDouble() / NANOS_PER_SECOND).toFloat(),
+            phaseFraction = phaseFraction,
+        )
+        if (
+            current.motion != MotionProfile.CAPACITY_TILES ||
+            capacityGeometryReady
+        ) {
+            lastAppliedLayerSizeFraction = phaseFraction
+            requestLayerGeometryCommit(current, phaseFraction)
+        }
+    }
+
+    private fun requestLayerGeometryCommit(
+        current: PhaseSpec,
+        phaseFraction: Float,
+    ) {
+        if (producerGeneration == Long.MIN_VALUE || animatedChildren.isEmpty()) return
+        val profileOrdinal = current.layerSizeProfile.ordinal
+        val sample = layerGeometrySampleKey(current.layerSizeProfile, phaseFraction)
+        if (
+            layerGeometryKeyGeneration == producerGeneration &&
+            layerGeometryKeyPhaseId == current.id &&
+            layerGeometryKeyProfileOrdinal == profileOrdinal &&
+            layerGeometryKeySample == sample &&
+            layerGeometryKeyLayerCount == animatedChildren.size &&
+            layerGeometryKeyWidth == width &&
+            layerGeometryKeyHeight == height
+        ) {
+            return
+        }
+        if (pendingLayerGeometryRevision > 0L) {
+            // Dynamic size is held at lastAppliedLayerSizeFraction until this revision is
+            // acknowledged. Keep the in-flight revision stable and treat the controller clock as
+            // a single latest-wins desired slot; the newest fraction is recomputed after ACK.
+            return
+        }
+        layerGeometryKeyGeneration = producerGeneration
+        layerGeometryKeyPhaseId = current.id
+        layerGeometryKeyProfileOrdinal = profileOrdinal
+        layerGeometryKeySample = sample
+        layerGeometryKeyLayerCount = animatedChildren.size
+        layerGeometryKeyWidth = width
+        layerGeometryKeyHeight = height
+        layerGeometryRevision =
+            if (layerGeometryRevision == Long.MAX_VALUE) 1L else layerGeometryRevision + 1L
+        pendingLayerGeometryRevision = layerGeometryRevision
+        pendingLayerGeometryProfileOrdinal = profileOrdinal
+        pendingLayerGeometryCoverageBit =
+            current.layerSizeProfile.coverageBitAt(phaseFraction)
+        pendingLayerGeometryAckFrames = LAYER_GEOMETRY_ACK_FRAME_COUNT
+        layerGeometryRequestedCallback?.invoke(
+            producerGeneration,
+            pendingLayerGeometryRevision,
+            pendingLayerGeometryProfileOrdinal,
+        )
+        scheduleFrame()
+    }
+
+    private fun acknowledgeLayerGeometryAfterFrame() {
+        if (pendingLayerGeometryRevision <= 0L) return
+        if (pendingLayerGeometryAckFrames > 1) {
+            pendingLayerGeometryAckFrames--
+            return
+        }
+        layerGeometryAppliedCallback?.invoke(
+            producerGeneration,
+            pendingLayerGeometryRevision,
+            pendingLayerGeometryProfileOrdinal,
+            pendingLayerGeometryCoverageBit,
+        )
+        pendingLayerGeometryRevision = 0L
+        pendingLayerGeometryProfileOrdinal = -1
+        pendingLayerGeometryCoverageBit = 0
+        pendingLayerGeometryAckFrames = 0
+    }
+
+    private fun resetLayerGeometryTracking() {
+        layerGeometryRevision = 0L
+        invalidateLayerGeometryKey()
+    }
+
+    private fun invalidateLayerGeometryKey() {
+        layerGeometryKeyGeneration = Long.MIN_VALUE
+        layerGeometryKeyPhaseId = null
+        layerGeometryKeyProfileOrdinal = -1
+        layerGeometryKeySample = -1
+        layerGeometryKeyLayerCount = -1
+        layerGeometryKeyWidth = -1
+        layerGeometryKeyHeight = -1
+        pendingLayerGeometryRevision = 0L
+        pendingLayerGeometryProfileOrdinal = -1
+        pendingLayerGeometryCoverageBit = 0
+        pendingLayerGeometryAckFrames = 0
+    }
+
+    private fun syncLayerSizePhaseClock(
+        phase: PhaseSpec,
+        authoritativeElapsedMs: Long,
+        anchorNanos: Long,
+        force: Boolean,
+    ) {
+        val boundedElapsedMs = authoritativeElapsedMs
+            .coerceAtLeast(0L)
+            .coerceAtMost(phase.durationMs.coerceAtLeast(0L))
+        if (!force && boundedElapsedMs == layerSizeAuthoritativeElapsedMs) return
+        if (force || boundedElapsedMs < layerSizeAuthoritativeElapsedMs) {
+            lastAppliedLayerSizeFraction = -1f
+        }
+        layerSizeAuthoritativeElapsedMs = boundedElapsedMs
+        layerSizeElapsedAtAnchorNanos = millisecondsToNanosSaturated(boundedElapsedMs)
+        layerSizeClockAnchorNanos = anchorNanos.coerceAtLeast(0L)
+    }
+
+    private fun currentLayerSizePhaseFraction(
+        phase: PhaseSpec,
+        frameTimeNanos: Long,
+    ): Float = normalizedLayerSizePhaseFraction(
+        elapsedNanos = anchoredLayerSizeElapsedNanos(
+            elapsedAtAnchorNanos = layerSizeElapsedAtAnchorNanos,
+            anchorNanos = layerSizeClockAnchorNanos,
+            frameTimeNanos = frameTimeNanos,
+            durationMs = phase.durationMs,
+        ),
+        durationMs = phase.durationMs,
+    )
+
+    private fun animateTransforms(
+        current: PhaseSpec,
+        time: Float,
+        phaseFraction: Float,
+    ) {
         if (width == 0 || height == 0) return
         if (current.motion == MotionProfile.CAPACITY_TILES) {
             capacityGeometryReady = applyCapacityTileGeometryAndTrackRecovery()
@@ -1009,89 +1254,112 @@ class LayerStageView @JvmOverloads constructor(
             }
             return
         }
-        animatedChildren.forEachIndexed { index, child ->
+        val layerCount = animatedChildren.size
+        var index = 0
+        while (index < layerCount) {
+            val child = animatedChildren[index]
             if (current.motion != MotionProfile.Z_ORDER_SWAP) child.translationZ = 0f
-            if (current.motion != MotionProfile.CAPACITY_TILES) child.clipBounds = null
+            applyFullStageCrop(child)
             val phaseOffset = index * 0.73f
             val wave = sin(time * 1.35f + phaseOffset)
             val wave2 = cos(time * 0.83f + phaseOffset * 1.7f)
-            val baseScale = when {
-                animatedChildren.size <= 1 -> 1f
-                animatedChildren.size <= 4 -> 0.72f
-                else -> 0.48f + (index % 3) * 0.055f
-            }
+            val profileSize = current.layerSizeProfile.normalizedSizeForLayer(
+                layerIndex = index,
+                layerCount = layerCount,
+                phaseFraction = phaseFraction,
+            )
+            val profileScaleX = profileSize.widthScale
+            val profileScaleY = profileSize.heightScale
+            val profileTranslationX = layerProfileBaseTranslationX(
+                stageWidth = width,
+                layerIndex = index,
+                layerCount = layerCount,
+                widthScale = profileScaleX,
+            )
+            val profileTranslationY = layerProfileBaseTranslationY(
+                stageHeight = height,
+                layerIndex = index,
+                layerCount = layerCount,
+                heightScale = profileScaleY,
+            )
 
             when (current.motion) {
                 MotionProfile.STATIC -> {
-                    if (animatedChildren.size == 1) {
-                        child.scaleX = 1f
-                        child.scaleY = 1f
-                        child.translationX = 0f
-                        child.translationY = 0f
-                    } else {
-                        val columns = minOf(4, animatedChildren.size)
-                        val rows = (animatedChildren.size + columns - 1) / columns
-                        val column = index % columns
-                        val row = index / columns
-                        child.scaleX = baseScale
-                        child.scaleY = baseScale
-                        child.translationX = (column - (columns - 1) / 2f) * width * 0.17f
-                        child.translationY = (row - (rows - 1) / 2f) * height * 0.18f
-                    }
+                    child.scaleX = profileScaleX
+                    child.scaleY = profileScaleY
+                    child.translationX = profileTranslationX
+                    child.translationY = profileTranslationY
                     child.rotation = 0f
                 }
 
                 MotionProfile.CAPACITY_TILES -> Unit
 
                 MotionProfile.SCROLL -> {
-                    child.scaleX = baseScale
-                    child.scaleY = baseScale
-                    child.translationX = ((time * (80 + index * 13)) % (width * 1.6f)) - width * 0.8f
-                    child.translationY = wave2 * height * 0.24f
+                    child.scaleX = profileScaleX
+                    child.scaleY = profileScaleY
+                    child.translationX = profileTranslationX +
+                        ((time * (80 + index * 13)) % (width * 1.6f)) -
+                        width * 0.8f
+                    child.translationY =
+                        profileTranslationY + wave2 * height * 0.24f
                     child.rotation = 0f
                 }
 
                 MotionProfile.ZOOM_PAN -> {
-                    val scale = baseScale * (0.72f + (wave + 1f) * 0.28f)
-                    child.scaleX = scale
-                    child.scaleY = scale
-                    child.translationX = wave2 * width * 0.22f
-                    child.translationY = wave * height * 0.18f
+                    val motionScale = 0.72f + (wave + 1f) * 0.28f
+                    child.scaleX = profileScaleX * motionScale
+                    child.scaleY = profileScaleY * motionScale
+                    child.translationX =
+                        profileTranslationX + wave2 * width * 0.22f
+                    child.translationY =
+                        profileTranslationY + wave * height * 0.18f
                     child.rotation = 0f
                 }
 
                 MotionProfile.ROTATE -> {
-                    child.scaleX = baseScale
-                    child.scaleY = baseScale
-                    child.translationX = wave2 * width * 0.2f
-                    child.translationY = wave * height * 0.16f
+                    child.scaleX = profileScaleX
+                    child.scaleY = profileScaleY
+                    child.translationX =
+                        profileTranslationX + wave2 * width * 0.2f
+                    child.translationY =
+                        profileTranslationY + wave * height * 0.16f
                     child.rotation = (time * (17f + index * 2.2f) + index * 29f) % 360f
                 }
 
                 MotionProfile.PARALLAX -> {
-                    child.scaleX = baseScale
-                    child.scaleY = baseScale
-                    child.translationX = sin(time * (0.55f + index * 0.025f) + phaseOffset) * width * 0.34f
-                    child.translationY = cos(time * (0.43f + index * 0.02f) + phaseOffset) * height * 0.28f
+                    child.scaleX = profileScaleX
+                    child.scaleY = profileScaleY
+                    child.translationX = profileTranslationX +
+                        sin(time * (0.55f + index * 0.025f) + phaseOffset) *
+                        width * 0.34f
+                    child.translationY = profileTranslationY +
+                        cos(time * (0.43f + index * 0.02f) + phaseOffset) *
+                        height * 0.28f
                     child.rotation = if (current.alphaOverlap) wave * 8f else 0f
                 }
 
                 MotionProfile.TRANSFORM_STORM -> {
-                    val scale = baseScale * (0.58f + (wave2 + 1f) * 0.34f)
-                    child.scaleX = scale
-                    child.scaleY = baseScale * (0.68f + (wave + 1f) * 0.27f)
-                    child.translationX = wave * width * 0.37f
-                    child.translationY = wave2 * height * 0.31f
+                    child.scaleX =
+                        profileScaleX * (0.58f + (wave2 + 1f) * 0.34f)
+                    child.scaleY =
+                        profileScaleY * (0.68f + (wave + 1f) * 0.27f)
+                    child.translationX =
+                        profileTranslationX + wave * width * 0.37f
+                    child.translationY =
+                        profileTranslationY + wave2 * height * 0.31f
                     child.rotation = (time * (21f + index * 3.3f)) % 360f
                 }
 
                 MotionProfile.Z_ORDER_SWAP -> {
-                    child.scaleX = baseScale
-                    child.scaleY = baseScale
-                    child.translationX = wave * width * 0.3f
-                    child.translationY = wave2 * height * 0.24f
+                    child.scaleX = profileScaleX
+                    child.scaleY = profileScaleY
+                    child.translationX =
+                        profileTranslationX + wave * width * 0.3f
+                    child.translationY =
+                        profileTranslationY + wave2 * height * 0.24f
                     child.rotation = wave * 12f
-                    child.translationZ = (((time * 1.5f).toInt() + index) % animatedChildren.size).toFloat()
+                    child.translationZ =
+                        (((time * 1.5f).toInt() + index) % layerCount).toFloat()
                 }
             }
             child.alpha = if (current.alphaOverlap) {
@@ -1099,6 +1367,20 @@ class LayerStageView @JvmOverloads constructor(
             } else {
                 1f
             }
+            index++
+        }
+    }
+
+    private fun applyFullStageCrop(child: View) {
+        val crop = childCropBounds[child] ?: return
+        if (
+            crop.left != 0 ||
+            crop.top != 0 ||
+            crop.right != width ||
+            crop.bottom != height
+        ) {
+            crop.set(0, 0, width, height)
+            child.clipBounds = crop
         }
     }
 
@@ -1136,7 +1418,9 @@ class LayerStageView @JvmOverloads constructor(
             child.translationX = 0f
             child.translationY = 0f
             child.rotation = 0f
-            child.clipBounds = Rect(tile.left, tile.top, tile.right, tile.bottom)
+            val crop = childCropBounds[child] ?: return false
+            crop.set(tile.left, tile.top, tile.right, tile.bottom)
+            child.clipBounds = crop
             index++
         }
         return true
@@ -1168,6 +1452,196 @@ class LayerStageView @JvmOverloads constructor(
         val relay: ProducerFrameRelay,
     )
 }
+
+private fun elapsedSince(startNanos: Long, frameTimeNanos: Long): Long {
+    if (startNanos <= 0L || frameTimeNanos <= startNanos) return 0L
+    val elapsed = frameTimeNanos - startNanos
+    return if (elapsed >= 0L) elapsed else Long.MAX_VALUE
+}
+
+internal fun anchoredLayerSizeElapsedNanos(
+    elapsedAtAnchorNanos: Long,
+    anchorNanos: Long,
+    frameTimeNanos: Long,
+    durationMs: Long,
+): Long {
+    val durationNanos = millisecondsToNanosSaturated(durationMs.coerceAtLeast(0L))
+    val safeBase = elapsedAtAnchorNanos.coerceIn(0L, durationNanos)
+    val sinceAnchor = elapsedSince(anchorNanos, frameTimeNanos)
+    val combined = if (safeBase > Long.MAX_VALUE - sinceAnchor) {
+        Long.MAX_VALUE
+    } else {
+        safeBase + sinceAnchor
+    }
+    return combined.coerceAtMost(durationNanos)
+}
+
+internal fun layerGeometrySampleKey(
+    profile: LayerSizeProfile,
+    phaseFraction: Float,
+): Int {
+    val fraction = phaseFraction
+        .takeIf(Float::isFinite)
+        ?.coerceIn(0f, 1f)
+        ?: 0f
+    return when (profile) {
+        LayerSizeProfile.GRADUAL_SMALL_TO_FULL -> when {
+            fraction >= 1f -> GRADUAL_GEOMETRY_ENDPOINT_KEY
+            fraction >= GRADUAL_MID_MIN_FRACTION -> GRADUAL_GEOMETRY_MID_KEY
+            else -> GRADUAL_GEOMETRY_ORIGIN_KEY
+        }
+        LayerSizeProfile.ABRUPT_SMALL_FULL ->
+            (fraction * ABRUPT_LAYER_SIZE_PROFILE_STEPS)
+                .toInt()
+                .coerceIn(0, ABRUPT_LAYER_SIZE_PROFILE_STEPS - 1)
+        LayerSizeProfile.FULL_SCREEN,
+        LayerSizeProfile.SMALL_UNIFORM,
+        LayerSizeProfile.MIXED_SIZES,
+        -> 0
+    }
+}
+
+internal fun layerTransformIntervalNanos(
+    producerFps: Float,
+    dynamicLayerSize: Boolean,
+): Long {
+    val safeFps = producerFps
+        .takeIf(Float::isFinite)
+        ?.coerceIn(1f, 120f)
+        ?: 60f
+    val producerInterval = (NANOS_PER_SECOND / safeFps.toDouble()).toLong()
+    return if (dynamicLayerSize) {
+        minOf(producerInterval, LAYER_SIZE_TRANSFORM_CADENCE_NANOS)
+    } else {
+        producerInterval
+    }
+}
+
+internal fun shouldApplyLayerTransform(
+    elapsedSinceLastNanos: Long,
+    transformIntervalNanos: Long,
+    dynamicLayerSize: Boolean,
+    phaseFraction: Float,
+    lastAppliedPhaseFraction: Float,
+): Boolean {
+    val intervalDue =
+        elapsedSinceLastNanos.coerceAtLeast(0L) >= transformIntervalNanos.coerceAtLeast(1L)
+    val finalDynamicSampleDue =
+        dynamicLayerSize &&
+            phaseFraction.isFinite() &&
+            phaseFraction >= 1f &&
+            (!lastAppliedPhaseFraction.isFinite() || lastAppliedPhaseFraction < 1f)
+    return intervalDue || finalDynamicSampleDue
+}
+
+/**
+ * Holds an in-flight dynamic size revision stable for its two-frame traversal acknowledgment.
+ *
+ * The controller-owned clock keeps advancing while the revision is pending. Once acknowledged,
+ * the next frame samples that clock directly, which gives us a bounded single-slot latest-wins
+ * queue without allocating or replaying stale intermediate geometry.
+ */
+internal fun layerSizeFractionForGeometryCommit(
+    desiredPhaseFraction: Float,
+    lastAppliedPhaseFraction: Float,
+    dynamicLayerSize: Boolean,
+    geometryRevisionPending: Boolean,
+): Float {
+    val desired = desiredPhaseFraction
+        .takeIf(Float::isFinite)
+        ?.coerceIn(0f, 1f)
+        ?: 0f
+    if (!dynamicLayerSize || !geometryRevisionPending) return desired
+    return lastAppliedPhaseFraction
+        .takeIf(Float::isFinite)
+        ?.takeIf { it >= 0f }
+        ?.coerceIn(0f, 1f)
+        ?: desired
+}
+
+private fun millisecondsToNanosSaturated(milliseconds: Long): Long {
+    if (milliseconds <= 0L) return 0L
+    return if (milliseconds > Long.MAX_VALUE / NANOS_PER_MILLI) {
+        Long.MAX_VALUE
+    } else {
+        milliseconds * NANOS_PER_MILLI
+    }
+}
+
+internal fun normalizedLayerSizePhaseFraction(
+    elapsedNanos: Long,
+    durationMs: Long,
+): Float {
+    if (durationMs <= 0L) return 1f
+    if (elapsedNanos <= 0L) return 0f
+    val fraction =
+        elapsedNanos.toDouble() / (durationMs.toDouble() * NANOS_PER_MILLI.toDouble())
+    return if (fraction.isFinite()) fraction.coerceIn(0.0, 1.0).toFloat() else 1f
+}
+
+/**
+ * Keeps identical full-screen producers from becoming completely occluded while distributing
+ * smaller footprints across the stage. The centered X stagger is bounded to eight pixels per
+ * layer and then clamped so every scaled child keeps at least one visible pixel.
+ */
+internal fun layerProfileBaseTranslationX(
+    stageWidth: Int,
+    layerIndex: Int,
+    layerCount: Int,
+    widthScale: Float,
+): Float {
+    if (
+        stageWidth <= 0 ||
+        layerCount !in 1..LayerStageView.MAX_LAYERS ||
+        layerIndex !in 0 until layerCount
+    ) {
+        return 0f
+    }
+    val safeScale = finiteLayerProfileScale(widthScale)
+    val columns = minOf(PROFILE_GRID_COLUMNS, layerCount)
+    val column = layerIndex % columns
+    val normalizedCenter = (column + 0.5f) / columns - 0.5f
+    val centeredOffset = normalizedCenter * stageWidth * (1f - safeScale)
+    val staggerStep = if (layerCount <= 1 || stageWidth <= 1) {
+        0f
+    } else {
+        minOf(
+            MAX_PROFILE_STAGGER_PX,
+            (stageWidth - 1).toFloat() / (layerCount - 1),
+        )
+    }
+    val centeredStagger =
+        staggerStep * (layerIndex - (layerCount - 1) / 2f)
+    val maxVisibleTranslation =
+        (stageWidth * (1f + safeScale) * 0.5f - 1f).coerceAtLeast(0f)
+    return (centeredOffset + centeredStagger)
+        .coerceIn(-maxVisibleTranslation, maxVisibleTranslation)
+}
+
+internal fun layerProfileBaseTranslationY(
+    stageHeight: Int,
+    layerIndex: Int,
+    layerCount: Int,
+    heightScale: Float,
+): Float {
+    if (
+        stageHeight <= 0 ||
+        layerCount !in 1..LayerStageView.MAX_LAYERS ||
+        layerIndex !in 0 until layerCount
+    ) {
+        return 0f
+    }
+    val safeScale = finiteLayerProfileScale(heightScale)
+    val columns = minOf(PROFILE_GRID_COLUMNS, layerCount)
+    val rows = (layerCount + columns - 1) / columns
+    val row = layerIndex / columns
+    val normalizedCenter = (row + 0.5f) / rows - 0.5f
+    return (normalizedCenter * stageHeight * (1f - safeScale))
+        .coerceIn(-stageHeight.toFloat(), stageHeight.toFloat())
+}
+
+private fun finiteLayerProfileScale(value: Float): Float =
+    if (value.isFinite()) value.coerceIn(MIN_RENDERED_PROFILE_SCALE, 1f) else 1f
 
 internal data class CapacityTileBounds(
     val left: Int,
@@ -3196,6 +3670,15 @@ internal fun shouldFrameworkReleaseTextureSurface(producerOwnsTexture: Boolean):
     !producerOwnsTexture
 
 private const val NANOS_PER_MILLI = 1_000_000L
+private const val NANOS_PER_SECOND = 1_000_000_000.0
+private const val LAYER_SIZE_TRANSFORM_CADENCE_NANOS = 100L * NANOS_PER_MILLI
+private const val LAYER_GEOMETRY_ACK_FRAME_COUNT = 2
+private const val GRADUAL_GEOMETRY_ORIGIN_KEY = 0
+private const val GRADUAL_GEOMETRY_MID_KEY = 1
+private const val GRADUAL_GEOMETRY_ENDPOINT_KEY = 2
 private const val PRODUCER_DRAIN_TIMEOUT_NANOS = 16_000_000L
 private const val PRODUCER_RECOVERY_TIMEOUT_MS = 5_000L
 private const val PRODUCER_RECOVERY_POLL_MS = 16L
+private const val PROFILE_GRID_COLUMNS = 4
+private const val MAX_PROFILE_STAGGER_PX = 8f
+private const val MIN_RENDERED_PROFILE_SCALE = 0.25f

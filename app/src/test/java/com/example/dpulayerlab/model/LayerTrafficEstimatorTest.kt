@@ -123,6 +123,129 @@ class LayerTrafficEstimatorTest {
     }
 
     @Test
+    fun destinationSizeDoesNotReduceConservativeFullBufferTraffic() {
+        val full = LayerTrafficEstimator.estimate(
+            phase = phase(
+                activeLayers = 4,
+                layerSizeProfile = LayerSizeProfile.FULL_SCREEN,
+            ),
+            displayWidthPx = 100,
+            displayHeightPx = 50,
+        )
+        val small = LayerTrafficEstimator.estimate(
+            phase = phase(
+                activeLayers = 4,
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
+            ),
+            displayWidthPx = 100,
+            displayHeightPx = 50,
+        )
+
+        assertEquals(full.bytesPerFrame, small.bytesPerFrame)
+        assertEquals(full.dpuReadBytesPerSecond, small.dpuReadBytesPerSecond)
+        assertEquals(full.producerWriteBytesPerSecond, small.producerWriteBytesPerSecond)
+        assertEquals(4.0, full.destinationFootprintScreenEquivalents, 0.0001)
+        assertEquals(100.0, full.destinationFootprintAveragePercent, 0.0001)
+        assertEquals(0.36, small.destinationFootprintScreenEquivalents, 0.0001)
+        assertEquals(9.0, small.destinationFootprintAveragePercent, 0.0001)
+        assertTrue(small.destinationFootprintLabel.contains("base profile only"))
+    }
+
+    @Test
+    fun mixedDestinationFootprintUsesEveryBoundedSizeVariant() {
+        val estimate = LayerTrafficEstimator.estimate(
+            phase = phase(
+                activeLayers = 5,
+                layerSizeProfile = LayerSizeProfile.MIXED_SIZES,
+            ),
+            displayWidthPx = 100,
+            displayHeightPx = 50,
+        )
+        val expected =
+            1.0 +
+                0.72 * 0.56 +
+                0.56 * 0.72 +
+                0.46 * 0.46 +
+                0.30 * 0.38
+
+        assertEquals(expected, estimate.destinationFootprintScreenEquivalents, 0.0001)
+        assertEquals(expected * 20.0, estimate.destinationFootprintAveragePercent, 0.0001)
+    }
+
+    @Test
+    fun gradualAndAbruptFootprintsFollowBoundedPhaseProgress() {
+        val gradualStart = LayerTrafficEstimator.estimate(
+            phase = phase(
+                activeLayers = 2,
+                layerSizeProfile = LayerSizeProfile.GRADUAL_SMALL_TO_FULL,
+            ),
+            displayWidthPx = 100,
+            displayHeightPx = 50,
+            phaseFraction = 0f,
+        )
+        val gradualEnd = LayerTrafficEstimator.estimate(
+            phase = phase(
+                activeLayers = 2,
+                layerSizeProfile = LayerSizeProfile.GRADUAL_SMALL_TO_FULL,
+            ),
+            displayWidthPx = 100,
+            displayHeightPx = 50,
+            phaseFraction = 1f,
+        )
+        val abruptSmall = LayerTrafficEstimator.estimate(
+            phase = phase(
+                activeLayers = 2,
+                layerSizeProfile = LayerSizeProfile.ABRUPT_SMALL_FULL,
+            ),
+            displayWidthPx = 100,
+            displayHeightPx = 50,
+            phaseFraction = 0f,
+        )
+        val abruptFull = LayerTrafficEstimator.estimate(
+            phase = phase(
+                activeLayers = 2,
+                layerSizeProfile = LayerSizeProfile.ABRUPT_SMALL_FULL,
+            ),
+            displayWidthPx = 100,
+            displayHeightPx = 50,
+            phaseFraction = 0.2f,
+        )
+        val invalidFraction = LayerTrafficEstimator.estimate(
+            phase = phase(
+                activeLayers = 2,
+                layerSizeProfile = LayerSizeProfile.GRADUAL_SMALL_TO_FULL,
+            ),
+            displayWidthPx = 100,
+            displayHeightPx = 50,
+            phaseFraction = Float.NaN,
+        )
+
+        assertEquals(0.18, gradualStart.destinationFootprintScreenEquivalents, 0.0001)
+        assertEquals(2.0, gradualEnd.destinationFootprintScreenEquivalents, 0.0001)
+        assertEquals(0.18, abruptSmall.destinationFootprintScreenEquivalents, 0.0001)
+        assertEquals(2.0, abruptFull.destinationFootprintScreenEquivalents, 0.0001)
+        assertEquals(2.0, invalidFraction.destinationFootprintScreenEquivalents, 0.0001)
+    }
+
+    @Test
+    fun capacityTilesAlwaysCoverOneScreenEquivalent() {
+        val estimate = LayerTrafficEstimator.estimate(
+            phase = phase(
+                activeLayers = 20,
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
+                motion = MotionProfile.CAPACITY_TILES,
+            ),
+            displayWidthPx = 100,
+            displayHeightPx = 50,
+        )
+
+        assertEquals(1.0, estimate.destinationFootprintScreenEquivalents, 0.0001)
+        assertEquals(5.0, estimate.destinationFootprintAveragePercent, 0.0001)
+        assertTrue(estimate.destinationFootprintLabel.contains("explicit crop union"))
+        assertTrue(estimate.destinationFootprintLabel.contains("profile bypassed"))
+    }
+
+    @Test
     fun singleGlLayerUsesDisplaySizeInsteadOfRequestedPrimarySize() {
         val estimate = LayerTrafficEstimator.estimate(
             phase = phase(
@@ -326,6 +449,8 @@ class LayerTrafficEstimatorTest {
         bufferSize: BufferSize = BufferSize.DISPLAY,
         includeGlLayer: Boolean = false,
         alphaOverlap: Boolean = false,
+        layerSizeProfile: LayerSizeProfile = LayerSizeProfile.FULL_SCREEN,
+        motion: MotionProfile = MotionProfile.STATIC,
     ) = PhaseSpec(
         id = "test",
         label = "test",
@@ -336,8 +461,9 @@ class LayerTrafficEstimatorTest {
         backend = backend,
         pixelRoute = pixelRoute,
         bufferSize = bufferSize,
-        motion = MotionProfile.STATIC,
+        motion = motion,
         includeGlLayer = includeGlLayer,
         alphaOverlap = alphaOverlap,
+        layerSizeProfile = layerSizeProfile,
     )
 }

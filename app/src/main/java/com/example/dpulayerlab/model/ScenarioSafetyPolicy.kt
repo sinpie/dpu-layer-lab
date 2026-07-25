@@ -375,6 +375,13 @@ object ScenarioSafetyPolicy {
                 return "Phase '${phase.id}' HWC composition expectation requires a stable " +
                     "STEP target for fresh DEVICE/CLIENT evidence"
             }
+            if (
+                phase.hwcCompositionExpectation != HwcCompositionExpectation.NONE &&
+                phase.layerSizeProfile.changesOverTime
+            ) {
+                return "Phase '${phase.id}' HWC composition expectation requires a stable " +
+                    "layer-size profile for fresh DEVICE/CLIENT evidence"
+            }
         }
         return null
     }
@@ -698,6 +705,21 @@ object ScenarioSafetyPolicy {
                 return "Phase '${phase.id}' is too short for " +
                     "${phase.hwcCompositionExpectation.name} bounded fresh HWC evidence and " +
                     "a post-target observation window (minimum ${minimumHwcDurationMs}ms)"
+            }
+            val minimumLayerSizeProfileDurationMs = when (phase.layerSizeProfile) {
+                LayerSizeProfile.GRADUAL_SMALL_TO_FULL -> LOAD_CONTROL_CADENCE_MS * 2L
+                LayerSizeProfile.ABRUPT_SMALL_FULL ->
+                    LOAD_CONTROL_CADENCE_MS * ABRUPT_LAYER_SIZE_PROFILE_STEPS.toLong()
+
+                LayerSizeProfile.FULL_SCREEN,
+                LayerSizeProfile.SMALL_UNIFORM,
+                LayerSizeProfile.MIXED_SIZES,
+                -> 0L
+            }
+            if (phase.durationMs < minimumLayerSizeProfileDurationMs) {
+                return "Phase '${phase.id}' is too short to preserve the " +
+                    "${phase.layerSizeProfile.name} layer-size waveform at the bounded " +
+                    "observation cadence (minimum ${minimumLayerSizeProfileDurationMs}ms)"
             }
             val cyclic =
                 phase.transition.mode == TransitionMode.PULSE_BURST ||

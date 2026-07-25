@@ -25,6 +25,7 @@ import com.example.dpulayerlab.model.DecoderLinearReference
 import com.example.dpulayerlab.model.Gauge
 import com.example.dpulayerlab.model.HwcCompositionExpectation
 import com.example.dpulayerlab.model.LayerBackend
+import com.example.dpulayerlab.model.LayerSizeProfile
 import com.example.dpulayerlab.model.LOAD_CONTROL_CADENCE_MS
 import com.example.dpulayerlab.model.MIN_EFFECTIVE_LOAD
 import com.example.dpulayerlab.model.LoadTransitionEvaluator
@@ -55,7 +56,9 @@ import com.example.dpulayerlab.model.TransitionMode
 import com.example.dpulayerlab.model.TransitionSample
 import com.example.dpulayerlab.model.TransitionSegment
 import com.example.dpulayerlab.model.TransitionSpec
+import com.example.dpulayerlab.model.coverageBitAt
 import com.example.dpulayerlab.model.requiresSelectedDecoderProducer
+import com.example.dpulayerlab.model.requiredCoverageMask
 import com.example.dpulayerlab.model.terminalReason
 import com.example.dpulayerlab.monitor.FrameTracker
 import com.example.dpulayerlab.monitor.CapabilityScanner
@@ -2722,6 +2725,9 @@ class LabController internal constructor(
                         candidateLayers = candidatePhase.activeLayers,
                         rendererCleanupPending = rendererCleanupPending,
                     ) == HwcCapacityGenerationAction.ACTIVATE &&
+                    readiness.geometryReady &&
+                    readiness.geometryAppliedProfileOrdinal ==
+                    candidatePhase.layerSizeProfile.ordinal &&
                     frameTracker.activateProducerGeneration(generation)
                 ) {
                     // activate() atomically clears every pre-activation observation. From this
@@ -2733,6 +2739,9 @@ class LabController internal constructor(
                     readiness.ready &&
                     readiness.topologyPublished &&
                     !readiness.topologyPending &&
+                    readiness.geometryReady &&
+                    readiness.geometryAppliedProfileOrdinal ==
+                    candidatePhase.layerSizeProfile.ordinal &&
                     !rendererCleanupPending &&
                     readiness.expectedCount == candidatePhase.activeLayers &&
                     readiness.observedCount == candidatePhase.activeLayers
@@ -2746,6 +2755,8 @@ class LabController internal constructor(
                             "expected=${candidatePhase.activeLayers}, " +
                             "published=${readiness.expectedCount}, " +
                             "observed=${readiness.observedCount}, " +
+                            "geometry=${readiness.geometryAppliedRevision}/" +
+                            "${readiness.geometryRequestedRevision}, " +
                             "topologyMissed=${readiness.topologyMissed}"
                     break
                 }
@@ -2789,6 +2800,9 @@ class LabController internal constructor(
                         stabilized.ready &&
                             stabilized.topologyPublished &&
                             !stabilized.topologyPending &&
+                            stabilized.geometryReady &&
+                            stabilized.geometryAppliedProfileOrdinal ==
+                            candidatePhase.layerSizeProfile.ordinal &&
                             !stabilized.teardownFailed &&
                             stabilized.runtimeFailureReason == null &&
                             !RendererSafetyState.hasUnconfirmedTeardown() &&
@@ -2800,7 +2814,9 @@ class LabController internal constructor(
                             "candidate topology changed during stabilization; " +
                                 "expected=${candidatePhase.activeLayers}, " +
                                 "published=${stabilized.expectedCount}, " +
-                                "observed=${stabilized.observedCount}"
+                                "observed=${stabilized.observedCount}, " +
+                                "geometry=${stabilized.geometryAppliedRevision}/" +
+                                "${stabilized.geometryRequestedRevision}"
                     }
                 }
             }
@@ -3579,6 +3595,7 @@ class LabController internal constructor(
                 if (
                     readiness.topologyPublished &&
                     !readiness.topologyPending &&
+                    readiness.geometryReady &&
                     !processLeaseActive
                 ) {
                     val freshBaseline = try {
@@ -3614,6 +3631,7 @@ class LabController internal constructor(
                         activationNowMs <= topologyDeadlineMs &&
                         afterSample.topologyPublished &&
                         !afterSample.topologyPending &&
+                        afterSample.geometryReady &&
                         !RendererSafetyState.hasUnconfirmedTeardown()
                     ) {
                         // Discard only a preparation-era boundary. If a topology-pending callback
@@ -3624,6 +3642,20 @@ class LabController internal constructor(
                             boundary?.takeUnless { it.generation == producerGeneration }
                         }
                         if (frameTracker.activateProducerGeneration(producerGeneration)) {
+                            if (
+                                targetPhase.layerSizeProfile.changesOverTime &&
+                                afterSample.geometryAppliedProfileOrdinal ==
+                                LayerSizeProfile.SMALL_UNIFORM.ordinal
+                            ) {
+                                // Preparation is a post-frame-acknowledged 0.30×0.30 transform,
+                                // exactly equal to both dynamic profiles' measured origin.
+                                frameTracker.recordEquivalentLayerGeometryCoverage(
+                                    generation = producerGeneration,
+                                    profileOrdinal = targetPhase.layerSizeProfile.ordinal,
+                                    coverageBit =
+                                        targetPhase.layerSizeProfile.coverageBitAt(0f),
+                                )
+                            }
                             phaseBaseline = freshBaseline
                             break
                         }
@@ -3636,6 +3668,8 @@ class LabController internal constructor(
                             "${PRODUCER_RECOVERY_TIMEOUT_MS}ms를 초과했습니다 " +
                             "(published=${readiness.topologyPublished}, " +
                             "pending=${readiness.topologyPending}, " +
+                            "geometry=${readiness.geometryAppliedRevision}/" +
+                            "${readiness.geometryRequestedRevision}, " +
                             "processLease=$processLeaseActive)."
                     cancellationReason = reason
                     runEvents += event("PRODUCER_RECOVERY_TIMEOUT", reason)
@@ -3653,6 +3687,9 @@ class LabController internal constructor(
                         append("Physical producer topology 준비 중")
                         if (readiness.topologyPending || processLeaseActive) {
                             append(" · 이전 producer drain")
+                        }
+                        if (!readiness.geometryReady) {
+                            append(" · layer geometry commit")
                         }
                     },
                 )
@@ -3704,10 +3741,7 @@ class LabController internal constructor(
             var postReadyControlTickApplied = false
             var transitionStarted = false
             var positiveNpuAcknowledged = false
-            var pendingCoverageSample: TransitionSample? = null
-            var pendingCoverageElapsedMs = 0L
-            var pendingCoverageProducerCount = 0
-            var pendingCoverageTopologyRevision = 0L
+            var pendingControlCoverage: PendingControlCoverage? = null
             var hwcCompositionProbeResolved = false
             var forcedHwcCompositionProbeAttempts = 0
             val producerFrameBudget = AppliedProducerFrameBudget(
@@ -3741,6 +3775,13 @@ class LabController internal constructor(
                 val boundedBoundaryMs = boundaryMs
                     .coerceAtLeast(phaseStarted)
                     .coerceAtMost(nowMs)
+                // The renderer is about to publish a preparation profile. A control sample which
+                // was waiting for the pre-recovery topology/profile can therefore never receive a
+                // truthful acknowledgment. Drop it so the first post-recovery control tick can
+                // republish the same frozen phase time instead of waiting behind an impossible
+                // dynamic-profile match until the phase deadline.
+                pendingControlCoverage =
+                    discardPendingControlCoverageForProducerRecovery(pendingControlCoverage)
                 recoveryPaused = true
                 producerRecoveryPaused = true
                 phaseClock.pause(
@@ -3798,13 +3839,19 @@ class LabController internal constructor(
                     val pendingBoundaryExists =
                         topologyPendingBoundary.get()?.generation == producerGeneration
                     return hwcCompositionTargetReadyForArm(
-                        ready = freshReadiness.ready,
+                        ready =
+                            freshReadiness.ready &&
+                                freshReadiness.geometryReady &&
+                                freshReadiness.geometryAppliedProfileOrdinal ==
+                                requestedPhase.layerSizeProfile.ordinal,
                         topologyPublished = freshReadiness.topologyPublished,
                         topologyPending = freshReadiness.topologyPending,
                         processLeaseActive =
                             RendererSafetyState.hasUnconfirmedTeardown(),
                         pendingBoundaryExists = pendingBoundaryExists,
+                        topologyMissed = freshReadiness.topologyMissed,
                         teardownFailed = freshReadiness.teardownFailed,
+                        teardownCompleted = freshReadiness.teardownCompleted,
                         runtimeFailurePresent =
                             freshReadiness.runtimeFailureReason != null,
                         expectedProducerCount = expectedProducerCount,
@@ -4163,6 +4210,10 @@ class LabController internal constructor(
                             delay(RENDERER_TEARDOWN_POLL_MS)
                             continue
                         }
+                        if (!restartReadiness.geometryReady) {
+                            delay(RENDERER_TEARDOWN_POLL_MS)
+                            continue
+                        }
                         if (
                             producerRecoveryDeadlineExceeded(
                                 recoveryStillActive = false,
@@ -4312,30 +4363,25 @@ class LabController internal constructor(
                 )
                 val phaseElapsed = phaseClock.elapsedMs(nowMs)
                 var compositionVerificationBoundaryHandled = false
-                pendingCoverageSample?.let { pendingSample ->
-                    if (
-                        producerReadiness.ready &&
-                        producerReadiness.expectedCount == pendingCoverageProducerCount &&
-                        producerReadiness.topologyRevision ==
-                        pendingCoverageTopologyRevision
-                    ) {
+                pendingControlCoverage?.let { pending ->
+                    if (pending.isAcknowledgedBy(producerReadiness)) {
                         transitionCoverage.observe(
-                            pendingSample,
-                            pendingCoverageElapsedMs,
+                            pending.sample,
+                            pending.phaseElapsedMs,
                         )
-                        pendingCoverageSample = null
+                        pendingControlCoverage = null
                         postReadyControlTickApplied = true
                         if (
-                            pendingSample.fraction >= 1f &&
+                            pending.sample.fraction >= 1f &&
                             hwcCompositionCoverage != null &&
                             !hwcCompositionProbeResolved
                         ) {
                             collectTargetHwcCompositionEvidence(
                                 boundaryMs = SystemClock.elapsedRealtime(),
                                 expectedProducerCount =
-                                    pendingCoverageProducerCount,
+                                    pending.expectedProducerCount,
                                 expectedTopologyRevision =
-                                    pendingCoverageTopologyRevision,
+                                    pending.expectedTopologyRevision,
                             )?.let { completedAtMs ->
                                 nextControlTickAtMs = completedAtMs
                                 compositionVerificationBoundaryHandled = true
@@ -4378,7 +4424,7 @@ class LabController internal constructor(
                     cancellationReason = reason
                     throw PlanAbortException(reason)
                 }
-                if (pendingCoverageSample != null) {
+                if (pendingControlCoverage != null) {
                     if (phaseElapsed >= targetPhase.durationMs) {
                         throw InconclusiveRunException(
                             "Phase '${targetPhase.id}' control tick의 physical producer " +
@@ -4416,11 +4462,17 @@ class LabController internal constructor(
                     },
                     phaseDurationMs = requestedPhase.durationMs,
                 )
+                val interpolatedRuntimePhase = LoadTransitionEvaluator.interpolate(
+                    previous = transitionOrigin,
+                    target = requestedPhase,
+                    fraction = transitionSample.fraction,
+                )
                 val rawRuntimePhase = allocationRouteSafePhase(
-                    initial = LoadTransitionEvaluator.interpolate(
-                        previous = transitionOrigin,
+                    initial = layerSizeProfileForActiveTransition(
+                        interpolated = interpolatedRuntimePhase,
                         target = requestedPhase,
-                        fraction = transitionSample.fraction,
+                        transitionStarted =
+                            transitionStarted || producerReadiness.ready,
                     ),
                     target = requestedPhase,
                 )
@@ -4513,28 +4565,31 @@ class LabController internal constructor(
                     ),
                     observedProducerCount = producerReadiness.observedCount,
                 )
-                pendingCoverageSample = transitionSample
-                pendingCoverageElapsedMs = phaseElapsed
-                pendingCoverageProducerCount = if (
-                    runtimePhase.backend == LayerBackend.FLATTENED_TEXTURE
-                ) {
-                    1
-                } else {
-                    runtimePhase.activeLayers.coerceIn(
-                        1,
-                        ScenarioSafetyPolicy.HARD_MAX_LAYERS,
-                    )
-                }
-                pendingCoverageTopologyRevision =
-                    if (rendererTopologyChanged(priorPublishedPhase, runtimePhase)) {
-                        if (producerReadiness.topologyRevision == Long.MAX_VALUE) {
-                            1L
-                        } else {
-                            producerReadiness.topologyRevision + 1L
-                        }
+                pendingControlCoverage = PendingControlCoverage(
+                    sample = transitionSample,
+                    phaseElapsedMs = phaseElapsed,
+                    expectedProducerCount = if (
+                        runtimePhase.backend == LayerBackend.FLATTENED_TEXTURE
+                    ) {
+                        1
                     } else {
-                        producerReadiness.topologyRevision
-                    }
+                        runtimePhase.activeLayers.coerceIn(
+                            1,
+                            ScenarioSafetyPolicy.HARD_MAX_LAYERS,
+                        )
+                    },
+                    expectedTopologyRevision =
+                        if (rendererTopologyChanged(priorPublishedPhase, runtimePhase)) {
+                            if (producerReadiness.topologyRevision == Long.MAX_VALUE) {
+                                1L
+                            } else {
+                                producerReadiness.topologyRevision + 1L
+                            }
+                        } else {
+                            producerReadiness.topologyRevision
+                        },
+                    expectedLayerSizeProfileOrdinal = runtimePhase.layerSizeProfile.ordinal,
+                )
                 planProgress = planProgress.copy(
                     currentRunFraction = progress.overallFraction,
                 )
@@ -4638,6 +4693,31 @@ class LabController internal constructor(
                     "Phase '${targetPhase.id}' transition 의미를 보존하지 못했습니다: $reason",
                 )
             }
+            val geometryReadiness = awaitLayerGeometryCoverage(
+                generation = producerGeneration,
+                profile = targetPhase.layerSizeProfile,
+            )
+            val requiredGeometryCoverage =
+                targetPhase.layerSizeProfile.requiredCoverageMask()
+            val geometryDetail =
+                "phase=${targetPhase.id}; profile=${targetPhase.layerSizeProfile.name}; " +
+                    "revision=${geometryReadiness.geometryAppliedRevision}/" +
+                    "${geometryReadiness.geometryRequestedRevision}; " +
+                    "coverage=0x${geometryReadiness.geometryCoverageMask.toString(16)}; " +
+                    "required=0x${requiredGeometryCoverage.toString(16)}"
+            if (
+                !layerGeometryCoverageSatisfied(
+                    readiness = geometryReadiness,
+                    profile = targetPhase.layerSizeProfile,
+                )
+            ) {
+                runEvents += event("LAYER_SIZE_COVERAGE_MISSING", geometryDetail)
+                throw InconclusiveRunException(
+                    "Phase '${targetPhase.id}' layer-size geometry 적용 coverage가 " +
+                        "불완전합니다: $geometryDetail",
+                )
+            }
+            runEvents += event("LAYER_SIZE_COVERAGE", geometryDetail)
             val phaseFinishedAtMs = SystemClock.elapsedRealtime()
             producerFrameBudget.observePhysicalFrames(
                 totalFrames = frameTracker.totalPhysicalProducedFrames(),
@@ -4683,10 +4763,14 @@ class LabController internal constructor(
                     phaseDurationMs = requestedPhase.durationMs,
                 )
                 allocationRouteSafePhase(
-                    initial = LoadTransitionEvaluator.interpolate(
-                        previous = transitionOrigin,
+                    initial = layerSizeProfileForActiveTransition(
+                        interpolated = LoadTransitionEvaluator.interpolate(
+                            previous = transitionOrigin,
+                            target = requestedPhase,
+                            fraction = terminalSample.fraction,
+                        ),
                         target = requestedPhase,
-                        fraction = terminalSample.fraction,
+                        transitionStarted = true,
                     ),
                     target = requestedPhase,
                 )
@@ -4777,6 +4861,23 @@ class LabController internal constructor(
             } else {
                 phaseIndex++
             }
+        }
+    }
+
+    private suspend fun awaitLayerGeometryCoverage(
+        generation: Long,
+        profile: LayerSizeProfile,
+    ): com.example.dpulayerlab.monitor.ProducerReadiness {
+        val deadlineMs = saturatingAdd(
+            SystemClock.elapsedRealtime(),
+            LAYER_GEOMETRY_COVERAGE_ACK_TIMEOUT_MS,
+        )
+        while (true) {
+            currentCoroutineContext().ensureActive()
+            val readiness = frameTracker.producerReadiness(generation)
+            if (layerGeometryCoverageSatisfied(readiness, profile)) return readiness
+            if (SystemClock.elapsedRealtime() >= deadlineMs) return readiness
+            delay(RENDERER_TEARDOWN_POLL_MS)
         }
     }
 
@@ -5608,6 +5709,7 @@ class LabController internal constructor(
                 if (target.includeGlLayer && target.activeLayers > 1) 2 else 1,
             producerFps = min(60f, target.producerFps),
             requestedDisplayHz = min(60f, target.requestedDisplayHz),
+            layerSizeProfile = preparationLayerSizeProfile(target.layerSizeProfile),
             workloads = LoadSetpoints(shape = target.workloads.shape),
         )
 
@@ -6994,6 +7096,7 @@ class LabController internal constructor(
         const val COOLDOWN_DELAY_MS = 2_000L
         const val RENDERER_TEARDOWN_ACK_TIMEOUT_MS = PRODUCER_RECOVERY_TIMEOUT_MS
         const val RENDERER_TEARDOWN_POLL_MS = 16L
+        const val LAYER_GEOMETRY_COVERAGE_ACK_TIMEOUT_MS = 500L
         const val MAX_TELEMETRY_HISTORY = 60
         const val MAX_RUN_SAMPLES = 3_600
         const val MAX_EVENT_MESSAGE_CHARS = 1_000
@@ -7619,6 +7722,7 @@ internal fun safeWarmupPhaseFor(target: PhaseSpec): PhaseSpec =
         pixelRoute = PixelRoute.RGB_8888,
         bufferSize = BufferSize.DISPLAY,
         motion = MotionProfile.STATIC,
+        layerSizeProfile = LayerSizeProfile.FULL_SCREEN,
         workloads = LoadSetpoints(),
         alphaOverlap = false,
         includeGlLayer = false,
@@ -7643,7 +7747,8 @@ internal fun rendererTopologyChanged(active: PhaseSpec?, target: PhaseSpec): Boo
 /**
  * Pixel/compression routes cannot be interpolated under a live producer. Continuous fields can
  * still start at the prior values, but the preparation producer must use the already validated
- * target allocation topology after the old route has been detached.
+ * target allocation topology after the old route has been detached. Destination size is not an
+ * allocation field, so it stays at the measured origin until the active transition is armed.
  */
 internal fun allocationRouteSafePhase(
     initial: PhaseSpec,
@@ -7667,14 +7772,91 @@ internal fun allocationRouteSafePhase(
         )
     }
 
+/**
+ * Discrete destination geometry keeps the measured origin for the first active sample, then stays
+ * armed for the rest of the phase. Cyclic transition valleys may release continuous FPS/workload
+ * values, but must not repeatedly replace/restart a dynamic layer-size waveform.
+ */
+internal fun layerSizeProfileForActiveTransition(
+    interpolated: PhaseSpec,
+    target: PhaseSpec,
+    transitionStarted: Boolean,
+): PhaseSpec =
+    if (transitionStarted) {
+        interpolated.copy(layerSizeProfile = target.layerSizeProfile)
+    } else {
+        interpolated
+    }
+
+internal data class PendingControlCoverage(
+    val sample: TransitionSample,
+    val phaseElapsedMs: Long,
+    val expectedProducerCount: Int,
+    val expectedTopologyRevision: Long,
+    val expectedLayerSizeProfileOrdinal: Int,
+) {
+    fun isAcknowledgedBy(
+        readiness: com.example.dpulayerlab.monitor.ProducerReadiness,
+    ): Boolean =
+        readiness.ready &&
+            readiness.expectedCount == expectedProducerCount &&
+            readiness.topologyRevision == expectedTopologyRevision &&
+            readiness.geometryReady &&
+            readiness.geometryAppliedProfileOrdinal == expectedLayerSizeProfileOrdinal
+}
+
+/**
+ * Recovery replaces the renderer phase with a safe preparation profile. An acknowledgment for a
+ * pre-recovery control sample can no longer prove that sample, even when the physical producer set
+ * is unchanged. Returning null forces the controller to republish from its frozen active clock.
+ */
+internal fun discardPendingControlCoverageForProducerRecovery(
+    @Suppress("UNUSED_PARAMETER") pending: PendingControlCoverage?,
+): PendingControlCoverage? = null
+
+internal fun layerGeometryCoverageSatisfied(
+    readiness: com.example.dpulayerlab.monitor.ProducerReadiness,
+    profile: LayerSizeProfile,
+): Boolean {
+    val requiredMask = profile.requiredCoverageMask()
+    return readiness.topologyPublished &&
+        !readiness.topologyPending &&
+        !readiness.topologyMissed &&
+        !readiness.teardownFailed &&
+        !readiness.teardownCompleted &&
+        readiness.ready &&
+        readiness.expectedCount > 0 &&
+        readiness.observedCount == readiness.expectedCount &&
+        readiness.geometryReady &&
+        readiness.geometryAppliedProfileOrdinal == profile.ordinal &&
+        readiness.geometryCoverageMask and requiredMask == requiredMask
+}
+
 internal fun rendererPreparationPhase(initialRuntime: PhaseSpec): PhaseSpec =
     initialRuntime.copy(
         producerFps = min(60f, initialRuntime.producerFps),
         requestedDisplayHz = min(60f, initialRuntime.requestedDisplayHz),
         motion = MotionProfile.STATIC,
+        layerSizeProfile = preparationLayerSizeProfile(initialRuntime.layerSizeProfile),
         workloads = LoadSetpoints(),
         hwcCompositionExpectation = HwcCompositionExpectation.NONE,
     )
+
+/**
+ * Topology preparation and recovery must not consume a dynamic layer-size waveform before the
+ * measured phase clock starts. Both dynamic profiles begin at the same bounded small geometry.
+ */
+internal fun preparationLayerSizeProfile(profile: LayerSizeProfile): LayerSizeProfile =
+    when (profile) {
+        LayerSizeProfile.GRADUAL_SMALL_TO_FULL,
+        LayerSizeProfile.ABRUPT_SMALL_FULL,
+        -> LayerSizeProfile.SMALL_UNIFORM
+
+        LayerSizeProfile.FULL_SCREEN,
+        LayerSizeProfile.SMALL_UNIFORM,
+        LayerSizeProfile.MIXED_SIZES,
+        -> profile
+    }
 
 internal fun progressForControllerPause(
     current: RunProgress,
@@ -8388,6 +8570,7 @@ internal fun hwcCompositionContractPreserved(
         requested.pixelRoute == effective.pixelRoute &&
         requested.bufferSize == effective.bufferSize &&
         requested.motion == effective.motion &&
+        requested.layerSizeProfile == effective.layerSizeProfile &&
         requested.workloads == effective.workloads &&
         requested.alphaOverlap == effective.alphaOverlap &&
         requested.includeGlLayer == effective.includeGlLayer
@@ -8400,6 +8583,7 @@ internal fun hwcCompositionContractDeltaSummary(
     "layers=${requested.activeLayers}→${effective.activeLayers}; " +
         "producerFps=${requested.producerFps}→${effective.producerFps}; " +
         "displayHz=${requested.requestedDisplayHz}→${effective.requestedDisplayHz}; " +
+        "size=${requested.layerSizeProfile.name}→${effective.layerSizeProfile.name}; " +
         "gpu=${requested.workloads.gpu}→${effective.workloads.gpu}; " +
         "gl=${requested.includeGlLayer}→${effective.includeGlLayer}"
 
@@ -8624,7 +8808,9 @@ internal fun hwcCompositionTargetReadyForArm(
     topologyPending: Boolean,
     processLeaseActive: Boolean,
     pendingBoundaryExists: Boolean,
+    topologyMissed: Boolean,
     teardownFailed: Boolean,
+    teardownCompleted: Boolean,
     runtimeFailurePresent: Boolean,
     expectedProducerCount: Int,
     observedProducerCount: Int,
@@ -8636,7 +8822,9 @@ internal fun hwcCompositionTargetReadyForArm(
         !topologyPending &&
         !processLeaseActive &&
         !pendingBoundaryExists &&
+        !topologyMissed &&
         !teardownFailed &&
+        !teardownCompleted &&
         !runtimeFailurePresent &&
         expectedProducerCount > 0 &&
         observedProducerCount == expectedProducerCount &&
