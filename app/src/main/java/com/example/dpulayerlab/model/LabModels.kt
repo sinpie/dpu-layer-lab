@@ -632,6 +632,12 @@ data class RunProgress(
     val thermalDerated: Boolean = false,
     /** Token that binds every physical producer callback to the currently displayed phase. */
     val producerGeneration: Long = 0L,
+    /**
+     * Generation-local renderer control publication. A positive revision is acknowledged only
+     * after every committed physical producer posts a frame captured after applying that exact
+     * revision.
+     */
+    val producerControlRevision: Long = 0L,
     /** Physical BufferQueue producers expected/observed within the live health window. */
     val expectedProducerCount: Int = 0,
     val observedProducerCount: Int = 0,

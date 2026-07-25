@@ -95,9 +95,12 @@ class LoadManager private constructor(
     private val memoryPrewarmStateLock = dependencies.runtimeState.memoryPrewarmStateLock
     private val memoryBuffersPinned = dependencies.runtimeState.memoryBuffersPinned
     private val shutdownResult = dependencies.runtimeState.shutdownResult
+    private val latestNpuCommandRequest =
+        dependencies.runtimeState.latestNpuCommandRequest
     private val latestPositiveNpuRequest = dependencies.runtimeState.latestPositiveNpuRequest
     private val npuRequestContractMissing =
         dependencies.runtimeState.npuRequestContractMissing
+    private val npuCommandEpoch = dependencies.runtimeState.npuCommandEpoch
     private val localWorkerOwner = dependencies.runtimeState.localWorkerOwner
     private val localWorkerStateLock = dependencies.runtimeState.localWorkerStateLock
 
@@ -145,11 +148,18 @@ class LoadManager private constructor(
             }
         } catch (error: Throwable) {
             if (error is OutOfMemoryError) memoryAllocationFailed.set(true)
-            markLocalWorkersStopping()
-            LoadSafetyState.releaseLocalWorkerLeaseIfEmpty(localWorkerOwner)
-            if (error is ThreadDeath || (error is VirtualMachineError && error !is OutOfMemoryError)) {
-                throw error
+            var terminal: Throwable = error
+            try {
+                markLocalWorkersStopping()
+            } catch (cleanupError: Throwable) {
+                terminal = mergeLoadFailurePreservingFatal(terminal, cleanupError)
             }
+            try {
+                LoadSafetyState.releaseLocalWorkerLeaseIfEmpty(localWorkerOwner)
+            } catch (cleanupError: Throwable) {
+                terminal = mergeLoadFailurePreservingFatal(terminal, cleanupError)
+            }
+            if (terminal is Error) throw terminal
             return false
         }
         return try {
@@ -173,10 +183,13 @@ class LoadManager private constructor(
             }
         } catch (error: Throwable) {
             if (error is OutOfMemoryError) memoryAllocationFailed.set(true)
-            cleanupPartiallyStartedWorkers(pendingWorkers)
-            if (error is ThreadDeath || (error is VirtualMachineError && error !is OutOfMemoryError)) {
-                throw error
+            var terminal: Throwable = error
+            try {
+                cleanupPartiallyStartedWorkers(pendingWorkers)
+            } catch (cleanupError: Throwable) {
+                terminal = mergeLoadFailurePreservingFatal(terminal, cleanupError)
             }
+            if (terminal is Error) throw terminal
             false
         }
     }
@@ -185,18 +198,62 @@ class LoadManager private constructor(
         applyInternal(newSetpoints, restartProfile)
     }
 
+    internal fun npuCommandEpoch(): Long = npuCommandEpoch.get()
+
     /**
-     * Phase-boundary apply path for a positive NPU setpoint. The normal 100 ms control loop keeps
-     * using [apply]; only first apply and safety derating need this bounded acknowledgment wait.
+     * Publishes a controller-owned setpoint only while no zero/release boundary has invalidated the
+     * captured epoch. The epoch check and request publication share this manager monitor with
+     * [releaseLoads], so a topology callback cannot publish zero and then be overtaken by an older
+     * positive request that had not started yet.
+     */
+    internal fun applyIfNpuCommandEpoch(
+        newSetpoints: LoadSetpoints,
+        restartProfile: Boolean,
+        expectedCommandEpoch: Long,
+    ): Boolean = applyInternalIfNpuCommandEpoch(
+        newSetpoints = newSetpoints,
+        restartProfile = restartProfile,
+        expectedCommandEpoch = expectedCommandEpoch,
+    ).epochMatched
+
+    /**
+     * Bounded apply path for a semantic NPU edge. Every call publishes a fresh NPU command even
+     * when the normalized setpoint is unchanged; adapter-level ordered release may otherwise have
+     * superseded the manager's previously saved request. CPU/memory profile restart remains
+     * independent. The normal 100 ms control loop keeps using latest-wins [apply], while
+     * zero-to-positive and positive-to-zero edges wait for the exact command ticket so a dropped
+     * valley or re-attack cannot be credited as transition coverage.
      */
     internal fun applyAndConfirmNpu(
         newSetpoints: LoadSetpoints,
         restartProfile: Boolean = true,
         timeoutMs: Long = DEFAULT_NPU_APPLY_TIMEOUT_MS,
+        expectedCommandEpoch: Long? = null,
     ): NpuControlHealth {
         val normalized = newSetpoints.normalizedForExecution()
-        val request = applyInternal(normalized, restartProfile)
-        if (normalized.npu <= 0f) return NpuControlHealth.idle()
+        val publication = if (expectedCommandEpoch == null) {
+            EpochBoundNpuPublication(
+                epochMatched = true,
+                request = applyInternal(
+                    newSetpoints = normalized,
+                    restartProfile = restartProfile,
+                    forceNpuCommand = true,
+                ),
+            )
+        } else {
+            applyInternalIfNpuCommandEpoch(
+                newSetpoints = normalized,
+                restartProfile = restartProfile,
+                expectedCommandEpoch = expectedCommandEpoch,
+                forceNpuCommand = true,
+            )
+        }
+        if (!publication.epochMatched) {
+            return NpuControlHealth.failed(
+                "NPU command epoch changed before request publication",
+            )
+        }
+        val request = publication.request
         if (request == null) {
             return if (npuAdapter.isAvailable()) {
                 NpuControlHealth.failed(
@@ -210,12 +267,36 @@ class LoadManager private constructor(
             request = request,
             timeoutMs = timeoutMs.coerceIn(1L, MAX_NPU_APPLY_TIMEOUT_MS),
         )
-        if (latestPositiveNpuRequest.get() !== request) {
+        if (
+            (expectedCommandEpoch != null &&
+                npuCommandEpoch.get() != expectedCommandEpoch) ||
+            latestNpuCommandRequest.get() !== request
+        ) {
             return NpuControlHealth.failed(
                 "NPU setpoint changed while apply confirmation was pending",
             )
         }
         return result
+    }
+
+    @Synchronized
+    private fun applyInternalIfNpuCommandEpoch(
+        newSetpoints: LoadSetpoints,
+        restartProfile: Boolean,
+        expectedCommandEpoch: Long,
+        forceNpuCommand: Boolean = false,
+    ): EpochBoundNpuPublication {
+        if (npuCommandEpoch.get() != expectedCommandEpoch) {
+            return EpochBoundNpuPublication(epochMatched = false, request = null)
+        }
+        return EpochBoundNpuPublication(
+            epochMatched = true,
+            request = applyInternal(
+                newSetpoints = newSetpoints,
+                restartProfile = restartProfile,
+                forceNpuCommand = forceNpuCommand,
+            ),
+        )
     }
 
     /**
@@ -252,6 +333,7 @@ class LoadManager private constructor(
     private fun applyInternal(
         newSetpoints: LoadSetpoints,
         restartProfile: Boolean,
+        forceNpuCommand: Boolean = false,
     ): NpuControlRequest? {
         if (closed.get()) return null
         val normalized = newSetpoints.normalizedForExecution()
@@ -276,6 +358,7 @@ class LoadManager private constructor(
             threads.forEach(LockSupport::unpark)
         }
         if (
+            forceNpuCommand ||
             restartProfile ||
             normalized.shape != previous.shape ||
             normalized.npu != previous.npu
@@ -285,6 +368,7 @@ class LoadManager private constructor(
                 shape = normalized.shape,
                 restartProfile = profileRestarted,
             )
+            latestNpuCommandRequest.set(request)
             if (normalized.npu > 0f) {
                 latestPositiveNpuRequest.set(request)
                 npuRequestContractMissing.set(request == null)
@@ -297,11 +381,12 @@ class LoadManager private constructor(
             latestPositiveNpuRequest.set(null)
             npuRequestContractMissing.set(false)
         }
-        return latestPositiveNpuRequest.get()
+        return latestNpuCommandRequest.get()
     }
 
+    @Synchronized
     fun releaseLoads(dropMemoryBuffers: Boolean = false) {
-        apply(LoadSetpoints())
+        npuCommandEpoch.incrementAndGet()
         if (dropMemoryBuffers) {
             synchronized(memoryPrewarmStateLock) {
                 memoryBuffersPinned.set(false)
@@ -311,7 +396,28 @@ class LoadManager private constructor(
                 // acknowledgment, so a cancelled request cannot silently re-populate buffers.
                 memoryPrewarmRequest.set(null)
             }
-            threads.forEach(LockSupport::unpark)
+        }
+        var publicationFailure: Throwable? = null
+        try {
+            apply(LoadSetpoints())
+        } catch (error: Throwable) {
+            publicationFailure = error
+            throw error
+        } finally {
+            if (dropMemoryBuffers) {
+                try {
+                    threads.forEach(LockSupport::unpark)
+                } catch (unparkFailure: Throwable) {
+                    val primary = publicationFailure
+                    if (primary != null) {
+                        if (primary !== unparkFailure) {
+                            runCatching { primary.addSuppressed(unparkFailure) }
+                        }
+                    } else {
+                        throw unparkFailure
+                    }
+                }
+            }
         }
     }
 
@@ -414,14 +520,30 @@ class LoadManager private constructor(
         if (closed.get()) {
             return shutdownResult.get()?.npu?.releaseConfirmed == true
         }
-        releaseLoads(dropMemoryBuffers)
-        val confirmed = npuAdapter.releaseAndConfirm()
+        var primaryFailure: Throwable? = null
+        try {
+            releaseLoads(dropMemoryBuffers)
+        } catch (error: Throwable) {
+            primaryFailure = error
+        }
+        val confirmed = try {
+            npuAdapter.releaseAndConfirm()
+        } catch (error: Throwable) {
+            val primary = primaryFailure
+            if (primary == null) {
+                primaryFailure = error
+            } else if (primary !== error) {
+                runCatching { primary.addSuppressed(error) }
+            }
+            false
+        }
         // closeWithResult uses the same monitor. Therefore either this publication completes
         // before close can return its final result to the controller, or a close-first caller
         // observes closed=true and cannot overwrite the controller's final rescue publication.
         if (!closed.get()) {
             LoadSafetyState.recordNpuLoadIdle(confirmed)
         }
+        primaryFailure?.let { throw it }
         return confirmed
     }
 
@@ -553,42 +675,68 @@ class LoadManager private constructor(
         // Publish running=false before interrupting. A same-owner retry is denied by
         // LoadSafetyState while any registered worker remains, so an old interrupt handler can
         // never observe a new run's running=true and poison the permanent failure latch.
-        markLocalWorkersStopping()
+        var terminalFailure: Throwable? = null
+        try {
+            markLocalWorkersStopping()
+        } catch (error: Throwable) {
+            terminalFailure =
+                mergeLoadFailurePreservingFatal(terminalFailure, error)
+        }
         // This function is also the rollback for an OOM during queue publication/Thread.start.
         // Indexed traversal avoids allocating ArrayList iterators after allocation pressure.
         var index = 0
         while (index < pendingWorkers.size) {
             val thread = pendingWorkers[index]
-            when (thread.state) {
-                Thread.State.NEW -> {
-                    threads.remove(thread)
-                    LoadSafetyState.recordLocalWorkerStopped(localWorkerOwner, thread)
+            try {
+                when (thread.state) {
+                    Thread.State.NEW -> {
+                        threads.remove(thread)
+                        LoadSafetyState.recordLocalWorkerStopped(localWorkerOwner, thread)
+                    }
+                    else -> {
+                        thread.interrupt()
+                        LockSupport.unpark(thread)
+                    }
                 }
-                else -> {
-                    thread.interrupt()
-                    LockSupport.unpark(thread)
-                }
+            } catch (error: Throwable) {
+                terminalFailure =
+                    mergeLoadFailurePreservingFatal(terminalFailure, error)
             }
             index++
         }
         val joinDeadlineNanos = System.nanoTime() + WORKER_JOIN_TIMEOUT_NANOS
+        var interruptedWhileJoining = false
         index = 0
         while (index < pendingWorkers.size) {
             val thread = pendingWorkers[index]
-            val remainingNanos = joinDeadlineNanos - System.nanoTime()
-            if (remainingNanos > 0L && thread.isAlive) {
-                val millis = remainingNanos / NANOS_PER_MILLI
-                val nanos = (remainingNanos % NANOS_PER_MILLI).toInt()
-                try {
+            try {
+                val remainingNanos = joinDeadlineNanos - System.nanoTime()
+                if (remainingNanos > 0L && thread.isAlive) {
+                    val millis = remainingNanos / NANOS_PER_MILLI
+                    val nanos = (remainingNanos % NANOS_PER_MILLI).toInt()
                     thread.join(millis, nanos)
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    break
                 }
+            } catch (_: InterruptedException) {
+                // join clears the interrupted bit. Delay restoration until every worker has had a
+                // bounded join opportunity; re-setting it here would make all later joins fail
+                // immediately and turn an interrupt into partial rollback.
+                interruptedWhileJoining = true
+            } catch (error: Throwable) {
+                terminalFailure =
+                    mergeLoadFailurePreservingFatal(terminalFailure, error)
             }
             index++
         }
-        LoadSafetyState.releaseLocalWorkerLeaseIfEmpty(localWorkerOwner)
+        try {
+            LoadSafetyState.releaseLocalWorkerLeaseIfEmpty(localWorkerOwner)
+        } catch (error: Throwable) {
+            terminalFailure =
+                mergeLoadFailurePreservingFatal(terminalFailure, error)
+        }
+        if (interruptedWhileJoining) {
+            Thread.currentThread().interrupt()
+        }
+        terminalFailure?.let { throw it }
     }
 
     private fun stopLocalWorkersAfterUnexpectedFailure(
@@ -906,8 +1054,10 @@ private class LoadManagerRuntimeState(
     val memoryPrewarmStateLock = Any()
     val memoryBuffersPinned = AtomicBoolean(false)
     val shutdownResult = AtomicReference<LoadShutdownResult?>(null)
+    val latestNpuCommandRequest = AtomicReference<NpuControlRequest?>(null)
     val latestPositiveNpuRequest = AtomicReference<NpuControlRequest?>(null)
     val npuRequestContractMissing = AtomicBoolean(false)
+    val npuCommandEpoch = AtomicLong(0L)
     val localWorkerOwner = Any()
     val localWorkerStateLock = Any()
 }
@@ -983,6 +1133,11 @@ private data class RuntimeLoadConfig(
 private data class MemoryPrewarmRequest(
     val generation: Long,
     val bufferDropGeneration: Long,
+)
+
+private data class EpochBoundNpuPublication(
+    val epochMatched: Boolean,
+    val request: NpuControlRequest?,
 )
 
 /**
@@ -1346,6 +1501,84 @@ internal class ReflectionKnownIdleState(initiallyKnownIdle: Boolean) {
     }
 }
 
+internal data class ReflectionIntensityCommand(
+    val intensity: Float,
+    val ticket: NpuControlCommandTicket,
+)
+
+/**
+ * Single-slot latest-wins mailbox for the reflection control lane.
+ *
+ * Waveform evaluation intentionally happens outside this lock. A newer desired ticket can
+ * therefore be published while an older waveform value is being calculated; [publishIfCurrent]
+ * rejects that stale snapshot instead of allowing it to overwrite the newer zero/setpoint.
+ */
+internal class ReflectionNpuCommandMailbox(
+    initialTicket: NpuControlCommandTicket,
+) {
+    private var desiredTicket = initialTicket
+    private var lastQueuedCommand: ReflectionIntensityCommand? = null
+    private val pendingCommand = AtomicReference<ReflectionIntensityCommand?>(null)
+
+    @Synchronized
+    fun replaceDesired(ticket: NpuControlCommandTicket) {
+        desiredTicket = ticket
+    }
+
+    @Synchronized
+    fun publishIfCurrent(
+        ticket: NpuControlCommandTicket,
+        intensity: Float,
+        force: Boolean,
+        epsilon: Float,
+    ): Boolean {
+        if (desiredTicket.version != ticket.version) return false
+        val previous = lastQueuedCommand
+        if (
+            force ||
+            previous == null ||
+            previous.ticket.version != ticket.version ||
+            kotlin.math.abs(previous.intensity - intensity) >= epsilon
+        ) {
+            val command = ReflectionIntensityCommand(
+                intensity = intensity,
+                ticket = ticket,
+            )
+            lastQueuedCommand = command
+            pendingCommand.set(command)
+        }
+        return true
+    }
+
+    @Synchronized
+    fun isCurrent(ticket: NpuControlCommandTicket): Boolean =
+        desiredTicket.version == ticket.version
+
+    fun takePending(): ReflectionIntensityCommand? = pendingCommand.getAndSet(null)
+
+    fun pending(): ReflectionIntensityCommand? = pendingCommand.get()
+
+    fun clear() {
+        pendingCommand.set(null)
+    }
+}
+
+/** Selects fatal Error precedence while keeping ordinary rollback failures as evidence. */
+internal fun mergeLoadFailurePreservingFatal(
+    current: Throwable?,
+    candidate: Throwable,
+): Throwable {
+    if (current == null || current === candidate) return current ?: candidate
+    val terminal = if (current is Error || candidate !is Error) current else candidate
+    val secondary = if (terminal === current) candidate else current
+    try {
+        terminal.addSuppressed(secondary)
+    } catch (_: Throwable) {
+        // An active OOM must retain its identity even if suppressed-state allocation also fails.
+    }
+    return terminal
+}
+
 /**
  * Thread.start() can fail after a Thread object and its captured resources have been prepared.
  * Callers keep ownership until this function returns null; on failure they must synchronously
@@ -1388,7 +1621,7 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
         version = 0L,
         serviceSession = REFLECTION_CONTROL_SESSION,
     )
-    private val pendingIntensity = AtomicReference<ReflectionIntensityCommand?>(null)
+    private val commandMailbox = ReflectionNpuCommandMailbox(initialControlTicket)
     private val requestedLoad = AtomicReference(
         ReflectionLoadConfig(
             baseIntensity = 0f,
@@ -1397,7 +1630,6 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
             ticket = initialControlTicket,
         ),
     )
-    private val lastQueuedIntensity = AtomicReference<Float?>(null)
     private val drainScheduled = AtomicBoolean(false)
     private val closed = AtomicBoolean(false)
     private val shutdownResult = AtomicReference<NpuShutdownResult?>(null)
@@ -1554,32 +1786,26 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
     override fun releaseAndConfirm(): Boolean {
         if (instance == null) return true
         if (closed.get()) return false
-        setLoad(0f, LoadShape.STEADY, restartProfile = true)
-        val releaseFuture = runCatching {
-            executor.submit<Boolean> {
-                val applied = runCatching {
-                    checkNotNull(setIntensityMethod).invoke(instance, 0f)
-                }.isSuccess
-                if (applied && !closed.get()) {
-                    cachedStatus.set("NPU adapter 연결됨 · release 0% 확인")
+        val zeroTicket = setLoad(
+            intensity = 0f,
+            shape = LoadShape.STEADY,
+            restartProfile = true,
+        ) ?: return false
+        val health = awaitApplied(
+            ticket = zeroTicket,
+            timeoutMs = REFLECTION_RELEASE_TIMEOUT_MS,
+        )
+        val confirmed =
+            health.state == NpuControlState.APPLIED &&
+                commandMailbox.isCurrent(zeroTicket) &&
+                requestedLoad.get().let { desired ->
+                    desired.ticket.version == zeroTicket.version &&
+                        desired.baseIntensity <= 0f
                 }
-                applied
-            }
-        }.getOrNull() ?: return false
-        return try {
-            releaseFuture.get(REFLECTION_RELEASE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-            releaseFuture.cancel(true)
-            (releaseFuture as? Runnable)?.let(executor::remove)
-            executor.purge()
-            false
-        } catch (_: Exception) {
-            releaseFuture.cancel(true)
-            (releaseFuture as? Runnable)?.let(executor::remove)
-            executor.purge()
-            false
+        if (confirmed && !closed.get()) {
+            cachedStatus.set("NPU adapter 연결됨 · release 0% 확인")
         }
+        return confirmed
     }
 
     override fun closeWithResult(): NpuShutdownResult {
@@ -1589,17 +1815,19 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
                 ?: NpuShutdownResult.unconfirmed("Reflection NPU 동시 종료 결과 미확인")
         }
         cachedStatus.set("NPU adapter 종료 중")
+        val closeTicket = controlAcknowledgments.recordPending(
+            version = controlVersion.incrementAndGet(),
+            serviceSession = REFLECTION_CONTROL_SESSION,
+        )
         requestedLoad.set(
             ReflectionLoadConfig(
                 baseIntensity = 0f,
                 shape = LoadShape.STEADY,
                 startedMs = SystemClock.elapsedRealtime(),
-                ticket = controlAcknowledgments.recordPending(
-                    version = controlVersion.incrementAndGet(),
-                    serviceSession = REFLECTION_CONTROL_SESSION,
-                ),
+                ticket = closeTicket,
             ),
         )
+        commandMailbox.replaceDesired(closeTicket)
         waveformThread?.interrupt()
         LockSupport.unpark(waveformThread)
         try {
@@ -1608,7 +1836,7 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
             Thread.currentThread().interrupt()
         }
         val waveformStopped = waveformThread?.isAlive != true
-        pendingIntensity.set(null)
+        commandMailbox.clear()
         executor.queue.clear()
         if (instance == null) {
             executor.shutdownNow()
@@ -1742,18 +1970,18 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
             version = controlVersion.incrementAndGet(),
             serviceSession = REFLECTION_CONTROL_SESSION,
         )
-        requestedLoad.set(
-            ReflectionLoadConfig(
-                baseIntensity = safeIntensity,
-                shape = shape,
-                startedMs = if (profileRestarted) {
-                    SystemClock.elapsedRealtime()
-                } else {
-                    previous.startedMs
-                },
-                ticket = ticket,
-            ),
+        val requested = ReflectionLoadConfig(
+            baseIntensity = safeIntensity,
+            shape = shape,
+            startedMs = if (profileRestarted) {
+                SystemClock.elapsedRealtime()
+            } else {
+                previous.startedMs
+            },
+            ticket = ticket,
         )
+        requestedLoad.set(requested)
+        commandMailbox.replaceDesired(ticket)
         queueCurrentWaveformIntensity(
             force = true,
         )
@@ -1787,19 +2015,15 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
             shape = load.shape,
             elapsedMs = SystemClock.elapsedRealtime() - load.startedMs,
         )
-        val previous = lastQueuedIntensity.get()
-        if (force || previous == null || kotlin.math.abs(previous - value) >= NPU_UPDATE_EPSILON) {
-            lastQueuedIntensity.set(value)
-            pendingIntensity.set(
-                ReflectionIntensityCommand(
-                    intensity = value,
-                    ticket = load.ticket,
-                ),
-            )
-        }
+        commandMailbox.publishIfCurrent(
+            ticket = load.ticket,
+            intensity = value,
+            force = force,
+            epsilon = NPU_UPDATE_EPSILON,
+        )
         // If a bounded executor rejected the previous submission, retry even when the waveform
         // value itself did not change.
-        if (pendingIntensity.get() != null) scheduleDrain()
+        if (commandMailbox.pending() != null) scheduleDrain()
     }
 
     private fun scheduleDrain(): Boolean {
@@ -1809,7 +2033,8 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
             executor.execute {
                 try {
                     while (!closed.get()) {
-                        val command = pendingIntensity.getAndSet(null) ?: break
+                        val command = commandMailbox.takePending() ?: break
+                        if (!commandMailbox.isCurrent(command.ticket)) continue
                         val intensity = command.intensity
                         val percent = (intensity * 100f).toInt().coerceIn(0, 100)
                         if (!closed.get()) {
@@ -1844,13 +2069,13 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
                     }
                 } finally {
                     drainScheduled.set(false)
-                    if (!closed.get() && pendingIntensity.get() != null) scheduleDrain()
+                    if (!closed.get() && commandMailbox.pending() != null) scheduleDrain()
                 }
             }
         }.isSuccess
         if (!accepted) {
             drainScheduled.set(false)
-            pendingIntensity.get()?.let { pending ->
+            commandMailbox.pending()?.let { pending ->
                 controlAcknowledgments.recordFailed(
                     pending.ticket,
                     "Reflection NPU control executor rejected command",
@@ -2160,11 +2385,6 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
         val baseIntensity: Float,
         val shape: LoadShape,
         val startedMs: Long,
-        val ticket: NpuControlCommandTicket,
-    )
-
-    private data class ReflectionIntensityCommand(
-        val intensity: Float,
         val ticket: NpuControlCommandTicket,
     )
 

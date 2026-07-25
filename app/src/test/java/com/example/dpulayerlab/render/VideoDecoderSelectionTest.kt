@@ -244,6 +244,55 @@ class VideoDecoderSelectionTest {
     }
 
     @Test
+    fun boundedCloseRunsRemainingAttemptThenRethrowsOriginalVmFatal() {
+        val fatal = OutOfMemoryError("close-fatal")
+        var closeCalls = 0
+        val closeState = BoundedCloseState(
+            closer = {
+                closeCalls += 1
+                if (closeCalls == 1) throw fatal
+            },
+        )
+        var thrown: Throwable? = null
+
+        try {
+            closeState.closeWithResult()
+        } catch (error: Throwable) {
+            thrown = error
+        }
+
+        assertSame(fatal, thrown)
+        assertEquals(2, closeCalls)
+        // The second attempt proved the descriptor closed even though the original fatal still
+        // had to escape. A defensive later caller observes stable terminal close evidence.
+        assertTrue(closeState.closeWithResult())
+    }
+
+    @Test
+    fun ownedConstructionCleanupVmFatalDominatesOrdinaryFactoryFailure() {
+        val factoryFailure = IllegalStateException("factory")
+        val cleanupFatal = OutOfMemoryError("close-fatal")
+        val resource = AutoCloseable { throw cleanupFatal }
+        var reportedCleanup: Throwable? = null
+        var thrown: Throwable? = null
+
+        try {
+            constructWithOwnedCloseOnFailure<AutoCloseable, Unit>(
+                resource = resource,
+                onCloseFailure = { reportedCleanup = it },
+            ) {
+                throw factoryFailure
+            }
+        } catch (error: Throwable) {
+            thrown = error
+        }
+
+        assertSame(cleanupFatal, thrown)
+        assertSame(cleanupFatal, reportedCleanup)
+        assertTrue(cleanupFatal.suppressed.any { it === factoryFailure })
+    }
+
+    @Test
     fun ownedResourceRetriesCloseAndPublishesNoFailureAfterRecovery() {
         val resource = RecordingCloseable(failuresBeforeSuccess = 1)
         val failures = mutableListOf<String>()

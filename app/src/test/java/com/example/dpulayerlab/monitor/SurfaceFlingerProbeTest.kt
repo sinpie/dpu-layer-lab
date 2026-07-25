@@ -3,6 +3,7 @@ package com.example.dpulayerlab.monitor
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -254,6 +255,62 @@ class SurfaceFlingerProbeTest {
         assertEquals(ProbeLaneResult.Completed("done-1"), firstResult.get())
         assertEquals(ProbeLaneResult.Completed("done-3"), lane.execute(3))
         assertEquals(listOf(1, 3), inputs)
+        assertTrue(lane.closeWithResult())
+    }
+
+    @Test
+    fun probeWorkerRethrowsOriginalOomAfterPublishingActualCompletion() {
+        val fatal = OutOfMemoryError("synthetic probe failure")
+        val uncaught = AtomicReference<Throwable?>()
+        val uncaughtPublished = CountDownLatch(1)
+        val lane = SingleFlightProbeLane<String>(
+            threadName = "SurfaceFlingerProbeTest-fatal",
+            timeoutMs = 2_000L,
+            shutdownTimeoutMs = 500L,
+            workerUncaughtExceptionHandler = Thread.UncaughtExceptionHandler { _, error ->
+                uncaught.set(error)
+                uncaughtPublished.countDown()
+            },
+        ) {
+            throw fatal
+        }
+
+        val callerFailure = assertThrows(OutOfMemoryError::class.java) {
+            lane.execute()
+        }
+
+        assertSame(fatal, callerFailure)
+        assertFalse(lane.isActive())
+        assertTrue(uncaughtPublished.await(1L, TimeUnit.SECONDS))
+        assertSame(fatal, uncaught.get())
+        assertTrue(lane.closeWithResult())
+    }
+
+    @Test
+    fun probeCleanupFatalSupersedesOrdinaryFailureWithoutSkippingCompletion() {
+        val operationFailure = IllegalStateException("synthetic operation failure")
+        val cleanupFatal = OutOfMemoryError("synthetic cleanup failure")
+        val uncaughtPublished = CountDownLatch(1)
+        val lane = SingleFlightProbeLane<String>(
+            threadName = "SurfaceFlingerProbeTest-cleanup-fatal",
+            timeoutMs = 2_000L,
+            shutdownTimeoutMs = 500L,
+            workerUncaughtExceptionHandler = Thread.UncaughtExceptionHandler { _, error ->
+                if (error === cleanupFatal) uncaughtPublished.countDown()
+            },
+        ) { cancellation ->
+            cancellation.registerCleanup { throw cleanupFatal }
+            throw operationFailure
+        }
+
+        val callerFailure = assertThrows(OutOfMemoryError::class.java) {
+            lane.execute()
+        }
+
+        assertSame(cleanupFatal, callerFailure)
+        assertTrue(cleanupFatal.suppressed.any { it === operationFailure })
+        assertFalse(lane.isActive())
+        assertTrue(uncaughtPublished.await(1L, TimeUnit.SECONDS))
         assertTrue(lane.closeWithResult())
     }
 
@@ -533,6 +590,32 @@ class SurfaceFlingerProbeTest {
     }
 
     @Test
+    fun childCleanupAttemptsEveryActionBeforeRethrowingOriginalFatal() {
+        val fatal = OutOfMemoryError("synthetic stream close failure")
+        val process = ControllableProcess(
+            exitAfterWaitCall = 2,
+            inputCloseFailure = fatal,
+        )
+        val registry = UnconfirmedProcessRegistry()
+
+        val thrown = assertThrows(OutOfMemoryError::class.java) {
+            cleanupProbeProcess(
+                process = process,
+                waitMs = 10L,
+                registry = registry,
+            )
+        }
+
+        assertSame(fatal, thrown)
+        assertEquals(1, process.inputCloseCalls.get())
+        assertEquals(1, process.errorCloseCalls.get())
+        assertEquals(1, process.outputCloseCalls.get())
+        assertEquals(2, process.waitCalls.get())
+        assertEquals(2, process.destroyCalls.get())
+        assertTrue(registry.isRestartSafe())
+    }
+
+    @Test
     fun probeShutdownBudgetExceedsBothChildWaitsAndSaturatesSafely() {
         val budget = surfaceFlingerProbeShutdownBudgetMs(
             processCleanupWaitMs = 100L,
@@ -592,13 +675,33 @@ class SurfaceFlingerProbeTest {
 
     private class ControllableProcess(
         private val exitAfterWaitCall: Int?,
+        private val inputCloseFailure: Error? = null,
     ) : Process() {
         private val alive = AtomicBoolean(true)
         val waitCalls = AtomicInteger()
         val destroyCalls = AtomicInteger()
-        private val input = ByteArrayInputStream(ByteArray(0))
-        private val error = ByteArrayInputStream(ByteArray(0))
-        private val output = ByteArrayOutputStream()
+        val inputCloseCalls = AtomicInteger()
+        val errorCloseCalls = AtomicInteger()
+        val outputCloseCalls = AtomicInteger()
+        private val input = object : ByteArrayInputStream(ByteArray(0)) {
+            override fun close() {
+                inputCloseCalls.incrementAndGet()
+                inputCloseFailure?.let { throw it }
+                super.close()
+            }
+        }
+        private val error = object : ByteArrayInputStream(ByteArray(0)) {
+            override fun close() {
+                errorCloseCalls.incrementAndGet()
+                super.close()
+            }
+        }
+        private val output = object : ByteArrayOutputStream() {
+            override fun close() {
+                outputCloseCalls.incrementAndGet()
+                super.close()
+            }
+        }
 
         override fun getOutputStream(): OutputStream = output
 

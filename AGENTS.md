@@ -14,12 +14,11 @@ Launcher와 Gradle project의 표시 이름은 `DPULayerTest`이고 canonical re
 `https://github.com/sinpie/dpu-layer-lab`이다. 제품 호환성 계약인 package
 `com.example.dpulayerlab`, automation component/action, `dpu-layer-lab-` report
 prefix, Soong module/APK 이름 `DpuLayerLab`은 별도 migration 요구 없이 바꾸지 않는다.
-현재 미배포 source candidate는 `20260725_095708`(`versionCode 5`), debug version은
-`20260725_095708-debug`이다. 최신 공개 release는
-`20260725_090252`(`versionCode 4`), tag는 `v20260725_090252`이다.
-`yyyyMMdd_HHmmss`는 KST build 시각이다. 공개 Release asset은
-`DPULayerTest-20260725_090252-debug.apk`,
-`DPULayerTest-20260725_090252-release-unsigned.apk`, `SHA256SUMS.txt` 이름을 사용한다.
+현재 release version은 `20260725_170750`(`versionCode 6`), debug version은
+`20260725_170750-debug`이며 tag는 `v20260725_170750`이다.
+`yyyyMMdd_HHmmss`는 KST build 시각이다. Release asset은
+`DPULayerTest-20260725_170750-debug.apk`,
+`DPULayerTest-20260725_170750-release-unsigned.apk`, `SHA256SUMS.txt` 이름을 사용한다.
 
 ## 기본 작업 규칙
 
@@ -132,9 +131,25 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   lambda, boxed timestamp 또는 불필요한 객체 할당을 추가하지 않는다.
 - CPU/memory 부하는 fixed-period bounded worker와 재사용 buffer를 유지한다. NPU/vendor
   control은 bounded latest-wins로 처리하며 오래된 setpoint backlog를 만들지 않는다.
+- Low-memory working-set drop은 NPU zero publication보다 먼저 pin 해제/drop generation/
+  prewarm 취소를 commit하고 worker를 깨운다. NPU adapter가 예외를 던져도 이 memory
+  release를 되돌리거나 생략하지 않는다. Reflection NPU waveform과 ordered zero는 같은
+  versioned single-slot lane을 사용하며 새 desired ticket 뒤의 오래된 positive waveform을
+  적용하지 않는다.
 - 양의 NPU setpoint도 latest command ticket과 acknowledgment가 일치한 뒤에만 적용
   완료로 본다. Active phase 동안 backend health를 확인하고 apply timeout/거부/health
   상실은 `NPU_WORKLOAD_APPLY_FAILED`로 fail-closed한다.
+- Pulse/triangle 등 cyclic transition의 NPU 양수→0 valley와 0→양수 re-attack은 각각
+  semantic edge다. Matching latest-command zero/positive ticket의 bounded acknowledgment와
+  backend health를 확인하기 전에는 해당 transition coverage를 인정하지 않는다. Zero
+  edge에서 이전 positive acknowledgment를 지우며, 같은 부호 안의 중간 checkpoint만
+  backlog 없는 latest-wins로 유지한다. Semantic apply는 동일 setpoint라도 CPU/memory
+  profile restart와 독립된 fresh NPU ticket을 발행해 adapter-level ordered release가
+  supersede한 request를 재사용하지 않는다. `TRIANGLE_WAVE`는 zero-origin이면 full-cycle,
+  zero-target이면 half-cycle zero 경계를 jitter로 건너뛰어도 NPU-only exact zero를 먼저
+  확인하고 positive re-attack을 새 ticket으로 확인한다. Phase 종료가 해당 zero 경계이면
+  positive 상태로 끝내지 않고 terminal zero ACK를 확인하며, 여러 zero 경계를 건너뛴
+  경우 backlog를 replay하지 않고 `INCONCLUSIVE`로 끝낸다.
 - Memory workload는 measured baseline 전에 bounded working-set allocation/page-touch
   prewarm과 worker acknowledgment를 완료한다. Prewarm byte는 generated traffic에서
   제외하고 완료 뒤 counter를 reset하며, allocation/timeout/cancel/ack 실패를 저부하
@@ -192,6 +207,14 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   실행 loop는 absolute-deadline fixed period로 늦은 tick을 busy catch-up하지 않는다.
   Runtime coverage가 ramp 중간값, staircase 전 level, pulse ON/OFF, triangle 상승/하강,
   soak attack/hold/recovery를 관측하지 못하면 `INCONCLUSIVE`다.
+- Whole-phase `LINEAR_RAMP`는 nominal deadline에서 exact target을 새
+  `producerControlRevision`으로 한 번 게시하고 committed physical producer 전부의 같은
+  revision frame을 bounded hold 안에 확인해야 한다. Topology recovery가 끼면 기존
+  endpoint evidence를 폐기하고 fresh first buffer 뒤 더 큰 revision으로 재게시한다.
+  Revision mismatch/timeout은 `INCONCLUSIVE`이며, endpoint 증명 hold에서 생긴 frame은
+  endpoint 적용 전 한 번 샘플한 동일 publication boundary에서 actual/expected를 함께
+  seal해 producer fidelity를 부풀리지 않는다. 늦은 control tick도 두 경계를 다르게
+  자르지 않으며 이후 proof frame은 fidelity window에 포함하지 않는다.
 - `LayerSizeProfile`은 source buffer가 아닌 destination transform/crop 계약이다.
   `FULL_SCREEN`이 기본이고 small/mixed/dynamic profile도 physical producer의 full
   source allocation과 conservative full-buffer traffic budget을 줄이지 않는다.
@@ -294,6 +317,35 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   callback은 무시한다. 시작된 Texture Canvas loop의 `Surface` wrapper와 backing
   `SurfaceTexture`는 worker의 실제 `finally`가 release하며 UI/framework hand-off
   timeout 경로에서 먼저 release하지 않는다.
+- Canvas/EGL/MediaCodec frame-commit 및 native draw 경로의 일반 실패는 producer를 먼저
+  revoke하고 runtime failure를 한 번 게시한 뒤 cleanup으로 진행한다. `ThreadDeath`와
+  `VirtualMachineError`는 모든 native cleanup을 시도한 뒤 원 오류를 다시 던지며 cleanup/
+  notification 실패로 대체하지 않는다. Producer timestamp map은 두 backing array
+  expansion이 모두 성공한 뒤 원자적으로 교체해 두 번째 allocation OOME가 기존
+  generation evidence를 손상시키지 않게 한다. Decoder output token은
+  `releaseOutputBuffer()` 전에 bounded preallocated epoch+PTS queue에 결속하고 실패 시
+  epoch+PTS+callback identity로 정확히 rollback한다. EOS는 listener를 내리고 재사용
+  callback-looper barrier를 flush 전후 bounded drain한 뒤 queue clear → overflow-safe
+  epoch 증가 → listener 재설치 순서를 사용한다. Teardown도 callback과 직렬화해 loop
+  PTS가 stale revision을 재사용하지 않게 한다.
+- Canvas/Texture/Video/GL의 physical Surface 또는 BufferQueue가 같은 generation에서
+  재생성돼도 lifecycle signal을 먼저 topology pending으로 게시하고 geometry/HWC/
+  first-buffer evidence를 지운다. 새 producer는 fresh geometry acknowledgment와 forced
+  expected-set 재게시 뒤의 first buffer만 readiness로 인정한다.
+- Renderer thread-start 실패 callback은 알림 예외와 무관하게 detach, stop/interrupt,
+  callback-looper quit/join과 owner clear를 모두 시도한다. 일반 rollback 실패도
+  `false` 성공처럼 낮추지 않으며 VM fatal 우선순위를 보존해 재전파한다. 이미 만들어진
+  child의 transaction owner slot은 child 생성 전에 bounded하게 선할당하고 registration
+  allocation gap을 허용하지 않는다. Process lifecycle owner set은 64개로 bounded
+  fail-closed이며 owner ID를 wrap해 재사용하지 않는다.
+- Frame/deferred scheduling과 expected-set callback은 renderer mutation transaction에
+  포함한다. 동기 callback 재진입은 transaction-owned suppression depth와 capture한
+  generation/callback/relay identity로 검증하며 release가 다른 transaction의 suppression
+  token을 초기화하거나 callback 뒤 stale publication bookkeeping을 commit하지 않는다.
+- 여러 producer의 control revision token 교체는 모든 replacement와 binding identity를
+  mutation 없이 준비한 뒤 stale binding이 없을 때만 commit한다. Prepare 실패는 기존
+  token을 전부 보존하고, commit 중 fatal/identity 실패는 모든 relay revoke, topology
+  pending/evidence clear와 bounded child stop/join rollback 뒤 원 fatal을 재전파한다.
 - STOP/pause는 cancellation reason 존재 여부와 관계없이 phase/target을 먼저 null로
   게시하고 local/NPU setpoint와 display request를 즉시 안전값으로 내린다. 취소된
   runJob의 NonCancellable finalizer가 소유권을 해제하기 전 새 START를 허용하지 않는다.
@@ -304,6 +356,10 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   DPU-read/producer-write traffic은 unavailable/provenance 및 pending `—P` 의미를
   숨기지 않는다. Gauge source/quality를 표시하고 provenance 변경/unavailable 경계를
   graph gap으로 유지한다.
+  `PHYSICAL` layer 값은 requested/logical `activeLayers`가 아니라 commit된 expected/
+  observed physical producer count를 사용한다. Unpublished/topology-pending/process-lease
+  동안 값과 history를 null gap(`—P`)으로 유지하고 logical count를 표시하면 별도 label로
+  구분한다.
 - Test Window의 immersive hide는 status/navigation bar가 모두 invisible이라는 Insets
   acknowledgment 전에는 producer를 시작하지 않는다. 종료 시 `show()` 요청 성공만으로
   token을 해제하지 않고 원래 bar visibility mask의 Insets acknowledgment까지
@@ -358,6 +414,16 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 
 - 숫자는 `MetricQuality`와 source를 유지한다.
 - DPU busy/exact underrun은 검증된 vendor 또는 kernel source만 사용한다.
+- Vendor broker는 product read-only config의 explicit component, permission owner,
+  owner/service signer SHA-256 trust root를 검증한 뒤에만 bind한다. Signature permission
+  grant, system/exported/enabled service와 exact service permission이 모두 맞아야 한다.
+  누락·불일치·bind permission 거부는 permanent `UNAVAILABLE`이며 implicit discovery나
+  Activity별 reconnect loop로 우회하지 않는다.
+- Built-in exact underrun kernel 후보는 DPU-scoped
+  `/sys/class/dpu/dpu0/{underrun_count,underrun_cnt}`뿐이다. Generic DRM underrun node를
+  자동 exact로 승격하지 않는다. Custom probe는 key별 sysfs namespace와 canonical
+  regular/readable attribute를 통과해야 하며 `/proc`, traversal, control/whitespace
+  path는 거부한다.
 - exact counter baseline은 warm-up 뒤에 잡고 source/quality/monotonic continuity를
   유지한다. Baseline은 fresh sample barrier로 획득하고 이전 run에서 시작된 in-flight
   sample은 새 run에 귀속하지 않는다. 양의 delta 증거는 보존하되 0-delta `CLEAN`은

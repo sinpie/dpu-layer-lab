@@ -1,11 +1,61 @@
 package com.example.dpulayerlab.monitor
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class KernelSensorProviderTest {
+    @Test
+    fun exactUnderrunDefaultsNeverUseAnUnscopedDrmDeviceCounter() {
+        assertEquals(
+            listOf(
+                "/sys/class/dpu/dpu0/underrun_count",
+                "/sys/class/dpu/dpu0/underrun_cnt",
+            ),
+            KernelSensorProvider.DEFAULT_DPU_UNDERRUN_PROBES,
+        )
+        assertFalse(
+            KernelSensorProvider.DEFAULT_DPU_UNDERRUN_PROBES.any {
+                it.startsWith("/sys/class/drm/")
+            },
+        )
+    }
+
+    @Test
+    fun customProbeConfigIsConfinedToKeySpecificSysfsNamespaces() {
+        val parsed = parseCustomProbeConfig(
+            listOf(
+                "gpu_busy_percent=/sys/class/drm/card1/device/gpu_busy_percent",
+                "bus_busy=/sys/class/devfreq/dmc/load",
+                "dpu_underrun=/sys/class/dpu/dpu0/underrun_count",
+                "gpu_frequency_index_khz=/sys/kernel/debug/ged/hal/current_freqency",
+                "gpu_busy_window=/proc/uptime",
+                "bus_busy=/sys/class/kgsl/kgsl-3d0/gpubusy",
+                "dpu_busy=/sys/devices/platform/unsafe/readable_scalar",
+                "gpu_frequency_hz=/sys/class/kgsl/../secret",
+            ),
+        )
+
+        assertEquals(
+            "/sys/class/drm/card1/device/gpu_busy_percent",
+            parsed["gpu_busy_percent"],
+        )
+        assertEquals("/sys/class/devfreq/dmc/load", parsed["bus_busy"])
+        assertEquals(
+            "/sys/class/dpu/dpu0/underrun_count",
+            parsed["dpu_underrun"],
+        )
+        assertEquals(
+            "/sys/kernel/debug/ged/hal/current_freqency",
+            parsed["gpu_frequency_index_khz"],
+        )
+        assertNull(parsed["gpu_busy_window"])
+        assertNull(parsed["dpu_busy"])
+        assertNull(parsed["gpu_frequency_hz"])
+    }
+
     @Test
     fun directBusyPercentAcceptsDecimalButNotCounterPairs() {
         assertEquals(37.5f, parseDirectUtilizationPercent("37.5 %")!!, 0.0001f)
@@ -41,6 +91,42 @@ class KernelSensorProviderTest {
         val changedSource = parseBusyPercent("150 400", "/sys/gpu-b", second.nextCounter)!!
         assertNull(changedSource.percent)
         assertEquals("/sys/gpu-b", changedSource.nextCounter?.source)
+    }
+
+    @Test
+    fun failureBeforeKernelReadDropsEveryPreviouslyPublishedCumulativeBaseline() {
+        val baselines = KernelBusyCounterBaselines().apply {
+            gpu = BusyCounterState(100L, 200L, "gpu")
+            bus = BusyCounterState(40L, 100L, "bus")
+            dpu = BusyCounterState(20L, 100L, "dpu")
+        }
+
+        // SystemMonitor observes a failed outer sample before KernelSensorProvider.sample().
+        baselines.reset()
+
+        assertNull(parseBusyPercent("150 300", "gpu", baselines.gpu)!!.percent)
+        assertNull(parseBusyPercent("60 140", "bus", baselines.bus)!!.percent)
+        assertNull(parseBusyPercent("30 140", "dpu", baselines.dpu)!!.percent)
+    }
+
+    @Test
+    fun failureAfterKernelReadDropsTheUnpublishedCumulativeAdvance() {
+        val baselines = KernelBusyCounterBaselines().apply {
+            gpu = BusyCounterState(100L, 200L, "gpu")
+            bus = BusyCounterState(40L, 100L, "bus")
+            dpu = BusyCounterState(20L, 100L, "dpu")
+        }
+
+        // The failed sample advanced private state but never published its TelemetrySnapshot.
+        baselines.gpu = parseBusyPercent("150 300", "gpu", baselines.gpu)!!.nextCounter
+        baselines.bus = parseBusyPercent("60 140", "bus", baselines.bus)!!.nextCounter
+        baselines.dpu = parseBusyPercent("30 140", "dpu", baselines.dpu)!!.nextCounter
+        baselines.reset()
+
+        // The next accepted sample is a new baseline, not an average across the invisible read.
+        assertNull(parseBusyPercent("175 350", "gpu", baselines.gpu)!!.percent)
+        assertNull(parseBusyPercent("70 160", "bus", baselines.bus)!!.percent)
+        assertNull(parseBusyPercent("35 160", "dpu", baselines.dpu)!!.percent)
     }
 
     @Test
@@ -369,10 +455,7 @@ class KernelSensorProviderTest {
                 "gpu_busy_percent" to "/sys/class/drm/card0/device/gpu_busy_percent",
                 "gpu_busy_window" to "/sys/class/kgsl/kgsl-3d0/gpubusy",
                 "gpu_busy_mtk_triplet" to "/sys/kernel/ged/hal/gpu_utilization",
-                "gpu_frequency_khz" to "/sys/vendor/gpu_clock",
                 "gpu_frequency_index_khz" to "/sys/kernel/ged/hal/current_freqency",
-                "dpu_busy" to "/proc/vendor/dpu_busy",
-                "dpu_frequency_hz" to "/sys/vendor/dpu/cur_freq",
             ),
             parsed,
         )

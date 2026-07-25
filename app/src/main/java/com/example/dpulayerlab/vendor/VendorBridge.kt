@@ -5,16 +5,19 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.content.pm.PermissionInfo
 import android.os.Binder
-import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import com.example.dpulayerlab.model.LoadShape
 import com.example.dpulayerlab.model.PixelRoute
+import java.io.File
+import java.security.MessageDigest
 import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.SynchronousQueue
 import java.util.concurrent.ThreadPoolExecutor
@@ -105,6 +108,39 @@ internal data class NpuControlCommandTicket(
     val submittedAtNanos: Long,
 )
 
+internal enum class VendorBrokerFailureCode {
+    CONFIG_MISSING,
+    CONFIG_INVALID,
+    PERMISSION_MISSING,
+    PERMISSION_NOT_SIGNATURE,
+    PERMISSION_OWNER_MISMATCH,
+    PERMISSION_NOT_GRANTED,
+    PERMISSION_OWNER_SIGNER_UNTRUSTED,
+    SERVICE_MISSING,
+    SERVICE_CONTRACT_MISMATCH,
+    SERVICE_NOT_SYSTEM,
+    SERVICE_SIGNER_UNTRUSTED,
+    DISCOVERY_FAILED,
+    BIND_PERMISSION_DENIED,
+}
+
+internal data class VendorBrokerFailure(
+    val code: VendorBrokerFailureCode,
+    val detail: String,
+    val retryable: Boolean = false,
+)
+
+internal enum class VendorBrokerBindingState {
+    CONNECTED,
+    PENDING,
+    UNAVAILABLE,
+}
+
+internal data class VendorBrokerBindingAvailability(
+    val state: VendorBrokerBindingState,
+    val failure: VendorBrokerFailure? = null,
+)
+
 class VendorBridge private constructor(
     private val context: Context,
     executorLanes: VendorExecutorLanes,
@@ -156,11 +192,20 @@ class VendorBridge private constructor(
     private val mainHandler = Handler(Looper.getMainLooper())
     private val reconnectScheduled = AtomicBoolean(false)
     private val reconnectAttempt = AtomicLong(0L)
+    private val permanentBrokerFailure = AtomicReference<VendorBrokerFailure?>(null)
     private val capabilityRetryAttempt = AtomicLong(0L)
     private val capabilityRetryRunnable = AtomicReference<Runnable?>(null)
+    private val capabilityIsolationSequence = AtomicLong(0L)
+    private val capabilityIsolationGate = VendorCapabilityIsolationGate()
+    private val activeCapabilityQuery = AtomicReference<CapabilityQuery?>(null)
+    private val deferredCapabilityRefreshScheduled = AtomicBoolean(false)
     private val reconnectRunnable = Runnable {
         reconnectScheduled.set(false)
         if (!closed.get()) connect()
+    }
+    private val deferredCapabilityRefreshRunnable = Runnable {
+        deferredCapabilityRefreshScheduled.set(false)
+        if (!closed.get()) refreshCurrentCapabilities()
     }
     /**
      * A broken product Binder implementation may ignore interruption after a client timeout.
@@ -174,6 +219,12 @@ class VendorBridge private constructor(
      * optional extension instead of accumulating stale work.
      */
     private val telemetryV2Executor = executorLanes.telemetryV2
+    /**
+     * Capability getters are product Binder code and may ignore interruption. Keep their one
+     * actual in-flight call on a no-backlog quarantine lane so a stuck getter cannot occupy the
+     * exact v1 telemetry lane or accumulate one retry per Handler tick.
+     */
+    private val capabilityExecutor = executorLanes.capability
     private val controlExecutor = executorLanes.control
     private val npuExecutor = executorLanes.npu
     /**
@@ -187,7 +238,11 @@ class VendorBridge private constructor(
             override fun onServiceConnected(name: ComponentName, binder: IBinder) {
                 // A callback proves registration even if it raced bindService() returning.
                 if (!markBindingConnected(this, generation)) {
-                    runCatching { context.unbindService(this) }
+                    try {
+                        context.unbindService(this)
+                    } catch (_: Exception) {
+                        // The stale registration may already have been removed.
+                    }
                     return
                 }
                 if (closed.get()) {
@@ -216,7 +271,12 @@ class VendorBridge private constructor(
                 val serviceGeneration = registration.second
                 unlinkDeathRecipient(previousRegistration.first, previousRegistration.second)
 
-                val linked = runCatching { binder.linkToDeath(recipient, 0) }.isSuccess
+                val linked = try {
+                    binder.linkToDeath(recipient, 0)
+                    true
+                } catch (_: Exception) {
+                    false
+                }
                 if (
                     !linked ||
                     closed.get() ||
@@ -274,35 +334,28 @@ class VendorBridge private constructor(
         }
 
     fun connect() {
-        if (closed.get()) return
+        if (closed.get() || permanentBrokerFailure.get() != null) return
         if (service != null || bound.get() || !binding.compareAndSet(false, true)) return
-        runCatching {
-            val query = Intent(ACTION_VENDOR_SERVICE)
-            val matches = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                context.packageManager.queryIntentServices(
-                    query,
-                    PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_SYSTEM_ONLY.toLong()),
-                )
-            } else {
-                @Suppress("DEPRECATION")
-                context.packageManager.queryIntentServices(query, PackageManager.MATCH_SYSTEM_ONLY)
-            }
-            val eligible = matches.mapNotNull { it.serviceInfo }
-                .filter { info ->
-                    info.exported &&
-                        info.permission == VENDOR_TELEMETRY_PERMISSION
-                }
-            // Binding to an arbitrary implementation makes telemetry and load control
-            // nondeterministic. Product integration must expose exactly one trusted broker.
-            val info = eligible.singleOrNull()
-                ?.takeIf { hasSignatureVendorPermission() }
-                ?: run {
+        val broker = when (val resolution = resolveConfiguredVendorBroker(context)) {
+            is VendorBrokerResolution.Trusted -> resolution
+            is VendorBrokerResolution.Failed -> {
                 binding.set(false)
+                if (resolution.failure.retryable) {
+                    scheduleReconnect()
+                } else {
+                    recordPermanentBrokerFailure(resolution.failure)
+                }
                 return
             }
-            val explicit = query.setComponent(ComponentName(info.packageName, info.name))
+        }
+        val explicit = Intent(ACTION_VENDOR_SERVICE).setComponent(broker.component)
+        var rollbackConnection: ServiceConnection? = null
+        var rollbackGeneration = 0L
+        try {
             val generation = bindingGeneration.incrementAndGet()
             val candidate = newServiceConnection(generation)
+            rollbackConnection = candidate
+            rollbackGeneration = generation
             val accepted = synchronized(connectionLock) {
                 if (closed.get() || service != null || bound.get()) {
                     false
@@ -320,9 +373,20 @@ class VendorBridge private constructor(
                 unbindCurrentBinding(candidate, generation)
                 return
             }
-            val registered = runCatching {
+            val registered = try {
                 context.bindService(explicit, candidate, Context.BIND_AUTO_CREATE)
-            }.getOrElse {
+            } catch (_: SecurityException) {
+                handleFailedBinding(
+                    connection = candidate,
+                    generation = generation,
+                    permanentFailure = VendorBrokerFailure(
+                        code = VendorBrokerFailureCode.BIND_PERMISSION_DENIED,
+                        detail =
+                            "Configured vendor broker rejected the declared signature permission",
+                    ),
+                )
+                return
+            } catch (_: Exception) {
                 handleFailedBinding(candidate, generation)
                 return
             }
@@ -340,13 +404,48 @@ class VendorBridge private constructor(
                 if (!stillCurrent || closed.get()) {
                     // A terminal callback or close may have detached it before bindService()
                     // returned. Balance a successful registration without reviving stale state.
-                    runCatching { context.unbindService(candidate) }
+                    try {
+                        context.unbindService(candidate)
+                    } catch (_: Exception) {
+                        // It may have been unregistered by a concurrent terminal callback.
+                    }
                     if (stillCurrent) {
                         abandonUnregisteredBinding(candidate, generation)
                     }
                 }
             }
-        }.onFailure {
+        } catch (error: Error) {
+            rollbackConnection?.let { connection ->
+                try {
+                    context.unbindService(connection)
+                } catch (cleanupFailure: Throwable) {
+                    if (
+                        cleanupFailure !is IllegalArgumentException &&
+                        cleanupFailure !== error
+                    ) {
+                        try {
+                            error.addSuppressed(cleanupFailure)
+                        } catch (_: Throwable) {
+                            // Preserve the original fatal error.
+                        }
+                    }
+                }
+                try {
+                    abandonUnregisteredBinding(connection, rollbackGeneration)
+                } catch (cleanupFailure: Throwable) {
+                    if (cleanupFailure !== error) {
+                        try {
+                            error.addSuppressed(cleanupFailure)
+                        } catch (_: Throwable) {
+                            // Preserve the original fatal error.
+                        }
+                    }
+                }
+                Unit
+            }
+            binding.set(false)
+            throw error
+        } catch (_: Exception) {
             binding.set(false)
         }
     }
@@ -371,12 +470,31 @@ class VendorBridge private constructor(
 
     fun isCapabilityDiscoveryPending(): Boolean =
         !closed.get() &&
+            permanentBrokerFailure.get() == null &&
             (
                 binding.get() ||
                     reconnectScheduled.get() ||
+                    activeCapabilityQuery.get() != null ||
+                    deferredCapabilityRefreshScheduled.get() ||
                     (bound.get() && service == null) ||
                     (service != null && (npuSupported == null || sbwcSupported == null))
                 )
+
+    internal fun brokerBindingAvailability(): VendorBrokerBindingAvailability {
+        permanentBrokerFailure.get()?.let { failure ->
+            return VendorBrokerBindingAvailability(
+                state = VendorBrokerBindingState.UNAVAILABLE,
+                failure = failure,
+            )
+        }
+        return VendorBrokerBindingAvailability(
+            state = if (isConnected()) {
+                VendorBrokerBindingState.CONNECTED
+            } else {
+                VendorBrokerBindingState.PENDING
+            },
+        )
+    }
 
     fun setNpuLoad(intensity: Float, shape: LoadShape) {
         requestNpuLoad(intensity, shape)
@@ -797,10 +915,59 @@ class VendorBridge private constructor(
      */
     internal fun awaitTelemetryQuiescent(timeoutMs: Long): Boolean =
         awaitVendorTelemetryLanesIdle(
-            executors = listOf(telemetryExecutor, telemetryV2Executor),
+            executors = listOf(
+                telemetryExecutor,
+                telemetryV2Executor,
+                capabilityExecutor,
+            ),
             timeoutMs = timeoutMs,
             maxTimeoutMs = MAX_CALIBRATION_TELEMETRY_QUIESCE_TIMEOUT_MS,
         )
+
+    /**
+     * Closes capability-query admission before the controller drains telemetry for the process
+     * one-shot HWC candidate. Work admitted just before this token is acquired is included in the
+     * subsequent quiescence barrier; all later discovery/retry requests collapse into one deferred
+     * refresh.
+     */
+    internal fun acquireCalibrationCapabilityIsolation():
+        VendorCapabilityIsolationToken? {
+        if (closed.get()) return null
+        val token = VendorCapabilityIsolationToken(
+            nextNonZeroSequence(capabilityIsolationSequence),
+        )
+        if (!capabilityIsolationGate.acquire(token)) return null
+        if (closed.get()) {
+            capabilityIsolationGate.release(token)
+            return null
+        }
+
+        val pendingRetry = capabilityRetryRunnable.getAndSet(null)
+        if (pendingRetry != null) {
+            capabilityIsolationGate.deferRefresh()
+            mainHandler.removeCallbacks(pendingRetry)
+        }
+        if (deferredCapabilityRefreshScheduled.compareAndSet(true, false)) {
+            capabilityIsolationGate.deferRefresh()
+            mainHandler.removeCallbacks(deferredCapabilityRefreshRunnable)
+        }
+        return token
+    }
+
+    /**
+     * Releases only the exact token. A deferred refresh is posted to the Handler after release, so
+     * no Binder task can be admitted while the calibration owner is still visible.
+     */
+    internal fun releaseCalibrationCapabilityIsolation(
+        token: VendorCapabilityIsolationToken,
+    ): Boolean {
+        val release = capabilityIsolationGate.release(token)
+        if (!release.released) return false
+        if (!release.refreshDeferred || closed.get()) return true
+        if (postDeferredCapabilityRefresh()) return true
+        capabilityIsolationGate.deferRefresh()
+        return false
+    }
 
     private fun endPerformanceAfterFailedCommand(
         ticket: VendorPerformanceSessionTicket,
@@ -933,10 +1100,10 @@ class VendorBridge private constructor(
             return false
         }
         if (performanceExecutor.isShutdown) return false
-        return runCatching {
+        return try {
             performanceExecutor.execute(::drainPerformanceCommands)
             true
-        }.getOrElse {
+        } catch (_: RejectedExecutionException) {
             // A rejection while the one-slot queue is occupied means a wake-up is already
             // guaranteed. The command itself was atomically replaced above, so no extra task is
             // needed and no stale command queue is created.
@@ -1281,6 +1448,13 @@ class VendorBridge private constructor(
         mainHandler.removeCallbacks(reconnectRunnable)
         reconnectScheduled.set(false)
         cancelCapabilityRetry(resetAttempt = false)
+        if (deferredCapabilityRefreshScheduled.compareAndSet(true, false)) {
+            mainHandler.removeCallbacks(deferredCapabilityRefreshRunnable)
+        }
+        activeCapabilityQuery.get()?.let { query ->
+            query.expired.set(true)
+            mainHandler.removeCallbacks(query.timeoutRunnable)
+        }
         val brokerWasConnected = service != null
         processPerformanceRestoreLatch.snapshot()?.let { ticket ->
             endPerformanceSessionInternal(
@@ -1326,6 +1500,7 @@ class VendorBridge private constructor(
         // merely slow snapshot cannot prevent shutdown reset from even starting.
         telemetryExecutor.queue.clear()
         telemetryV2Executor.queue.clear()
+        capabilityExecutor.queue.clear()
         npuExecutor.queue.clear()
         controlExecutor.queue.clear()
         npuExecutor.shutdownNow()
@@ -1337,31 +1512,46 @@ class VendorBridge private constructor(
         }
         var npuStopAcknowledged = false
         var compressionResetConfirmed = false
+        var shutdownFatal: Error? = null
         repeat(SHUTDOWN_RESET_ATTEMPTS) {
             if (npuStopAcknowledged && (!resetCompression || compressionResetConfirmed)) {
                 return@repeat
             }
-            val result = callRemote(
-                executor = controlExecutor,
-                fallback = RemoteResetResult(),
-                timeoutMs = CONTROL_TIMEOUT_MS,
-                allowClosed = true,
-            ) { remote, _ ->
-                val npuStopped = runCatching {
-                    remote.stopNpuLoad()
-                    true
-                }.getOrDefault(false)
-                val compressionReset = if (resetCompression) {
-                    runCatching {
-                        remote.setCompressionMode(COMPRESSION_LINEAR)
-                    }.getOrDefault(false)
-                } else {
-                    false
+            val result = try {
+                callRemote(
+                    executor = controlExecutor,
+                    fallback = RemoteResetResult(),
+                    timeoutMs = CONTROL_TIMEOUT_MS,
+                    allowClosed = true,
+                ) { remote, _ ->
+                    val npuStopped = remoteValueOrNull {
+                        remote.stopNpuLoad()
+                        true
+                    } ?: false
+                    val compressionReset = if (resetCompression) {
+                        remoteValueOrNull {
+                            remote.setCompressionMode(COMPRESSION_LINEAR)
+                        } ?: false
+                    } else {
+                        false
+                    }
+                    RemoteResetResult(
+                        npuStopConfirmed = npuStopped,
+                        compressionResetConfirmed = compressionReset,
+                    )
                 }
-                RemoteResetResult(
-                    npuStopConfirmed = npuStopped,
-                    compressionResetConfirmed = compressionReset,
-                )
+            } catch (error: Error) {
+                val first = shutdownFatal
+                if (first == null) {
+                    shutdownFatal = error
+                } else if (first !== error) {
+                    try {
+                        first.addSuppressed(error)
+                    } catch (_: Throwable) {
+                        // Preserve the first fatal while continuing bounded safety cleanup.
+                    }
+                }
+                RemoteResetResult()
             }
             npuStopAcknowledged = npuStopAcknowledged || result.npuStopConfirmed
             compressionResetConfirmed =
@@ -1371,11 +1561,13 @@ class VendorBridge private constructor(
         clearCurrentService()
         telemetryExecutor.shutdownNow()
         telemetryV2Executor.shutdownNow()
+        capabilityExecutor.shutdownNow()
         controlExecutor.shutdownNow()
         val auxiliaryLanesQuiesced = awaitExecutorTerminationTogether(
             executors = listOf(
                 telemetryExecutor,
                 telemetryV2Executor,
+                capabilityExecutor,
                 controlExecutor,
                 performanceExecutor,
             ),
@@ -1396,7 +1588,7 @@ class VendorBridge private constructor(
                 if (instance === this) instance = null
             }
         }
-        return VendorShutdownResult(
+        val result = VendorShutdownResult(
             brokerWasConnected = brokerWasConnected,
             // A stop response is not final if an older client set(nonzero) transaction can still
             // complete afterward on the provider Binder pool.
@@ -1404,6 +1596,8 @@ class VendorBridge private constructor(
             compressionResetConfirmed = compressionResetConfirmed,
             performanceRestoreConfirmed = performanceRestoreConfirmed,
         ).also(shutdownResult::set)
+        shutdownFatal?.let { throw it }
+        return result
     }
 
     override fun close() {
@@ -1432,17 +1626,23 @@ class VendorBridge private constructor(
     private fun scheduleNpuDrain(): Boolean {
         if (closed.get()) return false
         if (!npuDrainScheduled.compareAndSet(false, true)) return true
-        var accepted = runCatching {
+        var accepted = try {
             npuExecutor.execute(::drainNpuCommands)
-        }.isSuccess
+            true
+        } catch (_: RejectedExecutionException) {
+            false
+        }
         if (!accepted && pendingNpuCommand.get()?.intensity == 0f && !closed.get()) {
             // STOP/release-to-zero is safety-significant. Evict one stale queued NPU task and
             // reserve that slot for the latest-wins drain.
             (npuExecutor.queue.poll() as? java.util.concurrent.Future<*>)?.cancel(true)
             npuExecutor.purge()
-            accepted = runCatching {
+            accepted = try {
                 npuExecutor.execute(::drainNpuCommands)
-            }.isSuccess
+                true
+            } catch (_: RejectedExecutionException) {
+                false
+            }
         }
         if (!accepted) {
             npuDrainScheduled.set(false)
@@ -1487,7 +1687,7 @@ class VendorBridge private constructor(
                 }
                 val inFlight = npuCommandAcknowledgments.recordStarted(command.ticket)
                 val applied = try {
-                    runCatching {
+                    remoteValueOrNull {
                         if (command.intensity <= 0f) {
                             target.remote.stopNpuLoad()
                         } else {
@@ -1496,9 +1696,11 @@ class VendorBridge private constructor(
                                 command.shape.wireValue(),
                             )
                         }
-                    }.isSuccess &&
-                        isCurrentRemoteCallTarget(target, allowClosed = false)
+                        true
+                    } == true && isCurrentRemoteCallTarget(target, allowClosed = false)
                 } finally {
+                    // Error is deliberately not caught: publish terminal ticket ownership first,
+                    // then let the executor/process failure propagate to the lifecycle gate.
                     npuCommandAcknowledgments.recordFinished(inFlight)
                 }
                 if (applied) {
@@ -1555,14 +1757,6 @@ class VendorBridge private constructor(
         }
     }
 
-    @Suppress("DEPRECATION")
-    private fun hasSignatureVendorPermission(): Boolean = runCatching {
-        val permission =
-            context.packageManager.getPermissionInfo(VENDOR_TELEMETRY_PERMISSION, 0)
-        permission.protectionLevel and PermissionInfo.PROTECTION_MASK_BASE ==
-            PermissionInfo.PROTECTION_SIGNATURE
-    }.getOrDefault(false)
-
     private fun refreshCapabilities(
         remote: IDpuLabVendorService,
         connection: ServiceConnection,
@@ -1595,99 +1789,256 @@ class VendorBridge private constructor(
             )
             return
         }
-        val submitted = runCatching {
-            telemetryExecutor.execute {
-                if (closed.get()) return@execute
+        val query = CapabilityQuery(
+            remote = remote,
+            connection = connection,
+            bindingGeneration = bindingGeneration,
+            binder = binder,
+            serviceGeneration = serviceGeneration,
+            targets = queryTargets,
+            deadlineNanos = monotonicDeadlineAfter(
+                System.nanoTime(),
+                TimeUnit.MILLISECONDS.toNanos(CAPABILITY_QUERY_TIMEOUT_MS),
+            ),
+        )
+        val admitted = capabilityIsolationGate.runIfOpenOrDefer {
+            if (!activeCapabilityQuery.compareAndSet(null, query)) {
+                return@runIfOpenOrDefer false
+            }
+            var accepted = false
+            var admissionFailure: Throwable? = null
+            try {
                 if (
-                    !isCurrentService(
-                        connection = connection,
-                        bindingGeneration = bindingGeneration,
-                        binder = binder,
-                        serviceGeneration = serviceGeneration,
+                    !mainHandler.postDelayed(
+                        query.timeoutRunnable,
+                        CAPABILITY_QUERY_TIMEOUT_MS,
                     )
                 ) {
-                    return@execute
+                    return@runIfOpenOrDefer false
                 }
-                // null means the query failed or was not needed. A returned false is a verified
-                // capability result and must not be conflated with a Binder/provider exception.
-                val discoveredNpu = if (queryTargets.queryNpu) {
-                    runCatching { remote.isNpuLoadSupported }.getOrNull()
-                } else {
-                    null
-                }
-                val discoveredSbwc = if (queryTargets.querySbwc) {
-                    runCatching { remote.isSbwcControlSupported }.getOrNull()
-                } else {
-                    null
-                }
-                val merged = synchronized(connectionLock) {
-                    if (
-                        closed.get() ||
-                        !isCurrentBindingLocked(connection, bindingGeneration) ||
-                        serviceBinder !== binder ||
-                        this.serviceGeneration.get() != serviceGeneration
-                    ) {
-                        null
-                    } else {
-                        mergeCapabilityDiscovery(
-                            currentNpu = npuSupported,
-                            currentSbwc = sbwcSupported,
-                            queriedNpu = discoveredNpu,
-                            queriedSbwc = discoveredSbwc,
-                        ).also { result ->
-                            npuSupported = result.npuSupported
-                            sbwcSupported = result.sbwcSupported
-                        }
+                capabilityExecutor.execute(query)
+                accepted = true
+                true
+            } catch (error: Throwable) {
+                admissionFailure = error
+                false
+            } finally {
+                if (!accepted) {
+                    var rollbackFailure: Throwable? = null
+                    try {
+                        mainHandler.removeCallbacks(query.timeoutRunnable)
+                    } catch (error: Throwable) {
+                        rollbackFailure = error
+                    } finally {
+                        activeCapabilityQuery.compareAndSet(query, null)
                     }
-                } ?: return@execute
-                if (merged.npuBecameKnown) {
-                    if (merged.npuSupported == true) {
-                        replayDesiredNpuCommand()
-                        scheduleNpuDrain()
-                    } else {
-                        pendingNpuCommand.set(null)
-                        val desired = desiredNpuCommand.get()
-                        if (desired.intensity > 0f) {
-                            npuCommandAcknowledgments.recordFailed(
-                                desired.ticket,
-                                "Vendor service reported NPU workload control unsupported",
+                    fatalCapabilityAdmissionFailure(
+                        admissionFailure = admissionFailure,
+                        rollbackFailure = rollbackFailure,
+                    )?.let { throw it }
+                }
+            }
+        }
+        if (!admitted) {
+            recoverDeferredCapabilityRefreshAfterAdmissionFailure(
+                gate = capabilityIsolationGate,
+                activeQueryPresent = activeCapabilityQuery.get() != null,
+                scheduleRetry = {
+                    postDeferredCapabilityRefresh(
+                        delayMs = CAPABILITY_LANE_HANDOFF_RETRY_DELAY_MS,
+                    )
+                },
+            )
+        }
+    }
+
+    private fun executeCapabilityQuery(query: CapabilityQuery) {
+        var fatal: Throwable? = null
+        val outcome = try {
+            if (
+                closed.get() ||
+                !isCurrentService(
+                    connection = query.connection,
+                    bindingGeneration = query.bindingGeneration,
+                    binder = query.binder,
+                    serviceGeneration = query.serviceGeneration,
+                )
+            ) {
+                null
+            } else {
+                queryCapabilitiesBeforeDeadline(
+                    queryNpu = query.targets.queryNpu,
+                    querySbwc = query.targets.querySbwc,
+                    deadlineNanos = query.deadlineNanos,
+                    isExpired = {
+                        query.expired.get() ||
+                            closed.get() ||
+                            !isCurrentService(
+                                connection = query.connection,
+                                bindingGeneration = query.bindingGeneration,
+                                binder = query.binder,
+                                serviceGeneration = query.serviceGeneration,
                             )
-                        }
-                    }
-                }
-                if (merged.complete) {
+                    },
+                    readNpu = { query.remote.isNpuLoadSupported },
+                    readSbwc = { query.remote.isSbwcControlSupported },
+                )
+            }
+        } catch (error: Throwable) {
+            fatal = error
+            null
+        }
+        try {
+            completeCapabilityQuery(query, outcome)
+        } finally {
+            fatal?.let { throw it }
+        }
+    }
+
+    private fun completeCapabilityQuery(
+        query: CapabilityQuery,
+        outcome: CapabilityQueryOutcome?,
+    ) {
+        mainHandler.removeCallbacks(query.timeoutRunnable)
+        if (!activeCapabilityQuery.compareAndSet(query, null)) return
+
+        var retryOriginalRegistration = false
+        if (
+            outcome != null &&
+            outcome.completedWithinDeadline &&
+            !query.expired.get()
+        ) {
+            var merged: CapabilityDiscoveryMerge? = null
+            val applied = capabilityIsolationGate.runIfOpenOrDefer {
+                merged = publishCapabilityDiscovery(query, outcome)
+                merged != null
+            }
+            if (applied) {
+                val accepted = checkNotNull(merged)
+                if (accepted.complete) {
                     // A Binder connection is not considered healthy until both capability
                     // queries have produced verified true/false results. Resetting on the raw
                     // connection callback would turn a permanently broken broker into a tight
                     // 250 ms reconnect loop.
                     reconnectAttempt.set(0L)
                     cancelCapabilityRetryForService(
-                        connection = connection,
-                        bindingGeneration = bindingGeneration,
-                        binder = binder,
-                        serviceGeneration = serviceGeneration,
+                        connection = query.connection,
+                        bindingGeneration = query.bindingGeneration,
+                        binder = query.binder,
+                        serviceGeneration = query.serviceGeneration,
                         resetAttempt = true,
                     )
                 } else {
-                    scheduleCapabilityRetry(
-                        remote = remote,
-                        connection = connection,
-                        bindingGeneration = bindingGeneration,
-                        binder = binder,
-                        serviceGeneration = serviceGeneration,
+                    retryOriginalRegistration = true
+                }
+            }
+        } else if (
+            !closed.get() &&
+            isCurrentService(
+                connection = query.connection,
+                bindingGeneration = query.bindingGeneration,
+                binder = query.binder,
+                serviceGeneration = query.serviceGeneration,
+            )
+        ) {
+            // The result deadline bounds acceptance, not the provider's process. The no-backlog
+            // lane remains quarantined until this exact Binder call really returns, and only then
+            // may one retry be scheduled.
+            retryOriginalRegistration = true
+        } else {
+            capabilityIsolationGate.deferRefresh()
+        }
+
+        if (capabilityIsolationGate.consumeDeferredRefreshIfOpen()) {
+            if (!postDeferredCapabilityRefresh()) {
+                capabilityIsolationGate.deferRefresh()
+            }
+        } else if (retryOriginalRegistration) {
+            scheduleCapabilityRetry(
+                remote = query.remote,
+                connection = query.connection,
+                bindingGeneration = query.bindingGeneration,
+                binder = query.binder,
+                serviceGeneration = query.serviceGeneration,
+            )
+        }
+    }
+
+    private fun publishCapabilityDiscovery(
+        query: CapabilityQuery,
+        outcome: CapabilityQueryOutcome,
+    ): CapabilityDiscoveryMerge? {
+        val merged = synchronized(connectionLock) {
+            if (
+                closed.get() ||
+                !isCurrentBindingLocked(query.connection, query.bindingGeneration) ||
+                serviceBinder !== query.binder ||
+                serviceGeneration.get() != query.serviceGeneration
+            ) {
+                null
+            } else {
+                mergeCapabilityDiscovery(
+                    currentNpu = npuSupported,
+                    currentSbwc = sbwcSupported,
+                    queriedNpu = outcome.npuSupported,
+                    queriedSbwc = outcome.sbwcSupported,
+                ).also { result ->
+                    npuSupported = result.npuSupported
+                    sbwcSupported = result.sbwcSupported
+                }
+            }
+        } ?: return null
+        if (merged.npuBecameKnown) {
+            if (merged.npuSupported == true) {
+                replayDesiredNpuCommand()
+                scheduleNpuDrain()
+            } else {
+                pendingNpuCommand.set(null)
+                val desired = desiredNpuCommand.get()
+                if (desired.intensity > 0f) {
+                    npuCommandAcknowledgments.recordFailed(
+                        desired.ticket,
+                        "Vendor service reported NPU workload control unsupported",
                     )
                 }
             }
-        }.isSuccess
-        if (!submitted) {
-            scheduleCapabilityRetry(
+        }
+        return merged
+    }
+
+    private fun refreshCurrentCapabilities() {
+        val target = synchronized(connectionLock) {
+            val remote = service ?: return
+            val connection = activeConnection ?: return
+            val binder = serviceBinder ?: return
+            CapabilityRefreshTarget(
                 remote = remote,
                 connection = connection,
-                bindingGeneration = bindingGeneration,
+                bindingGeneration = activeBindingGeneration,
                 binder = binder,
-                serviceGeneration = serviceGeneration,
+                serviceGeneration = serviceGeneration.get(),
             )
         }
+        refreshCapabilities(
+            remote = target.remote,
+            connection = target.connection,
+            bindingGeneration = target.bindingGeneration,
+            binder = target.binder,
+            serviceGeneration = target.serviceGeneration,
+        )
+    }
+
+    private fun postDeferredCapabilityRefresh(delayMs: Long = 0L): Boolean {
+        if (closed.get()) return false
+        if (!deferredCapabilityRefreshScheduled.compareAndSet(false, true)) return true
+        val posted = if (delayMs <= 0L) {
+            mainHandler.post(deferredCapabilityRefreshRunnable)
+        } else {
+            mainHandler.postDelayed(deferredCapabilityRefreshRunnable, delayMs)
+        }
+        if (posted) return true
+        deferredCapabilityRefreshScheduled.set(false)
+        return false
     }
 
     private fun handleTerminalBindingLoss(
@@ -1725,7 +2076,11 @@ class VendorBridge private constructor(
         cleanup.capabilityRetry?.let(mainHandler::removeCallbacks)
         if (cleanup.shouldUnbind) {
             cleanup.connection?.let { connection ->
-                runCatching { context.unbindService(connection) }
+                try {
+                    context.unbindService(connection)
+                } catch (_: Exception) {
+                    // A terminal framework callback may already have removed the registration.
+                }
             }
         }
         val desired = desiredNpuCommand.get()
@@ -1792,6 +2147,7 @@ class VendorBridge private constructor(
     private fun handleFailedBinding(
         connection: ServiceConnection,
         generation: Long,
+        permanentFailure: VendorBrokerFailure? = null,
     ) {
         val detachedCurrent = abandonUnregisteredBinding(connection, generation)
         if (detachedCurrent) {
@@ -1803,7 +2159,15 @@ class VendorBridge private constructor(
                 )
             }
         }
-        if (shouldScheduleReconnectAfterBindFailure(detachedCurrent, closed.get())) {
+        if (permanentFailure != null) {
+            recordPermanentBrokerFailure(permanentFailure)
+        } else if (
+            shouldScheduleReconnectAfterBindFailure(
+                detachedCurrentBinding = detachedCurrent,
+                closed = closed.get(),
+                permanentFailure = permanentBrokerFailure.get(),
+            )
+        ) {
             scheduleReconnect()
         }
     }
@@ -1829,7 +2193,11 @@ class VendorBridge private constructor(
         recipient: IBinder.DeathRecipient?,
     ) {
         if (binder != null && recipient != null) {
-            runCatching { binder.unlinkToDeath(recipient, 0) }
+            try {
+                binder.unlinkToDeath(recipient, 0)
+            } catch (_: Exception) {
+                // A dead or already-unlinked registration needs no further action.
+            }
         }
     }
 
@@ -1856,17 +2224,36 @@ class VendorBridge private constructor(
         }
         if (shouldUnbind) {
             connectionToUnbind?.let { connection ->
-                runCatching { context.unbindService(connection) }
+                try {
+                    context.unbindService(connection)
+                } catch (_: Exception) {
+                    // A concurrent framework terminal callback may have unregistered it.
+                }
             }
         }
     }
 
     private fun scheduleReconnect() {
-        if (closed.get() || !reconnectScheduled.compareAndSet(false, true)) return
+        if (
+            closed.get() ||
+            permanentBrokerFailure.get() != null ||
+            !reconnectScheduled.compareAndSet(false, true)
+        ) {
+            return
+        }
         val delayMs = reconnectDelayMs(reconnectAttempt.getAndIncrement())
         if (!mainHandler.postDelayed(reconnectRunnable, delayMs)) {
             reconnectScheduled.set(false)
         }
+    }
+
+    private fun recordPermanentBrokerFailure(failure: VendorBrokerFailure) {
+        if (failure.retryable) return
+        permanentBrokerFailure.compareAndSet(null, failure)
+        if (reconnectScheduled.compareAndSet(true, false)) {
+            mainHandler.removeCallbacks(reconnectRunnable)
+        }
+        binding.set(false)
     }
 
     private fun scheduleCapabilityRetry(
@@ -1882,54 +2269,59 @@ class VendorBridge private constructor(
         ) {
             return
         }
-        val retry = object : Runnable {
-            override fun run() {
-                if (!capabilityRetryRunnable.compareAndSet(this, null)) return
-                if (
-                    closed.get() ||
-                    !isCurrentService(
+        capabilityIsolationGate.runIfOpenOrDefer schedule@{
+            if (
+                closed.get() ||
+                !isCurrentService(connection, bindingGeneration, binder, serviceGeneration)
+            ) {
+                return@schedule true
+            }
+            val retry = object : Runnable {
+                override fun run() {
+                    if (!capabilityRetryRunnable.compareAndSet(this, null)) return
+                    if (
+                        closed.get() ||
+                        !isCurrentService(
+                            connection = connection,
+                            bindingGeneration = bindingGeneration,
+                            binder = binder,
+                            serviceGeneration = serviceGeneration,
+                        )
+                    ) {
+                        return
+                    }
+                    refreshCapabilities(
+                        remote = remote,
                         connection = connection,
                         bindingGeneration = bindingGeneration,
                         binder = binder,
                         serviceGeneration = serviceGeneration,
                     )
-                ) {
-                    return
                 }
-                refreshCapabilities(
-                    remote = remote,
-                    connection = connection,
-                    bindingGeneration = bindingGeneration,
-                    binder = binder,
-                    serviceGeneration = serviceGeneration,
-                )
             }
-        }
-        if (!capabilityRetryRunnable.compareAndSet(null, retry)) return
-        val attempt = capabilityRetryAttempt.getAndIncrement()
-        if (!shouldScheduleCapabilityRetry(attempt)) {
-            // Keep one low-rate recovery probe instead of leaving capability discovery permanently
-            // pending with no runnable. Do not recycle a live registration here: an NPU workload
-            // may be pinned to it while the unrelated SBWC query is temporarily failing.
-            capabilityRetryAttempt.set(MAX_CAPABILITY_RETRY_ATTEMPTS)
+            if (!capabilityRetryRunnable.compareAndSet(null, retry)) {
+                return@schedule true
+            }
+            val attempt = capabilityRetryAttempt.getAndIncrement()
+            val delayMs = if (shouldScheduleCapabilityRetry(attempt)) {
+                capabilityRetryDelayMs(attempt)
+            } else {
+                // Keep one low-rate recovery probe instead of leaving capability discovery
+                // permanently pending with no runnable. Do not recycle a live registration here:
+                // an NPU workload may be pinned to it while unrelated SBWC discovery is failing.
+                capabilityRetryAttempt.set(MAX_CAPABILITY_RETRY_ATTEMPTS)
+                STEADY_CAPABILITY_RETRY_DELAY_MS
+            }
             if (
                 closed.get() ||
-                !isCurrentService(connection, bindingGeneration, binder, serviceGeneration) ||
-                !mainHandler.postDelayed(retry, STEADY_CAPABILITY_RETRY_DELAY_MS)
+                !isCurrentService(connection, bindingGeneration, binder, serviceGeneration)
             ) {
                 capabilityRetryRunnable.compareAndSet(retry, null)
+                return@schedule true
             }
-            return
-        }
-        if (
-            closed.get() ||
-            !isCurrentService(connection, bindingGeneration, binder, serviceGeneration)
-        ) {
-            capabilityRetryRunnable.compareAndSet(retry, null)
-            return
-        }
-        if (!mainHandler.postDelayed(retry, capabilityRetryDelayMs(attempt))) {
-            capabilityRetryRunnable.compareAndSet(retry, null)
+            val posted = mainHandler.postDelayed(retry, delayMs)
+            if (!posted) capabilityRetryRunnable.compareAndSet(retry, null)
+            posted
         }
     }
 
@@ -2035,7 +2427,7 @@ class VendorBridge private constructor(
         ) {
             return fallback
         }
-        val future = runCatching {
+        val future = try {
             executor.submit<T> {
                 val result = block(target.remote, target.serviceSession)
                 check(isCurrentRemoteCallTarget(target, allowClosed)) {
@@ -2043,22 +2435,55 @@ class VendorBridge private constructor(
                 }
                 result
             }
-        }.getOrNull()
-            ?: return fallback
+        } catch (_: RejectedExecutionException) {
+            return fallback
+        }
         return try {
             future.get(timeoutMs, TimeUnit.MILLISECONDS)
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
-            future.cancel(true)
-            (future as? Runnable)?.let(executor::remove)
-            executor.purge()
+            cleanupRemoteFuture(future, executor)
+            fallback
+        } catch (execution: ExecutionException) {
+            fatalRemoteExecutionCause(execution)?.let { fatal ->
+                rethrowRemoteFatal(fatal, future, executor)
+            }
+            cleanupRemoteFuture(future, executor)
             fallback
         } catch (_: Exception) {
-            future.cancel(true)
-            (future as? Runnable)?.let(executor::remove)
-            executor.purge()
+            cleanupRemoteFuture(future, executor)
             fallback
+        } catch (error: Error) {
+            rethrowRemoteFatal(error, future, executor)
         }
+    }
+
+    private fun cleanupRemoteFuture(
+        future: java.util.concurrent.Future<*>,
+        executor: ThreadPoolExecutor,
+    ) {
+        future.cancel(true)
+        (future as? Runnable)?.let(executor::remove)
+        executor.purge()
+    }
+
+    private fun rethrowRemoteFatal(
+        fatal: Error,
+        future: java.util.concurrent.Future<*>,
+        executor: ThreadPoolExecutor,
+    ): Nothing {
+        try {
+            cleanupRemoteFuture(future, executor)
+        } catch (cleanupFailure: Throwable) {
+            if (cleanupFailure !== fatal) {
+                try {
+                    fatal.addSuppressed(cleanupFailure)
+                } catch (_: Throwable) {
+                    // Preserve the original fatal error even if suppression itself cannot allocate.
+                }
+            }
+        }
+        throw fatal
     }
 
     private fun isCurrentRemoteCallTarget(
@@ -2098,6 +2523,7 @@ class VendorBridge private constructor(
                 shutdownResult.get() != null &&
                 telemetryExecutor.isTerminated &&
                 telemetryV2Executor.isTerminated &&
+                capabilityExecutor.isTerminated &&
                 controlExecutor.isTerminated &&
                 npuExecutor.isTerminated &&
                 performanceExecutor.isTerminated &&
@@ -2140,6 +2566,8 @@ class VendorBridge private constructor(
         const val MAX_NPU_APPLY_ACK_TIMEOUT_MS = 1_000L
         const val MAX_NPU_PENDING_TIMEOUT_MS = 2_000L
         const val REMOTE_LANE_QUIESCE_TIMEOUT_MS = 200L
+        const val CAPABILITY_QUERY_TIMEOUT_MS = 700L
+        const val CAPABILITY_LANE_HANDOFF_RETRY_DELAY_MS = 25L
         const val INITIAL_RECONNECT_DELAY_MS = 250L
         const val MAX_RECONNECT_DELAY_MS = 4_000L
         const val MAX_CAPABILITY_RETRY_ATTEMPTS = 4L
@@ -2180,6 +2608,8 @@ class VendorBridge private constructor(
                         newRemoteExecutor("DpuLab-VendorTelemetry")
                     VendorExecutorLane.TELEMETRY_V2 ->
                         newNoBacklogRemoteExecutor("DpuLab-VendorTelemetryV2")
+                    VendorExecutorLane.CAPABILITY ->
+                        newNoBacklogRemoteExecutor("DpuLab-VendorCapability")
                     VendorExecutorLane.CONTROL ->
                         newRemoteExecutor("DpuLab-VendorControl")
                     VendorExecutorLane.NPU ->
@@ -2289,6 +2719,33 @@ class VendorBridge private constructor(
         val querySbwc: Boolean,
     )
 
+    private data class CapabilityRefreshTarget(
+        val remote: IDpuLabVendorService,
+        val connection: ServiceConnection,
+        val bindingGeneration: Long,
+        val binder: IBinder,
+        val serviceGeneration: Long,
+    )
+
+    private inner class CapabilityQuery(
+        val remote: IDpuLabVendorService,
+        val connection: ServiceConnection,
+        val bindingGeneration: Long,
+        val binder: IBinder,
+        val serviceGeneration: Long,
+        val targets: CapabilityQueryTargets,
+        val deadlineNanos: Long,
+    ) : Runnable {
+        val expired = AtomicBoolean(false)
+        val timeoutRunnable = Runnable {
+            if (activeCapabilityQuery.get() === this) expired.set(true)
+        }
+
+        override fun run() {
+            executeCapabilityQuery(this)
+        }
+    }
+
     private data class TerminalBindingCleanup(
         val binder: IBinder?,
         val deathRecipient: IBinder.DeathRecipient?,
@@ -2298,14 +2755,588 @@ class VendorBridge private constructor(
     )
 }
 
+internal data class VendorBrokerConfiguration(
+    val servicePackage: String,
+    val serviceClass: String,
+    val permissionOwnerPackage: String,
+    val permissionOwnerSignerSha256: Set<String>,
+    val serviceSignerSha256: Set<String>,
+) {
+    val component: ComponentName
+        get() = ComponentName(servicePackage, serviceClass)
+}
+
+internal data class VendorSignerEvidence(
+    val currentSignerSha256: Set<String>,
+    val signingHistorySha256: Set<String>,
+    val multipleSigners: Boolean,
+)
+
+internal data class VendorBrokerTrustEvidence(
+    val permissionPresent: Boolean,
+    val permissionProtectionLevel: Int,
+    val permissionOwnerPackage: String?,
+    val selfPermissionGranted: Boolean,
+    val permissionOwnerSigners: VendorSignerEvidence?,
+    val servicePresent: Boolean,
+    val servicePackage: String?,
+    val serviceClass: String?,
+    val serviceExported: Boolean,
+    val serviceEnabled: Boolean,
+    val servicePermission: String?,
+    val serviceIsSystem: Boolean,
+    val serviceSigners: VendorSignerEvidence?,
+)
+
+internal sealed interface VendorBrokerResolution {
+    data class Trusted(
+        val component: ComponentName,
+    ) : VendorBrokerResolution
+
+    data class Failed(
+        val failure: VendorBrokerFailure,
+    ) : VendorBrokerResolution
+}
+
+internal fun parseVendorBrokerConfiguration(
+    lines: List<String>,
+): VendorBrokerConfiguration? {
+    if (
+        lines.size > MAX_VENDOR_BROKER_CONFIG_LINES ||
+        lines.any { it.length > MAX_VENDOR_BROKER_CONFIG_LINE_CHARS }
+    ) {
+        return null
+    }
+    val values = linkedMapOf<String, String>()
+    for (raw in lines) {
+        val line = raw.trim()
+        if (line.isEmpty() || line.startsWith("#")) continue
+        if ('=' !in line) return null
+        val (rawKey, rawValue) = line.split("=", limit = 2)
+        val key = rawKey.trim()
+        val value = rawValue.trim()
+        if (
+            key !in VENDOR_BROKER_CONFIG_KEYS ||
+            value.isEmpty() ||
+            values.put(key, value) != null
+        ) {
+            return null
+        }
+    }
+    if (values.keys != VENDOR_BROKER_CONFIG_KEYS) return null
+    val servicePackage = values.getValue("service_package")
+    val serviceClass = values.getValue("service_class")
+    val permissionOwnerPackage = values.getValue("permission_owner_package")
+    if (
+        !ANDROID_PACKAGE_NAME.matches(servicePackage) ||
+        !ANDROID_CLASS_NAME.matches(serviceClass) ||
+        !serviceClass.startsWith("$servicePackage.") ||
+        !ANDROID_PACKAGE_NAME.matches(permissionOwnerPackage)
+    ) {
+        return null
+    }
+    val permissionOwnerDigests =
+        parseSha256DigestSet(values.getValue("permission_owner_signer_sha256"))
+            ?: return null
+    val serviceDigests =
+        parseSha256DigestSet(values.getValue("service_signer_sha256"))
+            ?: return null
+    return VendorBrokerConfiguration(
+        servicePackage = servicePackage,
+        serviceClass = serviceClass,
+        permissionOwnerPackage = permissionOwnerPackage,
+        permissionOwnerSignerSha256 = permissionOwnerDigests,
+        serviceSignerSha256 = serviceDigests,
+    )
+}
+
+internal fun parseSha256DigestSet(value: String): Set<String>? {
+    val tokens = value.split(',').map(String::trim)
+    if (tokens.size !in 1..MAX_VENDOR_BROKER_TRUSTED_SIGNERS) return null
+    if (tokens.any { !SHA256_HEX.matches(it) }) return null
+    val normalized = tokens.map(String::uppercase).toSet()
+    return normalized.takeIf { it.size == tokens.size }
+}
+
+/**
+ * For a rotated single-signer package Android verifies the proof-of-rotation lineage, so any
+ * explicitly configured lineage root is sufficient. A multiple-signer package has no rotation
+ * lineage: every current signer must be explicitly trusted.
+ */
+internal fun vendorSignerEvidenceTrusted(
+    evidence: VendorSignerEvidence?,
+    trustedSha256: Set<String>,
+): Boolean {
+    evidence ?: return false
+    if (trustedSha256.isEmpty() || evidence.currentSignerSha256.isEmpty()) return false
+    return if (evidence.multipleSigners) {
+        evidence.currentSignerSha256.all(trustedSha256::contains)
+    } else {
+        evidence.signingHistorySha256.any(trustedSha256::contains)
+    }
+}
+
+@Suppress("DEPRECATION")
+internal fun evaluateVendorBrokerTrust(
+    configuration: VendorBrokerConfiguration,
+    evidence: VendorBrokerTrustEvidence,
+): VendorBrokerFailureCode? {
+    if (!evidence.permissionPresent) return VendorBrokerFailureCode.PERMISSION_MISSING
+    if (
+        evidence.permissionProtectionLevel and PermissionInfo.PROTECTION_MASK_BASE !=
+        PermissionInfo.PROTECTION_SIGNATURE
+    ) {
+        return VendorBrokerFailureCode.PERMISSION_NOT_SIGNATURE
+    }
+    if (evidence.permissionOwnerPackage != configuration.permissionOwnerPackage) {
+        return VendorBrokerFailureCode.PERMISSION_OWNER_MISMATCH
+    }
+    if (!evidence.selfPermissionGranted) return VendorBrokerFailureCode.PERMISSION_NOT_GRANTED
+    if (
+        !vendorSignerEvidenceTrusted(
+            evidence.permissionOwnerSigners,
+            configuration.permissionOwnerSignerSha256,
+        )
+    ) {
+        return VendorBrokerFailureCode.PERMISSION_OWNER_SIGNER_UNTRUSTED
+    }
+    if (!evidence.servicePresent) return VendorBrokerFailureCode.SERVICE_MISSING
+    if (
+        evidence.servicePackage != configuration.servicePackage ||
+        evidence.serviceClass != configuration.serviceClass ||
+        !evidence.serviceExported ||
+        !evidence.serviceEnabled ||
+        evidence.servicePermission != VendorBridge.VENDOR_TELEMETRY_PERMISSION
+    ) {
+        return VendorBrokerFailureCode.SERVICE_CONTRACT_MISMATCH
+    }
+    if (!evidence.serviceIsSystem) return VendorBrokerFailureCode.SERVICE_NOT_SYSTEM
+    if (
+        !vendorSignerEvidenceTrusted(
+            evidence.serviceSigners,
+            configuration.serviceSignerSha256,
+        )
+    ) {
+        return VendorBrokerFailureCode.SERVICE_SIGNER_UNTRUSTED
+    }
+    return null
+}
+
+@Suppress("DEPRECATION")
+private fun resolveConfiguredVendorBroker(context: Context): VendorBrokerResolution {
+    val configuration = when (val loaded = loadVendorBrokerConfiguration()) {
+        is VendorBrokerConfigurationLoad.Loaded -> loaded.configuration
+        is VendorBrokerConfigurationLoad.Failed -> {
+            return VendorBrokerResolution.Failed(loaded.failure)
+        }
+    }
+    val packageManager = context.packageManager
+    return try {
+        val permissionInfo = try {
+            @Suppress("DEPRECATION")
+            packageManager.getPermissionInfo(VendorBridge.VENDOR_TELEMETRY_PERMISSION, 0)
+        } catch (_: PackageManager.NameNotFoundException) {
+            null
+        }
+        val component = configuration.component
+        val serviceInfo = try {
+            @Suppress("DEPRECATION")
+            packageManager.getServiceInfo(component, 0)
+        } catch (_: PackageManager.NameNotFoundException) {
+            null
+        }
+        val permissionOwnerSigners = permissionInfo?.packageName?.let { packageName ->
+            readPackageSignerEvidence(packageManager, packageName)
+        }
+        val serviceSigners = serviceInfo?.packageName?.let { packageName ->
+            readPackageSignerEvidence(packageManager, packageName)
+        }
+        val appInfo = serviceInfo?.applicationInfo
+        val serviceIsSystem = appInfo?.let {
+            it.flags and (
+                ApplicationInfo.FLAG_SYSTEM or ApplicationInfo.FLAG_UPDATED_SYSTEM_APP
+                ) != 0
+        } == true
+        val evidence = VendorBrokerTrustEvidence(
+            permissionPresent = permissionInfo != null,
+            permissionProtectionLevel = permissionInfo?.protectionLevel ?: 0,
+            permissionOwnerPackage = permissionInfo?.packageName,
+            selfPermissionGranted =
+                context.checkSelfPermission(VendorBridge.VENDOR_TELEMETRY_PERMISSION) ==
+                PackageManager.PERMISSION_GRANTED,
+            permissionOwnerSigners = permissionOwnerSigners,
+            servicePresent = serviceInfo != null,
+            servicePackage = serviceInfo?.packageName,
+            serviceClass = serviceInfo?.name,
+            serviceExported = serviceInfo?.exported == true,
+            serviceEnabled = serviceInfo?.enabled == true && appInfo?.enabled == true,
+            servicePermission = serviceInfo?.permission,
+            serviceIsSystem = serviceIsSystem,
+            serviceSigners = serviceSigners,
+        )
+        val failureCode = evaluateVendorBrokerTrust(configuration, evidence)
+        if (failureCode == null) {
+            VendorBrokerResolution.Trusted(component)
+        } else {
+            VendorBrokerResolution.Failed(
+                VendorBrokerFailure(
+                    code = failureCode,
+                    detail = vendorBrokerFailureDetail(failureCode),
+                ),
+            )
+        }
+    } catch (_: SecurityException) {
+        VendorBrokerResolution.Failed(
+            VendorBrokerFailure(
+                code = VendorBrokerFailureCode.PERMISSION_NOT_GRANTED,
+                detail = "PackageManager denied vendor broker trust inspection",
+            ),
+        )
+    } catch (error: Exception) {
+        VendorBrokerResolution.Failed(
+            VendorBrokerFailure(
+                code = VendorBrokerFailureCode.DISCOVERY_FAILED,
+                detail = "Vendor broker trust inspection failed: ${error.javaClass.simpleName}",
+                retryable = true,
+            ),
+        )
+    }
+}
+
+private sealed interface VendorBrokerConfigurationLoad {
+    data class Loaded(
+        val configuration: VendorBrokerConfiguration,
+    ) : VendorBrokerConfigurationLoad
+
+    data class Failed(
+        val failure: VendorBrokerFailure,
+    ) : VendorBrokerConfigurationLoad
+}
+
+private fun loadVendorBrokerConfiguration(): VendorBrokerConfigurationLoad {
+    val file = File(PRODUCT_VENDOR_BROKER_CONFIG_PATH)
+    if (!file.exists()) {
+        return VendorBrokerConfigurationLoad.Failed(
+            VendorBrokerFailure(
+                code = VendorBrokerFailureCode.CONFIG_MISSING,
+                detail = "$PRODUCT_VENDOR_BROKER_CONFIG_PATH is not installed",
+            ),
+        )
+    }
+    return try {
+        val canonical = file.canonicalFile
+        val acceptedCanonicalRoots = listOf(
+            "/product/etc/dpulayerlab/",
+            "/system/product/etc/dpulayerlab/",
+        )
+        if (
+            acceptedCanonicalRoots.none { canonical.path.startsWith(it) } ||
+            !canonical.isFile ||
+            !canonical.canRead() ||
+            canonical.length() !in 1..MAX_VENDOR_BROKER_CONFIG_BYTES
+        ) {
+            VendorBrokerConfigurationLoad.Failed(
+                VendorBrokerFailure(
+                    code = VendorBrokerFailureCode.CONFIG_INVALID,
+                    detail = "Vendor broker config is not a bounded readable product file",
+                ),
+            )
+        } else {
+            val bytes = ByteArray(MAX_VENDOR_BROKER_CONFIG_BYTES.toInt() + 1)
+            var count = 0
+            canonical.inputStream().buffered().use { input ->
+                while (count < bytes.size) {
+                    val read = input.read(bytes, count, bytes.size - count)
+                    if (read < 0) break
+                    if (read == 0) {
+                        return VendorBrokerConfigurationLoad.Failed(
+                            VendorBrokerFailure(
+                                code = VendorBrokerFailureCode.CONFIG_INVALID,
+                                detail = "Vendor broker config read made no progress",
+                            ),
+                        )
+                    }
+                    count += read
+                }
+            }
+            val configuration = if (count <= MAX_VENDOR_BROKER_CONFIG_BYTES) {
+                parseVendorBrokerConfiguration(
+                    String(bytes, 0, count, Charsets.UTF_8).lineSequence().toList(),
+                )
+            } else {
+                null
+            }
+            configuration?.let(VendorBrokerConfigurationLoad::Loaded)
+                ?: VendorBrokerConfigurationLoad.Failed(
+                    VendorBrokerFailure(
+                        code = VendorBrokerFailureCode.CONFIG_INVALID,
+                        detail = "Vendor broker config is malformed or incomplete",
+                    ),
+                )
+        }
+    } catch (error: Exception) {
+        VendorBrokerConfigurationLoad.Failed(
+            VendorBrokerFailure(
+                code = VendorBrokerFailureCode.CONFIG_INVALID,
+                detail = "Vendor broker config cannot be verified: ${error.javaClass.simpleName}",
+            ),
+        )
+    }
+}
+
+private fun readPackageSignerEvidence(
+    packageManager: PackageManager,
+    packageName: String,
+): VendorSignerEvidence? {
+    @Suppress("DEPRECATION")
+    val packageInfo = try {
+        packageManager.getPackageInfo(packageName, PackageManager.GET_SIGNING_CERTIFICATES)
+    } catch (_: PackageManager.NameNotFoundException) {
+        return null
+    }
+    val signingInfo = packageInfo.signingInfo ?: return null
+    val current = signingInfo.apkContentsSigners
+        ?.mapTo(linkedSetOf()) { signature -> sha256Hex(signature.toByteArray()) }
+        .orEmpty()
+    if (current.isEmpty()) return null
+    val multipleSigners = signingInfo.hasMultipleSigners()
+    val history = if (multipleSigners) {
+        current
+    } else {
+        signingInfo.signingCertificateHistory
+            ?.mapTo(linkedSetOf()) { signature -> sha256Hex(signature.toByteArray()) }
+            ?.takeIf(Set<String>::isNotEmpty)
+            ?: current
+    }
+    return VendorSignerEvidence(
+        currentSignerSha256 = current,
+        signingHistorySha256 = history,
+        multipleSigners = multipleSigners,
+    )
+}
+
+private fun sha256Hex(value: ByteArray): String =
+    MessageDigest.getInstance("SHA-256")
+        .digest(value)
+        .joinToString(separator = "") { byte -> "%02X".format(byte) }
+
+private fun vendorBrokerFailureDetail(code: VendorBrokerFailureCode): String = when (code) {
+    VendorBrokerFailureCode.CONFIG_MISSING -> "Vendor broker product config is missing"
+    VendorBrokerFailureCode.CONFIG_INVALID -> "Vendor broker product config is invalid"
+    VendorBrokerFailureCode.PERMISSION_MISSING -> "Vendor broker permission is not declared"
+    VendorBrokerFailureCode.PERMISSION_NOT_SIGNATURE ->
+        "Vendor broker permission is not signature protected"
+    VendorBrokerFailureCode.PERMISSION_OWNER_MISMATCH ->
+        "Vendor broker permission owner does not match product config"
+    VendorBrokerFailureCode.PERMISSION_NOT_GRANTED ->
+        "DPULayerTest does not hold the configured vendor broker permission"
+    VendorBrokerFailureCode.PERMISSION_OWNER_SIGNER_UNTRUSTED ->
+        "Vendor broker permission-owner signer is outside the configured trust root"
+    VendorBrokerFailureCode.SERVICE_MISSING -> "Configured vendor broker component is missing"
+    VendorBrokerFailureCode.SERVICE_CONTRACT_MISMATCH ->
+        "Configured vendor broker component violates the exported/permission contract"
+    VendorBrokerFailureCode.SERVICE_NOT_SYSTEM ->
+        "Configured vendor broker component is not a system package"
+    VendorBrokerFailureCode.SERVICE_SIGNER_UNTRUSTED ->
+        "Configured vendor broker signer is outside the configured trust root"
+    VendorBrokerFailureCode.DISCOVERY_FAILED -> "Vendor broker trust inspection failed"
+    VendorBrokerFailureCode.BIND_PERMISSION_DENIED ->
+        "Configured vendor broker rejected the client permission"
+}
+
 internal const val MAX_VENDOR_STATUS_CHARS = 256
 internal const val VENDOR_TELEMETRY_API_V2 = 2
 internal const val VENDOR_PERFORMANCE_API_V3 = 3
 internal const val MAX_VENDOR_FREQUENCY_HZ = 20_000_000_000L
+internal const val PRODUCT_VENDOR_BROKER_CONFIG_PATH =
+    "/product/etc/dpulayerlab/vendor_broker.conf"
 private const val MAX_VENDOR_STATUS_INSPECTION_FACTOR = 4L
 private const val VENDOR_STATUS_TRUNCATION_MARKER = "\u2026"
+private const val MAX_VENDOR_BROKER_CONFIG_BYTES = 16L * 1_024L
+private const val MAX_VENDOR_BROKER_CONFIG_LINES = 32
+private const val MAX_VENDOR_BROKER_CONFIG_LINE_CHARS = 1_024
+private const val MAX_VENDOR_BROKER_TRUSTED_SIGNERS = 8
+private val VENDOR_BROKER_CONFIG_KEYS = setOf(
+    "service_package",
+    "service_class",
+    "permission_owner_package",
+    "permission_owner_signer_sha256",
+    "service_signer_sha256",
+)
+private val ANDROID_PACKAGE_NAME =
+    Regex("""[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*""")
+private val ANDROID_CLASS_NAME =
+    Regex("""[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)+""")
+private val SHA256_HEX = Regex("""(?i)[0-9a-f]{64}""")
 private val vendorPerformanceSessionIds = AtomicLong(0L)
 private val processPerformanceRestoreLatch = VendorPerformanceRestoreLatch()
+
+internal class VendorCapabilityIsolationToken internal constructor(
+    internal val sequence: Long,
+)
+
+internal data class VendorCapabilityIsolationRelease(
+    val released: Boolean,
+    val refreshDeferred: Boolean,
+)
+
+/**
+ * Admission gate shared by direct discovery, delayed retries, and service callbacks. The action is
+ * executed while holding the same monitor used by acquire(), so a task is either submitted before
+ * the calibration token (and then drained) or deferred until after release—never between them.
+ */
+internal class VendorCapabilityIsolationGate {
+    private val lock = Any()
+    private var owner: VendorCapabilityIsolationToken? = null
+    private var refreshDeferred = false
+
+    fun acquire(token: VendorCapabilityIsolationToken): Boolean = synchronized(lock) {
+        if (owner != null) {
+            false
+        } else {
+            owner = token
+            true
+        }
+    }
+
+    fun release(token: VendorCapabilityIsolationToken): VendorCapabilityIsolationRelease =
+        synchronized(lock) {
+            if (owner !== token) {
+                VendorCapabilityIsolationRelease(
+                    released = false,
+                    refreshDeferred = false,
+                )
+            } else {
+                owner = null
+                VendorCapabilityIsolationRelease(
+                    released = true,
+                    refreshDeferred = refreshDeferred,
+                ).also {
+                    refreshDeferred = false
+                }
+            }
+        }
+
+    fun runIfOpenOrDefer(action: () -> Boolean): Boolean = synchronized(lock) {
+        if (owner != null) {
+            refreshDeferred = true
+            false
+        } else {
+            action().also { admitted ->
+                if (!admitted) refreshDeferred = true
+            }
+        }
+    }
+
+    fun deferRefresh() {
+        synchronized(lock) {
+            refreshDeferred = true
+        }
+    }
+
+    fun consumeDeferredRefreshIfOpen(): Boolean = synchronized(lock) {
+        if (owner != null || !refreshDeferred) {
+            false
+        } else {
+            refreshDeferred = false
+            true
+        }
+    }
+
+    internal fun isIsolated(): Boolean = synchronized(lock) { owner != null }
+}
+
+internal data class CapabilityQueryOutcome(
+    val npuSupported: Boolean?,
+    val sbwcSupported: Boolean?,
+    val completedWithinDeadline: Boolean,
+)
+
+/**
+ * Applies one total deadline to both capability getters. A provider may ignore interruption; in
+ * that case the owning no-backlog executor remains quarantined, but a late return is never
+ * published and the second getter is not started after the deadline.
+ */
+internal fun queryCapabilitiesBeforeDeadline(
+    queryNpu: Boolean,
+    querySbwc: Boolean,
+    deadlineNanos: Long,
+    isExpired: () -> Boolean = { false },
+    monotonicNowNanos: () -> Long = System::nanoTime,
+    readNpu: () -> Boolean,
+    readSbwc: () -> Boolean,
+): CapabilityQueryOutcome {
+    fun deadlineExpired(): Boolean =
+        isExpired() ||
+            isMonotonicDeadlineReached(
+                nowNanos = monotonicNowNanos(),
+                deadlineNanos = deadlineNanos,
+            )
+
+    if (deadlineExpired()) {
+        return CapabilityQueryOutcome(null, null, completedWithinDeadline = false)
+    }
+    val npuSupported = if (queryNpu) {
+        try {
+            readNpu()
+        } catch (_: Exception) {
+            null
+        }
+    } else {
+        null
+    }
+    if (deadlineExpired()) {
+        return CapabilityQueryOutcome(null, null, completedWithinDeadline = false)
+    }
+    val sbwcSupported = if (querySbwc) {
+        try {
+            readSbwc()
+        } catch (_: Exception) {
+            null
+        }
+    } else {
+        null
+    }
+    if (deadlineExpired()) {
+        return CapabilityQueryOutcome(null, null, completedWithinDeadline = false)
+    }
+    return CapabilityQueryOutcome(
+        npuSupported = npuSupported,
+        sbwcSupported = sbwcSupported,
+        completedWithinDeadline = true,
+    )
+}
+
+/**
+ * Recovers the no-backlog executor's narrow hand-off race. The old task clears its active query
+ * just before returning from Runnable.run(); a Handler refresh can therefore see no logical owner
+ * while the SynchronousQueue worker still rejects a new task. Keep exactly one delayed refresh
+ * instead of leaving discovery permanently pending.
+ */
+internal fun recoverDeferredCapabilityRefreshAfterAdmissionFailure(
+    gate: VendorCapabilityIsolationGate,
+    activeQueryPresent: Boolean,
+    scheduleRetry: () -> Boolean,
+): Boolean {
+    if (activeQueryPresent || !gate.consumeDeferredRefreshIfOpen()) return false
+    if (scheduleRetry()) return true
+    gate.deferRefresh()
+    return false
+}
+
+internal fun fatalCapabilityAdmissionFailure(
+    admissionFailure: Throwable?,
+    rollbackFailure: Throwable?,
+): Error? {
+    val fatal = (admissionFailure as? Error) ?: (rollbackFailure as? Error) ?: return null
+    if (admissionFailure != null && admissionFailure !== fatal) {
+        runCatching { fatal.addSuppressed(admissionFailure) }
+    }
+    if (rollbackFailure != null && rollbackFailure !== fatal) {
+        runCatching { fatal.addSuppressed(rollbackFailure) }
+    }
+    return fatal
+}
 
 internal fun supportsVendorTelemetryV2(apiVersion: Int): Boolean =
     apiVersion >= VENDOR_TELEMETRY_API_V2
@@ -2546,6 +3577,19 @@ internal fun validVendorUtilizationPercent(value: Float): Float? =
 
 internal fun validVendorFrequencyHz(value: Long): Long? =
     value.takeIf { it in 0L..MAX_VENDOR_FREQUENCY_HZ }
+
+internal inline fun <T> remoteValueOrNull(block: () -> T): T? =
+    try {
+        block()
+    } catch (_: Exception) {
+        null
+    }
+
+internal fun fatalRemoteExecutionCause(failure: Throwable): Error? = when (failure) {
+    is Error -> failure
+    is ExecutionException -> failure.cause as? Error
+    else -> null
+}
 
 internal fun readVendorTelemetryV2(
     serviceSession: Long,
@@ -2859,6 +3903,7 @@ internal fun reconnectDelayMs(attempt: Long): Long {
 internal enum class VendorExecutorLane {
     TELEMETRY,
     TELEMETRY_V2,
+    CAPABILITY,
     CONTROL,
     NPU,
     PERFORMANCE,
@@ -2872,6 +3917,7 @@ internal enum class VendorExecutorLane {
 internal data class VendorExecutorLanes(
     val telemetry: ThreadPoolExecutor,
     val telemetryV2: ThreadPoolExecutor,
+    val capability: ThreadPoolExecutor,
     val control: ThreadPoolExecutor,
     val npu: ThreadPoolExecutor,
     val performance: ThreadPoolExecutor,
@@ -2882,6 +3928,7 @@ internal data class VendorExecutorLanes(
         shutdownExecutorBestEffort(performance)
         shutdownExecutorBestEffort(npu)
         shutdownExecutorBestEffort(control)
+        shutdownExecutorBestEffort(capability)
         shutdownExecutorBestEffort(telemetryV2)
         shutdownExecutorBestEffort(telemetry)
     }
@@ -2895,6 +3942,7 @@ internal fun constructVendorExecutorLanes(
 ): VendorExecutorLanes {
     var telemetry: ThreadPoolExecutor? = null
     var telemetryV2: ThreadPoolExecutor? = null
+    var capability: ThreadPoolExecutor? = null
     var control: ThreadPoolExecutor? = null
     var npu: ThreadPoolExecutor? = null
     var performance: ThreadPoolExecutor? = null
@@ -2903,6 +3951,8 @@ internal fun constructVendorExecutorLanes(
             factory(VendorExecutorLane.TELEMETRY).also { telemetry = it }
         val ownedTelemetryV2 =
             factory(VendorExecutorLane.TELEMETRY_V2).also { telemetryV2 = it }
+        val ownedCapability =
+            factory(VendorExecutorLane.CAPABILITY).also { capability = it }
         val ownedControl =
             factory(VendorExecutorLane.CONTROL).also { control = it }
         val ownedNpu =
@@ -2912,6 +3962,7 @@ internal fun constructVendorExecutorLanes(
         VendorExecutorLanes(
             telemetry = ownedTelemetry,
             telemetryV2 = ownedTelemetryV2,
+            capability = ownedCapability,
             control = ownedControl,
             npu = ownedNpu,
             performance = ownedPerformance,
@@ -2921,6 +3972,7 @@ internal fun constructVendorExecutorLanes(
         shutdownExecutorBestEffort(performance)
         shutdownExecutorBestEffort(npu)
         shutdownExecutorBestEffort(control)
+        shutdownExecutorBestEffort(capability)
         shutdownExecutorBestEffort(telemetryV2)
         shutdownExecutorBestEffort(telemetry)
         throw error
@@ -2977,7 +4029,8 @@ internal fun unattributedVendorShutdownResult(): VendorShutdownResult =
 internal fun shouldScheduleReconnectAfterBindFailure(
     detachedCurrentBinding: Boolean,
     closed: Boolean,
-): Boolean = detachedCurrentBinding && !closed
+    permanentFailure: VendorBrokerFailure? = null,
+): Boolean = detachedCurrentBinding && !closed && permanentFailure == null
 
 internal data class CapabilityDiscoveryMerge(
     val npuSupported: Boolean?,

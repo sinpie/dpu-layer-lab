@@ -36,6 +36,7 @@ class StressGlSurfaceView(
     private val captureFrameCommit: (() -> (() -> Unit)?)? = null,
     private val onTeardownFailure: (() -> Unit)? = null,
     private val onRuntimeFailure: ((String) -> Unit)? = null,
+    private val onProducerLifecycleTransition: (() -> Unit)? = null,
 ) : SurfaceView(context), SurfaceHolder.Callback {
 
     private val explicitlyReleased = AtomicBoolean(false)
@@ -99,10 +100,23 @@ class StressGlSurfaceView(
         surfaceWidth = holder.surfaceFrame.width().coerceAtLeast(1)
         surfaceHeight = holder.surfaceFrame.height().coerceAtLeast(1)
         applyFrameRateHint()
-        glSession?.let { session ->
-            requestStop(session)
-            if (session.thread.isAlive) RendererSafetyState.trackUnconfirmed(session.thread)
-        }
+        performProducerLifecycleTeardown(
+            signalPending = { onProducerLifecycleTransition?.invoke() },
+            cancelPendingStart = ::cancelDeferredRestart,
+            releaseProducer = {
+                val session = glSession
+                if (session == null) {
+                    true
+                } else {
+                    requestStop(session)
+                    if (session.thread.isAlive) {
+                        RendererSafetyState.trackUnconfirmed(session.thread)
+                    }
+                    !session.thread.isAlive
+                }
+            },
+        )
+        if (explicitlyReleased.get()) return
         scheduleDeferredRestart()
     }
 
@@ -126,11 +140,22 @@ class StressGlSurfaceView(
         // Surface lifecycle callbacks must never wait for a stalled driver. Explicit phase
         // teardown performs the bounded join; spontaneous surface loss only revokes the lease.
         restartWhenStopped.set(false)
-        cancelDeferredRestart()
-        glSession?.let { session ->
-            requestStop(session)
-            if (session.thread.isAlive) RendererSafetyState.trackUnconfirmed(session.thread)
-        }
+        performProducerLifecycleTeardown(
+            signalPending = { onProducerLifecycleTransition?.invoke() },
+            cancelPendingStart = ::cancelDeferredRestart,
+            releaseProducer = {
+                val session = glSession
+                if (session == null) {
+                    true
+                } else {
+                    requestStop(session)
+                    if (session.thread.isAlive) {
+                        RendererSafetyState.trackUnconfirmed(session.thread)
+                    }
+                    !session.thread.isAlive
+                }
+            },
+        )
     }
 
     fun requestStopLab() {
@@ -399,13 +424,6 @@ class StressGlSurfaceView(
                 var appliedHeight = 0
                 var nextFrameNanos = System.nanoTime()
                 while (session.running.get() && windowSurface.isValid) {
-                    val width = workload.width
-                    val height = workload.height
-                    if (width != appliedWidth || height != appliedHeight) {
-                        renderer.onSurfaceChanged(width, height)
-                        appliedWidth = width
-                        appliedHeight = height
-                    }
                     val now = System.nanoTime()
                     if (now < nextFrameNanos) {
                         LockSupport.parkNanos(
@@ -414,6 +432,17 @@ class StressGlSurfaceView(
                         if (Thread.interrupted() && !session.running.get()) break
                         continue
                     }
+                    // Capture the immutable publication token before reading any matching control
+                    // field. Seeing a new token therefore establishes that the preceding UI
+                    // control writes are visible to this exact frame.
+                    val frameCommit = session.captureFrameCommit()
+                    val width = workload.width
+                    val height = workload.height
+                    if (width != appliedWidth || height != appliedHeight) {
+                        renderer.onSurfaceChanged(width, height)
+                        appliedWidth = width
+                        appliedHeight = height
+                    }
                     renderer.setComplexity(
                         LoadShapeEvaluator.intensityAt(
                             base = workload.baseLoad,
@@ -421,14 +450,16 @@ class StressGlSurfaceView(
                             elapsedMs = SystemClock.elapsedRealtime() - workload.loadStartedMs,
                         ),
                     )
-                    val frameCommit = session.captureFrameCommit()
                     renderer.onDrawFrame()
                     if (!EGL14.eglSwapBuffers(display, eglSurface)) {
                         runtimeFailure =
                             "EGL swap failed (0x${EGL14.eglGetError().toString(16)})"
                         break
                     }
-                    runCatching { frameCommit?.invoke() }
+                    val committed = invokeProducerFrameCommitFailClosed(frameCommit) { failure ->
+                        runtimeFailure = glRuntimeFailureReason(failure)
+                    }
+                    if (!committed) break
 
                     val interval =
                         (1_000_000_000L / safeGlFps(workload.targetFps)).toLong()

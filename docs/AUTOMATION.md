@@ -59,7 +59,9 @@ flowchart TD
     A -->|START| P["bounded extras parse"]
     P --> V["known catalog ID · repeat/40-run cap"]
     V --> Q["startup queue"]
-    Q -->|controller ready + idle| R["immutable plan START"]
+    Q -->|START| W["decor attach + first root Insets acknowledgment"]
+    W -->|controller ready + idle| R["immutable plan START"]
+    Q -->|STOP| S
     Q -->|newer STOP| X["미실행 START 폐기"]
     Q -->|busy| J["START 거부"]
 ```
@@ -68,6 +70,11 @@ flowchart TD
 - 이 규칙은 STOP duplicate 제거보다 우선한다.
 - STOP은 malformed START Bundle을 unparcel하지 않는다.
 - Activity/backend 초기화 전 command는 bounded startup queue에만 머문다.
+- Cold start의 START는 decor가 attach되고 authoritative root Insets가 한 번 도착할
+  때까지 queue 선두에 유지한다. 이 acknowledgment 뒤에만 fullscreen isolation의 원래
+  visibility mask를 capture한다.
+- STOP은 decor/Insets readiness를 기다리지 않고 deferred START를 폐기한 뒤 즉시
+  safety escape로 처리한다.
 - Controller가 실행 중이면 START를 쌓아 나중에 실행하지 않고 거부한다.
 - SHOW는 load를 시작하지 않는다.
 
@@ -103,8 +110,10 @@ Parser rejected message는 input 오류다. Accepted START 뒤 safety/media/prov
 6. busy START 거부
 7. STOP이 malformed START payload보다 우선
 8. 최신 STOP이 pending START를 모두 폐기
-9. direct MainActivity START 무시
-10. implicit resolution 실패
-11. release permission 보호와 debug overlay 차이
+9. cold-start START가 decor attach+첫 root Insets 뒤에만 실행
+10. deferred START 앞의 최신 STOP은 Insets 없이도 즉시 처리
+11. direct MainActivity START 무시
+12. implicit resolution 실패
+13. release permission 보호와 debug overlay 차이
 
 관련 unit test는 `AutomationIntentContractTest`와 `MainActivityMathTest`다.

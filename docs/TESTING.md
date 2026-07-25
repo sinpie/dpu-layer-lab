@@ -94,7 +94,7 @@ release configuration에 local keystore, platform key 경로나 credential을 �
 | `model/LabModelsTest.kt` | model normalization, duration, terminal reason, dynamic size coverage mask |
 | `model/ScenarioPlanPolicyTest.kt` | queue/repeat/expanded-run cap |
 | `model/ScenarioQueueEditorTest.kt` | duplicate, order, move, unknown restore |
-| `model/ScenarioSafetyPolicyTest.kt` | hard cap, load, duration, graphics budget, typed phase |
+| `model/ScenarioSafetyPolicyTest.kt` | hard cap, negative/sub-effective load reject, duration, graphics budget, typed phase |
 | `model/ScenarioClassifierTest.kt` | facet OR/AND 입력과 intensity |
 | `model/LoadShapeEvaluatorTest.kt` | worker modulation |
 | `model/LoadTransitionEvaluatorTest.kt` | STEP/ramp/stair/pulse/triangle/soak |
@@ -105,7 +105,7 @@ release configuration에 local keystore, platform key 경로나 credential을 �
 | Test | 계약 |
 |---|---|
 | `engine/ScenarioCatalogTest.kt` | preset uniqueness, phase validity, catalog semantics |
-| `engine/LabControllerMathTest.kt` | verdict, telemetry/HWC coverage, session-calibration deadline, size-profile arm·coverage, preparation/recovery timing, cleanup decisions |
+| `engine/LabControllerMathTest.kt` | verdict, telemetry/HWC coverage, session-calibration deadline, size-profile arm·coverage, terminal linear endpoint revision/timeout/recovery/fidelity seal, cleanup fatal precedence와 media-worker fatal relay |
 | `engine/HwcCapacityCalibrationSessionTest.kt` | process one-shot claim/reuse, terminal N/A, Activity recreation scope와 display projection invalidation |
 | `engine/DeviceRenderSafetyTest.kt` | RAM/power-save/low-RAM envelope |
 | `engine/AutomationIntentContractTest.kt` | explicit action, malformed extras, STOP ordering |
@@ -117,25 +117,26 @@ release configuration에 local keystore, platform key 경로나 credential을 �
 | Test | 계약 |
 |---|---|
 | `render/LayerStageViewMathTest.kt` | geometry function, controller elapsed re-anchor, dynamic cadence/final sample, narrow-stage visibility |
-| `render/ProducerFrameRelayTest.kt` | generation·producer ID relay |
+| `render/ProducerFrameRelayTest.kt` | generation·producer ID·control revision 2-phase relay와 decoder epoch+PTS queue/barrier |
+| `render/ProducerFrameCommitTest.kt` | callback/native draw failure의 worker revoke, cleanup와 VM fatal 원본 전파 |
 | `render/RendererSafetyStateTest.kt` | process-wide teardown latch |
 | `render/RendererRecoveryPolicyTest.kt` | hand-off/recovery deadline |
 | `render/CanvasComplexityTest.kt` | flattened GPU/canvas work mapping |
 | `render/CodecLoopBackoffTest.kt` | bounded codec dequeue/backoff |
-| `render/VideoDecoderSelectionTest.kt` | immutable media/codec fingerprint |
+| `render/VideoDecoderSelectionTest.kt` | immutable media/codec fingerprint, bounded descriptor close와 cleanup VM-fatal precedence |
 | `render/MediaSampleFlagsTest.kt` | codec input/sample flag |
 
 ### Local load와 lifecycle
 
 | Test | 계약 |
 |---|---|
-| `engine/LoadThreadStartTest.kt` | partial thread start rollback |
+| `engine/LoadThreadStartTest.kt` | partial thread start rollback과 cleanup fatal 우선순위 |
 | `engine/LoadManagerPrewarmTest.kt` | allocation/page-touch/ack/cancel |
 | `engine/LoadManagerNpuControlTest.kt` | latest-wins ticket와 ordered zero |
-| `engine/LoadSafetyStateTest.kt` | sticky local/NPU failure |
+| `engine/LoadSafetyStateTest.kt` | sticky local/NPU failure와 partial-start OOME cleanup 후 원본 재전파 |
 | `engine/ActivityFreeCompletionGroupTest.kt` | Activity-free job completion |
 | `engine/ControllerBackendCleanupTest.kt` | backend shutdown order |
-| `engine/ControllerBackendCleanupCoordinatorTest.kt` | process cleanup gate |
+| `engine/ControllerBackendCleanupCoordinatorTest.kt` | process cleanup gate와 OOME/VM-fatal/ThreadDeath 원본 재전파 |
 
 ### Telemetry와 vendor
 
@@ -143,17 +144,18 @@ release configuration에 local keystore, platform key 경로나 credential을 �
 |---|---|
 | `monitor/SystemMonitorMathTest.kt` | source merge, interval, HWC evidence와 one-shot vendor-prefetch/SF-fallback 선택 |
 | `monitor/SystemMonitorConstructionTest.kt` | transactional construction rollback |
-| `monitor/KernelSensorProviderTest.kt` | typed ABI parse, Xclipse/KGSL/GED, units |
-| `monitor/SurfaceFlingerProbeTest.kt` | bounded dump parse와 lifecycle |
-| `monitor/ProducerGenerationGateTest.kt` | fresh generation count와 generation-scoped geometry revision/profile acknowledgment |
+| `monitor/KernelSensorProviderTest.kt` | typed ABI parse, Xclipse/KGSL/GED, units, key별 sysfs allowlist와 exact underrun default |
+| `monitor/LongTimestampMapTest.kt` | 20-producer timestamp map과 expansion OOME 원자성 |
+| `monitor/SurfaceFlingerProbeTest.kt` | bounded dump parse/lifecycle, worker·child all-action cleanup과 fatal 원본 재전파 |
+| `monitor/ProducerGenerationGateTest.kt` | fresh generation count, 같은 ID의 physical producer 재생성 뒤 fresh-buffer 강제와 generation-scoped geometry revision/profile acknowledgment |
 | `monitor/CapabilityScannerTest.kt` | display/codec capability projection |
-| `vendor/VendorBridgeStateTest.kt` | API version, session, lane, NPU/SBWC/power restore |
+| `vendor/VendorBridgeStateTest.kt` | API version, session, lane, NPU/SBWC/power restore, broker permission/signer trust와 fatal rollback |
 
 ### UI, version과 report
 
 | Test | 계약 |
 |---|---|
-| `ui/DpuLayerLabAppMathTest.kt` | 목적/facet/preview/HUD pure helper |
+| `ui/DpuLayerLabAppMathTest.kt`, `engine/LabControllerMathTest.kt` | 목적/facet/preview, bounded queue preview, decoder-media 노출 조건, topology-pending 즉시 `—P`를 포함한 HUD pure helper |
 | `ui/RendererContainerRememberOwnerTest.kt` | Compose renderer owner identity |
 | `MainActivityMathTest.kt` | display/window/automation helper |
 | `engine/ReportWriterMathTest.kt` | schema/provenance/retention/atomic naming helper |
@@ -176,10 +178,16 @@ Capacity 변경은 다음 경계를 별도로 검증해야 한다.
   실패는 candidate N/A
 - topology readiness, 100ms stabilization과 single sample 전체가 하나의 absolute
   6000ms producer-active deadline을 공유
+- deadline 직전 readiness poll은 stabilization+snapshot reserve를 침범하지 않고,
+  stabilization 전체 budget이 없으면 target을 즉시 null
 - sample 전후 topology/geometry revision과 discontinuity serial이 같고 모든 producer
   heartbeat가 fresh일 때만 observation 수락
 - 모든 terminal path에서 load zero, renderer teardown과 counter drain을 확인하고
-  cleanup-confirmed non-cancelled 경로에서만 3000ms settle 뒤 scenario로 진행
+  cleanup-confirmed non-cancelled 경로에서만 cancellable 3000ms settle 뒤 scenario로
+  진행하며 STOP/cancel은 settle을 기다리지 않고 terminal `UNAVAILABLE`로 one-shot을
+  닫아 두 번째 20L burst를 만들지 않음
+- safety-clamped 6/12/16L의 partial final tile row도 non-overlap 상태로 전체 stage
+  crop union을 덮고 HUD 평균이 `100 / actual producer count`와 일치
 - final producer teardown 뒤 calibration frame/generated-traffic counter를 drain해 첫
   scenario baseline/peak와 분리
 - priority 획득 뒤 기존 periodic local sample, SurfaceFlinger worker/child, vendor v1/v2
@@ -194,6 +202,18 @@ Capacity 변경은 다음 경계를 별도로 검증해야 한다.
   nonnegative atomic D/C pair이면 SurfaceFlinger를 실행하지 않음
 - calibration은 optional vendor v2 transaction을 생략하고, v1 실패/partial 뒤 actual
   vendor-worker quiescence가 확인되지 않으면 SF fallback을 시작하지 않음
+- capability getter는 v1 exact telemetry와 분리된 no-backlog lane의 single total
+  deadline을 사용하고 late/stale-session 결과를 폐기하며 첫 getter timeout 뒤 두 번째
+  getter를 시작하지 않음
+- capability deadline의 signed `nanoTime` wrap과 worker-return 직전 transient
+  `SynchronousQueue` rejection에서 하나의 deferred refresh가 보존됨
+- 첫 capability getter 도중 service-session이 바뀌면 stale Binder의 두 번째 getter를
+  시작하지 않고, Handler/executor admission fatal은 active/timeout rollback 뒤 재전파됨
+- calibration capability admission token이 delayed retry/service callback을 post-drain
+  release까지 하나로 defer하고 stuck capability call은 pre/post barrier를 실패시킴
+- calibration final barrier/capability release가 `Error`를 던져도 watchdog/priority/
+  claim cleanup을 끝낸 뒤 fatal을 재전파하며, thermal NPU apply의 cancellation/fatal도
+  일반 adapter 실패로 삼키지 않음
 - vendor pair null/partial/negative/session mismatch에서만 SurfaceFlinger fallback 한 번,
   fallback 뒤 vendor snapshot 재호출 없음
 - display ID 또는 normalized physical short/long edge 변경은 projection을 N/A로 만들고
@@ -271,15 +291,52 @@ Capacity 변경은 다음 경계를 별도로 검증해야 한다.
 ### Resource
 
 - RAM total/available invalid, lowMemory, allocation OOM
-- CPU/memory worker partial start와 unexpected exception
-- NPU apply timeout, rejected ticket, session change, zero/close 실패
-- codec capability mismatch, descriptor open/parse timeout
-- GL/Canvas/codec teardown timeout
+- CPU/memory worker partial start, unexpected exception, memory drop 뒤 NPU zero 예외
+- NPU apply timeout, rejected ticket, session change, stale positive waveform, zero/close 실패
+- pulse/triangle NPU positive→zero→positive semantic edge마다 matching ticket/ACK와
+  health를 요구하고 ACK 전 coverage를 거부
+- adapter release가 manager의 zero request를 supersede한 뒤 동일 zero semantic apply가
+  CPU/memory restart 없이 fresh ticket을 발행하는지 확인
+- triangle zero-origin full-cycle `999→1001 ms`와 zero-target half-cycle
+  `249→251 ms` jitter crossing, 각 terminal zero, nonzero floor/no-zero와 no-crossing을
+  구분하고 여러 누락 zero boundary를 replay하지 않는지 확인
+- codec capability mismatch, descriptor open/parse timeout, provider/parser worker fatal의 owning
+  coroutine identity relay
+- GL/Canvas/codec teardown timeout과 commit failure
+- Canvas/Texture/Video/GL Surface destroy/recreate의 pending → geometry ACK → forced
+  expected-set republish와 stale first-buffer/HWC evidence 거부
+- renderer thread-start callback의 notification/cleanup 부분 실패에서도 detach,
+  interrupt/quit/join/owner clear 전부 실행, ordinary rollback failure 전파
+- decoder requestStop/release/start-failure의 action별 예외와 두 thread shared-deadline
+  join, callback fatal identity 보존
+- child transaction owner storage 선할당과 registration 경계 failure
+- frame/deferred post 거부의 topology rollback, expected callback의 configure/release
+  재진입과 stale publication bookkeeping 거부
+- lifecycle stage owner 복수 identity, bounded cap과 cleanup watcher failure sticky 처리
+- timestamp map 두 번째 backing-array OOME에서 기존 map 보존
+- VM fatal cleanup 뒤 원본 fatal identity 보존
+- 20-relay control-token prepare 중 OOME에서 기존 binding 전부 보존
+- prepared token 뒤 rebind의 stale commit 거부와 commit fatal의 전 relay rollback
+
+### Transition endpoint
+
+- whole-phase linear endpoint를 nominal deadline에 한 번 게시
+- committed physical producer 전부의 exact control revision ACK
+- old generation/revision, pre-activation frame과 partial ACK 거부
+- topology recovery에서 stale 증거 폐기, fresh buffer 뒤 revision 증가 재arm
+- revision mismatch/timeout을 `INCONCLUSIVE`로 분류
+- endpoint apply 전 같은 observed boundary에서 actual/expected seal, delayed tick 대칭성
+- endpoint proof hold frame을 producer-fidelity에서 제외
+- decoder duplicate PTS, submit 실패 exact epoch/PTS/identity rollback
+- EOS listener disable과 flush 전후 reusable callback barrier, clear+epoch 증가 뒤
+  old callback/new same-PTS offer 분리
 
 ### Telemetry
 
 - source/quality change
 - cumulative counter reset/regress/wrap/read gap
+- outer sample failure가 kernel probe 전/후 어느 쪽이든 GPU/bus/DPU cumulative baseline
+  전체를 reset해 다음 interval을 N/A로 만듦
 - stale/partial DEVICE/CLIENT pair
 - session calibration vendor prefetch complete/partial/session-change와 SF fallback
 - vendor v2 timeout while v1 remains valid
@@ -295,6 +352,9 @@ Capacity 변경은 다음 경계를 별도로 검증해야 한다.
 - topology miss/teardown failure/completed teardown 뒤 stale producer·geometry·typed HWC
   evidence 재사용과 incomplete reattach
 - system bar partial hide, focus loss, restore timeout
+- cold-start automation START의 decor/root-Insets defer와 readiness 전 STOP supersede
+- 실행 시작 display snapshot 대비 same-size display-ID 변경, normalized physical-size
+  변경 중단 및 단순 width/height 축 교환 허용
 - Battery Saver renewal/END/restore failure
 - telemetry monitor/watchdog one-sided completion
 - old job finalizer racing with new START

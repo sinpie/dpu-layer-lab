@@ -40,7 +40,7 @@
 | pixel route | `RGB_8888` |
 | buffer size | `DISPLAY` |
 | motion | `CAPACITY_TILES` |
-| destination | non-overlap crop union 1 screen-equivalent |
+| destination | non-overlap crop union 1 screen-equivalent; partial final row도 full-width 재분할 |
 | alpha | opaque |
 | GL tail | 없음 |
 | CPU/memory/generated GPU/NPU cross-load | 모두 0 |
@@ -68,9 +68,9 @@ Disk, SharedPreferences와 report에서 다음 process의 calibration을 복원�
 
 ```mermaid
 flowchart TD
-    A["첫 START · fullscreen/performance precheck"] --> C["process claim"]
-    C --> P["typed telemetry priority acquire"]
-    P --> D["periodic drop/pause · local/SF/vendor pre-drain"]
+    A["첫 START · fullscreen/performance precheck"] --> CLAIM["process claim"]
+    CLAIM --> P["typed telemetry priority + capability admission token"]
+    P --> D["periodic drop/pause · local/SF/vendor/capability pre-drain"]
     D --> S["safety-approved actual candidate"]
     S --> G["producer generation · CAPACITY_TILES geometry"]
     G --> R["all first buffer + fresh heartbeat + 100ms stabilize"]
@@ -82,15 +82,23 @@ flowchart TD
     F --> Q
     Q --> Z["phase/target null 즉시"]
     Z --> T["load zero · renderer teardown · counter drain"]
-    T --> W["local/SF/vendor post-drain · 3s settle"]
-    W --> E["terminal result publish · priority release"]
-    E --> H["기존 1L scenario warm-up/fresh baseline"]
+    T --> I["local/SF/vendor/capability post-drain"]
+    I --> CANCEL{"run cancellation 없음?"}
+    CANCEL -->|yes| W["cancellable 3s zero-load settle"]
+    CANCEL -->|STOP/cancel| ABANDON["terminal UNAVAILABLE publish"]
+    W --> E["measured terminal result publish"]
+    E --> RELEASE["final drain · admission/priority release"]
+    ABANDON --> RELEASE
+    RELEASE --> H["기존 1L scenario warm-up/fresh baseline"]
 ```
 
 Priority를 먼저 획득한 뒤 periodic telemetry를 drop하고 기존 worker를 drain한다.
 Calibration sample은 optional vendor v2 GPU/frequency transaction을 생략한다. V1
 snapshot이 원자 D/C를 제공하지 못하면 실제 vendor telemetry worker가 끝난 뒤에만
 SurfaceFlinger child를 시작한다.
+Capability retry/discovery admission token은 pre-drain 전에 획득하고 final post-drain
+뒤에만 identity-matched release한다. 그 사이 도착한 service callback/retry는 하나의
+deferred refresh로 합쳐지고 20L candidate가 내려간 뒤 Handler에 게시된다.
 
 Producer readiness를 기다리는 구간은 100ms control cadence로 direct
 thermal/power/low-memory를 확인한다. Pre-drain과 bounded composition sample 자체에는
@@ -98,11 +106,16 @@ thermal/power/low-memory를 확인한다. Pre-drain과 bounded composition sampl
 
 ## Deadline
 
-Topology 준비, 모든 first buffer, 100ms stabilization, single composition sample과
+Topology 준비, 모든 first buffer, 100ms stabilization, single calibration composition
+transaction과
 post-sample validation은 하나의 최대 6000ms producer-active deadline 안에서 끝나야 한다.
 
+- readiness poll은 stabilization+snapshot completion reserve를 남기는 범위로 clamp한다.
+- 100ms stabilization 전체와 snapshot reserve를 확보할 수 없으면 target을 즉시 null로
+  내리고 `UNAVAILABLE`로 끝낸다.
 - sample 직후 20L target을 null로 내려 validation 지연이 load를 연장하지 않게 한다.
-- renderer teardown, worker quiescence와 3000ms settle은 deadline 밖이어도 mandatory다.
+- renderer teardown과 worker quiescence는 deadline 밖이어도 mandatory다. 3000ms
+  zero-load settle은 cleanup-confirmed 정상 진행에서만 수행하는 cancellable 단계다.
 - deadline을 넘으면 값이 늦게 도착해도 `OBSERVED_AT_CANDIDATE`로 수락하지 않는다.
 
 ## 수락 조건
@@ -163,11 +176,13 @@ Reuse guidance는 matching opaque RGB/crop topology의 advisory일 뿐 safety ca
 - local SystemMonitor worker actual completion
 - SurfaceFlinger lane와 dumpsys child 종료
 - vendor v1/v2 executor lane completion
+- vendor capability lane actual completion과 새 discovery/retry admission 차단
 
-위 cleanup이 모두 확인된 경로만 3초 zero-load settle을 수행한다. 그 경로가
-non-cancelled인 경우에만 마지막 direct thermal/power/low-memory recheck를 통과한 뒤
-scenario warm-up으로 이동한다. STOP/cancel은 cleanup을 생략하지 않지만 settle 뒤 다음
-scenario로 진행하지 않는다.
+위 cleanup이 모두 확인되고 run이 취소되지 않은 경로만 cancellable 3초 zero-load
+settle과 마지막 direct thermal/power/low-memory recheck를 수행한 뒤 scenario warm-up으로
+이동한다. STOP/cancel은 mandatory cleanup을 생략하지 않지만 optional settle은 즉시
+건너뛰고 process-session을 terminal `UNAVAILABLE`로 닫아 두 번째 20L burst 없이
+Window/performance owner를 복구한다.
 
 Barrier 미확인은 telemetry lifecycle을 process-sticky failure로 만들고 후속 START를
 차단한다. Calibration frame, traffic와 exact counter delta는 첫 scenario의 fresh
@@ -202,6 +217,9 @@ baseline/peak에 포함하지 않는다.
 - requested 20과 safety-clamped actual 분리
 - exact fixed topology와 zero cross-load
 - vendor timeout 뒤 SF overlap 금지
+- capability retry/service callback이 admission token과 pre/post drain 사이에 끼어들지 않음
 - cancel 중 pre/post drain과 identity-matched priority release
+- deadline 직전 poll/stabilization clamp와 STOP 시 optional settle 생략
+- safety-clamped partial final row의 non-overlap full crop union
 - post-sample deadline/topology discontinuity 거부
 - teardown/counter drain 뒤 첫 scenario 시작

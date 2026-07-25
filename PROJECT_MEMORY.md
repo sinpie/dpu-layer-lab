@@ -79,6 +79,10 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
    보수적 4 B/px로 별도 계산하고 color/depth 모두 triple buffering한다.
 7. **portable과 vendor 계측을 분리한다.** 공통 API는 Android service/앱 측정/proxy를
    제공하고, exact DPU/DDR/HWC/SBWC/NPU는 signature-protected AIDL broker를 사용한다.
+   Broker는 implicit action resolution 결과를 신뢰하지 않는다. Product의 bounded
+   read-only config가 지정한 explicit component, permission owner와 owner/service
+   signing lineage를 모두 검증한 뒤에만 bind한다. Config/grant/contract/signer
+   불일치는 permanent `UNAVAILABLE`이며 Activity 재생성마다 reconnect하지 않는다.
 8. **값마다 provenance를 유지한다.** `MetricQuality`와 `source` 없이 숫자를 노출하지
    않는다. unavailable은 `N/A`다.
 9. **영상은 codec-to-Surface다.** SAF URI를 `MediaExtractor`/`MediaCodec`로 decode해
@@ -123,14 +127,23 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
 12. **외부 자동화는 보호된 alias만 허용한다.** Explicit `AutomationActivity` Intent는
     preset ID와 bounded repeat만 전달하며 custom workload, phase 또는 safety 값을
     주입하지 못한다. Launcher `MainActivity`에 직접 보낸 control action은 무시한다.
+    Cold-start START는 decor attach와 첫 root Insets까지 queue에 유지하지만 STOP은 이
+    readiness를 기다리지 않는 safety escape다.
 13. **부하 worker는 backlog를 만들지 않는다.** CPU/memory는 bounded fixed-period
     worker와 재사용 buffer를 사용하고 NPU control은 bounded latest-wins로 합친다.
     양의 NPU setpoint는 command ticket/acknowledgment가 일치한 뒤 적용 완료로 보며
     active phase 동안 adapter health를 확인한다. Apply timeout/거부/health 상실은
-    `NPU_WORKLOAD_APPLY_FAILED`로 fail-closed한다.
+    `NPU_WORKLOAD_APPLY_FAILED`로 fail-closed한다. Producer topology recovery의 ordered
+    zero는 NPU command epoch를 증가시키고, 양의 request 게시 전과 acknowledgment 뒤
+    epoch/run owner/generation을 다시 확인해 늦은 positive setpoint와 display/progress
+    재게시를 막는다.
     Memory workload가 있는 plan은 계측 전에 worker별 buffer 할당/page touch를
     acknowledgment하는 bounded prewarm을 실행한다. Prewarm byte는 generated traffic에
-    포함하지 않으며 allocation/timeout/cancel/ack 실패는 fail-closed다.
+    포함하지 않으며 allocation/timeout/cancel/ack 실패는 fail-closed다. Low-memory
+    release는 NPU zero 호출보다 먼저 buffer pin/drop generation을 commit해 NPU adapter
+    예외와 무관하게 working set을 폐기한다. Reflection waveform과 ordered zero는 같은
+    versioned single-slot lane을 사용해 오래된 positive waveform이 새 zero 뒤에 다시
+    적용되지 않게 한다.
 14. **DVFS는 관찰 대상이다.** settle/shock scenario는 governor가 낮은 clock을 선택할
     기회를 주지만 앱이 DPU frequency를 쓰거나 고정하지 않는다.
 15. **실험 선택은 직교 facet과 ordered queue다.** Catalog의 카테고리·변화 파형·예상
@@ -139,7 +152,14 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
     보존하되 복원된 unknown ID는 실행 index를 만들기 전에 제거한다. Repeat는 1~10,
     expanded plan은 40 run 상한이다. DPU 저→고 burst와 HWC DEVICE/CLIENT 목적도
     phase의 typed control/expectation으로 분류하며 이름이나 tag에서 실행 의미를
-    추론하지 않는다.
+    추론하지 않는다. UI는 기본 정보를 `테스트 선택`과 `순서·반복` 두 단계로 분리하고
+    목적 선택과 일괄 queue mutation을 중복 배치하지 않는다. Catalog subtree는
+    saveable-state holder로 step/filter/펼침/scroll을 보존한다. Queue/facet/repeat
+    action은 event 시점의 최신 state를 다시 sanitize/reduce해 빠른 연속 입력의
+    stale-snapshot 덮어쓰기를 피한다. Position edit는 render 시 full queue snapshot이
+    최신 queue와 다르면 거부하고, START는 클릭 시 최신 queue/repeat로 immutable plan을
+    다시 만든다. Empty queue의 UI repeat는 의도치 않은 다음 다회 실행을 막기 위해
+    항상 1이다.
 16. **성능 정책 변경은 typed v3 Battery Saver lease로 제한한다.** Portable app이나
     platform signing만으로 전역 power policy 접근을 가정하지 않는다. API v3 broker가
     있으면 BEGIN 전 원래 Battery Saver를 capture하고 10초 lease를 2초 cadence로
@@ -265,7 +285,9 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
   write/lock하지 않는다.
 - 실행 중 display ID 또는 정규화한 physical pixel dimensions가 달라지면
   `SAFETY_ENVELOPE_CHANGED`로 중단한다. 같은 ID/physical dimensions의 축 교환은
-  graphics envelope를 바꾸지 않는다.
+  graphics envelope를 바꾸지 않는다. 시작 시 immutable identity를 capture하고
+  `DisplayManager.DisplayListener`와 lifecycle/configuration/focus 경계를 함께 사용해
+  같은 크기의 다른 display 이동과 focus를 바꾸지 않는 mode change도 감시한다.
 - 선택형 선제 감속이 ON인 plan에서 thermal `SEVERE` 이후의
   layer/FPS/Hz/workload derating은 다음 phase에서 원래 setpoint로 되돌아가지 않는다.
   기존 generated/NPU workload의 ordered zero 확인, reduced workload의
@@ -308,6 +330,15 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
 - 양의 NPU setpoint도 latest command ticket의 acknowledgment 전에는 phase 적용
   성공으로 처리하지 않는다. Active phase에서 command/backend health를 확인하고
   timeout/거부/unhealthy를 `NPU_WORKLOAD_APPLY_FAILED`로 중단한다.
+- Pulse/triangle NPU의 양수→0 valley와 0→양수 re-attack은 각각 matching command
+  acknowledgment를 요구한다. Zero ACK에서 positive-ready 상태를 지우고, 재상승 ACK가
+  끝나기 전에는 transition coverage를 인정하지 않는다. 같은 부호 안의 보간값만
+  bounded latest-wins로 합칠 수 있다. Semantic apply는 같은 값이어도 fresh NPU ticket을
+  발행하며 CPU/memory waveform restart 여부와 분리한다. Triangle은 zero-origin의
+  full-cycle(`999→1001 ms`)과 zero-target의 half-cycle(`249→251 ms`, cycle 500ms) 경계를
+  건넌 tick에서도 stable cross-load를 유지한 채 zero를 먼저 확인하고 positive를 다시
+  확인한다. Phase가 해당 zero boundary에서 끝나도 zero ACK를 생략하지 않으며, 여러 zero
+  boundary 누락을 command backlog replay로 보정하지 않는다.
 - 미확인 NPU cleanup은 process-wide latch로 후속 adapter 초기화와 새 plan을 차단한다.
   Activity close가 남긴 최종 cleanup 증거는 close 전에 시작된 release의 늦은 결과보다
   우선하며, stale `false`가 최종 확인을 다시 오염시키지 못한다. 종료 lane이 멈춰
@@ -318,7 +349,8 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
 - `ABORTED` artifact는 결과 이력/report에 보존하되 `PlanProgress.completedRuns`에는
   포함하지 않는다. Finalize 중 도착한 cancellation도 completed 갱신보다 먼저 확인한다.
 - producer callback은 generation token과 physical producer ID로 분리하고 buffer 게시
-  전에 immutable token을 capture한다. Expected topology가 먼저 선언되기 전에는
+  전에 immutable generation/control-revision token을 capture한다. Expected topology가
+  먼저 선언되기 전에는
   generation을 ready로 만들지 않으며, 모든 producer first buffer/heartbeat와 peak
   topology 실현을 확인한다. Frame hot path는 token을 재사용하고 primitive timestamp
   storage를 사용해 telemetry 자체의 allocation/GC traffic을 피한다.
@@ -332,17 +364,38 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
   Controller의 다음 100 ms poll 경계까지 이전 producer count를 적분하거나 부하를
   유지해서는 안 되며, commit/restart 뒤에만 resume한다. Unpublished/topology-pending/
   process-lease 상태의 HUD expected count는 0(`—P`)이고 committed count와 분리한다.
+  HUD의 `PHYSICAL` 값과 history도 committed expected/observed producer를 사용하며,
+  requested logical layer 수를 대신 넣거나 pending 구간을 선으로 이어 그리지 않는다.
 - topology miss, teardown failure 또는 completed teardown 뒤에는 같은 generation의
   producer readiness, geometry revision/profile/coverage와 typed HWC evidence를
   재사용하지 않는다. Miss/failure는 새 generation에서만 복구하며, clean reattach도
   topology pending → 새 geometry acknowledgment → topology publish → activation →
   모든 fresh first buffer → fresh HWC observation의 전체 barrier를 다시 통과한다.
+- Canvas/Texture/Video/GL의 physical Surface 재생성은 relay와 generation이 같아도
+  discontinuity다. Lifecycle callback에서 즉시 pending과 evidence clear를 수행하고,
+  fresh geometry acknowledgment와 forced expected-set publication 뒤의 frame만 새
+  readiness로 사용한다.
+- Renderer resource owner storage는 bounded maximum을 child 생성 전에 선할당한다.
+  Thread-start/stop/release callback의 알림이 실패해도 detach, interrupt, looper quit,
+  bounded join과 owner clear를 끝까지 시도한다. Ordinary rollback failure도 성공
+  `false`로 숨기지 않고, process lifecycle owner bookkeeping은 bounded fail-closed로
+  유지한다.
+- Expected-set callback은 capture한 generation/callback/relay identity에 결속한다.
+  동기 release/configure 재진입은 자기 suppression token만 닫을 수 있고, callback 뒤
+  identity가 달라졌으면 이전 transaction의 publication bookkeeping을 commit하지 않는다.
 - `STEP` target은 fresh baseline 뒤 origin topology의 generation-scoped buffer가
   확인된 다음 measured 100 ms control tick에서 적용한다. Duration cap 이후의 실제
   transition window가 cadence상 중간/level/cycle/attack-hold-release를 표현하지 못하면
   실행하지 않는다. Control loop는 absolute-deadline fixed period이며, 실행 후 coverage
   tracker가 ramp/staircase/pulse/triangle/soak의 필수 segment를 실제 관측하지 못하면
   `INCONCLUSIVE`다.
+- Whole-phase `LINEAR_RAMP`의 exact endpoint는 nominal deadline에서 한 번 게시한
+  producer-control revision을 committed producer 전부의 fresh frame으로 증명한다.
+  Topology recovery는 기존 revision evidence를 폐기하고 fresh first-buffer barrier 뒤
+  더 큰 revision으로 재arm한다. Bounded hold 안에 exact ACK가 모이지 않으면
+  `INCONCLUSIVE`다. Endpoint apply 직전의 monotonic time/frame counter 한 쌍으로
+  actual과 expected를 같은 observed boundary에서 seal하고 proof hold frame은 이후
+  fidelity에 넣지 않는다.
 - Phase fidelity는 primary 하나가 아니라 generation이 승인한 모든 physical producer
   frame을 합산한다. 실제 적용한 `FPS × physical producer count` 적분값이 30 frame
   이상이고 actual이 70% 미만이면 `PRODUCER_RATE_SHORTFALL`을 남긴다.
@@ -432,6 +485,16 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
   `DEVICE_ONLY`는 같은 snapshot의 DEVICE>0·CLIENT=0을 한 번, `CLIENT_REQUIRED`는
   서로 다른 fresh sample 2회에서 CLIENT>0을 요구하며 evidence 부재·stale·불일치는
   `INCONCLUSIVE`다.
+- Vendor NPU/SBWC capability getter는 exact v1 telemetry lane과 분리한 단일 no-backlog
+  quarantine lane에서 한 total deadline과 service-session을 검증한다. Interrupt를
+  무시하는 call은 그 lane 하나만 실제 반환까지 점유하며 late result나 retry backlog를
+  허용하지 않는다. `nanoTime` signed wrap에서도 subtraction deadline을 사용하고, 이전
+  task의 논리 완료와 `SynchronousQueue` worker 반환 사이 hand-off rejection은 하나의
+  25ms deferred refresh로 복구한다. Getter 사이에도 service-session identity를
+  재검증해 stale Binder의 두 번째 getter를 시작하지 않으며, admission/rollback의
+  `Error`는 active identity와 timeout callback을 정리한 뒤 재전파한다. Process-session
+  HWC calibration은 capability admission을 pre-drain 전에 닫고 post-drain 뒤
+  release해 delayed retry가 20L candidate와 겹치지 않게 한다.
 - Typed HWC expectation은 관측 대상 target의 layer topology, producer FPS, display
   pacing, GL producer와 GPU pressure를 safety clamp 뒤에도 그대로 보존해야 한다.
   Fresh evidence가 한 target geometry를 나타내도록 dynamic `LayerSizeProfile`을 결합한
@@ -458,6 +521,14 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
   아니다. 요청 topology, deadline, display scope, telemetry serialization과 cleanup의
   현재 계약은
   [HWC capacity calibration](docs/HWC_CAPACITY_CALIBRATION.md)이 authority다.
+  Producer-active poll과 100ms stabilization은 post-sample reserve를 침범하지 않도록
+  absolute deadline에 맞춰 줄이거나 중단한다. Cleanup은 취소와 무관하게 mandatory지만
+  producer가 이미 내려간 뒤의 3초 zero-load settle은 정상 진행에만 필요한 cancellable
+  단계이므로 STOP/cancel에서 건너뛰고 one-shot을 terminal `UNAVAILABLE`로 닫아
+  재계측하지 않는다. `CAPACITY_TILES`의 부분 마지막 행도 행 전체 폭을 다시 분할해
+  actual crop union과 HUD의 1 screen-equivalent 의미를 일치시킨다.
+  Calibration final barrier/release의 `Error`도 capability token, watchdog pause,
+  priority owner와 session claim cleanup을 모두 시도한 뒤 재전파한다.
 - Active phase는 SurfaceFlinger child를 생성하지 않는다. Typed boundary도 fresh vendor
   pair만 사용하고 없으면 INCONCLUSIVE다. Session calibration의 SF cache를 phase evidence로
   재사용하지 않으며 untyped active sweep도 vendor pair가 없으면 N/A를 보존한다.
@@ -506,7 +577,7 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
 
 ## 현재 구현
 
-- DPULayerTest source candidate `20260725_095708` / `20260725_095708-debug`
+- DPULayerTest release `20260725_170750` / `20260725_170750-debug`(`versionCode 6`)
   launcher/Gradle project, 화면/HUD/report build version과 stable
   `com.example.dpulayerlab`/`DpuLayerLab` 제품 통합 identifier
 - Compose 기반 scenario browser, system dashboard, running HUD, result 화면. 실행

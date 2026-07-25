@@ -296,6 +296,13 @@ Checkpoint:
 6. `monitor/SystemMonitor.kt`
 7. `monitor/CapabilityScanner.kt`
 
+`VendorBridge`를 복구할 때 implicit action discovery를 신뢰 경계로 만들지 않는다.
+`/product/etc/dpulayerlab/vendor_broker.conf`의 explicit component, permission owner와
+owner/service signer trust root를 파싱하고 PackageManager evidence와 대조한 뒤에만
+bind한다. Config/grant/contract/signer 오류는 permanent unavailable이어야 하며
+Activity 재생성마다 retry하지 않는다. Kernel exact underrun의 built-in 후보는
+DPU-scoped node만 복구하고 generic DRM node는 제품의 typed opt-in 없이 승격하지 않는다.
+
 중요 계약:
 
 - sample은 bounded single-flight transaction
@@ -333,8 +340,11 @@ worker:
 - CPU 12 ms fixed period와 bounded batch
 - memory 10 ms fixed period, reused working set, 256 KiB block
 - measured baseline 전 memory prewarm/page touch/ack
-- NPU bounded latest-wins ticket와 active health
+- low-memory/drop에서 memory pin 해제/drop generation/prewarm 취소를 NPU zero 전에 commit
+- NPU waveform과 ordered zero가 공유하는 versioned single-slot latest-wins lane
+- stale positive waveform 금지, bounded ticket acknowledgment와 active health
 - ordered zero와 adapter close acknowledgment
+- NPU 실패와 독립적인 memory worker wake/drop, primary/secondary release 오류 보존
 - partial thread start rollback과 bounded join
 - unexpected exception의 process-sticky latch
 
@@ -366,6 +376,25 @@ Checkpoint:
 3. bounded shared deadline teardown
 4. 모든 child 생성/add
 5. runtime control과 generation relay 설치
+6. producer마다 immutable generation/control-revision token 설치
+
+Canvas/EGL/MediaCodec frame commit 일반 실패는 producer를 먼저 revoke한 뒤 cleanup한다.
+`ThreadDeath`/`VirtualMachineError`는 cleanup을 모두 시도하고 원본을 다시 던진다.
+Renderer child owner storage는 최대 layer 수를 생성 전에 선할당한다. Canvas/Texture/
+Video/GL physical Surface 재생성은 같은 generation이어도 topology pending과 기존
+geometry/HWC/first-buffer evidence clear를 먼저 수행한다. Thread-start/stop/release는
+notification 실패와 독립적으로 detach, interrupt, callback-looper quit/join과 owner
+clear를 모두 시도하며 incomplete rollback을 `false`로 숨기지 않는다. Expected-set
+callback은 capture한 generation/callback/relay identity가 재진입 뒤에도 같은 경우에만
+publication bookkeeping을 commit한다.
+Primitive timestamp map은 두 backing array가 모두 준비된 뒤에만 교체한다. Decoder는
+output submission 전에 token을 bounded epoch+PTS queue에 결속하고 submit 실패를
+epoch+PTS+callback identity로 rollback한다. EOS는 listener disable → reusable callback
+barrier drain → flush → listener pending 제거와 두 번째 drain → queue clear/epoch 증가
+→ listener 재설치 순서를 사용한다. Producer control revision은 전 relay replacement와
+binding identity를 먼저 prepare하고 stale binding이 없을 때만 commit한다. Prepare
+실패는 기존 token을 보존하고 commit fatal은 전 relay revoke/topology pending/bounded
+renderer rollback 뒤 재전파한다.
 6. expected physical producer set 한 번 publish
 7. first-buffer/heartbeat
 
@@ -444,6 +473,12 @@ pulse/triangle once-arm, 100 ms/final apply, 2-frame fraction hold와 latest-win
 gate, teardown terminal evidence invalidation·fresh reattach, source buffer·producer
 count 불변과 teardown timeout을 포함한다.
 
+Whole-phase `LINEAR_RAMP`는 nominal deadline에서 exact target+control revision을 한 번
+게시하고 committed producer 전부의 matching fresh frame을 bounded하게 확인한다.
+Recovery는 stale proof를 버리고 fresh first buffers 뒤 새 revision으로 재arm한다.
+Mismatch/timeout은 `INCONCLUSIVE`다. Endpoint apply 전 같은 observed time/frame
+boundary에서 actual/expected를 seal하고 proof hold frame은 제외한다.
+
 ## 7단계: controller
 
 `engine/LabController.kt`를 가장 나중에 복구한다. 이 파일은 앞 단계의 모든 typed
@@ -458,7 +493,7 @@ dependency를 조율한다.
 5. process-local HWC capacity session store와 one-shot claim/projection
 6. scenario media/vendor preflight
 7. warm-up, memory prewarm와 exact baseline
-8. phase transaction과 transition coverage
+8. phase transaction, transition coverage와 all-producer endpoint proof
 9. runtime safety/thermal/producer recovery
 10. terminal teardown/sample/verdict/report
 11. plan-wide restore와 sticky cleanup gate
@@ -554,6 +589,10 @@ Checkpoint:
 - `system_integration/product/dpulayerlab_product.mk`
 - `system_integration/product/privapp-permissions-com.example.dpulayerlab.xml`
 - `system_integration/vendor/probe_paths.conf.example`
+
+제품 통합에서는 `vendor_broker.conf`를 제품별 signer digest로 별도 생성해
+`/product/etc/dpulayerlab/`에 root-owned read-only 파일로 설치한다. Placeholder digest나
+private signing material을 repository에 넣지 않는다.
 
 schema v2 report의 phase에는 `layerSizeProfile` enum을 포함한다. sample/value마다
 quality/source를 보존하고 non-finite는 `null`로 쓴다. 일반 base size-profile 또는

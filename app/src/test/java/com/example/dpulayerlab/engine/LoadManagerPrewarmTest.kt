@@ -2,14 +2,17 @@ package com.example.dpulayerlab.engine
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import com.example.dpulayerlab.model.LoadSetpoints
+import com.example.dpulayerlab.model.LoadShape
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 class LoadManagerPrewarmTest {
     @Test
@@ -179,12 +182,124 @@ class LoadManagerPrewarmTest {
         }
     }
 
+    @Test
+    fun explicitDropSurvivesRuntimeAndFatalNpuZeroPublicationFailures() {
+        listOf(
+            IllegalStateException("synthetic zero failure"),
+            AssertionError("synthetic zero assertion"),
+            OutOfMemoryError("synthetic zero OOM"),
+        ).forEach { expectedFailure ->
+            verifyDropSurvivesZeroPublicationFailure(
+                expectedFailure = expectedFailure,
+                confirmRelease = false,
+            )
+        }
+    }
+
+    @Test
+    fun confirmedReleaseAttemptsIndependentZeroAndPreservesPublicationFailure() {
+        val expectedFailure = IllegalStateException("synthetic initial zero failure")
+        val releaseCalls = verifyDropSurvivesZeroPublicationFailure(
+            expectedFailure = expectedFailure,
+            confirmRelease = true,
+        )
+
+        assertEquals(1, releaseCalls)
+    }
+
+    @Test
+    fun confirmedReleaseKeepsFirstFailureAndSuppressesIndependentReleaseFailure() {
+        val publicationFailure = IllegalStateException("synthetic publication failure")
+        val independentFailure = AssertionError("synthetic ordered release failure")
+        val adapter = ThrowOnZeroNpuAdapter()
+        val manager = manager(
+            memoryWorkerCount = 0,
+            npuAdapter = adapter,
+        )
+        try {
+            manager.apply(LoadSetpoints(npu = 0.5f))
+            adapter.zeroFailure.set(publicationFailure)
+            adapter.releaseFailure.set(independentFailure)
+
+            val actual = try {
+                manager.releaseLoadsAndConfirm()
+                null
+            } catch (error: Throwable) {
+                error
+            }
+
+            assertSame(publicationFailure, actual)
+            assertEquals(1, adapter.releaseCalls.get())
+            assertEquals(1, publicationFailure.suppressed.size)
+            assertSame(independentFailure, publicationFailure.suppressed.single())
+        } finally {
+            adapter.zeroFailure.set(null)
+            adapter.releaseFailure.set(null)
+            manager.closeWithResult()
+        }
+    }
+
+    private fun verifyDropSurvivesZeroPublicationFailure(
+        expectedFailure: Throwable,
+        confirmRelease: Boolean,
+    ): Int {
+        val allocations = AtomicInteger(0)
+        val adapter = ThrowOnZeroNpuAdapter()
+        val manager = manager(
+            memoryWorkerCount = 1,
+            allocator = { size ->
+                allocations.incrementAndGet()
+                ByteArray(size)
+            },
+            npuAdapter = adapter,
+        )
+        try {
+            assertTrue(manager.start())
+            assertTrue(manager.prewarmMemoryWorkingSet(timeoutMs = 1_000L))
+            assertEquals(2, allocations.get())
+            manager.apply(LoadSetpoints(npu = 0.5f))
+            adapter.zeroFailure.set(expectedFailure)
+
+            val actualFailure = try {
+                if (confirmRelease) {
+                    manager.releaseLoadsAndConfirm(dropMemoryBuffers = true)
+                } else {
+                    manager.releaseLoads(dropMemoryBuffers = true)
+                }
+                null
+            } catch (error: Throwable) {
+                error
+            }
+
+            assertSame(expectedFailure, actualFailure)
+            if (confirmRelease) {
+                assertEquals(
+                    "ordered release must run after the first zero publication failed",
+                    1,
+                    adapter.releaseCalls.get(),
+                )
+            }
+            adapter.zeroFailure.set(null)
+            assertTrue(manager.prewarmMemoryWorkingSet(timeoutMs = 1_000L))
+            assertEquals(
+                "drop generation must revoke both pinned arrays despite the NPU failure",
+                4,
+                allocations.get(),
+            )
+            return adapter.releaseCalls.get()
+        } finally {
+            adapter.zeroFailure.set(null)
+            assertTrue(manager.closeWithResult().workersStopped)
+        }
+    }
+
     private fun manager(
         memoryWorkerCount: Int,
         allocator: (Int) -> ByteArray = { ByteArray(it) },
         monotonicNowMs: () -> Long = { 0L },
+        npuAdapter: NpuWorkloadAdapter = NoOpNpuAdapter,
     ) = LoadManager(
-        npuAdapter = NoOpNpuAdapter,
+        npuAdapter = npuAdapter,
         cpuWorkerCount = 0,
         memoryWorkerCount = memoryWorkerCount,
         memoryWorkingSetBytes = 512 * 1024,
@@ -209,4 +324,43 @@ class LoadManagerPrewarmTest {
             detail = "test",
         )
     }
+
+    private class ThrowOnZeroNpuAdapter : NpuWorkloadAdapter {
+        val zeroFailure = AtomicReference<Throwable?>(null)
+        val releaseFailure = AtomicReference<Throwable?>(null)
+        val releaseCalls = AtomicInteger(0)
+        private val version = AtomicLong(0L)
+
+        override fun isAvailable(): Boolean = true
+
+        override fun setIntensity(intensity: Float) = Unit
+
+        override fun requestLoad(
+            intensity: Float,
+            shape: LoadShape,
+            restartProfile: Boolean,
+        ): NpuControlRequest {
+            if (intensity <= 0f) zeroFailure.get()?.let { throw it }
+            return PrewarmNpuControlRequest(version.incrementAndGet())
+        }
+
+        override fun releaseAndConfirm(): Boolean {
+            releaseCalls.incrementAndGet()
+            releaseFailure.get()?.let { throw it }
+            return true
+        }
+
+        override fun status(): String = "test"
+
+        override fun closeWithResult() = NpuShutdownResult(
+            releaseConfirmed = true,
+            backendCloseConfirmed = true,
+            mayRemainActive = false,
+            detail = "test",
+        )
+    }
+
+    private data class PrewarmNpuControlRequest(
+        val version: Long,
+    ) : NpuControlRequest
 }

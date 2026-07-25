@@ -247,7 +247,8 @@ class LoadSafetyStateTest {
     }
 
     @Test
-    fun allocationPressureDuringPartialStartReclaimsEveryRegisteredWorker() {
+    fun allocationPressureDuringPartialStartReclaimsWorkersBeforeRethrowingOriginalOom() {
+        val fatal = OutOfMemoryError("synthetic worker-start allocation pressure")
         val startCalls = AtomicInteger(0)
         val manager = LoadManager(
             npuAdapter = BlockingNpuAdapter(releaseResult = true),
@@ -256,14 +257,20 @@ class LoadSafetyStateTest {
             memoryWorkingSetBytes = 0,
             workerStarter = { worker ->
                 if (startCalls.incrementAndGet() == 2) {
-                    throw OutOfMemoryError("synthetic worker-start allocation pressure")
+                    throw fatal
                 }
                 worker.start()
             },
         )
 
+        var thrown: OutOfMemoryError? = null
         try {
-            assertFalse(manager.start())
+            try {
+                manager.start()
+            } catch (error: OutOfMemoryError) {
+                thrown = error
+            }
+            assertTrue(thrown === fatal)
             assertTrue(manager.hasMemoryAllocationFailure())
             assertFalse(LoadSafetyState.hasLiveLocalWorkers())
 

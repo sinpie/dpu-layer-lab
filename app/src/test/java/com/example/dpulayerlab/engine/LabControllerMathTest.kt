@@ -38,9 +38,11 @@ import kotlinx.coroutines.yield
 import java.io.File
 import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicLong
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -164,6 +166,74 @@ class LabControllerMathTest {
                 remainingMs = Long.MAX_VALUE,
                 hardTimeoutMs = 0L,
                 completionReserveMs = 50L,
+            ),
+        )
+        assertEquals(
+            16L,
+            hwcCapacityCalibrationWaitMs(
+                remainingMs = 1_000L,
+                requestedWaitMs = 16L,
+                completionReserveMs = 150L,
+            ),
+        )
+        assertNull(
+            hwcCapacityCalibrationWaitMs(
+                remainingMs = 151L,
+                requestedWaitMs = 16L,
+                completionReserveMs = 150L,
+            ),
+        )
+        assertEquals(
+            1L,
+            hwcCapacityCalibrationWaitMs(
+                remainingMs = 152L,
+                requestedWaitMs = 16L,
+                completionReserveMs = 150L,
+            ),
+        )
+        assertNull(
+            hwcCapacityCalibrationWaitMs(
+                remainingMs = 150L,
+                requestedWaitMs = 16L,
+                completionReserveMs = 150L,
+            ),
+        )
+        assertEquals(
+            100L,
+            hwcCapacityCalibrationWaitMs(
+                remainingMs = 151L,
+                requestedWaitMs = 100L,
+                completionReserveMs = 50L,
+            ),
+        )
+        assertEquals(
+            99L,
+            hwcCapacityCalibrationWaitMs(
+                remainingMs = 150L,
+                requestedWaitMs = 100L,
+                completionReserveMs = 50L,
+            ),
+        )
+    }
+
+    @Test
+    fun capacityCalibrationSettleIsSkippedForStopOrFailedTeardown() {
+        assertTrue(
+            shouldRunHwcCapacityCalibrationSettle(
+                teardownConfirmed = true,
+                cancellationRequested = false,
+            ),
+        )
+        assertFalse(
+            shouldRunHwcCapacityCalibrationSettle(
+                teardownConfirmed = true,
+                cancellationRequested = true,
+            ),
+        )
+        assertFalse(
+            shouldRunHwcCapacityCalibrationSettle(
+                teardownConfirmed = false,
+                cancellationRequested = false,
             ),
         )
     }
@@ -977,6 +1047,85 @@ class LabControllerMathTest {
     }
 
     @Test
+    fun terminalEndpointHoldFramesCannotInflateProducerFidelityRatio() {
+        val frameBudget = AppliedProducerFrameBudget(
+            phaseStartedMs = 0L,
+            phaseDurationMs = 1_000L,
+        )
+        frameBudget.observePhysicalFrames(totalFrames = 100L, countAsActive = false)
+        frameBudget.apply(
+            atMonotonicMs = 0L,
+            producerFps = 60f,
+            activeLayers = 2,
+        )
+        frameBudget.observePhysicalFrames(totalFrames = 220L, countAsActive = true)
+        frameBudget.sealNominalActualWindow(
+            atMonotonicMs = 1_000L,
+            totalFrames = 220L,
+        )
+
+        // These frames prove the terminal control publication, but belong to its bounded hold.
+        frameBudget.observePhysicalFrames(totalFrames = 820L, countAsActive = true)
+        frameBudget.sealNominalActualWindow(
+            atMonotonicMs = 4_000L,
+            totalFrames = 900L,
+        )
+        frameBudget.finish(atMonotonicMs = 4_000L)
+
+        assertEquals(120.0, frameBudget.expectedAggregateFrames(), 0.001)
+        assertEquals(120L, frameBudget.actualAggregateFrames())
+        assertEquals(
+            1.0,
+            assessProducerRate(
+                actualFrames = frameBudget.actualAggregateFrames(),
+                expectedFrames = frameBudget.expectedAggregateFrames(),
+            ).ratio!!,
+            0.001,
+        )
+    }
+
+    @Test
+    fun delayedEndpointTickUsesOneObservedBoundaryForActualAndExpectedFidelity() {
+        val frameBudget = AppliedProducerFrameBudget(
+            phaseStartedMs = 0L,
+            phaseDurationMs = 1_000L,
+        )
+        frameBudget.observePhysicalFrames(totalFrames = 0L, countAsActive = false)
+        frameBudget.apply(
+            atMonotonicMs = 0L,
+            producerFps = 60f,
+            activeLayers = 2,
+        )
+
+        // The controller did not run at the nominal 1 s boundary. The aggregate counter cannot
+        // separate the first second from these three seconds of pre-endpoint apply delay.
+        frameBudget.sealNominalActualWindow(
+            atMonotonicMs = 4_000L,
+            totalFrames = 480L,
+            useObservedExpectedBoundary = true,
+        )
+        // Endpoint apply and its acknowledgment hold must change neither side after the seal.
+        frameBudget.apply(
+            atMonotonicMs = 4_000L,
+            producerFps = 120f,
+            activeLayers = 2,
+        )
+        frameBudget.observePhysicalFrames(totalFrames = 960L, countAsActive = true)
+        frameBudget.finish(atMonotonicMs = 6_000L)
+
+        assertEquals(480.0, frameBudget.expectedAggregateFrames(), 0.001)
+        assertEquals(480L, frameBudget.actualAggregateFrames())
+        assertEquals(
+            1.0,
+            assessProducerRate(
+                actualFrames = frameBudget.actualAggregateFrames(),
+                expectedFrames = frameBudget.expectedAggregateFrames(),
+            ).ratio!!,
+            0.001,
+        )
+    }
+
+    @Test
     fun activePhaseClockFreezesDuringRepeatedRecoveryEpisodes() {
         val clock = ActivePhaseClock(startedAtMs = 1_000L)
         assertEquals(100L, clock.elapsedMs(1_100L))
@@ -1266,6 +1415,19 @@ class LabControllerMathTest {
     }
 
     @Test
+    fun topologyPendingImmediatelyHidesExpectedPhysicalCountWithoutRewritingObservedCount() {
+        val pending = progressForProducerTopologyPending(
+            RunProgress(
+                expectedProducerCount = 4,
+                observedProducerCount = 2,
+            ),
+        )
+
+        assertEquals(0, pending.expectedProducerCount)
+        assertEquals(2, pending.observedProducerCount)
+    }
+
+    @Test
     fun producerRecoveryCallbackFailsClosedIfEitherSafeActionIsUnconfirmed() {
         assertFalse(
             producerRecoverySafePointFailed(
@@ -1517,6 +1679,58 @@ class LabControllerMathTest {
         assertTrue(pending.isAcknowledgedBy(acknowledgedTarget))
         assertFalse(pending.isAcknowledgedBy(recoveryPreparation))
         assertNull(discardPendingControlCoverageForProducerRecovery(pending))
+    }
+
+    @Test
+    fun endpointPendingCoverageRequiresExactAllProducerControlRevision() {
+        val profile = LayerSizeProfile.FULL_SCREEN
+        val pending = PendingControlCoverage(
+            sample = TransitionSample(1f, TransitionSegment.HOLD),
+            phaseElapsedMs = 1_000L,
+            expectedProducerCount = 2,
+            expectedTopologyRevision = 4L,
+            expectedLayerSizeProfileOrdinal = profile.ordinal,
+            expectedProducerControlRevision = 9L,
+        )
+        val base = com.example.dpulayerlab.monitor.ProducerReadiness(
+            expectedCount = 2,
+            ready = true,
+            topologyRevision = 4L,
+            geometryRequestedRevision = 5L,
+            geometryAppliedRevision = 5L,
+            geometryRequestedProfileOrdinal = profile.ordinal,
+            geometryAppliedProfileOrdinal = profile.ordinal,
+            geometryReady = true,
+        )
+
+        assertFalse(pending.isAcknowledgedBy(base))
+        assertFalse(
+            pending.isAcknowledgedBy(
+                base.copy(
+                    producerControlAppliedCount = 1,
+                    producerControlAppliedRevision = 9L,
+                    producerControlReady = false,
+                ),
+            ),
+        )
+        assertFalse(
+            pending.isAcknowledgedBy(
+                base.copy(
+                    producerControlAppliedCount = 2,
+                    producerControlAppliedRevision = 8L,
+                    producerControlReady = true,
+                ),
+            ),
+        )
+        assertTrue(
+            pending.isAcknowledgedBy(
+                base.copy(
+                    producerControlAppliedCount = 2,
+                    producerControlAppliedRevision = 9L,
+                    producerControlReady = true,
+                ),
+            ),
+        )
     }
 
     @Test
@@ -2364,6 +2578,21 @@ class LabControllerMathTest {
         assertTrue(isFatalTelemetryStartupFailure(ThreadDeath()))
         assertTrue(isFatalTelemetryStartupFailure(AssertionError("fatal")))
         assertTrue(isFatalControllerStartupFailure(OutOfMemoryError("oom")))
+        assertTrue(
+            shouldRethrowRuntimeWorkloadApplyFailure(
+                CancellationException("STOP"),
+            ),
+        )
+        assertTrue(
+            shouldRethrowRuntimeWorkloadApplyFailure(
+                OutOfMemoryError("thermal apply"),
+            ),
+        )
+        assertFalse(
+            shouldRethrowRuntimeWorkloadApplyFailure(
+                IllegalStateException("recoverable adapter failure"),
+            ),
+        )
         assertFalse(
             isFatalTelemetryStartupFailure(
                 IllegalStateException("recoverable startup failure"),
@@ -2374,6 +2603,37 @@ class LabControllerMathTest {
                 IllegalStateException("recoverable startup failure"),
             ),
         )
+    }
+
+    @Test
+    fun controllerCleanupFailureMergePromotesFatalAndPreservesIdentity() {
+        val ordinary = IllegalStateException("ordinary cleanup")
+        val fatal = OutOfMemoryError("fatal cleanup")
+
+        val terminal = mergeControllerFailurePreservingFatal(ordinary, fatal)
+
+        assertSame(fatal, terminal)
+        assertTrue(fatal.suppressed.any { it === ordinary })
+        val later = IllegalArgumentException("later cleanup")
+        assertSame(fatal, mergeControllerFailurePreservingFatal(terminal, later))
+        assertTrue(fatal.suppressed.any { it === later })
+    }
+
+    @Test
+    fun boundedControllerWorkerRelaysExactFatalToOwningCoroutine() {
+        val fatal = ThreadDeath()
+        var thrown: Throwable? = null
+
+        try {
+            controllerWorkerFailureOrThrow(fatal)
+        } catch (error: Throwable) {
+            thrown = error
+        }
+
+        assertSame(fatal, thrown)
+        val ordinary = IllegalStateException("worker")
+        assertSame(ordinary, controllerWorkerFailureOrThrow(ordinary))
+        assertNull(controllerWorkerFailureOrThrow(null))
     }
 
     @Test
@@ -2821,6 +3081,436 @@ class LabControllerMathTest {
             )
         }
         assertTrue(skipped.failureReason()!!.contains("1"))
+    }
+
+    @Test
+    fun wholePhaseLinearRampPublishesOneTerminalEndpointWithBoundedAcknowledgment() {
+        val nowMs = AtomicLong(1_000L)
+        val spec = TransitionSpec(
+            mode = TransitionMode.LINEAR_RAMP,
+            transitionDurationMs = 0L,
+        )
+        val gate = TerminalLinearRampEndpointGate(
+            acknowledgmentTimeoutMs = 3_000L,
+            monotonicNowMs = nowMs::get,
+        )
+
+        assertFalse(
+            gate.shouldPublish(
+                spec = spec,
+                phaseElapsedMs = 199L,
+                phaseDurationMs = 200L,
+            ),
+        )
+        assertTrue(
+            gate.shouldPublish(
+                spec = spec,
+                phaseElapsedMs = 200L,
+                phaseDurationMs = 200L,
+            ),
+        )
+        val endpoint = LoadTransitionEvaluator.sampleAt(
+            spec = spec,
+            elapsedMs = 200L,
+            phaseDurationMs = 200L,
+        )
+        assertEquals(1f, endpoint.fraction)
+
+        assertEquals(1L, gate.markPublished())
+        assertTrue(gate.published)
+        assertFalse(
+            gate.shouldPublish(
+                spec = spec,
+                phaseElapsedMs = 300L,
+                phaseDurationMs = 200L,
+            ),
+        )
+        nowMs.set(3_999L)
+        assertFalse(gate.acknowledgmentTimedOut())
+        nowMs.set(4_000L)
+        assertTrue(gate.acknowledgmentTimedOut())
+
+        val shorterWindow = TerminalLinearRampEndpointGate(
+            acknowledgmentTimeoutMs = 3_000L,
+            monotonicNowMs = nowMs::get,
+        )
+        assertFalse(
+            shorterWindow.shouldPublish(
+                spec = spec.copy(transitionDurationMs = 100L),
+                phaseElapsedMs = 200L,
+                phaseDurationMs = 200L,
+            ),
+        )
+    }
+
+    @Test
+    fun terminalLinearRampEndpointRearmsWithANewRevisionAfterProducerRecovery() {
+        val nowMs = AtomicLong(1_000L)
+        val spec = TransitionSpec(
+            mode = TransitionMode.LINEAR_RAMP,
+            transitionDurationMs = 0L,
+        )
+        val gate = TerminalLinearRampEndpointGate(
+            acknowledgmentTimeoutMs = 3_000L,
+            monotonicNowMs = nowMs::get,
+        )
+
+        assertTrue(gate.shouldPublish(spec, phaseElapsedMs = 200L, phaseDurationMs = 200L))
+        val staleRevision = gate.markPublished()
+        assertFalse(gate.rearmAfterProducerRecovery(staleRevision + 1L))
+        assertTrue(gate.published)
+
+        assertTrue(gate.rearmAfterProducerRecovery(staleRevision))
+        assertFalse(gate.published)
+        assertTrue(gate.shouldPublish(spec, phaseElapsedMs = 200L, phaseDurationMs = 200L))
+
+        nowMs.set(1_500L)
+        val recoveredRevision = gate.markPublished()
+        assertEquals(staleRevision + 1L, recoveredRevision)
+        assertFalse(gate.acknowledgmentTimedOut())
+        nowMs.set(4_500L)
+        assertTrue(gate.acknowledgmentTimedOut())
+    }
+
+    @Test
+    fun linearRampCoverageRequiresBothIntermediateAndAcknowledgedTarget() {
+        val coverage = TransitionCoverageTracker(
+            TransitionSpec(mode = TransitionMode.LINEAR_RAMP),
+        )
+        coverage.observe(
+            TransitionSample(0.5f, TransitionSegment.RAMP_UP),
+            phaseElapsedMs = 100L,
+        )
+        assertTrue(coverage.failureReason()!!.contains("target"))
+
+        coverage.observe(
+            TransitionSample(1f, TransitionSegment.HOLD),
+            phaseElapsedMs = 200L,
+        )
+        assertNull(coverage.failureReason())
+
+        val targetOnly = TransitionCoverageTracker(
+            TransitionSpec(mode = TransitionMode.LINEAR_RAMP),
+        )
+        targetOnly.observe(
+            TransitionSample(1f, TransitionSegment.HOLD),
+            phaseElapsedMs = 200L,
+        )
+        assertTrue(targetOnly.failureReason()!!.contains("intermediate"))
+    }
+
+    @Test
+    fun pulseNpuZeroAndPositiveEdgesEachRequireFreshAcknowledgment() {
+        val spec = TransitionSpec(
+            mode = TransitionMode.PULSE_BURST,
+            cycleMs = 1_000L,
+            dutyCycle = 0.5f,
+        )
+        val origin = LoadSetpoints(npu = 0f)
+        val target = LoadSetpoints(npu = 0.8f)
+        var previousNpu: Float? = origin.npu
+        var positiveAcknowledged = false
+
+        fun decisionAt(elapsedMs: Long): NpuSemanticEdgeDecision {
+            val sample = LoadTransitionEvaluator.sampleAt(
+                spec = spec,
+                elapsedMs = elapsedMs,
+                phaseDurationMs = 2_000L,
+            )
+            val current = LoadTransitionEvaluator.interpolate(
+                previous = origin,
+                target = target,
+                fraction = sample.fraction,
+            ).npu
+            return npuSemanticEdgeDecision(
+                previousNpu = previousNpu,
+                currentNpu = current,
+                positiveAcknowledged = positiveAcknowledged,
+            ).also { decision ->
+                // Simulate the controller commit that is allowed only after APPLIED.
+                previousNpu = current
+                positiveAcknowledged = decision.positiveAcknowledgedAfterApply
+            }
+        }
+
+        val firstOn = decisionAt(0L)
+        assertEquals(NpuSemanticEdge.ZERO_TO_POSITIVE, firstOn.edge)
+        assertTrue(firstOn.acknowledgmentRequired)
+        assertTrue(firstOn.positiveAcknowledgedAfterApply)
+
+        val off = decisionAt(500L)
+        assertEquals(NpuSemanticEdge.POSITIVE_TO_ZERO, off.edge)
+        assertTrue(off.acknowledgmentRequired)
+        assertFalse(off.positiveAcknowledgedAfterApply)
+
+        val secondOn = decisionAt(1_000L)
+        assertEquals(NpuSemanticEdge.ZERO_TO_POSITIVE, secondOn.edge)
+        assertTrue(secondOn.acknowledgmentRequired)
+        assertTrue(secondOn.positiveAcknowledgedAfterApply)
+    }
+
+    @Test
+    fun triangleNpuInteriorCheckpointsStayLatestWinsButValleyEdgesRequireAck() {
+        val spec = TransitionSpec(
+            mode = TransitionMode.TRIANGLE_WAVE,
+            cycleMs = 1_000L,
+        )
+        val origin = LoadSetpoints(npu = 0f)
+        val target = LoadSetpoints(npu = 0.8f)
+        var previousNpu: Float? = origin.npu
+        var positiveAcknowledged = false
+
+        fun decisionAt(elapsedMs: Long): NpuSemanticEdgeDecision {
+            val sample = LoadTransitionEvaluator.sampleAt(
+                spec = spec,
+                elapsedMs = elapsedMs,
+                phaseDurationMs = 2_000L,
+            )
+            val current = LoadTransitionEvaluator.interpolate(
+                previous = origin,
+                target = target,
+                fraction = sample.fraction,
+            ).npu
+            return npuSemanticEdgeDecision(
+                previousNpu = previousNpu,
+                currentNpu = current,
+                positiveAcknowledged = positiveAcknowledged,
+            ).also { decision ->
+                previousNpu = current
+                positiveAcknowledged = decision.positiveAcknowledgedAfterApply
+            }
+        }
+
+        val originSample = decisionAt(0L)
+        assertEquals(NpuSemanticEdge.NONE, originSample.edge)
+        assertFalse(originSample.acknowledgmentRequired)
+
+        val firstAttack = decisionAt(100L)
+        assertEquals(NpuSemanticEdge.ZERO_TO_POSITIVE, firstAttack.edge)
+        assertTrue(firstAttack.acknowledgmentRequired)
+
+        listOf(200L, 500L, 900L).forEach { elapsedMs ->
+            val interior = decisionAt(elapsedMs)
+            assertEquals(NpuSemanticEdge.NONE, interior.edge)
+            assertFalse(interior.acknowledgmentRequired)
+            assertTrue(interior.positiveAcknowledgedAfterApply)
+        }
+
+        val valley = decisionAt(1_000L)
+        assertEquals(NpuSemanticEdge.POSITIVE_TO_ZERO, valley.edge)
+        assertTrue(valley.acknowledgmentRequired)
+        assertFalse(valley.positiveAcknowledgedAfterApply)
+
+        val reattack = decisionAt(1_100L)
+        assertEquals(NpuSemanticEdge.ZERO_TO_POSITIVE, reattack.edge)
+        assertTrue(reattack.acknowledgmentRequired)
+    }
+
+    @Test
+    fun triangleNpuFullCycleZeroBoundarySurvivesJitterAndRequiresFreshReattack() {
+        val spec = TransitionSpec(
+            mode = TransitionMode.TRIANGLE_WAVE,
+            cycleMs = 1_000L,
+        )
+
+        val boundary = triangleNpuZeroBoundaryDecision(
+            spec = spec,
+            previousPhaseElapsedMs = 999L,
+            currentPhaseElapsedMs = 1_001L,
+            phaseDurationMs = 2_000L,
+            originNpu = 0f,
+            targetNpu = 0.8f,
+        )
+
+        assertEquals(1L, boundary.crossedZeroBoundaries)
+        assertTrue(boundary.zeroAcknowledgmentRequired)
+        assertTrue(boundary.positiveReattackAcknowledgmentRequired)
+        assertFalse(boundary.terminalBoundary)
+
+        val zero = npuSemanticEdgeDecision(
+            previousNpu = 0.2f,
+            currentNpu = 0f,
+            positiveAcknowledged = true,
+        )
+        assertEquals(NpuSemanticEdge.POSITIVE_TO_ZERO, zero.edge)
+        assertTrue(zero.acknowledgmentRequired)
+        assertFalse(zero.positiveAcknowledgedAfterApply)
+        val reattack = npuSemanticEdgeDecision(
+            previousNpu = 0f,
+            currentNpu = 0.01f,
+            positiveAcknowledged = zero.positiveAcknowledgedAfterApply,
+        )
+        assertEquals(NpuSemanticEdge.ZERO_TO_POSITIVE, reattack.edge)
+        assertTrue(reattack.acknowledgmentRequired)
+    }
+
+    @Test
+    fun triangleNpuTerminalFullCycleBoundaryRequiresZeroWithoutPositiveReattack() {
+        val boundary = triangleNpuZeroBoundaryDecision(
+            spec = TransitionSpec(
+                mode = TransitionMode.TRIANGLE_WAVE,
+                cycleMs = 1_000L,
+            ),
+            previousPhaseElapsedMs = 900L,
+            // A late callback is clamped to the exact duration/cycle boundary.
+            currentPhaseElapsedMs = 1_017L,
+            phaseDurationMs = 1_000L,
+            originNpu = 0f,
+            targetNpu = 0.8f,
+        )
+
+        assertEquals(1L, boundary.crossedZeroBoundaries)
+        assertTrue(boundary.zeroAcknowledgmentRequired)
+        assertFalse(boundary.positiveReattackAcknowledgmentRequired)
+        assertTrue(boundary.terminalBoundary)
+    }
+
+    @Test
+    fun triangleNpuBoundaryReportsMultipleSkippedZerosForFailClosedDecision() {
+        val boundary = triangleNpuZeroBoundaryDecision(
+            spec = TransitionSpec(
+                mode = TransitionMode.TRIANGLE_WAVE,
+                cycleMs = 1_000L,
+            ),
+            previousPhaseElapsedMs = 999L,
+            currentPhaseElapsedMs = 3_001L,
+            phaseDurationMs = 4_000L,
+            originNpu = 0f,
+            targetNpu = 0.8f,
+        )
+
+        // The controller confirms only the newest exact zero, then treats this count as
+        // inconclusive. It must never enqueue three historical zero/re-attack pairs.
+        assertEquals(3L, boundary.crossedZeroBoundaries)
+        assertTrue(boundary.zeroAcknowledgmentRequired)
+        assertTrue(boundary.positiveReattackAcknowledgmentRequired)
+        assertFalse(boundary.terminalBoundary)
+    }
+
+    @Test
+    fun invertedTriangleHalfCycleZeroBoundarySurvivesJitterAndRequiresFreshReattack() {
+        val spec = TransitionSpec(
+            mode = TransitionMode.TRIANGLE_WAVE,
+            cycleMs = 500L,
+        )
+
+        val boundary = triangleNpuZeroBoundaryDecision(
+            spec = spec,
+            previousPhaseElapsedMs = 249L,
+            currentPhaseElapsedMs = 251L,
+            phaseDurationMs = 1_000L,
+            originNpu = 0.8f,
+            targetNpu = 0f,
+        )
+
+        assertEquals(1L, boundary.crossedZeroBoundaries)
+        assertTrue(boundary.zeroAcknowledgmentRequired)
+        assertTrue(boundary.positiveReattackAcknowledgmentRequired)
+        assertFalse(boundary.terminalBoundary)
+    }
+
+    @Test
+    fun invertedTriangleExactHalfCycleZeroDefersReattackUntilFollowingPositiveTick() {
+        val boundary = triangleNpuZeroBoundaryDecision(
+            spec = TransitionSpec(
+                mode = TransitionMode.TRIANGLE_WAVE,
+                cycleMs = 500L,
+            ),
+            previousPhaseElapsedMs = 249L,
+            currentPhaseElapsedMs = 250L,
+            phaseDurationMs = 1_000L,
+            originNpu = 0.8f,
+            targetNpu = 0f,
+        )
+
+        assertEquals(1L, boundary.crossedZeroBoundaries)
+        assertTrue(boundary.zeroAcknowledgmentRequired)
+        assertFalse(boundary.positiveReattackAcknowledgmentRequired)
+        assertFalse(boundary.terminalBoundary)
+    }
+
+    @Test
+    fun invertedTriangleTerminalHalfCycleEndsWithExactZeroOnly() {
+        val boundary = triangleNpuZeroBoundaryDecision(
+            spec = TransitionSpec(
+                mode = TransitionMode.TRIANGLE_WAVE,
+                cycleMs = 500L,
+            ),
+            previousPhaseElapsedMs = 700L,
+            currentPhaseElapsedMs = 767L,
+            phaseDurationMs = 750L,
+            originNpu = 0.8f,
+            targetNpu = 0f,
+        )
+
+        assertEquals(1L, boundary.crossedZeroBoundaries)
+        assertTrue(boundary.zeroAcknowledgmentRequired)
+        assertFalse(boundary.positiveReattackAcknowledgmentRequired)
+        assertTrue(boundary.terminalBoundary)
+    }
+
+    @Test
+    fun invertedTriangleMultipleSkippedHalfCycleZerosFailClosedWithoutBacklog() {
+        val boundary = triangleNpuZeroBoundaryDecision(
+            spec = TransitionSpec(
+                mode = TransitionMode.TRIANGLE_WAVE,
+                cycleMs = 500L,
+            ),
+            previousPhaseElapsedMs = 249L,
+            currentPhaseElapsedMs = 1_251L,
+            phaseDurationMs = 1_500L,
+            originNpu = 0.8f,
+            targetNpu = 0f,
+        )
+
+        assertEquals(3L, boundary.crossedZeroBoundaries)
+        assertTrue(boundary.zeroAcknowledgmentRequired)
+        assertTrue(boundary.positiveReattackAcknowledgmentRequired)
+        assertFalse(boundary.terminalBoundary)
+    }
+
+    @Test
+    fun triangleNpuBoundaryIgnoresNonZeroFloorOriginAndNonCrossingSamples() {
+        val base = TransitionSpec(
+            mode = TransitionMode.TRIANGLE_WAVE,
+            cycleMs = 1_000L,
+        )
+        val nonZeroFloor = triangleNpuZeroBoundaryDecision(
+            spec = base.copy(floor = 0.2f),
+            previousPhaseElapsedMs = 999L,
+            currentPhaseElapsedMs = 1_001L,
+            phaseDurationMs = 2_000L,
+            originNpu = 0f,
+            targetNpu = 0.8f,
+        )
+        assertEquals(0L, nonZeroFloor.crossedZeroBoundaries)
+        assertFalse(nonZeroFloor.zeroAcknowledgmentRequired)
+        assertFalse(nonZeroFloor.positiveReattackAcknowledgmentRequired)
+
+        val nonZeroOrigin = triangleNpuZeroBoundaryDecision(
+            spec = base,
+            previousPhaseElapsedMs = 999L,
+            currentPhaseElapsedMs = 1_001L,
+            phaseDurationMs = 2_000L,
+            originNpu = 0.2f,
+            targetNpu = 0.8f,
+        )
+        assertEquals(0L, nonZeroOrigin.crossedZeroBoundaries)
+        assertFalse(nonZeroOrigin.zeroAcknowledgmentRequired)
+        assertFalse(nonZeroOrigin.positiveReattackAcknowledgmentRequired)
+
+        val noCrossing = triangleNpuZeroBoundaryDecision(
+            spec = base,
+            previousPhaseElapsedMs = 900L,
+            currentPhaseElapsedMs = 999L,
+            phaseDurationMs = 2_000L,
+            originNpu = 0f,
+            targetNpu = 0.8f,
+        )
+        assertEquals(0L, noCrossing.crossedZeroBoundaries)
+        assertFalse(noCrossing.zeroAcknowledgmentRequired)
+        assertFalse(noCrossing.positiveReattackAcknowledgmentRequired)
+        assertFalse(noCrossing.terminalBoundary)
     }
 
     @Test

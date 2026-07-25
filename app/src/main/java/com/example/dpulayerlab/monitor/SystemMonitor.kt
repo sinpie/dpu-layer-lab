@@ -15,6 +15,7 @@ import com.example.dpulayerlab.model.SensorReading
 import com.example.dpulayerlab.model.TelemetrySnapshot
 import com.example.dpulayerlab.model.PixelRoute
 import com.example.dpulayerlab.vendor.VendorBridge
+import com.example.dpulayerlab.vendor.VendorCapabilityIsolationToken
 import com.example.dpulayerlab.vendor.VendorShutdownResult
 import com.example.dpulayerlab.vendor.validVendorFrequencyHz
 import kotlinx.coroutines.CancellationException
@@ -220,7 +221,7 @@ class SystemMonitor private constructor(
                 sampleContinuityLost.set(true)
                 throw SystemMonitorSampleException(
                     "telemetry sample failed: ${result.error.javaClass.simpleName}",
-                    result.error,
+                    nonFatalTelemetryFailure(result.error),
                 )
             }
             ProbeLaneResult.Busy -> sampleFailure("previous telemetry sample is still active")
@@ -255,6 +256,15 @@ class SystemMonitor private constructor(
             )
         }
     }
+
+    internal fun acquireCalibrationCapabilityIsolation():
+        VendorCapabilityIsolationToken? =
+        vendorBridge.acquireCalibrationCapabilityIsolation()
+
+    internal fun releaseCalibrationCapabilityIsolation(
+        token: VendorCapabilityIsolationToken,
+    ): Boolean =
+        vendorBridge.releaseCalibrationCapabilityIsolation(token)
 
     private fun sampleFailure(message: String): Nothing {
         sampleContinuityLost.set(true)
@@ -459,6 +469,7 @@ class SystemMonitor private constructor(
         val vendorGpu = vendor?.gpuUtilization?.validUtilizationPercent()
         val vendorGpuFrequencyMhz = normalizedVendorFrequencyMhz(vendor?.gpuFrequencyHz)
         val vendorDpuFrequencyMhz = normalizedVendorFrequencyMhz(vendor?.dpuFrequencyHz)
+        val vendorBrokerAvailability = vendorBridge.brokerBindingAvailability()
 
         // Read and reset both counters at the same point in every sample. The monitor loop can
         // slip while dumpsys/sysfs is slow, so rates must use this real interval instead of
@@ -506,6 +517,17 @@ class SystemMonitor private constructor(
             maxAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
         )
         latestReadings = buildList {
+            vendorBrokerAvailability.failure?.let { failure ->
+                add(
+                    SensorReading(
+                        "vendor_broker",
+                        "Vendor broker",
+                        "UNAVAILABLE · ${failure.code.name}",
+                        MetricQuality.UNAVAILABLE,
+                        failure.detail,
+                    ),
+                )
+            }
             vendor?.underrunCount?.takeIf { it >= 0L }?.let { underrunCount ->
                 add(
                     SensorReading(
@@ -691,6 +713,8 @@ class SystemMonitor private constructor(
             compressionState = when {
                 vendor != null -> vendor.compressionState.ifBlank { "Unknown" }
                 currentVendorServiceSession != null -> "Unavailable · snapshot timeout"
+                vendorBrokerAvailability.failure != null ->
+                    "Unavailable · ${vendorBrokerAvailability.failure.code.name}"
                 else -> "Adapter 없음"
             },
             // Reuse the vendor transaction already completed at the start of this sample.
@@ -707,6 +731,7 @@ class SystemMonitor private constructor(
         lastCompositionEvidence = null
         verifiedVendorCompositionSession = null
         compositionSamplesUntilProbe = 0
+        kernelSensors.resetCumulativeBaselines()
         // A detached/timed-out sample may have consumed part of these interval counters. Discard
         // the remainder so the next accepted value starts from one explicit fresh baseline.
         frameTracker.sampleProducedFrames()
@@ -767,26 +792,33 @@ class SystemMonitor private constructor(
     internal fun stopLocalSamplingForShutdown(): Boolean =
         sampleLane.closeWithResult()
 
-    private fun readCpuTimes(): CpuTimes? = runCatching {
-        File("/proc/stat").bufferedReader().use { reader ->
-            parseProcStatCpuLine(reader.readLine())
+    private fun readCpuTimes(): CpuTimes? =
+        try {
+            File("/proc/stat").bufferedReader().use { reader ->
+                parseProcStatCpuLine(reader.readLine())
+            }
+        } catch (_: Exception) {
+            null
         }
-    }.getOrNull()
 
-    private fun readHardwareCpuTimes(): CpuTimes? = runCatching {
-        val rawUsages = hardwareProperties.cpuUsages
-        val usages = rawUsages.filterNotNull()
-        if (usages.isEmpty() || usages.size != rawUsages.size) return null
-        if (usages.any { it.active < 0L || it.total <= 0L || it.active > it.total }) return null
-        val active = usages.map { it.active }.checkedSum()
-        val total = usages.map { it.total }.checkedSum()
-        if (total <= 0) return null
-        CpuTimes(
-            idle = total - active,
-            total = total,
-            participantCount = usages.size,
-        )
-    }.getOrNull()
+    private fun readHardwareCpuTimes(): CpuTimes? {
+        return try {
+            val rawUsages = hardwareProperties.cpuUsages
+            val usages = rawUsages.filterNotNull()
+            if (usages.isEmpty() || usages.size != rawUsages.size) return null
+            if (usages.any { it.active < 0L || it.total <= 0L || it.active > it.total }) return null
+            val active = usages.map { it.active }.checkedSum()
+            val total = usages.map { it.total }.checkedSum()
+            if (total <= 0) return null
+            CpuTimes(
+                idle = total - active,
+                total = total,
+                participantCount = usages.size,
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
 
     private fun thermalLabel(status: Int): String = when (status) {
         PowerManager.THERMAL_STATUS_NONE -> "정상"
@@ -806,6 +838,16 @@ internal data class NormalizedMemoryMetrics(
     val availableMb: Float?,
     val appPssMb: Float?,
 )
+
+/**
+ * [SingleFlightInputProbeLane] publishes worker completion before returning a failed result.
+ * Preserve that cleanup boundary, but never downgrade a fatal VM/process error to an ordinary
+ * telemetry gap that the controller might continue past.
+ */
+internal fun nonFatalTelemetryFailure(error: Throwable): Throwable {
+    if (error is Error) throw error
+    return error
+}
 
 internal fun normalizedMemoryMetrics(
     totalBytes: Long,
@@ -1230,21 +1272,25 @@ internal data class CpuTimes(
  * Parses the aggregate Linux CPU line without double-counting guest/guest_nice. Those fields are
  * already included in user/nice by the kernel ABI.
  */
-internal fun parseProcStatCpuLine(line: String?): CpuTimes? = runCatching {
-    val tokens = line
-        ?.trim()
-        ?.split(Regex("""\s+"""))
-        ?: return null
-    if (tokens.firstOrNull() != "cpu" || tokens.size < 6) return null
-    val fields = tokens.drop(1).map(String::toLong)
-    if (fields.any { it < 0L }) return null
-    val idle = Math.addExact(fields[3], fields.getOrElse(4) { 0L })
-    // user, nice, system, idle, iowait, irq, softirq, steal. guest values after this range
-    // are accounting subsets rather than additional elapsed time.
-    val total = fields.take(8).checkedSum()
-    if (total <= 0L || idle > total) return null
-    CpuTimes(idle = idle, total = total)
-}.getOrNull()
+internal fun parseProcStatCpuLine(line: String?): CpuTimes? {
+    return try {
+        val tokens = line
+            ?.trim()
+            ?.split(Regex("""\s+"""))
+            ?: return null
+        if (tokens.firstOrNull() != "cpu" || tokens.size < 6) return null
+        val fields = tokens.drop(1).map(String::toLong)
+        if (fields.any { it < 0L }) return null
+        val idle = Math.addExact(fields[3], fields.getOrElse(4) { 0L })
+        // user, nice, system, idle, iowait, irq, softirq, steal. guest values after this range
+        // are accounting subsets rather than additional elapsed time.
+        val total = fields.take(8).checkedSum()
+        if (total <= 0L || idle > total) return null
+        CpuTimes(idle = idle, total = total)
+    } catch (_: Exception) {
+        null
+    }
+}
 
 internal fun normalizedPerSecond(count: Long, elapsedMs: Long?): Float? {
     if (count < 0L || elapsedMs == null || elapsedMs <= 0L) return null

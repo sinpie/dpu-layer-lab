@@ -105,6 +105,14 @@ sample과 waiter backlog를 경쟁시키지 않는다.
 3. 없음: `N/A`
 
 platform signing만으로 counter 접근이 생긴다고 가정하지 않는다.
+Portable built-in kernel 후보는 DPU-scoped
+`/sys/class/dpu/dpu0/underrun_count`와
+`/sys/class/dpu/dpu0/underrun_cnt`뿐이다. Generic DRM device의
+`/sys/class/drm/card0/device/underrun_count`는 counter 의미와 display scope가
+검증되지 않으므로 exact 기본 후보가 아니다. 제품이 DRM counter를 사용하려면 typed
+`dpu_underrun` custom config로 명시하고 BSP에서 monotonicity, reset/wrap, display
+scope를 검증해야 한다. Custom path도 key별 sysfs namespace, canonical regular/readable
+attribute와 bounded input 검사를 통과하지 못하면 `N/A`다.
 
 ### Baseline과 continuity
 
@@ -205,6 +213,10 @@ architecture-specific ABI 뒤에서만 검사한다. 주소 기반 platform dire
 
 명시적인 GPU path/format이 실패하면 generic fallback으로 숨기지 않는다. cumulative
 encoding은 read gap 뒤 baseline을 폐기한다.
+Outer telemetry sample이 kernel probe 전 또는 probe 뒤 snapshot publish 전에 실패한
+경우도 GPU/bus/DPU cumulative baseline 세 개를 모두 폐기한다. 다음 sample은 새
+baseline을 만드는 `N/A` interval이며 보이지 않은 긴 구간을 현재 utilization로 평균내지
+않고 HUD graph/peak continuity도 끊는다.
 
 ## DPU, bus와 frequency
 
@@ -227,6 +239,10 @@ producer FPS × committed physical producer count × active interval
 
 topology pending, transient producer recovery와 안전 control 구간은 frame budget에서
 제외한다. callback은 generation과 physical producer ID가 일치해야 한다.
+Whole-phase linear endpoint는 apply 직전 한 번 읽은 monotonic time과 aggregate frame
+counter를 actual/expected의 같은 observed publication boundary로 사용한다. 이후
+all-producer revision proof hold frame은 FrameTracker 증거에는 남지만 fidelity
+분자·분모에는 넣지 않는다.
 
 - `FLATTENED_TEXTURE` physical count는 1
 - expected aggregate가 30 frame 이상이고 actual이 70% 미만이면

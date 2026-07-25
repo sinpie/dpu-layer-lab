@@ -74,4 +74,16 @@ class SystemMonitorConstructionTest {
 
         assertEquals(listOf("owned"), events)
     }
+
+    @Test
+    fun telemetryFailurePreservesExpectedExceptionButRethrowsFatalError() {
+        val expected = IllegalStateException("binder")
+        assertSame(expected, nonFatalTelemetryFailure(expected))
+
+        val fatal = OutOfMemoryError("telemetry allocation")
+        val thrown = assertThrows(OutOfMemoryError::class.java) {
+            nonFatalTelemetryFailure(fatal)
+        }
+        assertSame(fatal, thrown)
+    }
 }

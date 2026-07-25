@@ -17,11 +17,10 @@ Android AP의 DPU underrun 재현·검출과 Hardware Composer 합성 한계 탐
 service를 연결하면 DPU·DDR·HWC·SBWC·NPU와 같은 제품 전용 기능을 추가로 사용할 수
 있습니다.
 
-현재 launcher/Gradle project 표시 이름은 **DPULayerTest**입니다. 저장소의 미배포
-source candidate는 `20260725_095708`(`versionCode 5`), debug는
-`20260725_095708-debug`입니다. 최신 공개 release는
-[`v20260725_090252`](https://github.com/sinpie/dpu-layer-lab/releases/tag/v20260725_090252)
-(`versionCode 4`)입니다. Version name은 KST build 시각을 `yyyyMMdd_HHmmss`로 고정한
+현재 launcher/Gradle project 표시 이름은 **DPULayerTest**입니다. 현재 release는
+[`v20260725_170750`](https://github.com/sinpie/dpu-layer-lab/releases/tag/v20260725_170750)
+(`versionCode 6`), debug version은 `20260725_170750-debug`입니다. Version name은 KST
+build 시각을 `yyyyMMdd_HHmmss`로 고정한
 형식입니다. 앱 상단과 실행 HUD에 실제 build version을 노출해 결과를 만든 바이너리를
 현장에서 바로 식별할 수 있습니다.
 소스 저장소는 계속 [sinpie/dpu-layer-lab](https://github.com/sinpie/dpu-layer-lab)을
@@ -101,8 +100,10 @@ Soong module/APK 통합 이름 `DpuLayerLab`은 이름을 바꾸지 않는 호�
 - HWC DEVICE/CLIENT layer 파싱(`DUMP` 권한이 있을 때)
 - exact underrun counter와 frame-deadline proxy를 분리한 판정
 - thermal·low-memory·graphics-memory budget 기반 런타임 안전 정책
-- 카테고리·변화 파형·예상 강도·부하/조건을 조합하는 시나리오 필터와 순서가 보존되는
-  queue, plan 반복 및 실행/결과 진행률
+- `테스트 선택 → 순서·반복 → 확인 후 실행`의 두 단계 시나리오 설정, 선택 단계 고정
+  요약 dock, 접을 수 있는 세부 조건·scenario 상세, 세로 queue 편집
+- 카테고리·변화 파형·예상 강도·부하/조건을 조합하는 필터와 순서·중복이 보존되는
+  queue, plan 반복 및 실행/결과 진행률. 필터·단계·각 목록 위치는 탭 왕복/회전 후 보존
 - 목적 중심 빠른 선택(`급격한 DPU 부하`, `DEVICE 후보 유지`, `CLIENT 전환 목표`)과
   small/mixed/full size A/B, 점진 확대, 급격 toggle, size+layer+FPS burst preset
 - phase/event/telemetry를 포함한 로컬 JSON 결과와 명시적 공유
@@ -119,6 +120,13 @@ active tick에서 target을 적용하며, 그 tick까지 실행할 시간이 없
 fixed-period cadence를 사용합니다. Runtime coverage가 ramp 중간값, staircase의 모든
 level, pulse ON/OFF, triangle 상승/하강, soak attack/hold/recovery를 실제로 관측하지
 못하면 완료처럼 보이지 않고 `INCONCLUSIVE`입니다.
+Whole-phase `LINEAR_RAMP`는 명목상 종료 시점에 정확한 target을 한 번 게시한 뒤 모든
+실제 producer가 같은 control revision의 frame을 낸 것을 bounded하게 확인합니다.
+중간에 topology가 복구되면 이전 증거를 버리고 fresh buffer 뒤 새 revision으로 다시
+확인합니다. 확인 timeout이나 revision 불일치는 `INCONCLUSIVE`이고, 이 증명 대기에서
+추가된 frame은 producer-rate fidelity를 부풀리는 데 쓰지 않습니다. 종료 target 적용
+직전 같은 시각·frame counter 경계에서 기대 frame과 실제 frame을 함께 닫으므로 늦은
+control tick에서도 분자만 길어지지 않습니다.
 `floor`는 반복 파형인 pulse/triangle의 valley에만 적용합니다. STEP/linear/staircase/
 soak 같은 one-shot transition에 0이 아닌 `floor`를 넣은 runnable plan은 의미가
 모호하므로 safety policy가 거부합니다. 순수 evaluator의 defensive bounding만 잘못된
@@ -252,13 +260,19 @@ non-idle이라는 시작 조건을 확인한 뒤 실행 중 변화를 감시합�
   고르지 않고 항목별 최솟값으로 합칩니다. 원본 preset은 바꾸지 않고 effective phase의
   layer/FPS/workload만 clamp하며 safety adjustment event에 기록합니다.
 - `ActivityManager.MemoryInfo.lowMemory` 또는 memory-load allocation 실패가 감지되면
-  실행 중인 test를 중단하고 memory working set도 즉시 버린 뒤 모든 부하를 해제합니다.
+  실행 중인 test를 중단합니다. Memory pin 해제, drop generation과 prewarm 취소를 NPU
+  zero보다 먼저 commit하고 worker를 깨우므로 NPU adapter가 예외를 던져도 working set
+  해제를 건너뛰지 않습니다.
 - memory workload가 있는 scenario는 계측 baseline 전에 bounded worker별 working set을
   사전 할당하고 page touch acknowledgment를 기다립니다. 이 prewarm은 generated traffic
   byte에 더하지 않고 완료 뒤 byte baseline을 초기화합니다. 할당 실패, timeout, 중단 또는
   worker acknowledgment 누락은 부하가 실행된 것처럼 계속하지 않고 plan을 fail-closed로
   중단합니다. 확인된 buffer는 run 동안 pin해 5초가 넘는 idle/settle 뒤에도 measured
   phase에서 재할당되지 않으며, run 종료·low-memory·명시적 drop에서만 해제합니다.
+- Reflection NPU waveform과 ordered zero는 같은 versioned single-slot lane을 사용합니다.
+  새 desired ticket 뒤에는 이전 positive waveform이 다시 적용될 수 없고, release는 그
+  lane의 exact zero acknowledgment를 확인합니다. Memory/NPU release가 함께 실패하면
+  첫 오류와 후속 오류를 모두 보존합니다.
 - 앱의 선제 thermal `SEVERE` 감속은 테스트 설정에서 선택할 수 있으며 기본값은
   **OFF**입니다. OFF이면 SEVERE에서도 앱이 요청 layer/FPS/Hz/workload를 임의로
   낮추지 않지만 Android/kernel thermal throttling은 그대로 동작합니다. ON이면 시작 전
@@ -303,6 +317,12 @@ non-idle이라는 시작 조건을 확인한 뒤 실행 중 변화를 감시합�
   내립니다. 다음 100 ms poll까지 존재하지 않는 producer frame을 기대값에 더하거나
   교차 부하를 남기지 않습니다. Pending/미게시 topology는 HUD에서 fake `1P`가 아니라
   `—P`로 표시합니다.
+  `PHYSICAL` 숫자와 그래프는 실제 commit된 producer 수만 사용하므로 flattened
+  N-layer도 `1P`이며, pending 구간은 이전 값으로 메우지 않고 graph gap으로 남습니다.
+- Canvas/Texture/Video/GL Surface가 Android lifecycle에 의해 같은 phase 안에서
+  재생성돼도 이전 first-buffer/HWC 증거를 이어 쓰지 않습니다. 즉시 `—P` pending으로
+  전환한 뒤 새 geometry와 expected producer set을 확인하고 모든 producer의 fresh
+  buffer를 다시 기다립니다.
 - codec/Canvas/EGL의 짧은 UI hand-off를 넘긴 teardown은 process-wide lease로 넘겨
   main thread를 막지 않고 최대 5초 동안 복구합니다. 그동안 phase 시간/transition/
   예상 frame budget을 정지하고 교차 부하를 0으로 내리며, lease가 풀리면 같은
@@ -378,6 +398,14 @@ non-idle이라는 시작 조건을 확인한 뒤 실행 중 변화를 감시합�
   acknowledgment가 일치한 뒤에만 measured phase를 진행하고, 실행 중 adapter health를
   계속 확인합니다. Positive apply timeout/거부/health 상실은
   `NPU_WORKLOAD_APPLY_FAILED`로 fail-closed합니다.
+- Pulse/triangle의 NPU 양수→0 valley와 다음 0→양수 re-attack도 각각 matching
+  zero/positive acknowledgment를 받아야 coverage로 인정합니다. 첫 양수 ACK를 이후
+  re-attack 성공으로 재사용하지 않습니다. Semantic edge 확인은 같은 setpoint라도
+  fresh NPU ticket을 발행하므로 직전 ordered release가 supersede한 요청을 재사용하지
+  않습니다. Triangle tick이 zero-origin의 full-cycle 또는 zero-target의 half-cycle
+  zero 경계를 건너면 CPU/memory/GPU 값을 유지한 NPU-only zero를 먼저 확인하고 positive를
+  다시 확인합니다. Phase 종료가 해당 zero 경계이면 terminal zero ACK 뒤 종료하며,
+  놓친 여러 zero 경계를 빠르게 replay하지 않고 결과를 inconclusive로 처리합니다.
 - YUV/P010/SBWC decoder phase는 선택·pin·검증된 media와 concrete hardware codec
   binding이 필수입니다. 선택 media가 없거나 fingerprint/binding이 불완전하면 RGBA
   procedural proxy로 대체하지 않고 실행 전에 거부합니다. Decoder source/capability
@@ -498,7 +526,10 @@ safety cap 또는 typed phase evidence가 아닙니다. Display ID나 정규화 
 바뀌면 같은 process에서는 `N/A`로 투영하며 다시 측정하려면 process를 재시작해야 합니다.
 정확한 topology, 6000ms producer-active deadline, telemetry priority/drain, cleanup과
 event 계약은 [Process-session HWC capacity calibration](docs/HWC_CAPACITY_CALIBRATION.md)을
-참고하세요.
+참고하세요. Deadline 직전의 poll/stabilization은 남은 snapshot 검증 시간을 침범하지
+않도록 줄이거나 종료하며, STOP/cancel은 필수 teardown만 확인하고 선택적인 3초
+zero-load settle을 기다리지 않습니다. 이때 one-shot은 terminal `UNAVAILABLE`로 닫혀
+같은 process에서 20-layer 계측을 다시 실행하지 않습니다.
 8K60 preset은 decoder primary 한 장, RGB overlay 6장과 GL tail 한 장으로 총 8개의
 physical layer를 구성합니다. 8K30 preset과 분리되어 있으므로 8K30-only 장치가 8K60
 capability 때문에 불필요하게 거부되지 않습니다.
@@ -612,6 +643,10 @@ adb shell am start -n `
   com.example.dpulayerlab.debug/com.example.dpulayerlab.AutomationActivity `
   -a com.example.dpulayerlab.action.STOP
 ```
+
+Cold start START는 Activity decor attach와 첫 root Insets acknowledgment까지 bounded
+startup queue에서 기다린 뒤 fullscreen isolation을 시작합니다. STOP은 이 readiness를
+기다리지 않고 미실행 START를 폐기해 즉시 안전 중단 경로로 들어갑니다.
 
 순서 보존 plan, repeat/40-run cap, SHOW/STOP ordering, release permission과 오류 의미는
 [Intent automation guide](docs/AUTOMATION.md), 변하지 않는 이름·타입은
@@ -900,14 +935,14 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 - debug: `app/build/outputs/apk/debug/app-debug.apk`
 - release: `app/build/outputs/apk/release/app-release-unsigned.apk`
 
-### `20260725_090252` 릴리스 산출물의 의미
+### `20260725_170750` 릴리스 산출물의 의미
 
-- release tag는 `v20260725_090252`입니다.
-- `DPULayerTest-20260725_090252-debug.apk`는 Android debug key로 서명되어 바로 설치 가능한
+- release tag는 `v20260725_170750`입니다.
+- `DPULayerTest-20260725_170750-debug.apk`는 Android debug key로 서명되어 바로 설치 가능한
   **전용 lab/개발용** APK입니다. Explicit automation alias에는 debug manifest에서
   `CONTROL_TESTS` permission이 제거되어 있으므로 ADB 사용이 쉽지만, 신뢰 경계가 열린
   이 동작을 제품 release 보안으로 간주하거나 일반 사용자 단말에 배포하면 안 됩니다.
-- `DPULayerTest-20260725_090252-release-unsigned.apk`는 제품 빌드/서명 파이프라인
+- `DPULayerTest-20260725_170750-release-unsigned.apk`는 제품 빌드/서명 파이프라인
   입력을 위한 **서명되지 않은 통합 산출물**입니다. 그대로 설치 가능한 최종 제품
   APK가 아닙니다.
 - 실제 제품 APK는 secure product build 환경에서 platform/product key로 서명하고
@@ -918,11 +953,10 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   signing token을 넣지 않습니다. 배포한 APK와 `SHA256SUMS.txt`만 공개 검증
   산출물로 취급합니다.
 
-이 timestamp build에서 41개 suite의 host unit test **575개**가 실패·오류·skip 없이
-통과했고, `lintDebug`는 error 0개(버전/도구 업데이트 알림 warning 6개)로
-통과했습니다. `assembleDebug`와 `assembleRelease`도 성공했습니다. 이번 작업에서는
-emulator/실기기 stress를 자동 실행하지 않았으며, host 결과는 exact DPU counter가
-있는 실기기 underrun 검증을 대체하지 않습니다.
+이 timestamp build의 고정 host/APK 검증 evidence와 checksum은
+[Release 절차](docs/RELEASE.md)에 기록합니다. 대상 실험기와 실행 범위를 지정하지
+않았으므로 emulator/실기기 stress는 자동 실행하지 않으며, host 결과는 exact DPU
+counter가 있는 실기기 underrun 검증을 대체하지 않습니다.
 
 Debug build는 package suffix가 `.debug`이므로 제품의 release privapp allowlist와
 동일하게 취급되지 않습니다. 실제 system integration 검증은 release package로
@@ -949,6 +983,13 @@ signing/`priv-app` 배치만으로 vendor node의 DAC 또는
 SELinux 접근이 생기지 않습니다. 최소 권한의 system broker와 typed Binder API를
 사용하는 제품 통합 절차는 [docs/SYSTEM_INTEGRATION.md](docs/SYSTEM_INTEGRATION.md)를
 참고하세요.
+
+Portable APK는 action에 응답한 임의 vendor service를 자동 신뢰하지 않습니다. 제품
+이미지는 `/product/etc/dpulayerlab/vendor_broker.conf`에 explicit component,
+permission owner와 owner/service signer SHA-256 trust root를 설치해야 합니다. Config,
+signature permission grant 또는 service 계약이 맞지 않으면 vendor metric은 typed
+`N/A`로 유지되고 반복 bind를 시도하지 않습니다. 이 digest는 public trust metadata이며
+private platform/vendor key 자체를 저장소나 Release에 넣어서는 안 됩니다.
 
 ## 보고서 개인정보와 보존
 

@@ -44,18 +44,21 @@ UI의 목표는 시험자가 다음 네 질문에 한 화면 흐름으로 답할
 
 ```mermaid
 flowchart LR
-    D["Dashboard"] --> P["목적 선택"]
-    P --> C["Catalog filter"]
-    C --> Q["Queue 순서·중복·repeat"]
-    Q --> V["Validation preview"]
+    D["Dashboard"] --> SEL["1. 테스트 선택"]
+    SEL --> P["목적 선택"]
+    P --> C["선택형 세부 조건"]
+    C --> Q["2. 순서·중복·repeat"]
+    Q --> M["필요할 때만 Decoder media"]
+    M --> V["3. 확인 후 실행"]
     V --> R["Running fullscreen + HUD"]
     R --> O["Result overview"]
-    O --> S["Scenario detail/report share"]
+    O --> SHARE["Scenario detail/report share"]
     O --> D
 ```
 
 Custom builder는 catalog queue와 별도의 single custom scenario를 만든다. Selected-media가
-필요한 preset은 실행 전에 media card에서 SAF URI를 선택한다.
+필요한 preset이 실행 queue에 있을 때만 두 번째 단계에 media card를 표시하고, SAF URI가
+선택되기 전에는 시작 action을 비활성화한다.
 
 ## Dashboard
 
@@ -67,12 +70,19 @@ Custom builder는 catalog queue와 별도의 single custom scenario를 만든다
 - DPU busy+provenance, GPU busy+frequency, measured memory bus+generated traffic
 - 각 metric의 quality color와 N/A 상태
 - HWC DEVICE/CLIENT와 permission 상태
-- `급격한 DPU 부하`, `DEVICE 후보 유지`, `CLIENT 전환 목표` quick start
+- `급격한 DPU 부하`, `DEVICE 후보 유지`, `CLIENT 전환 목표` 대표 preset의 명시적
+  `즉시 1회 실행`
 - 최근 result
 
 Metric value가 unavailable이면 0 대신 N/A를 표시한다.
 
 ## Catalog
+
+Catalog는 한 개의 긴 설정 form 대신 `테스트 선택`과 `순서·반복` 두 단계로 나눈다.
+상단 step control로 되돌아갈 수 있고, 선택 단계 하단에는 queue 수·repeat·예상 시간을
+보이는 고정 dock을 유지한다. Catalog의 step, filter, 펼침 상태와 각 단계 scroll은
+탭 왕복과 configuration 재생성 뒤에도 보존한다. `순서·반복` 단계의 Android Back은
+Activity를 닫지 않고 먼저 `테스트 선택` 단계로 돌아간다.
 
 ### 목적 중심 선택
 
@@ -82,7 +92,9 @@ Metric value가 unavailable이면 0 대신 N/A를 표시한다.
 - DEVICE 후보 유지
 - CLIENT 전환 목표
 
-각 목적은 예상 입력 변화, 검증 badge와 결과에서 볼 evidence를 함께 설명한다.
+각 목적은 한 줄 설명과 일치하는 preset 수만 기본 표시한다. 상세 evidence 설명은
+scenario 상세와 결과에 두어 첫 화면의 기술 용어를 줄인다. 목적 선택은 filter만
+변경하며 queue append/replace action은 아래의 단일 일괄 선택 card에만 둔다.
 
 ### Facet
 
@@ -95,20 +107,29 @@ Metric value가 unavailable이면 0 대신 N/A를 표시한다.
 - condition/format
 - composition target
 
-Filtered result는 catalog 원래 순서를 유지한다. `결과로 교체`와 `queue에 추가`를
-분리한다.
+Filtered result는 catalog 원래 순서를 유지한다. 일괄 `queue 교체`와 `뒤에 추가`는
+한 위치에서만 제공한다. Scenario card는 이름·설명·부하 패턴·최대 layer/Hz·강도·크기와
+선택 action을 기본 표시하고 phase/tag/검증 evidence는 명시적으로 펼쳤을 때만 표시한다.
 
 ### Queue와 loop
 
 - 항목 순서와 duplicate를 보존
 - 항목별 remove와 explicit move
+- 기본 세로 preview는 앞 4개만 표시하고, 전체 편집기는 화면 높이에 비례한 bounded
+  내부 scroll과 목록 위 `큐 접기` action을 사용
+- 이동/삭제 action의 접근성 이름에 scenario 이름과 occurrence 번호 포함
+- position action은 render 시 queue snapshot과 event 시 최신 queue가 다르면 적용하지
+  않아 연속 입력이 다른 occurrence를 수정하지 않음
 - catalog 순서로 reset
 - repeat count와 expanded run 수
 - 현재 예상 duration
 - unknown restored ID 자동 제거
 - 40-run cap 안에서 repeat 조정
+- queue가 비면 숨은 repeat를 항상 1로 canonicalize
 
-실행 전 preview는 input change, composition target, verification을 요약한다.
+실행 전 preview는 접을 수 있으며 input change, composition target, verification을
+요약한다. Queue mutation과 repeat 증감, START는 event 시점의 최신 state를 다시 읽어
+빠른 연속 입력이 이전 snapshot을 덮어쓰거나 제거한 scenario를 실행하지 않게 한다.
 
 ## Custom builder
 
@@ -133,7 +154,8 @@ Selected-media가 필요한 route는 media와 codec preflight 없이 실행하�
 │ Scenario · QUEUE x/y · LOOP x/y · STAGE   │
 │ Layer size · BUILD version        [STOP]   │
 │ Plan / phase progress                       │
-│ LAYERS  value + graph + PHYSICAL            │
+│ PHYSICAL observed/expected + committed graph │
+│ LOGICAL requested/active count (별도 label)  │
 │ DPU     value + graph + source/quality      │
 │ CPU     value + graph + source/quality      │
 │ GPU     value + graph + source/quality      │
@@ -153,7 +175,8 @@ HUD는 control layer로 남으며 report의 `controlLayerIncluded=true`와 일�
 
 | Metric | 값 | Graph |
 |---|---|---|
-| LAYERS | requested logical layer + observed/expected physical producer | 최근 60 sample |
+| PHYSICAL | observed/expected physical producer; committed expected가 없으면 `—P` | committed expected 최근 60 sample; pending은 null gap |
+| LOGICAL | requested/active logical layer를 `LOGICAL nL`로 별도 표시 | PHYSICAL graph에 사용하지 않음 |
 | DPU | busy % 또는 N/A | provenance segment별 gap |
 | CPU | AP CPU % 또는 N/A | provenance segment별 gap |
 | GPU | busy % 또는 N/A | provenance segment별 gap |
@@ -166,6 +189,9 @@ Producer count 표기:
 - `observed/—P`: topology expected set 미게시
 - `observed/expected P`: committed expected set 게시
 - pending/process lease에서는 expected를 0으로 투영
+- `PHYSICAL` 현재 값과 history는 양수인 committed expected count만 사용한다. 따라서
+  `FLATTENED_TEXTURE`의 logical N-layer는 `1P`이고 pending sample은 이전 값으로 채우지
+  않는다.
 
 ### Traffic
 
@@ -229,6 +255,7 @@ Exact evidence가 없으면 proxy를 exact로 승격하지 않는다. Result col
 - codec capability
 - direct sensor label/source/value
 - product integration 안내
+- vendor broker permanent typed failure reason(config/grant/signer/service contract)
 
 Unavailable 기능에 “활성” toggle을 제공하지 않는다.
 
@@ -257,7 +284,11 @@ Unavailable 기능에 “활성” toggle을 제공하지 않는다.
 - 숫자에 unit 포함
 - N/A, pending, proxy, exact 표현을 일관되게 사용
 - destructive/reset action과 run action을 시각적으로 구분
-- 목적 선택 → queue → run → result가 세 번 이하의 주요 decision으로 이어짐
+- 목적/개별 선택 → 순서·반복 → run → result의 두 단계 설정 흐름
+- queue 이동/삭제는 기호만 쓰지 않고 text label과 occurrence 기반 TalkBack 설명 제공
+- 두 step control은 button 색뿐 아니라 tab role과 selected semantics를 제공
+- 선택 화면의 고정 dock은 실제 측정 높이로 bottom padding을 갱신해 큰 글꼴에서도 마지막
+  scenario를 가리지 않음
 
 ## UI 회귀 test
 
@@ -276,5 +307,5 @@ Unavailable 기능에 “활성” toggle을 제공하지 않는다.
 - `AppVersionTest`
 
 변경 뒤 compact/landscape STOP, graph provenance gap, `—P`, requested/actual calibration,
-queue duplicate/order, Window hide/restore acknowledgment와 result-old-state 분리를
-반드시 재검토한다.
+queue duplicate/order, 선택/plan별 scroll·filter 복원, 연속 add/repeat 입력,
+Window hide/restore acknowledgment와 result-old-state 분리를 반드시 재검토한다.

@@ -26,6 +26,7 @@ identifier입니다. 표시 이름에 맞춰 이 계약들을 일괄 rename하�
 Product image
 ├─ /product/priv-app/DpuLayerLab/DpuLayerLab.apk
 ├─ /product/etc/permissions/privapp-permissions-com.example.dpulayerlab.xml
+├─ /product/etc/dpulayerlab/vendor_broker.conf
 └─ vendor telemetry service
    ├─ DPU driver underrun/active-cycle counter
    ├─ GPU active-cycle + GPU/DPU clock counter
@@ -49,14 +50,16 @@ Product image
 
 2. `system_integration/product/DpuLayerLab-release.apk` 위치에 복사합니다.
 3. `system_integration/product/Android.bp`와 permission XML을 제품 트리에 포함합니다.
-4. `PRODUCT_PACKAGES += DpuLayerLab DpuLayerLabPrivPermissions`를 product makefile에 추가합니다.
+4. 아래 Vendor service 계약의 `vendor_broker.conf`를 제품별 signer digest로 생성하고
+   `prebuilt_etc { product_specific: true, sub_dir: "dpulayerlab" }` 등으로 설치합니다.
+5. app, permission XML, broker config module을 `PRODUCT_PACKAGES`에 추가합니다.
 
 샘플 `Android.bp`는 Soong이 platform certificate로 다시 서명하는 구성입니다. 외부에서 이미 platform key로 서명한 APK를 쓴다면 `certificate: "PRESIGNED"`로 바꿉니다.
 
-최신 공개 GitHub Release의 `DPULayerTest-20260725_090252-debug.apk`는 Android debug key로 서명된
+최신 공개 GitHub Release의 `DPULayerTest-20260725_170750-debug.apk`는 Android debug key로 서명된
 lab-only 산출물이며 debug manifest가 automation alias의 `CONTROL_TESTS` permission을
 제거합니다. 제품 이미지에 넣지 마세요.
-`DPULayerTest-20260725_090252-release-unsigned.apk`는 Soong 또는 secure signing
+`DPULayerTest-20260725_170750-release-unsigned.apk`는 Soong 또는 secure signing
 pipeline 입력용이며 그대로 설치하는 최종 제품 APK가 아닙니다. Platform key,
 certificate, keystore, password/token은 저장소, GitHub Release, `dist/`에 두지 않고
 제품 보안 환경에서만 사용합니다. Release에는 두 APK와 `SHA256SUMS.txt`만 배포합니다.
@@ -124,8 +127,8 @@ STOP을 처리하는 fail-safe 계약을 유지합니다.
 
 ## Vendor service 계약
 
-앱은 다음 action을 가진 system service APK를 찾습니다. 이 서비스는 앱과 vendor
-HAL/sysfs/SDK 사이의 **system-side broker 경계**입니다. 앱 프로세스에 vendor node
+이 서비스는 앱과 vendor HAL/sysfs/SDK 사이의 **system-side broker 경계**입니다.
+앱 프로세스에 vendor node
 권한을 직접 주지 말고, broker가 signing identity와 입력 범위를 검증한 뒤 작은 typed
 counter/control 값만 전달해야 합니다. 대형 frame/trace를 Binder data plane으로
 전송하지 마세요.
@@ -134,6 +137,46 @@ counter/control 값만 전달해야 합니다. 대형 frame/trace를 Binder data
 action:     com.example.dpulayerlab.VENDOR_TELEMETRY
 permission: com.example.dpulayerlab.permission.ACCESS_VENDOR_TELEMETRY
 AIDL:       com.example.dpulayerlab.vendor.IDpuLabVendorService
+```
+
+Portable APK에는 신뢰할 broker package/component나 certificate 기본값이 없습니다.
+`/product/etc/dpulayerlab/vendor_broker.conf`가 없거나 불완전하면 action implicit
+discovery를 시도하지 않고 vendor telemetry/control을 영구 `UNAVAILABLE`로 둡니다.
+제품 build는 root-owned read-only product config를 다음 형식으로 설치해야 합니다.
+
+```properties
+service_package=com.vendor.dpulab
+service_class=com.vendor.dpulab.DpuLabVendorService
+permission_owner_package=com.android.permissionowner
+permission_owner_signer_sha256=<64-hex SHA-256 digest>[,<rotation/multi-signer digest>...]
+service_signer_sha256=<64-hex SHA-256 digest>[,<rotation/multi-signer digest>...]
+```
+
+- package/class는 fully qualified exact component이며 runtime action 검색으로 대체하지
+  않습니다.
+- `permission_owner_signer_sha256`와 `service_signer_sha256`는 secret이 아니라 제품
+  trust-root metadata입니다. secure product configuration에서 생성하고 일반 writable
+  data partition에 복사하지 마세요.
+- 단일 signer의 Android proof-of-rotation lineage는 설정된 이전/현재 digest 중 하나와
+  일치하면 허용합니다. multiple-signer package는 현재 signer 전부가 allowlist에 있어야
+  합니다.
+- permission owner와 service signer가 다를 수 있으므로 두 allowlist를 분리합니다.
+  예를 들어 platform-owned signature permission을 vendor-signed broker가 service
+  permission으로 사용할 수 있습니다. 단 앱이 그 permission을 실제로 grant받아야 합니다.
+- permission 선언 package, permission의 signature protection, 앱의
+  `checkSelfPermission`, service의 system-image/exported/enabled/permission contract,
+  permission owner와 service의 signer를 모두 확인한 뒤에만 explicit bind합니다.
+- permanent config/grant/signer mismatch는 4초 reconnect loop로 낮추지 않으며
+  `Vendor broker · UNAVAILABLE · <typed reason>`으로 telemetry/report에 남깁니다.
+
+구성 A — broker가 permission을 직접 소유하는 경우:
+
+```properties
+service_package=com.vendor.dpulab
+service_class=com.vendor.dpulab.DpuLabVendorService
+permission_owner_package=com.vendor.dpulab
+permission_owner_signer_sha256=<broker signer SHA-256>
+service_signer_sha256=<broker signer SHA-256>
 ```
 
 provider manifest 예:
@@ -153,11 +196,45 @@ provider manifest 예:
 </service>
 ```
 
-클라이언트는 system image에 있고 위 signature permission을 선언한 provider가 정확히
-하나일 때만 bind합니다. 여러 구현이 같은 action을 노출하면 임의 선택하지 않고 연결을
-거부합니다. synchronous control/snapshot 호출에도 짧은 timeout을 적용하지만, 이미
-kernel Binder에서 멈춘 provider call을 앱이 강제로 회수할 수는 없으므로 provider
-메서드가 non-blocking이어야 한다는 계약은 그대로 유지됩니다.
+위 예처럼 provider가 permission도 직접 선언하면 signature permission 특성상 앱과
+provider가 호환되는 signing lineage를 가져야 앱에 grant됩니다.
+
+구성 B — 외부 platform package가 permission을 소유하는 경우:
+
+```properties
+service_package=com.vendor.dpulab
+service_class=com.vendor.dpulab.DpuLabVendorService
+permission_owner_package=com.android.permissionowner
+permission_owner_signer_sha256=<platform permission-owner signer SHA-256>
+service_signer_sha256=<vendor broker signer SHA-256>
+```
+
+이 경우 permission 선언은 owner package manifest에만 두고 broker service는 그 정확한
+permission 문자열로 보호합니다. Config의 두 trust root는 각각 owner와 service에
+대조합니다.
+`priv-app` 배치나 platform signing만으로 vendor-owned signature permission이 자동
+grant된다고 가정하지 마세요. synchronous control/snapshot 호출에도 짧은 timeout을
+적용하지만, 이미 kernel Binder에서 멈춘 provider call을 앱이 강제로 회수할 수는
+없으므로 provider 메서드가 non-blocking이어야 한다는 계약은 그대로 유지됩니다.
+
+`isNpuLoadSupported()`와 `isSbwcControlSupported()`도 예외가 아닙니다. 앱은 두 getter를
+exact v1 telemetry와 분리된 단일 no-backlog capability lane에서 하나의 700ms 결과
+deadline으로 실행합니다. Deadline 뒤 반환값과 이전 service-session 결과는 게시하지
+않고, 첫 getter가 deadline을 넘으면 두 번째 getter를 시작하지 않습니다. Provider가
+interrupt를 무시하면 그 실제 call이 돌아올 때까지 capability lane만 quarantine하며
+v1 exact telemetry를 막거나 retry backlog를 만들지 않습니다. 실제 call 종료 전에는
+같은 lane의 retry도 시작하지 않습니다. Deadline 비교는 `System.nanoTime()`의 signed
+wrap을 허용하는 subtraction 방식이며, 이전 task가 active identity를 내린 직후 executor
+worker가 아직 반환 중이라 새 hand-off가 거부되는 경우에는 25ms 뒤 하나의 deferred
+refresh만 다시 시도합니다. 첫 getter가 실행되는 동안 service registration이 바뀌면
+두 번째 getter를 호출하지 않으며, Handler timeout 등록이나 executor hand-off의
+`Error`는 active query/timeout callback rollback 뒤 재전파합니다.
+
+Binder/probe의 예상 `Exception`은 typed unavailable 또는 rejected 결과로 변환하지만
+`OutOfMemoryError`, `ThreadDeath` 같은 fatal `Error`를 N/A로 낮추지 않습니다. Remote
+future/ticket ownership과 shutdown reset을 가능한 범위에서 정리한 뒤 같은 `Error`를
+재전파하므로, memory-stress 중 손상된 worker가 정상 telemetry gap처럼 계속 실행되지
+않아야 합니다.
 
 서비스 메서드는 짧고 non-blocking이어야 합니다. PMU 누적값은 provider가 주기적으로
 cache하고 Binder getter는 cache만 반환하는 편이 안전합니다. provider는 caller UID와
@@ -176,6 +253,10 @@ command ticket과 acknowledgment가 일치한 뒤에만 measured phase를 진행
 backend health를 확인합니다. Provider는 ticket이 가리키는 setpoint가 실제 accelerator에
 적용됐는지 또는 명시적으로 거부됐는지를 bounded하게 반환해야 합니다. Timeout, 거부,
 ticket 불일치나 health 상실은 앱에서 `NPU_WORKLOAD_APPLY_FAILED`로 fail-closed합니다.
+Producer topology pending/STOP/thermal ordered-zero는 command epoch를 증가시킵니다.
+양의 setpoint는 request 게시 직전과 acknowledgment 뒤에 같은 epoch, run owner,
+producer generation과 recovery 상태를 확인해야 하며, stale이면 high display/progress를
+게시하지 않고 같은 control lane에서 ordered zero를 다시 확인합니다.
 
 앱 선제 thermal `SEVERE` derating은 plan 시작 시 immutable snapshot으로 고정하는
 선택형이며 기본 OFF입니다. OFF에서는 앱 setpoint를 유지하고 Android/kernel thermal
@@ -350,7 +431,11 @@ reflection adapter도 `close()`와 intensity 0에서 accelerator job을 확실�
 
 앱의 reflection 제어 lane은 daemon thread, bounded queue, 짧은 초기화/종료 timeout과
 latest-wins setpoint를 사용해 phase 변경 때 오래된 NPU request backlog가 쌓이지 않게
-합니다. 다만 Java reflection으로 interruption을 무시하는 vendor method를 강제로
+합니다. Waveform과 ordered zero는 동일한 versioned single-slot lane을 사용하며 새
+desired ticket 뒤의 stale positive waveform을 게시하지 않습니다. Low-memory release는
+memory pin 해제/drop generation/prewarm 취소를 먼저 commit하고 worker를 깨운 뒤 NPU
+zero를 요청하므로 adapter 예외가 working set 폐기를 막지 않습니다. 다만 Java
+reflection으로 interruption을 무시하는 vendor method를 강제로
 종료할 수는 없습니다. 제품 adapter는 별도 broker process의 bounded call, lease token,
 heartbeat, `linkToDeath`와 watchdog으로 client death/timeout 시 accelerator 부하를
 반드시 0으로 복구해야 합니다.
@@ -412,8 +497,22 @@ Android 12 이상 production 빌드에서는 debugfs 의존을 피하고 sysfs �
 - `/vendor/etc/dpulayerlab/probe_paths.conf`
 - `/data/local/tmp/dpulayerlab-probes.conf` — `BuildConfig.DEBUG`인 debug APK에서만
 
-허용 key와 `/sys/` 또는 `/proc/`의 명시적 절대 경로만 받아들이며 임의 path 탐색은
-하지 않습니다.
+허용 key와 key별로 제한한 `/sys/` namespace의 명시적 절대 경로만 받아들이며 임의
+path 탐색은 하지 않습니다. `/proc`, `..`, whitespace/control 문자가 있는 경로,
+canonical target이 `/sys` 밖인 경로와 regular sysfs attribute가 아닌 target은
+거부합니다.
+
+| key group | 허용 lexical namespace |
+|---|---|
+| GPU busy/frequency | `/sys/class/kgsl/`, `/sys/class/drm/`, `/sys/class/misc/`, `/sys/kernel/gpu/`, `/sys/kernel/ged/`, `/sys/module/ged/`, `/sys/kernel/debug/ged/` |
+| bus busy | `/sys/class/devfreq/` |
+| DPU busy/frequency/underrun | `/sys/class/dpu/`, `/sys/class/drm/` |
+
+address-named `/sys/devices/platform/...`, 임의 vendor/debugfs scalar 또는 새 namespace가
+필요하면 config만 넓히지 말고 typed broker를 구현하거나 source allowlist와 ABI
+문서를 함께 변경합니다. Reader는 첫 줄 4096자와 config 64 KiB로 제한하지만 kernel
+pseudo-file open/read 자체를 앱이 강제로 종료할 수는 없으므로 production에서는
+non-blocking cached Binder getter를 우선합니다.
 
 지원 key:
 
@@ -477,6 +576,13 @@ bring-up용 debug convenience이며 release APK에서는 로드되지 않습니�
 - MediaTek: `/sys/module/ged/parameters/gpu_loading` direct percent
 - 호환 SKI `/sys/kernel/gpu/gpu_busy`는 위 architecture-specific ABI를 가리지 않도록
   마지막 direct-percent 후보로만 사용
+
+내장 exact DPU underrun 후보는 DPU scope가 이름에 결속된
+`/sys/class/dpu/dpu0/underrun_count`와 `underrun_cnt`뿐입니다.
+`/sys/class/drm/card0/device/underrun_count`는 DRM card/CRTC scope가 증명되지 않으므로
+기본 exact 후보에서 제외됩니다. 제품이 검증한 DRM counter를 사용하려면
+`dpu_underrun` explicit config와 counter scope/reset/wrap 계약을 함께 제공하거나 vendor
+Binder counter를 사용합니다.
 
 GED debugfs와 address가 포함된 devfreq/platform directory는 기본 탐색하지 않습니다.
 제품이 explicit typed key를 하나 설정하면 그 경로가 authoritative하며 unreadable,

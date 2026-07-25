@@ -1,13 +1,18 @@
 package com.example.dpulayerlab.vendor
 
+import android.content.pm.PermissionInfo
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 class VendorBridgeStateTest {
@@ -215,7 +220,7 @@ class VendorBridgeStateTest {
         }
 
         assertTrue(failed)
-        assertEquals(2, created.size)
+        assertEquals(3, created.size)
         assertTrue(created.all { it.isShutdown })
     }
 
@@ -414,13 +419,16 @@ class VendorBridgeStateTest {
     }
 
     @Test
-    fun calibrationTelemetryBarrierRequiresBothVendorLanesToBecomeIdle() {
+    fun calibrationTelemetryBarrierRequiresEveryVendorTelemetryLaneToBecomeIdle() {
         val started = CountDownLatch(1)
         val release = CountDownLatch(1)
         val v2Started = CountDownLatch(1)
         val v2Release = CountDownLatch(1)
+        val capabilityStarted = CountDownLatch(1)
+        val capabilityRelease = CountDownLatch(1)
         val v1 = newNoBacklogRemoteExecutor("VendorCalibrationBarrier-v1")
         val v2 = newNoBacklogRemoteExecutor("VendorCalibrationBarrier-v2")
+        val capability = newNoBacklogRemoteExecutor("VendorCalibrationBarrier-capability")
         try {
             v1.execute {
                 started.countDown()
@@ -435,7 +443,7 @@ class VendorBridgeStateTest {
             assertTrue(started.await(1L, TimeUnit.SECONDS))
             assertFalse(
                 awaitVendorTelemetryLanesIdle(
-                    executors = listOf(v1, v2),
+                    executors = listOf(v1, v2, capability),
                     timeoutMs = 20L,
                     maxTimeoutMs = 1_000L,
                 ),
@@ -444,7 +452,7 @@ class VendorBridgeStateTest {
             release.countDown()
             assertTrue(
                 awaitVendorTelemetryLanesIdle(
-                    executors = listOf(v1, v2),
+                    executors = listOf(v1, v2, capability),
                     timeoutMs = 1_000L,
                     maxTimeoutMs = 1_000L,
                 ),
@@ -463,7 +471,7 @@ class VendorBridgeStateTest {
             assertTrue(v2Started.await(1L, TimeUnit.SECONDS))
             assertFalse(
                 awaitVendorTelemetryLanesIdle(
-                    executors = listOf(v1, v2),
+                    executors = listOf(v1, v2, capability),
                     timeoutMs = 20L,
                     maxTimeoutMs = 1_000L,
                 ),
@@ -471,7 +479,34 @@ class VendorBridgeStateTest {
             v2Release.countDown()
             assertTrue(
                 awaitVendorTelemetryLanesIdle(
-                    executors = listOf(v1, v2),
+                    executors = listOf(v1, v2, capability),
+                    timeoutMs = 1_000L,
+                    maxTimeoutMs = 1_000L,
+                ),
+            )
+
+            capability.execute {
+                capabilityStarted.countDown()
+                while (capabilityRelease.count > 0L) {
+                    try {
+                        capabilityRelease.await()
+                    } catch (_: InterruptedException) {
+                        // A stuck capability getter remains part of the calibration barrier.
+                    }
+                }
+            }
+            assertTrue(capabilityStarted.await(1L, TimeUnit.SECONDS))
+            assertFalse(
+                awaitVendorTelemetryLanesIdle(
+                    executors = listOf(v1, v2, capability),
+                    timeoutMs = 20L,
+                    maxTimeoutMs = 1_000L,
+                ),
+            )
+            capabilityRelease.countDown()
+            assertTrue(
+                awaitVendorTelemetryLanesIdle(
+                    executors = listOf(v1, v2, capability),
                     timeoutMs = 1_000L,
                     maxTimeoutMs = 1_000L,
                 ),
@@ -479,10 +514,13 @@ class VendorBridgeStateTest {
         } finally {
             release.countDown()
             v2Release.countDown()
+            capabilityRelease.countDown()
             v1.shutdownNow()
             v2.shutdownNow()
+            capability.shutdownNow()
             assertTrue(v1.awaitTermination(2L, TimeUnit.SECONDS))
             assertTrue(v2.awaitTermination(2L, TimeUnit.SECONDS))
+            assertTrue(capability.awaitTermination(2L, TimeUnit.SECONDS))
         }
     }
 
@@ -690,6 +728,263 @@ class VendorBridgeStateTest {
     }
 
     @Test
+    fun capabilityQueryDeadlineDiscardsLatePartialResultAndSkipsSecondGetter() {
+        val nowNanos = AtomicLong(0L)
+        val sbwcCalled = AtomicBoolean(false)
+        val timeoutNanos =
+            TimeUnit.MILLISECONDS.toNanos(VendorBridge.CAPABILITY_QUERY_TIMEOUT_MS)
+
+        val outcome = queryCapabilitiesBeforeDeadline(
+            queryNpu = true,
+            querySbwc = true,
+            deadlineNanos = timeoutNanos,
+            monotonicNowNanos = nowNanos::get,
+            readNpu = {
+                nowNanos.set(timeoutNanos)
+                true
+            },
+            readSbwc = {
+                sbwcCalled.set(true)
+                true
+            },
+        )
+
+        assertFalse(outcome.completedWithinDeadline)
+        assertNull(outcome.npuSupported)
+        assertNull(outcome.sbwcSupported)
+        assertFalse(sbwcCalled.get())
+    }
+
+    @Test
+    fun capabilityQueryDeadlineRemainsCorrectAcrossSignedNanoTimeWrap() {
+        val origin = Long.MAX_VALUE - 2L
+        val deadline = monotonicDeadlineAfter(origin, 5L)
+        val nowNanos = AtomicLong(origin)
+
+        val outcome = queryCapabilitiesBeforeDeadline(
+            queryNpu = true,
+            querySbwc = false,
+            deadlineNanos = deadline,
+            monotonicNowNanos = nowNanos::get,
+            readNpu = {
+                nowNanos.set(Long.MIN_VALUE)
+                true
+            },
+            readSbwc = { error("SBWC getter must not run") },
+        )
+
+        assertTrue(outcome.completedWithinDeadline)
+        assertEquals(true, outcome.npuSupported)
+        assertNull(outcome.sbwcSupported)
+    }
+
+    @Test
+    fun capabilityQueryStopsBeforeSecondGetterWhenServiceSessionExpires() {
+        val sessionExpired = AtomicBoolean(false)
+        val sbwcCalled = AtomicBoolean(false)
+
+        val outcome = queryCapabilitiesBeforeDeadline(
+            queryNpu = true,
+            querySbwc = true,
+            deadlineNanos = Long.MAX_VALUE,
+            isExpired = sessionExpired::get,
+            monotonicNowNanos = { 0L },
+            readNpu = {
+                sessionExpired.set(true)
+                true
+            },
+            readSbwc = {
+                sbwcCalled.set(true)
+                true
+            },
+        )
+
+        assertFalse(outcome.completedWithinDeadline)
+        assertNull(outcome.npuSupported)
+        assertNull(outcome.sbwcSupported)
+        assertFalse(sbwcCalled.get())
+    }
+
+    @Test
+    fun capabilityAdmissionRethrowsFatalAfterRollbackAndPreservesContext() {
+        val rejected = RejectedExecutionException("executor handoff")
+        val admissionOom = OutOfMemoryError("thread creation")
+        val rollbackOom = OutOfMemoryError("rollback")
+
+        val admissionFatal = fatalCapabilityAdmissionFailure(
+            admissionFailure = admissionOom,
+            rollbackFailure = rejected,
+        )
+        assertTrue(admissionFatal === admissionOom)
+        assertTrue(admissionFatal!!.suppressed.contains(rejected))
+
+        val rollbackFatal = fatalCapabilityAdmissionFailure(
+            admissionFailure = rejected,
+            rollbackFailure = rollbackOom,
+        )
+        assertTrue(rollbackFatal === rollbackOom)
+        assertTrue(rollbackFatal!!.suppressed.contains(rejected))
+        assertNull(
+            fatalCapabilityAdmissionFailure(
+                admissionFailure = rejected,
+                rollbackFailure = IllegalStateException("nonfatal rollback"),
+            ),
+        )
+    }
+
+    @Test
+    fun rejectedCapabilityHandoffRetainsExactlyOneDeferredRefresh() {
+        val gate = VendorCapabilityIsolationGate()
+        var scheduled = 0
+
+        assertFalse(gate.runIfOpenOrDefer { false })
+        assertTrue(
+            recoverDeferredCapabilityRefreshAfterAdmissionFailure(
+                gate = gate,
+                activeQueryPresent = false,
+                scheduleRetry = {
+                    scheduled += 1
+                    true
+                },
+            ),
+        )
+        assertEquals(1, scheduled)
+        assertFalse(
+            recoverDeferredCapabilityRefreshAfterAdmissionFailure(
+                gate = gate,
+                activeQueryPresent = false,
+                scheduleRetry = {
+                    scheduled += 1
+                    true
+                },
+            ),
+        )
+        assertEquals(1, scheduled)
+
+        assertFalse(gate.runIfOpenOrDefer { false })
+        assertFalse(
+            recoverDeferredCapabilityRefreshAfterAdmissionFailure(
+                gate = gate,
+                activeQueryPresent = false,
+                scheduleRetry = { false },
+            ),
+        )
+        assertTrue(
+            recoverDeferredCapabilityRefreshAfterAdmissionFailure(
+                gate = gate,
+                activeQueryPresent = false,
+                scheduleRetry = {
+                    scheduled += 1
+                    true
+                },
+            ),
+        )
+        assertEquals(2, scheduled)
+
+        assertFalse(gate.runIfOpenOrDefer { false })
+        assertFalse(
+            recoverDeferredCapabilityRefreshAfterAdmissionFailure(
+                gate = gate,
+                activeQueryPresent = true,
+                scheduleRetry = {
+                    scheduled += 1
+                    true
+                },
+            ),
+        )
+        assertTrue(
+            recoverDeferredCapabilityRefreshAfterAdmissionFailure(
+                gate = gate,
+                activeQueryPresent = false,
+                scheduleRetry = {
+                    scheduled += 1
+                    true
+                },
+            ),
+        )
+        assertEquals(3, scheduled)
+    }
+
+    @Test
+    fun stuckCapabilityLaneDoesNotPoisonExactTelemetryLaneOrAcceptBacklog() {
+        val capabilityStarted = CountDownLatch(1)
+        val capabilityRelease = CountDownLatch(1)
+        val telemetryCompleted = CountDownLatch(1)
+        val capability = newNoBacklogRemoteExecutor("VendorCapabilityQuarantine")
+        val telemetry = newNoBacklogRemoteExecutor("VendorExactTelemetryIndependent")
+        try {
+            capability.execute {
+                capabilityStarted.countDown()
+                while (capabilityRelease.count > 0L) {
+                    try {
+                        capabilityRelease.await()
+                    } catch (_: InterruptedException) {
+                        // Model a Binder getter that ignores Future/thread cancellation.
+                    }
+                }
+            }
+            assertTrue(capabilityStarted.await(1L, TimeUnit.SECONDS))
+
+            telemetry.execute { telemetryCompleted.countDown() }
+            assertTrue(telemetryCompleted.await(1L, TimeUnit.SECONDS))
+
+            var secondCapabilityRejected = false
+            try {
+                capability.execute {}
+            } catch (_: RejectedExecutionException) {
+                secondCapabilityRejected = true
+            }
+            assertTrue(secondCapabilityRejected)
+            assertTrue(capability.queue.isEmpty())
+        } finally {
+            capabilityRelease.countDown()
+            capability.shutdownNow()
+            telemetry.shutdownNow()
+            assertTrue(capability.awaitTermination(2L, TimeUnit.SECONDS))
+            assertTrue(telemetry.awaitTermination(2L, TimeUnit.SECONDS))
+        }
+    }
+
+    @Test
+    fun calibrationCapabilityGateUsesTokenIdentityAndDefersExactlyOneRefresh() {
+        val gate = VendorCapabilityIsolationGate()
+        val owner = VendorCapabilityIsolationToken(7L)
+        val sameSequenceButForeignIdentity = VendorCapabilityIsolationToken(7L)
+        var admittedCalls = 0
+
+        assertTrue(gate.acquire(owner))
+        assertTrue(gate.isIsolated())
+        assertFalse(
+            gate.runIfOpenOrDefer {
+                admittedCalls += 1
+                true
+            },
+        )
+        assertEquals(0, admittedCalls)
+
+        val foreignRelease = gate.release(sameSequenceButForeignIdentity)
+        assertFalse(foreignRelease.released)
+        assertFalse(foreignRelease.refreshDeferred)
+        assertTrue(gate.isIsolated())
+
+        val release = gate.release(owner)
+        assertTrue(release.released)
+        assertTrue(release.refreshDeferred)
+        assertFalse(gate.isIsolated())
+
+        val duplicateRelease = gate.release(owner)
+        assertFalse(duplicateRelease.released)
+        assertFalse(duplicateRelease.refreshDeferred)
+        assertTrue(
+            gate.runIfOpenOrDefer {
+                admittedCalls += 1
+                true
+            },
+        )
+        assertEquals(1, admittedCalls)
+    }
+
+    @Test
     fun retryFailureCannotErasePreviouslyVerifiedCapability() {
         val verifiedSupported = mergeCapabilityDiscovery(
             currentNpu = true,
@@ -764,6 +1059,141 @@ class VendorBridgeStateTest {
         assertEquals("\ufffd", sanitizeVendorStatus("\ud800", maxChars = 1))
         assertEquals("safe text", sanitizeVendorStatus("safe\u202E text"))
     }
+
+    @Test
+    fun vendorBrokerConfigRequiresExplicitComponentOwnersAndSeparateTrustRoots() {
+        val ownerDigest = "A".repeat(64)
+        val serviceDigest = "b".repeat(64)
+        val parsed = parseVendorBrokerConfiguration(
+            listOf(
+                "service_package=com.vendor.dpulab",
+                "service_class=com.vendor.dpulab.DpuLabVendorService",
+                "permission_owner_package=com.android.permissionowner",
+                "permission_owner_signer_sha256=$ownerDigest",
+                "service_signer_sha256=$serviceDigest",
+            ),
+        )
+
+        assertEquals("com.vendor.dpulab", parsed?.servicePackage)
+        assertEquals("com.vendor.dpulab.DpuLabVendorService", parsed?.serviceClass)
+        assertEquals(setOf(ownerDigest), parsed?.permissionOwnerSignerSha256)
+        assertEquals(setOf(serviceDigest.uppercase()), parsed?.serviceSignerSha256)
+        assertNull(
+            parseVendorBrokerConfiguration(
+                listOf(
+                    "service_package=com.vendor.dpulab",
+                    "service_class=com.vendor.dpulab.DpuLabVendorService",
+                ),
+            ),
+        )
+        assertNull(
+            parseSha256DigestSet(
+                "$ownerDigest,$ownerDigest",
+            ),
+        )
+    }
+
+    @Test
+    fun brokerTrustRejectsForeignServiceSignerAndMissingClientGrant() {
+        val ownerDigest = "A".repeat(64)
+        val serviceDigest = "B".repeat(64)
+        val configuration = vendorBrokerConfiguration(ownerDigest, serviceDigest)
+        val trusted = vendorBrokerTrustEvidence(
+            ownerDigest = ownerDigest,
+            serviceDigest = serviceDigest,
+        )
+
+        assertNull(evaluateVendorBrokerTrust(configuration, trusted))
+        assertEquals(
+            VendorBrokerFailureCode.SERVICE_SIGNER_UNTRUSTED,
+            evaluateVendorBrokerTrust(
+                configuration,
+                trusted.copy(
+                    serviceSigners = signerEvidence("C".repeat(64)),
+                ),
+            ),
+        )
+        assertEquals(
+            VendorBrokerFailureCode.PERMISSION_NOT_GRANTED,
+            evaluateVendorBrokerTrust(
+                configuration,
+                trusted.copy(selfPermissionGranted = false),
+            ),
+        )
+        assertFalse(
+            shouldScheduleReconnectAfterBindFailure(
+                detachedCurrentBinding = true,
+                closed = false,
+                permanentFailure = VendorBrokerFailure(
+                    VendorBrokerFailureCode.PERMISSION_NOT_GRANTED,
+                    "signature permission missing",
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun brokerSignerTrustSupportsVerifiedRotationButRequiresEveryCurrentCosigner() {
+        val old = "A".repeat(64)
+        val current = "B".repeat(64)
+        assertTrue(
+            vendorSignerEvidenceTrusted(
+                evidence = VendorSignerEvidence(
+                    currentSignerSha256 = setOf(current),
+                    signingHistorySha256 = setOf(old, current),
+                    multipleSigners = false,
+                ),
+                trustedSha256 = setOf(old),
+            ),
+        )
+        assertFalse(
+            vendorSignerEvidenceTrusted(
+                evidence = VendorSignerEvidence(
+                    currentSignerSha256 = setOf(old, current),
+                    signingHistorySha256 = setOf(old, current),
+                    multipleSigners = true,
+                ),
+                trustedSha256 = setOf(old),
+            ),
+        )
+        assertTrue(
+            vendorSignerEvidenceTrusted(
+                evidence = VendorSignerEvidence(
+                    currentSignerSha256 = setOf(old, current),
+                    signingHistorySha256 = setOf(old, current),
+                    multipleSigners = true,
+                ),
+                trustedSha256 = setOf(old, current),
+            ),
+        )
+    }
+
+    @Test
+    fun fatalRemoteFailuresAreNeverConvertedToUnavailable() {
+        val fatal = OutOfMemoryError("vendor parcel allocation")
+        try {
+            remoteValueOrNull<Int> { throw fatal }
+            fail("fatal Error must escape the unavailable adapter")
+        } catch (caught: OutOfMemoryError) {
+            assertSame(fatal, caught)
+        }
+        try {
+            queryCapabilitiesBeforeDeadline(
+                queryNpu = true,
+                querySbwc = false,
+                deadlineNanos = Long.MAX_VALUE,
+                monotonicNowNanos = { 0L },
+                readNpu = { throw fatal },
+                readSbwc = { false },
+            )
+            fail("fatal capability getter Error must escape")
+        } catch (caught: OutOfMemoryError) {
+            assertSame(fatal, caught)
+        }
+        assertSame(fatal, fatalRemoteExecutionCause(ExecutionException(fatal)))
+        assertNull(fatalRemoteExecutionCause(ExecutionException(IllegalStateException("binder"))))
+        assertNull(remoteValueOrNull<Int> { throw IllegalStateException("binder") })
+    }
 }
 
 private fun performanceTicket(
@@ -791,4 +1221,40 @@ private fun vendorSnapshotForTelemetryTest(serviceSession: Long) = VendorSnapsho
     clientLayers = 1,
     compressionState = "linear",
     npuStatus = "idle",
+)
+
+private fun vendorBrokerConfiguration(
+    ownerDigest: String,
+    serviceDigest: String,
+) = VendorBrokerConfiguration(
+    servicePackage = "com.vendor.dpulab",
+    serviceClass = "com.vendor.dpulab.DpuLabVendorService",
+    permissionOwnerPackage = "com.android.permissionowner",
+    permissionOwnerSignerSha256 = setOf(ownerDigest),
+    serviceSignerSha256 = setOf(serviceDigest),
+)
+
+private fun signerEvidence(digest: String) = VendorSignerEvidence(
+    currentSignerSha256 = setOf(digest),
+    signingHistorySha256 = setOf(digest),
+    multipleSigners = false,
+)
+
+private fun vendorBrokerTrustEvidence(
+    ownerDigest: String,
+    serviceDigest: String,
+) = VendorBrokerTrustEvidence(
+    permissionPresent = true,
+    permissionProtectionLevel = PermissionInfo.PROTECTION_SIGNATURE,
+    permissionOwnerPackage = "com.android.permissionowner",
+    selfPermissionGranted = true,
+    permissionOwnerSigners = signerEvidence(ownerDigest),
+    servicePresent = true,
+    servicePackage = "com.vendor.dpulab",
+    serviceClass = "com.vendor.dpulab.DpuLabVendorService",
+    serviceExported = true,
+    serviceEnabled = true,
+    servicePermission = VendorBridge.VENDOR_TELEMETRY_PERMISSION,
+    serviceIsSystem = true,
+    serviceSigners = signerEvidence(serviceDigest),
 )

@@ -6,6 +6,7 @@ import com.example.dpulayerlab.model.Gauge
 import com.example.dpulayerlab.model.MetricQuality
 import com.example.dpulayerlab.model.SensorReading
 import java.io.File
+import java.nio.file.Files
 import java.util.concurrent.atomic.AtomicReference
 
 data class KernelSensorSnapshot(
@@ -28,9 +29,7 @@ data class KernelSensorSnapshot(
  */
 class KernelSensorProvider(private val context: Context) {
     private val customPaths = AtomicReference<Map<String, String>>(emptyMap())
-    private var lastGpuBusyCounter: BusyCounterState? = null
-    private var lastBusBusyCounter: BusyCounterState? = null
-    private var lastDpuBusyCounter: BusyCounterState? = null
+    private val cumulativeBaselines = KernelBusyCounterBaselines()
 
     init {
         reloadCustomPaths()
@@ -47,7 +46,11 @@ class KernelSensorProvider(private val context: Context) {
         }
         val values = linkedMapOf<String, String>()
         candidates.filter { it.isFile && it.canRead() }.forEach { file ->
-            val fileLength = runCatching { file.length() }.getOrNull() ?: return@forEach
+            val fileLength = try {
+                file.length()
+            } catch (_: Exception) {
+                return@forEach
+            }
             if (fileLength < 0L || fileLength > MAX_CONFIG_BYTES) return@forEach
             val lines = readBoundedConfigLines(file) ?: return@forEach
             values.putAll(parseCustomProbeConfig(lines))
@@ -61,11 +64,11 @@ class KernelSensorProvider(private val context: Context) {
 
         val gpuBusy = readGpuBusyPercent(
             paths = paths,
-            previous = lastGpuBusyCounter,
+            previous = cumulativeBaselines.gpu,
         )
         // A read gap invalidates a cumulative baseline. Reusing it after permissions, power, or
         // the selected source changed would turn a long unknown interval into a current sample.
-        lastGpuBusyCounter = gpuBusy?.nextCounter
+        cumulativeBaselines.gpu = gpuBusy?.nextCounter
 
         val gpuFreq = readGpuFrequencyMhz(paths)
         val busBusy = readBusyPercent(
@@ -74,9 +77,9 @@ class KernelSensorProvider(private val context: Context) {
                 "/sys/class/devfreq/17000010.devfreq_mif/load",
                 "/sys/class/devfreq/dmc/load",
             ),
-            previous = lastBusBusyCounter,
+            previous = cumulativeBaselines.bus,
         )
-        lastBusBusyCounter = busBusy?.nextCounter
+        cumulativeBaselines.bus = busBusy?.nextCounter
 
         val dpuBusy = readBusyPercent(
             explicit = paths["dpu_busy"],
@@ -85,9 +88,9 @@ class KernelSensorProvider(private val context: Context) {
                 "/sys/class/dpu/dpu0/busy_percent",
                 "/sys/class/drm/card0/device/dpu_busy",
             ),
-            previous = lastDpuBusyCounter,
+            previous = cumulativeBaselines.dpu,
         )
-        lastDpuBusyCounter = dpuBusy?.nextCounter
+        cumulativeBaselines.dpu = dpuBusy?.nextCounter
         // There is no portable Android DPU/decon clock node and vendor units differ. Accept this
         // metric only through an explicitly configured, Hz-valued product path.
         val dpuFrequencyHz = readFirstLong(
@@ -96,11 +99,7 @@ class KernelSensorProvider(private val context: Context) {
         )?.takeIf { (value, _) -> value.validDpuFrequencyHz() != null }
         val underruns = readFirstLong(
             paths["dpu_underrun"],
-            listOf(
-                "/sys/class/dpu/dpu0/underrun_count",
-                "/sys/class/dpu/dpu0/underrun_cnt",
-                "/sys/class/drm/card0/device/underrun_count",
-            ),
+            DEFAULT_DPU_UNDERRUN_PROBES,
         )?.takeIf { (value, _) -> value >= 0L }
 
         val gpuGauge = gpuBusy?.percent?.let { (value, path) ->
@@ -168,6 +167,18 @@ class KernelSensorProvider(private val context: Context) {
             exactUnderrunSource = underruns?.second,
             readings = readings,
         )
+    }
+
+    /**
+     * Drops every cumulative utilization interval after an outer telemetry gap. A timed-out
+     * SystemMonitor sample may have failed either before these probes ran or after their private
+     * baselines advanced but before the snapshot was published; both cases require one fresh
+     * unavailable baseline instead of averaging across the invisible interval.
+     *
+     * SystemMonitor confines sampling and this reset to its single-flight worker.
+     */
+    internal fun resetCumulativeBaselines() {
+        cumulativeBaselines.reset()
     }
 
     private fun readBusyPercent(
@@ -289,11 +300,13 @@ class KernelSensorProvider(private val context: Context) {
     }
 
     private fun readProbeText(path: String): String? {
-        val file = File(path)
-        if (file.canRead() && file.isFile) {
-            val value = runCatching {
+        val file = verifiedSysfsAttribute(path) ?: return null
+        if (file.canRead()) {
+            val value = try {
                 file.bufferedReader().use(::readBoundedFirstLine)
-            }.getOrNull()
+            } catch (_: Exception) {
+                null
+            }
             if (!value.isNullOrBlank()) {
                 return value.trim()
             }
@@ -301,24 +314,44 @@ class KernelSensorProvider(private val context: Context) {
         return null
     }
 
-    private fun readBoundedConfigLines(file: File): List<String>? = runCatching {
-        val byteLimit = MAX_CONFIG_BYTES.toInt()
-        val bytes = ByteArray(byteLimit + 1)
-        var count = 0
-        file.inputStream().buffered().use { input ->
-            while (count < bytes.size) {
-                val read = input.read(bytes, count, bytes.size - count)
-                if (read < 0) break
-                // The requested length is non-zero, so FileInputStream must either make
-                // progress or report EOF. Fail closed on a contract-violating zero read instead
-                // of spinning or carrying a warning-only retry counter.
-                if (read == 0) return null
-                count += read
+    private fun verifiedSysfsAttribute(path: String): File? =
+        try {
+            val canonical = File(path).canonicalFile
+            if (
+                !canonical.path.startsWith("/sys/") ||
+                !Files.isRegularFile(canonical.toPath()) ||
+                !canonical.canRead()
+            ) {
+                null
+            } else {
+                canonical
             }
+        } catch (_: Exception) {
+            null
         }
-        if (count > byteLimit) return null
-        String(bytes, 0, count, Charsets.UTF_8).lineSequence().toList()
-    }.getOrNull()
+
+    private fun readBoundedConfigLines(file: File): List<String>? {
+        return try {
+            val byteLimit = MAX_CONFIG_BYTES.toInt()
+            val bytes = ByteArray(byteLimit + 1)
+            var count = 0
+            file.inputStream().buffered().use { input ->
+                while (count < bytes.size) {
+                    val read = input.read(bytes, count, bytes.size - count)
+                    if (read < 0) break
+                    // The requested length is non-zero, so FileInputStream must either make
+                    // progress or report EOF. Fail closed on a contract-violating zero read
+                    // instead of spinning or carrying a warning-only retry counter.
+                    if (read == 0) return null
+                    count += read
+                }
+            }
+            if (count > byteLimit) return null
+            String(bytes, 0, count, Charsets.UTF_8).lineSequence().toList()
+        } catch (_: Exception) {
+            null
+        }
+    }
 
     private data class BusySensorResult(
         val percent: Pair<Float, String>?,
@@ -397,6 +430,10 @@ class KernelSensorProvider(private val context: Context) {
             // it is commonly exposed through debugfs/hal and must be opted into with
             // gpu_frequency_index_khz after product access policy is reviewed.
         )
+        internal val DEFAULT_DPU_UNDERRUN_PROBES = listOf(
+            "/sys/class/dpu/dpu0/underrun_count",
+            "/sys/class/dpu/dpu0/underrun_cnt",
+        )
     }
 }
 
@@ -437,6 +474,18 @@ internal data class BusyCounterState(
     val total: Long,
     val source: String,
 )
+
+internal class KernelBusyCounterBaselines {
+    var gpu: BusyCounterState? = null
+    var bus: BusyCounterState? = null
+    var dpu: BusyCounterState? = null
+
+    fun reset() {
+        gpu = null
+        bus = null
+        dpu = null
+    }
+}
 
 internal data class BusyPercentParse(
     val percent: Float?,
@@ -554,14 +603,25 @@ internal fun parseCustomProbeConfig(lines: List<String>): Map<String, String> {
             if (
                 key in ALLOWED_PROBE_KEYS &&
                 value.length in 1..MAX_CUSTOM_PATH_CHARS &&
-                (value.startsWith("/sys/") || value.startsWith("/proc/")) &&
+                isAllowedCustomProbePath(key, value) &&
                 value.split('/').none { it == ".." } &&
-                '\u0000' !in value
+                value.none { it == '\u0000' || it.isISOControl() || it.isWhitespace() }
             ) {
                 put(key, value)
             }
         }
     }
+}
+
+/**
+ * Product fallback probes are deliberately confined to a small set of typed sysfs namespaces.
+ * Address-named platform/debugfs nodes need a product broker or a source change that documents
+ * their ABI; a config file alone cannot turn an arbitrary readable scalar into hardware evidence.
+ */
+internal fun isAllowedCustomProbePath(key: String, path: String): Boolean {
+    if (!path.startsWith("/sys/")) return false
+    val prefixes = CUSTOM_PROBE_PREFIXES[key] ?: return false
+    return prefixes.any(path::startsWith)
 }
 
 internal fun Float.validUtilizationPercent(): Float? = takeIf { isFinite() && this in 0f..100f }
@@ -728,6 +788,36 @@ private val ALLOWED_PROBE_KEYS = setOf(
     "dpu_frequency_hz",
     "dpu_underrun",
 )
+private val GPU_CUSTOM_PROBE_PREFIXES = listOf(
+    "/sys/class/kgsl/",
+    "/sys/class/drm/",
+    "/sys/class/misc/",
+    "/sys/kernel/gpu/",
+    "/sys/kernel/ged/",
+    "/sys/module/ged/",
+    "/sys/kernel/debug/ged/",
+)
+private val DPU_CUSTOM_PROBE_PREFIXES = listOf(
+    "/sys/class/dpu/",
+    "/sys/class/drm/",
+)
+private val CUSTOM_PROBE_PREFIXES = buildMap<String, List<String>> {
+    listOf(
+        "gpu_busy",
+        "gpu_busy_percent",
+        "gpu_busy_window",
+        "gpu_busy_mtk_triplet",
+        "gpu_frequency",
+        "gpu_frequency_hz",
+        "gpu_frequency_khz",
+        "gpu_frequency_mhz",
+        "gpu_frequency_index_khz",
+    ).forEach { key -> put(key, GPU_CUSTOM_PROBE_PREFIXES) }
+    put("bus_busy", listOf("/sys/class/devfreq/"))
+    put("dpu_busy", DPU_CUSTOM_PROBE_PREFIXES)
+    put("dpu_frequency_hz", DPU_CUSTOM_PROBE_PREFIXES)
+    put("dpu_underrun", DPU_CUSTOM_PROBE_PREFIXES)
+}
 private const val MAX_CUSTOM_CONFIG_LINES = 128
 private const val MAX_CUSTOM_CONFIG_LINE_CHARS = 1_024
 private const val MAX_CUSTOM_PATH_CHARS = 512

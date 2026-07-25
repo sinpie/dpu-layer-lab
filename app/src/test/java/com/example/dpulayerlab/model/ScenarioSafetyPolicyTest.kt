@@ -72,6 +72,22 @@ class ScenarioSafetyPolicyTest {
     }
 
     @Test
+    fun negativeWorkloadsAreRejectedInsteadOfSilentlyClampedToIdle() {
+        listOf(
+            LoadSetpoints(cpu = -0.1f),
+            LoadSetpoints(memory = -0.1f),
+            LoadSetpoints(gpu = -0.1f),
+            LoadSetpoints(npu = -0.1f),
+        ).forEach { workloads ->
+            assertRejected(
+                scenario(
+                    phases = listOf(phase(workloads = workloads)),
+                ),
+            )
+        }
+    }
+
+    @Test
     fun subEffectivePositiveWorkloadIsRejectedInsteadOfReportedAsActive() {
         assertAccepted(
             ScenarioSafetyPolicy.evaluate(
@@ -560,7 +576,7 @@ class ScenarioSafetyPolicyTest {
                         durationMs = Long.MAX_VALUE,
                         workloads = LoadSetpoints(
                             cpu = 2f,
-                            memory = -0.5f,
+                            memory = 2f,
                             gpu = 0.9f,
                             npu = 0.8f,
                         ),
@@ -586,7 +602,7 @@ class ScenarioSafetyPolicyTest {
         assertEquals(120f, actual.producerFps)
         assertEquals(240f, actual.requestedDisplayHz)
         assertEquals(5_000L, actual.durationMs)
-        assertEquals(LoadSetpoints(0.5f, 0f, 0.6f, 0.7f), actual.workloads)
+        assertEquals(LoadSetpoints(0.5f, 0.5f, 0.6f, 0.7f), actual.workloads)
         assertTrue(decision.adjustments.isNotEmpty())
     }
 

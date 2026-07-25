@@ -212,15 +212,28 @@ class PinnedMediaSource internal constructor(
     }
 
     fun closeWithResult(): Boolean {
+        var terminalFailure: Throwable? = null
         val result = synchronized(lock) {
             closed = true
-            closeState.closeWithResult()
+            try {
+                closeState.closeWithResult()
+            } catch (error: Error) {
+                terminalFailure = error
+                // BoundedCloseState publishes its stable close evidence before rethrowing.
+                closeState.closeWithResult()
+            }
         }
         if (!result) {
-            PinnedMediaCleanupState.markUnconfirmed(
-                closeState.lastFailureClass() ?: "unknown",
-            )
+            try {
+                PinnedMediaCleanupState.markUnconfirmed(
+                    closeState.lastFailureClass() ?: "unknown",
+                )
+            } catch (error: Throwable) {
+                terminalFailure =
+                    mergeFailurePreservingFatal(terminalFailure, error)
+            }
         }
+        terminalFailure?.let { throw it }
         return result
     }
 
@@ -264,10 +277,26 @@ internal class BoundedOwnedResource<T : AutoCloseable>(
     private val failurePublished = AtomicBoolean(false)
 
     fun closeWithResult(): Boolean {
-        val confirmed = closeState.closeWithResult()
-        if (!confirmed && failurePublished.compareAndSet(false, true)) {
-            onTerminalCloseFailure(closeState.lastFailureClass() ?: "unknown")
+        var fatalFailure: Error? = null
+        val confirmed = try {
+            closeState.closeWithResult()
+        } catch (error: Error) {
+            fatalFailure = error
+            closeState.closeWithResult()
         }
+        if (!confirmed && failurePublished.compareAndSet(false, true)) {
+            try {
+                onTerminalCloseFailure(closeState.lastFailureClass() ?: "unknown")
+            } catch (error: Throwable) {
+                val merged = mergeFailurePreservingFatal(fatalFailure, error)
+                if (merged is Error) {
+                    fatalFailure = merged
+                } else {
+                    throw merged
+                }
+            }
+        }
+        fatalFailure?.let { throw it }
         return confirmed
     }
 
@@ -307,6 +336,7 @@ internal class BoundedCloseState(
     fun closeWithResult(): Boolean = synchronized(lock) {
         result?.let { return it }
         var confirmed = false
+        var terminalFailure: Throwable? = null
         var attemptsRemaining = maxAttempts
         while (!confirmed && attemptsRemaining > 0) {
             attemptsRemaining -= 1
@@ -314,13 +344,22 @@ internal class BoundedCloseState(
                 closer()
                 confirmed = true
             } catch (error: Throwable) {
-                if (error is ThreadDeath) throw error
-                failureClass = error.javaClass.simpleName.ifBlank {
-                    error.javaClass.name
+                terminalFailure =
+                    mergeFailurePreservingFatal(terminalFailure, error)
+                try {
+                    failureClass = error.javaClass.simpleName.ifBlank {
+                        error.javaClass.name
+                    }
+                } catch (recordError: Throwable) {
+                    terminalFailure =
+                        mergeFailurePreservingFatal(terminalFailure, recordError)
                 }
             }
         }
         result = confirmed
+        terminalFailure?.let { failure ->
+            if (failure is Error) throw failure
+        }
         confirmed
     }
 
@@ -334,7 +373,8 @@ internal class BoundedCloseState(
 
 /**
  * Transfers [resource] to [factory]. If construction fails before ownership transfer completes,
- * the resource is closed and any close failure is attached to the original exception.
+ * the resource is closed. Ordinary close failures are attached to the original exception; a
+ * cleanup [Error] is promoted while retaining the original failure as suppressed evidence.
  */
 internal inline fun <T : AutoCloseable, R> constructWithOwnedCloseOnFailure(
     resource: T,
@@ -344,14 +384,18 @@ internal inline fun <T : AutoCloseable, R> constructWithOwnedCloseOnFailure(
     try {
         return factory(resource)
     } catch (error: Throwable) {
+        var terminal: Throwable = error
         try {
             resource.close()
         } catch (cleanupError: Throwable) {
-            if (cleanupError is ThreadDeath) throw cleanupError
-            onCloseFailure(cleanupError)
-            if (cleanupError !== error) error.addSuppressed(cleanupError)
+            terminal = mergeFailurePreservingFatal(terminal, cleanupError)
+            try {
+                onCloseFailure(cleanupError)
+            } catch (reportError: Throwable) {
+                terminal = mergeFailurePreservingFatal(terminal, reportError)
+            }
         }
-        throw error
+        throw terminal
     }
 }
 

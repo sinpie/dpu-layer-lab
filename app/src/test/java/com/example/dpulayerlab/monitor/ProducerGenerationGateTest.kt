@@ -9,6 +9,64 @@ import org.junit.Test
 
 class ProducerGenerationGateTest {
     @Test
+    fun exactControlRevisionRequiresFreshFrameFromEveryExpectedProducer() {
+        val gate = ProducerGenerationGate()
+        val generation = gate.begin(nowMs = 0L)
+        assertFalse(gate.requestProducerControlRevision(generation, 7L, nowMs = 0L))
+        assertFalse(gate.expect(generation, (0L..20L).toSet(), nowMs = 1L))
+        assertTrue(gate.expect(generation, setOf(11L, 22L), nowMs = 1L))
+        assertFalse(gate.requestProducerControlRevision(generation, 7L, nowMs = 1L))
+        assertTrue(gate.activate(generation, nowMs = 2L))
+        assertTrue(gate.accept(generation, 11L, nowMs = 3L))
+        assertTrue(gate.accept(generation, 22L, nowMs = 3L))
+        assertTrue(gate.readiness(generation, nowMs = 4L).ready)
+
+        assertTrue(
+            gate.requestProducerControlRevision(
+                candidate = generation,
+                revision = 7L,
+                nowMs = 10L,
+            ),
+        )
+        val staleReadiness = gate.readiness(generation, nowMs = 11L)
+        assertTrue(staleReadiness.ready)
+        assertFalse(staleReadiness.producerControlReady)
+        assertEquals(0, staleReadiness.producerControlAppliedCount)
+        assertEquals(1L, staleReadiness.producerControlPendingForMs)
+
+        // A stale revision and one exact producer cannot stand in for the complete topology.
+        assertTrue(gate.accept(generation, 11L, nowMs = 12L, controlRevision = 6L))
+        assertEquals(
+            0,
+            gate.readiness(generation, nowMs = 13L).producerControlAppliedCount,
+        )
+        assertTrue(gate.accept(generation, 11L, nowMs = 14L, controlRevision = 7L))
+        val partial = gate.readiness(generation, nowMs = 15L)
+        assertFalse(partial.producerControlReady)
+        assertEquals(1, partial.producerControlAppliedCount)
+
+        assertTrue(gate.accept(generation, 22L, nowMs = 16L, controlRevision = 8L))
+        assertFalse(gate.readiness(generation, nowMs = 17L).producerControlReady)
+        assertTrue(gate.accept(generation, 22L, nowMs = 18L, controlRevision = 7L))
+        val complete = gate.readiness(generation, nowMs = 19L)
+        assertTrue(complete.producerControlReady)
+        assertEquals(2, complete.producerControlAppliedCount)
+        assertEquals(7L, complete.producerControlAppliedRevision)
+
+        // Re-arm is monotonic and clears all prior producer evidence.
+        assertTrue(gate.requestProducerControlRevision(generation, 8L, nowMs = 20L))
+        assertFalse(gate.readiness(generation, nowMs = 21L).producerControlReady)
+        assertFalse(gate.requestProducerControlRevision(generation, 7L, nowMs = 22L))
+        assertFalse(
+            gate.requestProducerControlRevision(
+                candidate = generation + 1L,
+                revision = 9L,
+                nowMs = 23L,
+            ),
+        )
+    }
+
+    @Test
     fun geometryRevisionRequiresMatchingPostFrameAckAndIsGenerationScoped() {
         val gate = ProducerGenerationGate()
         val generation = gate.begin(nowMs = 100L)
@@ -414,6 +472,37 @@ class ProducerGenerationGateTest {
         assertTrue(gate.accept(generation, 1L, nowMs = 2_510L))
         assertTrue(gate.accept(generation, 2L, nowMs = 2_520L))
         assertTrue(gate.readiness(generation, nowMs = 2_521L).ready)
+    }
+
+    @Test
+    fun sameIdPendingRepublishRequiresFreshReplacementBuffers() {
+        val gate = ProducerGenerationGate()
+        val generation = gate.begin(nowMs = 0L)
+        assertTrue(gate.expect(generation, setOf(1L, 2L), nowMs = 10L))
+        assertTrue(gate.activate(generation, nowMs = 20L))
+        assertTrue(gate.accept(generation, 1L, nowMs = 30L))
+        assertTrue(gate.accept(generation, 2L, nowMs = 40L))
+        val beforePending = gate.readiness(generation, nowMs = 41L)
+        assertTrue(beforePending.ready)
+
+        assertTrue(gate.markTopologyPending(generation))
+        assertTrue(gate.expect(generation, setOf(2L, 1L), nowMs = 50L))
+        val republished = gate.readiness(generation, nowMs = 51L)
+
+        assertFalse(republished.ready)
+        assertEquals(0, republished.observedCount)
+        assertEquals(0, republished.everObservedCount)
+        assertEquals(beforePending.topologyPublishedAtMs, republished.topologyPublishedAtMs)
+        assertEquals(beforePending.topologyRevision, republished.topologyRevision)
+        assertEquals(
+            beforePending.topologyDiscontinuitySerial + 1L,
+            republished.topologyDiscontinuitySerial,
+        )
+
+        assertTrue(gate.accept(generation, 1L, nowMs = 60L))
+        assertFalse(gate.readiness(generation, nowMs = 61L).ready)
+        assertTrue(gate.accept(generation, 2L, nowMs = 70L))
+        assertTrue(gate.readiness(generation, nowMs = 71L).ready)
     }
 
     @Test

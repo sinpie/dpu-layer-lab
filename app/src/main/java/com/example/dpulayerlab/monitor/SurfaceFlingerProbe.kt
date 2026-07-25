@@ -90,10 +90,22 @@ class SurfaceFlingerProbe(context: Context) : AutoCloseable {
     }
 
     internal fun closeWithResult(): Boolean {
-        val laneStopped = laneLease.closeWithResult()
+        var terminalFailure: Throwable? = null
+        val laneStopped = try {
+            laneLease.closeWithResult()
+        } catch (error: Throwable) {
+            terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
+            false
+        }
         // Always inspect the child gate even when the lane stop failed. A process which exited
         // after the bounded lane wait can then release its process reference deterministically.
-        val childStopped = processChildren.isRestartSafe()
+        val childStopped = try {
+            processChildren.isRestartSafe()
+        } catch (error: Throwable) {
+            terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
+            false
+        }
+        terminalFailure?.let { throw it }
         return laneStopped && childStopped
     }
 
@@ -117,12 +129,22 @@ class SurfaceFlingerProbe(context: Context) : AutoCloseable {
                 ProcessBuilder("/system/bin/dumpsys", "SurfaceFlinger", "--hwclayers")
                     .redirectErrorStream(true)
                     .start()
-            return try {
+            var snapshot: CompositionSnapshot? = null
+            var terminalFailure: Throwable? = null
+            try {
                 if (
                     !cancellation.registerCleanup {
                         // Keep the waiting caller's cancellation path non-blocking. The worker
                         // owns stream close/wait in finally after destroy wakes the pipe reader.
-                        if (process.isAlive) runCatching { process.destroyForcibly() }
+                        if (process.isAlive) {
+                            try {
+                                process.destroyForcibly()
+                            } catch (error: Error) {
+                                throw error
+                            } catch (_: Exception) {
+                                // The worker-owned bounded cleanup below remains authoritative.
+                            }
+                        }
                     }
                 ) {
                     throw InterruptedException(
@@ -135,19 +157,34 @@ class SurfaceFlingerProbe(context: Context) : AutoCloseable {
                 if (cancellation.isCancellationRequested()) {
                     throw InterruptedException("SurfaceFlinger probe cancelled")
                 }
-                parseSurfaceFlingerDump(text)
-            } finally {
-                if (
-                    !cleanupProbeProcess(
-                        process = process,
-                        waitMs = PROCESS_CLEANUP_WAIT_MS,
-                        registry = processChildren,
-                    )
-                ) {
-                    throw IllegalStateException(
+                snapshot = parseSurfaceFlingerDump(text)
+            } catch (error: Throwable) {
+                terminalFailure = error
+            }
+            try {
+                val cleanupConfirmed = cleanupProbeProcess(
+                    process = process,
+                    waitMs = PROCESS_CLEANUP_WAIT_MS,
+                    registry = processChildren,
+                )
+                if (!cleanupConfirmed) {
+                    val cleanupFailure = IllegalStateException(
                         "SurfaceFlinger process termination was not confirmed",
                     )
+                    terminalFailure = mergeProbeFailurePreservingFatal(
+                        terminalFailure,
+                        cleanupFailure,
+                    )
                 }
+            } catch (cleanupError: Throwable) {
+                terminalFailure = mergeProbeFailurePreservingFatal(
+                    terminalFailure,
+                    cleanupError,
+                )
+            }
+            terminalFailure?.let { throw it }
+            return checkNotNull(snapshot) {
+                "SurfaceFlinger probe completed without a snapshot"
             }
         }
 
@@ -190,10 +227,24 @@ internal class ProbeCancellation {
     }
 
     fun cleanup() {
-        cleanupAction.getAndSet(null)?.let { action ->
-            runCatching(action)
-        }
+        cleanupAction.getAndSet(null)?.invoke()
     }
+}
+
+/** Keeps the first fatal identity while retaining ordinary/later cleanup failures as evidence. */
+internal fun mergeProbeFailurePreservingFatal(
+    current: Throwable?,
+    candidate: Throwable,
+): Throwable {
+    if (current == null || current === candidate) return current ?: candidate
+    val terminal = if (current is Error || candidate !is Error) current else candidate
+    val secondary = if (terminal === current) candidate else current
+    try {
+        terminal.addSuppressed(secondary)
+    } catch (_: Throwable) {
+        // Preserve an active fatal even when suppressed-state allocation itself is unavailable.
+    }
+    return terminal
 }
 
 internal sealed class ProbeLaneResult<out T> {
@@ -216,12 +267,14 @@ internal class SingleFlightProbeLane<T>(
     threadName: String,
     timeoutMs: Long,
     shutdownTimeoutMs: Long,
+    workerUncaughtExceptionHandler: Thread.UncaughtExceptionHandler? = null,
     operation: (ProbeCancellation) -> T,
 ) : AutoCloseable {
     private val delegate = SingleFlightInputProbeLane<Unit, T>(
         threadName = threadName,
         timeoutMs = timeoutMs,
         shutdownTimeoutMs = shutdownTimeoutMs,
+        workerUncaughtExceptionHandler = workerUncaughtExceptionHandler,
     ) { _, cancellation ->
         operation(cancellation)
     }
@@ -250,6 +303,7 @@ internal class SingleFlightInputProbeLane<I : Any, T>(
     threadName: String,
     private val timeoutMs: Long,
     private val shutdownTimeoutMs: Long,
+    workerUncaughtExceptionHandler: Thread.UncaughtExceptionHandler? = null,
     private val operation: (I, ProbeCancellation) -> T,
 ) : AutoCloseable {
     private val closed = AtomicBoolean(false)
@@ -263,7 +317,12 @@ internal class SingleFlightInputProbeLane<I : Any, T>(
         TimeUnit.MILLISECONDS,
         ArrayBlockingQueue(1),
         { runnable ->
-            Thread(runnable, threadName).apply { isDaemon = true }
+            Thread(runnable, threadName).apply {
+                isDaemon = true
+                if (workerUncaughtExceptionHandler != null) {
+                    uncaughtExceptionHandler = workerUncaughtExceptionHandler
+                }
+            }
         },
         ThreadPoolExecutor.AbortPolicy(),
     )
@@ -311,26 +370,49 @@ internal class SingleFlightInputProbeLane<I : Any, T>(
         try {
             executor.execute(task)
         } catch (error: Throwable) {
-            task.finishWithoutRun()
-            if (error is ThreadDeath) throw error
-            return if (closed.get() || error is RejectedExecutionException) {
+            var terminal: Throwable = error
+            try {
+                task.finishWithoutRun()
+            } catch (cleanupError: Throwable) {
+                terminal = mergeProbeFailurePreservingFatal(terminal, cleanupError)
+            }
+            if (terminal is Error) throw terminal
+            return if (closed.get() || terminal is RejectedExecutionException) {
                 if (closed.get()) ProbeLaneResult.Closed else ProbeLaneResult.Busy
             } else {
-                ProbeLaneResult.Failed(error)
+                ProbeLaneResult.Failed(terminal)
             }
         }
 
         return try {
             task.result.get(effectiveTimeoutMs, TimeUnit.MILLISECONDS)
         } catch (_: TimeoutException) {
-            task.cancel()
-            ProbeLaneResult.TimedOut
+            try {
+                task.cancel()
+                ProbeLaneResult.TimedOut
+            } catch (error: Error) {
+                throw error
+            } catch (error: Throwable) {
+                ProbeLaneResult.Failed(error)
+            }
         } catch (_: InterruptedException) {
-            task.cancel()
-            Thread.currentThread().interrupt()
+            var cancellationFailure: Throwable? = null
+            try {
+                task.cancel()
+            } catch (error: Throwable) {
+                cancellationFailure = error
+            } finally {
+                Thread.currentThread().interrupt()
+            }
+            cancellationFailure?.let { error ->
+                if (error is Error) throw error
+                return ProbeLaneResult.Failed(error)
+            }
             ProbeLaneResult.Interrupted
         } catch (error: ExecutionException) {
-            ProbeLaneResult.Failed(error.cause ?: error)
+            val cause = error.cause ?: error
+            if (cause is Error) throw cause
+            ProbeLaneResult.Failed(cause)
         }
     }
 
@@ -367,19 +449,45 @@ internal class SingleFlightInputProbeLane<I : Any, T>(
         val deadlineNanos = System.nanoTime() +
             TimeUnit.MILLISECONDS.toNanos(shutdownTimeoutMs)
         val task = synchronized(handoffLock) { activeTask.get() }
-        task?.cancel()
+        var terminalFailure: Throwable? = null
+        try {
+            task?.cancel()
+        } catch (error: Throwable) {
+            terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
+        }
         // A close can race the executor hand-off after execute(task) accepted the Runnable but
         // before the worker called run(). shutdownNow returns that never-started task; publish its
         // actual completion explicitly or the single-flight gate would remain sticky forever.
-        val neverStartedTasks = executor.shutdownNow()
+        val neverStartedTasks = try {
+            executor.shutdownNow()
+        } catch (error: Throwable) {
+            terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
+            emptyList()
+        }
         task?.let { pendingTask ->
             if (neverStartedTasks.any { it === pendingTask }) {
-                pendingTask.finishWithoutRun()
+                try {
+                    pendingTask.finishWithoutRun()
+                } catch (error: Throwable) {
+                    terminalFailure =
+                        mergeProbeFailurePreservingFatal(terminalFailure, error)
+                }
             }
         }
 
-        val taskStopped = task?.awaitActualCompletion(deadlineNanos) ?: !active.get()
-        val executorStopped = awaitExecutorTermination(deadlineNanos)
+        val taskStopped = try {
+            task?.awaitActualCompletion(deadlineNanos) ?: !active.get()
+        } catch (error: Throwable) {
+            terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
+            false
+        }
+        val executorStopped = try {
+            awaitExecutorTermination(deadlineNanos)
+        } catch (error: Throwable) {
+            terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
+            false
+        }
+        terminalFailure?.let { throw it }
         return taskStopped && executorStopped && !active.get()
     }
 
@@ -409,17 +517,17 @@ internal class SingleFlightInputProbeLane<I : Any, T>(
         private val actualCompletionPublished = AtomicBoolean(false)
 
         override fun run() {
-            runner.set(Thread.currentThread())
             var outcome: ProbeLaneResult<T> = ProbeLaneResult.Cancelled
-            var threadDeath: ThreadDeath? = null
+            var terminalFailure: Throwable? = null
             try {
+                runner.set(Thread.currentThread())
                 outcome = if (cancellation.isCancellationRequested()) {
                     ProbeLaneResult.Cancelled
                 } else {
                     ProbeLaneResult.Completed(operation(input, cancellation))
                 }
             } catch (error: Throwable) {
-                if (error is ThreadDeath) threadDeath = error
+                terminalFailure = error
                 outcome = if (
                     cancellation.isCancellationRequested() ||
                     error is InterruptedException
@@ -429,25 +537,77 @@ internal class SingleFlightInputProbeLane<I : Any, T>(
                     ProbeLaneResult.Failed(error)
                 }
             } finally {
-                cancellation.cleanup()
-                runner.set(null)
-                publishActualCompletion()
-                result.complete(outcome)
+                try {
+                    cancellation.cleanup()
+                } catch (error: Throwable) {
+                    terminalFailure =
+                        mergeProbeFailurePreservingFatal(terminalFailure, error)
+                }
+                try {
+                    runner.set(null)
+                } catch (error: Throwable) {
+                    terminalFailure =
+                        mergeProbeFailurePreservingFatal(terminalFailure, error)
+                }
+                try {
+                    publishActualCompletion()
+                } catch (error: Throwable) {
+                    terminalFailure =
+                        mergeProbeFailurePreservingFatal(terminalFailure, error)
+                }
+                val failure = terminalFailure
+                if (failure != null && failure !is Error && outcome is ProbeLaneResult.Completed) {
+                    outcome = ProbeLaneResult.Failed(failure)
+                }
+                try {
+                    if (failure is Error) {
+                        result.completeExceptionally(failure)
+                    } else {
+                        result.complete(outcome)
+                    }
+                } catch (error: Throwable) {
+                    terminalFailure =
+                        mergeProbeFailurePreservingFatal(terminalFailure, error)
+                }
             }
-            threadDeath?.let { throw it }
+            (terminalFailure as? Error)?.let { throw it }
         }
 
         fun cancel() {
             // Publish cancellation before releasing a blocking resource. Otherwise that resource
             // can wake and race a stale successful result ahead of the close/timeout boundary.
-            result.complete(ProbeLaneResult.Cancelled)
-            cancellation.cancel()
-            runner.get()?.interrupt()
+            var terminalFailure: Throwable? = null
+            try {
+                result.complete(ProbeLaneResult.Cancelled)
+            } catch (error: Throwable) {
+                terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
+            }
+            try {
+                cancellation.cancel()
+            } catch (error: Throwable) {
+                terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
+            }
+            try {
+                runner.get()?.interrupt()
+            } catch (error: Throwable) {
+                terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
+            }
+            terminalFailure?.let { throw it }
         }
 
         fun finishWithoutRun() {
-            cancel()
-            publishActualCompletion()
+            var terminalFailure: Throwable? = null
+            try {
+                cancel()
+            } catch (error: Throwable) {
+                terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
+            }
+            try {
+                publishActualCompletion()
+            } catch (error: Throwable) {
+                terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
+            }
+            terminalFailure?.let { throw it }
         }
 
         fun awaitActualCompletion(deadlineNanos: Long): Boolean {
@@ -518,7 +678,12 @@ internal class SharedProbeLaneRegistry<T>(
         if (owners > 0) return true
         if (closeFailed) return false
 
-        val stopped = target.closeWithResult()
+        val stopped = try {
+            target.closeWithResult()
+        } catch (error: Throwable) {
+            closeFailed = true
+            throw error
+        }
         if (stopped) {
             lane = null
         } else {
@@ -597,32 +762,102 @@ internal fun cleanupProbeProcess(
     registry: UnconfirmedProcessRegistry,
 ): Boolean {
     require(waitMs >= 0L)
-    if (process.isAlive) {
-        runCatching { process.destroyForcibly() }
-    }
-    runCatching { process.inputStream.close() }
-    runCatching { process.errorStream.close() }
-    runCatching { process.outputStream.close() }
-    runCatching {
-        process.waitFor(waitMs, TimeUnit.MILLISECONDS)
-    }
-    if (process.isAlive) {
-        runCatching { process.destroyForcibly() }
-        // A second wait is required after the final kill request. Without it the worker can
-        // publish completion while the old dumpsys process still owns its pipe/native state.
-        runCatching {
-            process.waitFor(waitMs, TimeUnit.MILLISECONDS)
-        }
-    }
-    return if (process.isAlive) {
-        registry.record(process)
-        // The process can exit between the final observation and registration. Re-read through
-        // the registry so that race is accepted only when death is explicitly observed.
-        registry.isRestartSafe()
-    } else {
-        registry.clear(process)
+    var terminalFailure: Throwable? = null
+
+    var processAlive = try {
+        process.isAlive
+    } catch (error: Throwable) {
+        terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
         true
     }
+    if (processAlive) {
+        try {
+            process.destroyForcibly()
+        } catch (error: Throwable) {
+            terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
+        }
+    }
+    try {
+        process.inputStream.close()
+    } catch (error: Throwable) {
+        terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
+    }
+    try {
+        process.errorStream.close()
+    } catch (error: Throwable) {
+        terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
+    }
+    try {
+        process.outputStream.close()
+    } catch (error: Throwable) {
+        terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
+    }
+    try {
+        process.waitFor(waitMs, TimeUnit.MILLISECONDS)
+    } catch (error: Throwable) {
+        terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
+    }
+    processAlive = try {
+        process.isAlive
+    } catch (error: Throwable) {
+        terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
+        true
+    }
+    if (processAlive) {
+        try {
+            process.destroyForcibly()
+        } catch (error: Throwable) {
+            terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
+        }
+        // A second wait is required after the final kill request. Without it the worker can
+        // publish completion while the old dumpsys process still owns its pipe/native state.
+        try {
+            process.waitFor(waitMs, TimeUnit.MILLISECONDS)
+        } catch (error: Throwable) {
+            terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
+        }
+    }
+    val processStillAlive = try {
+        process.isAlive
+    } catch (error: Throwable) {
+        terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
+        true
+    }
+    val restartSafe = if (processStillAlive) {
+        val recorded = try {
+            registry.record(process)
+            true
+        } catch (error: Throwable) {
+            terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
+            false
+        }
+        // The process can exit between the final observation and registration. Re-read through
+        // the registry so that race is accepted only when death is explicitly observed.
+        val observedSafe = try {
+            registry.isRestartSafe()
+        } catch (error: Throwable) {
+            terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
+            false
+        }
+        recorded && observedSafe
+    } else {
+        val cleared = try {
+            registry.clear(process)
+            true
+        } catch (error: Throwable) {
+            terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
+            false
+        }
+        val observedSafe = try {
+            registry.isRestartSafe()
+        } catch (error: Throwable) {
+            terminalFailure = mergeProbeFailurePreservingFatal(terminalFailure, error)
+            false
+        }
+        cleared && observedSafe
+    }
+    (terminalFailure as? Error)?.let { throw it }
+    return restartSafe
 }
 
 /**

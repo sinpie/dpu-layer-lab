@@ -108,12 +108,12 @@ per-frame lambda, boxed timestamp, unbounded allocation을 추가하지 않는�
 
 | 파일 | 책임 |
 |---|---|
-| `monitor/FrameTracker.kt` | producer heartbeat, topology readiness, frame/miss counter |
+| `monitor/FrameTracker.kt` | producer heartbeat, topology/readiness/control-revision evidence, frame/miss counter |
 | `monitor/SystemMonitor.kt` | serialized telemetry transaction과 source 선택 |
 | `monitor/SurfaceFlingerProbe.kt` | bounded dumpsys child와 parsing |
 | `monitor/KernelSensorProvider.kt` | allowlisted kernel/product probe path |
 | `monitor/CapabilityScanner.kt` | device capability projection |
-| `vendor/VendorBridge.kt` | versioned AIDL/reflection adapter, timeout, session, cleanup |
+| `vendor/VendorBridge.kt` | explicit broker signer trust, versioned AIDL/reflection adapter, timeout, session, cleanup |
 
 Portable app은 임의 sysfs/debugfs 탐색을 하지 않는다. 제품별 path와 service는
 [System integration](SYSTEM_INTEGRATION.md)에 정의된 typed boundary를 통과해야 한다.
@@ -158,10 +158,10 @@ Provider 구현, SELinux policy와 signing key는 이 저장소에서 생성하�
 | catalog/facet/queue | `ScenarioCatalogTest`, `ScenarioClassifierTest`, `ScenarioQueueEditorTest` |
 | controller/calibration | `LabControllerMathTest`, `HwcCapacityCalibrationSessionTest` |
 | local worker/NPU/prewarm | `LoadManager*Test`, `LoadThreadStartTest`, `LoadSafetyStateTest` |
-| producer/generation/geometry | `LayerStageViewMathTest`, `ProducerGenerationGateTest`, renderer recovery tests |
+| producer/generation/geometry | `LayerStageViewMathTest`, `ProducerGenerationGateTest`, `LongTimestampMapTest`, `ProducerFrameCommitTest`, renderer recovery tests |
 | selected media/codec | `VideoDecoderSelectionTest`, codec/media tests |
 | telemetry/kernel/SF | `SystemMonitor*Test`, `KernelSensorProviderTest`, `SurfaceFlingerProbeTest` |
-| vendor session | `VendorBridgeStateTest` |
+| vendor session/trust | `VendorBridgeStateTest` |
 | automation/Activity | `AutomationIntentContractTest`, `MainActivityMathTest` |
 | UI/HUD/traffic | `DpuLayerLabAppMathTest`, `LayerTrafficEstimatorTest` |
 | report/version | `ReportWriterMathTest`, `AppVersionTest` |

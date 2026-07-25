@@ -93,7 +93,7 @@
 | [UI_SPEC.md](UI_SPEC.md) | 화면 정보 구조, 실행 HUD와 상태별 표시 |
 | [TESTING.md](TESTING.md) | host/device gate와 invariant-to-test 지도 |
 | [SYSTEM_INTEGRATION.md](SYSTEM_INTEGRATION.md) | product/BSP 배치, permission, SELinux, provider |
-| [RELEASE.md](RELEASE.md) | version, build artifact, signing, publish |
+| [RELEASE.md](RELEASE.md) | version, build artifact, signing, 고정 release evidence, publish |
 | [RECONSTRUCTION.md](RECONSTRUCTION.md) | dependency 순서의 source 복구 절차 |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | 증상에서 원인·안전한 조치로 가는 운영 진단 |
 
@@ -124,7 +124,8 @@
 - Intent wire identifier는 `EXTERNAL_CONTRACTS.md`, 사용·ordering은 `AUTOMATION.md`가
   소유한다.
 - JSON field와 nullability는 `REPORT_SCHEMA.md`가 소유한다.
-- 공개 release checksum은 `RELEASE.md`만 소유한다.
+- 공개 release checksum과 suite/test/lint/build/APK/device 검증 evidence는
+  `RELEASE.md`만 소유한다.
 - `PLAN.md`의 미래 의도를 현재 구현 사실처럼 다른 문서에 복사하지 않는다.
 - 변동 가능한 test 수는 완료 시점 evidence에만 기록하고 suite 설명에는 고정하지 않는다.
 - 임시 로컬 경로, SDK 위치, device serial, report 본문과 signing material을 문서에 넣지

@@ -228,21 +228,27 @@ class LayerTrafficEstimatorTest {
     }
 
     @Test
-    fun capacityTilesAlwaysCoverOneScreenEquivalent() {
-        val estimate = LayerTrafficEstimator.estimate(
-            phase = phase(
-                activeLayers = 20,
-                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
-                motion = MotionProfile.CAPACITY_TILES,
-            ),
-            displayWidthPx = 100,
-            displayHeightPx = 50,
-        )
+    fun capacityTilesAlwaysCoverOneScreenEquivalentIncludingPartialRows() {
+        listOf(1, 6, 12, 16, 20).forEach { layerCount ->
+            val estimate = LayerTrafficEstimator.estimate(
+                phase = phase(
+                    activeLayers = layerCount,
+                    layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
+                    motion = MotionProfile.CAPACITY_TILES,
+                ),
+                displayWidthPx = 100,
+                displayHeightPx = 50,
+            )
 
-        assertEquals(1.0, estimate.destinationFootprintScreenEquivalents, 0.0001)
-        assertEquals(5.0, estimate.destinationFootprintAveragePercent, 0.0001)
-        assertTrue(estimate.destinationFootprintLabel.contains("explicit crop union"))
-        assertTrue(estimate.destinationFootprintLabel.contains("profile bypassed"))
+            assertEquals(1.0, estimate.destinationFootprintScreenEquivalents, 0.0001)
+            assertEquals(
+                100.0 / layerCount,
+                estimate.destinationFootprintAveragePercent,
+                0.0001,
+            )
+            assertTrue(estimate.destinationFootprintLabel.contains("explicit crop union"))
+            assertTrue(estimate.destinationFootprintLabel.contains("profile bypassed"))
+        }
     }
 
     @Test

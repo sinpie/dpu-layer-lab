@@ -6,11 +6,11 @@ import org.junit.Test
 
 class AppVersionTest {
     @Test
-    fun versionUsesSourceCandidateTimestampAndOnlyDebugAddsVariantSuffix() {
+    fun releaseVersionUsesTimestampAndOnlyDebugAddsVariantSuffix() {
         val expected = if (BuildConfig.DEBUG) {
-            "20260725_095708-debug"
+            "20260725_170750-debug"
         } else {
-            "20260725_095708"
+            "20260725_170750"
         }
         assertEquals(expected, BuildConfig.VERSION_NAME)
         assertTrue(
@@ -21,7 +21,7 @@ class AppVersionTest {
     }
 
     @Test
-    fun versionCodeMatchesSourceCandidate() {
-        assertEquals(5, BuildConfig.VERSION_CODE)
+    fun versionCodeMatchesRelease() {
+        assertEquals(6, BuildConfig.VERSION_CODE)
     }
 }

@@ -82,6 +82,11 @@ plan-wide Battery Saver restore → Window/SystemUI restore
 ## 입력과 UI
 
 `MainActivity`는 launcher와 protected `AutomationActivity` alias의 실제 target이다.
+Cold-start automation START는 decor attach와 첫 authoritative root Insets까지 보류하고
+STOP은 readiness와 무관하게 즉시 처리한다. 실행 owner가 활성화되면 immutable display
+ID/normalized physical dimensions를 capture하며 `DisplayManager.DisplayListener`,
+configuration/start/focus 경계가 같은 snapshot과 달라지는 즉시
+`SAFETY_ENVELOPE_CHANGED`로 중단한다.
 automation 요청은 component class를 다시 확인하며, `START`에서만 extras를
 unmarshal한다. `STOP`은 pending START보다 우선한다. 계약과 cap은
 `engine/AutomationIntentContract.kt`에 있다.
@@ -89,7 +94,8 @@ unmarshal한다. `STOP`은 pending START보다 우선한다. 계약과 cap은
 Compose의 주요 section은 다음과 같다.
 
 - Dashboard: 현재 capability와 metric overview, 목적별 빠른 시작
-- Scenario catalog: 목적 선택, category/pattern/load/condition facet, queue 구성
+- Scenario catalog: saveable한 `테스트 선택`/`순서·반복` 두 단계, 목적과
+  category/pattern/load/condition facet, bounded vertical queue 구성
 - Custom builder: 단일 scenario의 topology·format·motion·workload·transition 설정
 - System: permission, codec, display mode, direct probe와 runtime protection 상태
 - Running: 항상 접근 가능한 STOP, phase/plan 진행, 좌측 상단 HUD
@@ -180,7 +186,8 @@ Centered horizontal stagger는 stage 폭과 profile scale을 함께 사용해 �
 `LayerTrafficEstimator`와 HUD는 일반 phase에서 `LayerSizeProfile` base scale의 area 합을
 screen-equivalent와 physical producer당 평균 `%`로 별도 표시한다. `CAPACITY_TILES`는
 예외적으로 explicit crop union 1 screen-equivalent와 평균 `100 / producer count`%를
-표시한다. 이 값은
+표시한다. 5-column 기본 grid의 마지막 행이 불완전하면 그 행의 producer만 전체 폭으로
+다시 분할하므로 safety clamp 뒤 6/12/16 producer에서도 실제 union과 같은 값이다. 이 값은
 `MotionProfile` scale, overlap, clipping/crop, rotation과 off-screen loss를 제외한
 geometry estimate이며 conservative
 full-buffer read/write traffic이나 measured bus를 대체하지 않는다.
@@ -217,6 +224,15 @@ topology가 pending으로 바뀌면 callback 경계에서 즉시 frame budget을
 0으로 내린다. 16 ms hand-off를 넘긴 producer를 즉시 교체하지 않고 process-wide
 teardown lease를 bounded poll한다.
 
+Whole-phase `LINEAR_RAMP`의 nominal deadline에서는 exact target과 단조 증가하는
+`producerControlRevision`을 하나의 progress publication으로 보낸다. FrameTracker는
+committed producer 전부가 그 revision을 적용한 fresh frame을 낸 경우에만 endpoint를
+확정한다. Bounded proof hold 중 topology recovery가 발생하면 이전 증거를 버리고 fresh
+first-buffer barrier 뒤 새 revision으로 endpoint를 재게시한다. Hold frame은 proof에는
+쓰되 fidelity에는 넣지 않는다. Endpoint 적용 전에 monotonic time과 aggregate frame
+counter를 한 번 샘플하고 actual/expected를 같은 observed publication boundary에서
+seal하므로 늦은 control tick도 ratio 분자만 늘리지 않는다.
+
 ## Renderer topology와 generation
 
 `LayerStageView`는 실제 BufferQueue-backed child를 소유한다.
@@ -233,6 +249,7 @@ producer callback은 다음 두 identity로 보호된다.
 
 - generation token: 현재 phase topology의 세대
 - physical producer ID: 동일 generation 안의 실제 BufferQueue producer
+- producer control revision: 해당 frame이 실제 적용한 endpoint/control 세대
 
 `topologyMissed`, `teardownFailed`, `teardownCompleted`는 현재 generation의 activation과
 producer readiness를 내리고 geometry request/applied revision·profile·coverage를
@@ -240,10 +257,29 @@ producer readiness를 내리고 geometry request/applied revision·profile·cove
 `topologyMissed`/`teardownFailed`는 새 generation이 필요하다. 정상 detach 뒤 reattach도
 topology pending, 새 geometry acknowledgment, expected topology 재게시, activation,
 모든 producer의 fresh first buffer, fresh HWC observation 순서를 다시 만족해야 한다.
+Canvas/Texture/Video뿐 아니라 GL의 physical Surface/BufferQueue 재생성도 같은
+discontinuity다. 같은 relay/generation을 재사용하더라도 lifecycle callback이 먼저
+pending을 게시하고 geometry/HWC/first-buffer evidence를 폐기한다.
 
 Frame hot path에는 per-frame lambda, boxed timestamp나 반복 buffer를 추가하지 않는다.
 Canvas/EGL/codec worker가 실제 `finally`를 끝내기 전 backing surface를 UI thread에서
 먼저 release하지 않는다.
+Canvas/EGL/MediaCodec commit 실패는 producer revoke와 runtime failure publication을 먼저
+수행하고 cleanup한다. VM fatal은 cleanup을 모두 시도한 뒤 원본 identity로 다시 던진다.
+Thread 생성 전에 renderer transaction owner storage를 최대 producer 수만큼 선할당한다.
+Thread-start/stop/release는 notification 실패와 독립적으로 detach, interrupt, quit,
+shared-deadline join과 identity clear를 모두 시도하며, 불완전 rollback을 일반
+`false`로 낮추지 않는다. Frame/deferred post와 expected-set callback도 fail-closed
+transaction 안에 있고, callback 재진입 뒤에는 capture한 generation/callback/relay
+identity가 모두 같은 경우에만 publication bookkeeping을 commit한다.
+Primitive timestamp map은 두 backing array allocation이 모두 성공한 뒤에만 교체한다.
+Producer control token은 모든 replacement/binding identity prepare가 성공한 뒤 2-phase로
+commit한다. Stale binding이나 commit fatal은 전 relay revoke와 topology pending,
+bounded renderer rollback을 수행한다. Decoder는 submit 직전 immutable control token을
+bounded preallocated epoch+PTS queue에 결속한다. Submit 실패는 epoch+PTS+callback
+identity exact rollback을 사용한다. EOS는 listener disable, callback-looper의 재사용
+barrier를 이용한 flush 전후 drain, queue clear, overflow-safe epoch 증가, listener
+재설치 순서이며 teardown도 같은 callback 경계를 닫는다.
 
 ## Workload subsystem
 
@@ -258,6 +294,20 @@ Canvas/EGL/codec worker가 실제 `finally`를 끝내기 전 backing surface를 
 positive load는 정확한 0 또는 `0.001`보다 커야 한다. start는 worker들을 모두
 생성·등록한 뒤 transaction으로 commit하며 partial start는 bounded join한다.
 unexpected local worker failure는 process-sticky latch로 남고 후속 run을 차단한다.
+Low-memory working-set drop은 NPU zero publication보다 먼저 독립적으로 commit되므로
+NPU adapter가 실패해도 buffer가 다시 pin되지 않는다. Reflection NPU의 waveform과
+release zero는 같은 versioned latest-wins lane을 사용한다. 이전 ticket에서 계산한
+waveform 값은 새 desired ticket을 확인하지 못하면 queue에 게시할 수 없고, release는
+그 lane의 exact zero ticket acknowledgment를 기다린다. Cyclic transition의 양수→0
+valley와 0→양수 re-attack은 semantic edge ticket으로 분리한다. Semantic apply는
+setpoint가 같아도 CPU/memory profile restart와 별도로 fresh NPU ticket을 발행한다.
+Controller는 각 edge의 matching ACK와 backend health를 확인한 뒤에만 transition
+coverage를 기록하며, 같은 부호 안의 중간값만 single-slot latest-wins다.
+Triangle은 zero-origin의 full-cycle 또는 zero-target의 half-cycle 경계를 관측 tick이
+건너도 stable CPU/memory/GPU setpoint 위에서 NPU-only zero를 먼저 확인한다. Terminal
+zero boundary는 zero ACK로 끝내고, 중간 경계이면 이후 positive re-attack을 새 ticket으로
+확인한다. 여러 zero boundary를 놓친 경우 과거 command를 replay하지 않고 inconclusive로
+닫는다.
 
 ## Telemetry data flow
 
@@ -275,6 +325,14 @@ unexpected local worker failure는 process-sticky latch로 남고 후속 run을 
 vendor hardware counter가 유효하면 kernel fallback보다 우선한다. source/quality가
 바뀐 interval은 baseline을 새로 잡고 graph gap/`N/A`를 유지한다. 세부 규칙은
 [docs/METRICS.md](docs/METRICS.md)에 있다.
+Outer sample failure는 CPU/rate뿐 아니라 kernel GPU/bus/DPU cumulative baseline도 함께
+reset한다. Vendor capability getter는 v1 sample lane과 분리된 single-flight
+no-backlog lane에서 deadline/session을 검증하며, HWC one-shot은 admission token을 먼저
+닫고 이 lane까지 drain한 뒤 producer를 게시한다. Capability deadline은 signed
+`nanoTime` wrap-safe이고, worker 반환 직전의 no-backlog hand-off rejection은 25ms
+single deferred refresh로 복구한다. 각 getter 사이에는 current service-session을 다시
+확인하며 executor/Handler admission의 fatal `Error`는 active query rollback 뒤
+재전파한다.
 
 active run은 periodic/typed path에서 새 SurfaceFlinger child process를 만들지 않는다.
 예외는 process-session one-shot capacity calibration의 제한된 fallback뿐이다. 이
@@ -295,6 +353,13 @@ SF fallback을 한 번 실행하며 vendor를 다시 읽지 않는다.
 Binder registration마다 service-session ID를 부여한다. API v2 결과와 HWC 원자 쌍,
 SBWC acknowledgment, NPU ticket, performance ticket은 같은 session에 결속된다.
 timeout은 disconnect와 같지 않으며, 실제 session 변경 시 이전 snapshot/ack를 폐기한다.
+
+Portable build는 implicit action discovery를 신뢰 경계로 사용하지 않는다.
+`/product/etc/dpulayerlab/vendor_broker.conf`의 explicit component, permission owner와
+owner/service signer SHA-256 trust root를 먼저 검증한다. Signature permission grant,
+system service/exported/enabled/permission 계약과 signing lineage가 모두 맞을 때만
+explicit bind한다. 누락·불일치·bind permission 거부는 typed permanent
+`UNAVAILABLE`이며 reconnect loop를 만들지 않는다.
 
 BSP 구현·permission·SELinux·Stable AIDL 규칙은
 [docs/SYSTEM_INTEGRATION.md](docs/SYSTEM_INTEGRATION.md)를 따른다.

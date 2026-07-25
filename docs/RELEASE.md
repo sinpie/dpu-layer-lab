@@ -1,6 +1,7 @@
 # Release 절차
 
-> **Authority:** version/tag/artifact naming, build·checksum·signing·GitHub publish와 product handoff 절차
+> **Authority:** version/tag/artifact naming, build·checksum·signing·GitHub publish,
+> release별 고정 host/APK/device evidence와 product handoff 절차
 > **Audience:** release engineer, repository maintainer, product integration 담당자
 > **Update when:** version 규칙, build type, asset allowlist, signing 또는 publish 절차가 바뀔 때
 > **Does not own:** 구현 architecture, safety invariant, 테스트 의미, BSP provider 계약
@@ -12,30 +13,23 @@
 Canonical remote:
 `https://github.com/sinpie/dpu-layer-lab.git`
 
-## 미배포 source candidate
-
-현재 `main` source candidate는 `20260725_095708`(`versionCode 5`), debug
-`20260725_095708-debug`이다. 아직 이 candidate의 tag 또는 GitHub Release는 만들지
-않았다. 따라서 아래 공개 release의 tag, asset 이름과 checksum을 candidate build에
-재사용하지 않는다. Source version의 machine authority는
-[app/build.gradle.kts](../app/build.gradle.kts)다.
-
 ## 최신 공개 release contract
 
 | 항목 | 값 |
 |---|---|
 | launcher/project | `DPULayerTest` |
 | application ID | `com.example.dpulayerlab` |
-| versionCode | `4` |
-| release versionName | `20260725_090252` |
-| debug versionName | `20260725_090252-debug` |
-| tag | `v20260725_090252` |
+| versionCode | `6` |
+| release versionName | `20260725_170750` |
+| debug versionName | `20260725_170750-debug` |
+| tag | `v20260725_170750` |
 | Soong module/APK | `DpuLayerLab` |
 | report prefix | `dpu-layer-lab-` |
 
-`yyyyMMdd_HHmmss`는 KST build 시각이다. 이 표는 최신 공개 release를 기록하므로
-source candidate와 다를 수 있다. 새 release를 발행할 때 이 표, `README.md`,
-`PROJECT_MEMORY.md`, `AGENTS.md`, release tag와 asset 이름을 함께 갱신한다.
+`yyyyMMdd_HHmmss`는 KST build 시각이다. Source version의 machine authority는
+[app/build.gradle.kts](../app/build.gradle.kts)다. 새 release를 발행할 때 이 표,
+`README.md`, `PROJECT_MEMORY.md`, `AGENTS.md`, release tag와 asset 이름을 함께
+갱신한다.
 
 package, automation component/action, report prefix와 Soong 이름은 제품 호환성 계약이다.
 단순 rebranding 작업에서 바꾸지 않는다.
@@ -44,20 +38,37 @@ package, automation component/action, report prefix와 Soong 이름은 제품 �
 
 GitHub Release에는 다음 세 파일만 올린다.
 
-- `DPULayerTest-20260725_090252-debug.apk`
-- `DPULayerTest-20260725_090252-release-unsigned.apk`
+- `DPULayerTest-20260725_170750-debug.apk`
+- `DPULayerTest-20260725_170750-release-unsigned.apk`
 - `SHA256SUMS.txt`
 
-현재 checksum:
+현재 checksum은 최종 source 상태의 APK를 빌드·검증한 뒤 이 위치에 고정한다. 다른
+version의 값을 재사용하지 않는다.
 
 ```text
-19ce8cd810b186edb05117d840151c83c617ea4d65f32f7ab4cd31c73cf90131  DPULayerTest-20260725_090252-debug.apk
-5251ad87cdb1a7ddc01459b02ec8afb35e4c74d7428ed3f21d6745b890ed1915  DPULayerTest-20260725_090252-release-unsigned.apk
+172773479fefd514a58c527aa107f23231b0ec1d4440f50fbb59bfeffe845d2c  DPULayerTest-20260725_170750-debug.apk
+ea700b9dbfd4a19a1563c8a2abc7ac6ff4acb580e104a8aef00f3f28991551fc  DPULayerTest-20260725_170750-release-unsigned.apk
 ```
 
-이 값은 tag `v20260725_090252`의 공개 asset에만 해당한다. 새 build에 재사용하지 않는다.
-현재 host validation 수치는 [README.md](../README.md)와
-[PROJECT_MEMORY.md](../PROJECT_MEMORY.md)의 해당 release 기록이 authority다.
+이 값은 tag `v20260725_170750`의 공개 asset에만 해당한다. 새 build에 재사용하지
+않는다. 아래 release evidence도 이 문서만 authority이며 가변 test 수를 README나
+PROJECT_MEMORY에 복제하지 않는다.
+
+## 최신 공개 release evidence
+
+최종 gate가 끝나면 XML/report와 APK 자체를 기준으로 다음 표를 채운다. 명령 exit code만
+성공 증거로 사용하지 않는다.
+
+| 검증 | `20260725_170750` 결과 |
+|---|---|
+| JVM unit test XML | 44 suites / 741 tests / failure 0 / error 0 / skipped 0 |
+| `lintDebug` XML | fatal 0 / error 0 / warning 6 — Gradle·dependency 새 version 알림만 존재 |
+| assemble | `assembleDebug`, `assembleRelease` 성공 — 25,198,804 B / 18,721,770 B |
+| APK badging | debug `com.example.dpulayerlab.debug` / `20260725_170750-debug`; release `com.example.dpulayerlab` / `20260725_170750`; 모두 code 6, label `DPULayerTest`, SDK 29/36 |
+| APK signing | debug v2, `C=US, O=Android, CN=Android Debug`, cert SHA-256 `12d0b1998405a522c7ba73c985a3f7726bd13e7f6e3417d6fa3d43f04371c799`; release는 의도대로 unsigned이며 `apksigner`가 `Missing META-INF/MANIFEST.MF`로 거부 |
+| zip alignment | 두 APK 모두 `zipalign -c -P 16 4` 통과; native library 0개 |
+| merged manifest | release alias만 `CONTROL_TESTS`(`signature\|privileged`) 요구; debug alias permission 없음; 두 variant 모두 alias `CATEGORY_DEFAULT` 0개, MainActivity automation action 0개 |
+| device stress | 미실행 — 대상 실험기와 실행 범위가 지정되지 않음 |
 
 ## Artifact 의미
 

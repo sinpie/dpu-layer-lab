@@ -166,6 +166,14 @@ allocation route, backend, pixel format, layer-size의 discrete contract를 보�
 control cadence는 100 ms다. duration cap 반영 뒤 이 의미를 보존할 수 없으면 phase를
 짧게 축소해 실행하지 않고 거부한다. `floor`는 pulse/triangle valley에만 허용한다.
 
+Whole-phase `LINEAR_RAMP`는 nominal phase deadline에서 exact target을 새
+`producerControlRevision`으로 한 번 게시하고, committed physical producer 전부가 그
+revision의 fresh frame을 낼 때까지 bounded proof hold를 사용한다. Recovery가 끼면
+stale endpoint evidence를 폐기하고 fresh first buffer 뒤 더 큰 revision으로 재arm한다.
+Mismatch/timeout은 `INCONCLUSIVE`다. Endpoint apply 직전 한 번 샘플한 observed
+publication boundary에서 actual/expected fidelity window를 함께 seal하고 이후 proof
+hold frame은 제외한다.
+
 `LoadShape`은 CPU/memory/NPU worker의 phase 내부 legacy modulation ABI다.
 `TransitionSpec`과 역할이 다르며 둘을 같은 필드로 합치지 않는다.
 

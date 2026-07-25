@@ -23,6 +23,17 @@ class LoadThreadStartTest {
     }
 
     @Test
+    fun loadRollbackFailureMergePromotesCleanupFatalWithoutReplacingItsIdentity() {
+        val startFailure = IllegalStateException("start")
+        val cleanupFatal = OutOfMemoryError("rollback")
+
+        val terminal = mergeLoadFailurePreservingFatal(startFailure, cleanupFatal)
+
+        assertSame(cleanupFatal, terminal)
+        assertTrue(cleanupFatal.suppressed.any { it === startFailure })
+    }
+
+    @Test
     fun successfulStartReturnsOnlyAfterThreadOwnershipTransfers() {
         val ran = CountDownLatch(1)
         val thread = Thread({ ran.countDown() }, "load-start-success-test")

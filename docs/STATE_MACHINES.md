@@ -21,7 +21,7 @@ stateDiagram-v2
     Idle --> Preparing: immutable plan 승인
     Preparing --> Calibrating: process calibration claim
     Preparing --> Running: calibration terminal result 재사용
-    Calibrating --> Running: one-shot terminal + teardown/settle
+    Calibrating --> Running: one-shot terminal + teardown + optional settle
     Calibrating --> Aborting: STOP/safety/lifecycle 실패
     Running --> Running: 다음 queue item/repeat
     Running --> Aborting: STOP/safety/worker/telemetry 실패
@@ -61,8 +61,10 @@ stateDiagram-v2
 - 요청은 20L/30fps/60Hz이고 safety-approved actual candidate는 별도 기록한다.
 - 성공·실패·취소 모두 terminal이다. 같은 process에서 두 번째 burst를 만들지 않는다.
 - display ID/normalized dimensions가 바뀌면 N/A projection을 반환하고 재측정하지 않는다.
-- terminal 결과를 publish하기 전에 producer/load teardown, counter drain, worker
-  quiescence와 settle을 확인한다.
+- terminal 결과를 publish하기 전에 producer/load teardown, counter drain과 worker
+  quiescence를 확인한다. 3초 settle은 non-cancelled 정상 진행에서만 cancellable하게
+  수행하며 STOP/cancel에서는 owner 복구를 위해 생략하고 terminal `UNAVAILABLE`을
+  게시해 같은 process의 재계측을 막는다.
 
 ## Producer generation
 
@@ -74,7 +76,7 @@ stateDiagram-v2
     Pending --> Published: replacement 완료 + expected set 1회 게시
     Published --> Activated: preparation observation reset
     Activated --> Ready: 모든 physical producer fresh first buffer/heartbeat
-    Ready --> Pending: route/topology recovery
+    Ready --> Pending: route/topology 또는 physical Surface 재생성
     Ready --> Teardown: phase null/route 변경/STOP
     Pending --> Failed: recovery deadline/teardown 실패
     Teardown --> Complete: 모든 child 종료 확인
@@ -86,6 +88,8 @@ stateDiagram-v2
 - generation activation은 pre-activation first buffer를 지운다.
 - callback은 immutable generation token과 physical producer ID를 함께 사용한다.
 - topology pending/discontinuity 동안 phase clock, frame budget과 cross-load를 pause한다.
+- 같은 generation의 Canvas/Texture/Video/GL BufferQueue 재생성도 geometry와 HWC/
+  first-buffer evidence를 지우고 forced expected-set publication을 다시 거친다.
 - teardown complete/failure의 늦은 callback은 active generation에만 귀속한다.
 
 ## Phase transaction
@@ -98,7 +102,23 @@ Allocation route가 유지되는 연속 setpoint 변경과 route가 바뀌는 tr
 2. absolute-deadline 100ms control tick
 3. FPS/Hz/workload와 허용되는 layer count 보간
 4. transition coverage 기록
-5. phase-end fresh sample
+5. whole-phase linear이면 nominal deadline에 exact endpoint+control revision 게시
+6. committed producer 전부의 matching-revision frame을 bounded hold에서 확인
+7. phase-end fresh sample
+
+```mermaid
+stateDiagram-v2
+    ActiveRamp --> EndpointPublished: nominal deadline
+    EndpointPublished --> EndpointAcked: all committed producers / exact revision
+    EndpointPublished --> Inconclusive: mismatch or timeout
+    EndpointPublished --> RecoveryPending: topology discontinuity
+    RecoveryPending --> EndpointPublished: fresh first buffers / revision + 1
+    EndpointAcked --> TerminalSample
+```
+
+Endpoint apply 직전 한 번 샘플한 시각/frame counter로 producer-fidelity 분자·분모를
+같은 observed publication boundary에서 seal한다. 이후 proof hold frame은 포함하지
+않는다.
 
 ### route 변경
 
@@ -150,7 +170,10 @@ stateDiagram-v2
 
 - CPU/memory worker는 fixed period와 재사용 buffer를 사용한다.
 - memory baseline 전 allocation/page-touch prewarm과 acknowledgment가 필요하다.
-- NPU는 latest command ticket/acknowledgment가 일치할 때만 applied다.
+- Low-memory/drop은 memory pin 해제, drop generation, prewarm cancel을 NPU zero보다
+  먼저 commit하고 worker를 깨운다. NPU adapter 예외가 memory drop을 되돌리지 않는다.
+- NPU waveform과 ordered zero는 같은 versioned single-slot lane을 사용하며 latest
+  command ticket/acknowledgment가 일치할 때만 applied다.
 - worker exception은 first-wins process latch를 세우고 같은 process에서 clear하지 않는다.
 - partial start 실패는 이미 시작된 worker를 bounded join한 뒤에만 lease를 놓는다.
 

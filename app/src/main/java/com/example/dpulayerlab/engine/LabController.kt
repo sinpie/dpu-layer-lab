@@ -88,6 +88,7 @@ import com.example.dpulayerlab.render.videoDimensionCeiling
 import com.example.dpulayerlab.render.visibleVideoDimensions
 import com.example.dpulayerlab.util.currentDisplayCompat
 import com.example.dpulayerlab.vendor.VendorBridge
+import com.example.dpulayerlab.vendor.VendorCapabilityIsolationToken
 import com.example.dpulayerlab.vendor.VendorPerformanceSessionState
 import com.example.dpulayerlab.vendor.VendorPerformanceSessionTicket
 import kotlinx.coroutines.CancellationException
@@ -351,6 +352,209 @@ internal fun currentHwcCapacityCalibrationScope(
         heightPx = heightPx,
     )
 }
+
+internal data class RuntimeLoadCommandOwner(
+    val commandEpoch: Long,
+    val runOwner: Any,
+    val producerGeneration: Long,
+)
+
+internal enum class NpuSemanticEdge {
+    NONE,
+    ZERO_TO_POSITIVE,
+    POSITIVE_TO_ZERO,
+}
+
+internal data class NpuSemanticEdgeDecision(
+    val edge: NpuSemanticEdge,
+    val acknowledgmentRequired: Boolean,
+    val positiveAcknowledgedAfterApply: Boolean,
+)
+
+internal data class TriangleNpuZeroBoundaryDecision(
+    val crossedZeroBoundaries: Long = 0L,
+    val zeroAcknowledgmentRequired: Boolean = false,
+    val positiveReattackAcknowledgmentRequired: Boolean = false,
+    val terminalBoundary: Boolean = false,
+)
+
+/**
+ * Only zero/non-zero NPU boundaries are semantic waveform edges. Intermediate positive ramp
+ * checkpoints stay on the bounded latest-wins lane; a missing initial/recovery positive
+ * acknowledgment is still repaired before the sample can be published for coverage.
+ */
+internal fun npuSemanticEdgeDecision(
+    previousNpu: Float?,
+    currentNpu: Float,
+    positiveAcknowledged: Boolean,
+): NpuSemanticEdgeDecision {
+    val previousPositive = previousNpu?.let { it.isFinite() && it > MIN_EFFECTIVE_LOAD }
+    val currentPositive = currentNpu.isFinite() && currentNpu > MIN_EFFECTIVE_LOAD
+    val edge = when {
+        previousPositive == false && currentPositive -> NpuSemanticEdge.ZERO_TO_POSITIVE
+        previousPositive == true && !currentPositive -> NpuSemanticEdge.POSITIVE_TO_ZERO
+        else -> NpuSemanticEdge.NONE
+    }
+    val acknowledgmentRequired =
+        edge != NpuSemanticEdge.NONE || (currentPositive && !positiveAcknowledged)
+    return NpuSemanticEdgeDecision(
+        edge = edge,
+        acknowledgmentRequired = acknowledgmentRequired,
+        positiveAcknowledgedAfterApply =
+            currentPositive && (positiveAcknowledged || acknowledgmentRequired),
+    )
+}
+
+/**
+ * Detects a triangle-wave zero boundary from two observed controller timestamps.
+ *
+ * The controller deliberately does not replay every missed 100 ms tick. A jittered
+ * observation still represents one zero valley, while more than one crossed zero boundary is
+ * reported to the caller so it can fail inconclusive instead of building an apply backlog.
+ * Origin-zero waves reach zero at full-cycle boundaries; target-zero waves reach zero at
+ * half-cycle boundaries.
+ */
+internal fun triangleNpuZeroBoundaryDecision(
+    spec: TransitionSpec,
+    previousPhaseElapsedMs: Long?,
+    currentPhaseElapsedMs: Long,
+    phaseDurationMs: Long,
+    originNpu: Float,
+    targetNpu: Float,
+): TriangleNpuZeroBoundaryDecision {
+    if (
+        spec.mode != TransitionMode.TRIANGLE_WAVE ||
+        previousPhaseElapsedMs == null ||
+        phaseDurationMs <= 0L
+    ) {
+        return TriangleNpuZeroBoundaryDecision()
+    }
+    val safe = spec.boundedFor(phaseDurationMs)
+    val previous = previousPhaseElapsedMs.coerceIn(0L, phaseDurationMs)
+    val current = currentPhaseElapsedMs.coerceIn(0L, phaseDurationMs)
+    if (current <= previous) return TriangleNpuZeroBoundaryDecision()
+    val cycleMs = safe.cycleMs.coerceAtLeast(1L)
+
+    val safeOrigin = originNpu.takeIf(Float::isFinite)?.coerceIn(0f, 1f) ?: 0f
+    val safeTarget = targetNpu.takeIf(Float::isFinite)?.coerceIn(0f, 1f) ?: 0f
+    val floor = safe.floor.takeIf(Float::isFinite)?.coerceIn(0f, 1f) ?: 0f
+    val valleyNpu = effectiveTriangleNpu(
+        start = safeOrigin,
+        end = safeTarget,
+        fraction = floor,
+    )
+    val peakNpu = effectiveTriangleNpu(
+        start = safeOrigin,
+        end = safeTarget,
+        fraction = 1f,
+    )
+    val zeroBoundaryKind = when {
+        valleyNpu <= MIN_EFFECTIVE_LOAD && peakNpu > MIN_EFFECTIVE_LOAD ->
+            TriangleNpuZeroBoundaryKind.FULL_CYCLE
+        valleyNpu > MIN_EFFECTIVE_LOAD && peakNpu <= MIN_EFFECTIVE_LOAD ->
+            TriangleNpuZeroBoundaryKind.HALF_CYCLE
+        else -> TriangleNpuZeroBoundaryKind.NONE
+    }
+    val crossedZeroBoundaries = when (zeroBoundaryKind) {
+        TriangleNpuZeroBoundaryKind.FULL_CYCLE ->
+            current / cycleMs - previous / cycleMs
+        TriangleNpuZeroBoundaryKind.HALF_CYCLE ->
+            triangleHalfCycleBoundaryCount(current, cycleMs) -
+                triangleHalfCycleBoundaryCount(previous, cycleMs)
+        TriangleNpuZeroBoundaryKind.NONE -> 0L
+    }
+    if (crossedZeroBoundaries <= 0L) return TriangleNpuZeroBoundaryDecision()
+
+    val terminalBoundary =
+        current == phaseDurationMs &&
+            currentPhaseElapsedMs >= phaseDurationMs &&
+            when (zeroBoundaryKind) {
+                TriangleNpuZeroBoundaryKind.FULL_CYCLE ->
+                    phaseDurationMs % cycleMs == 0L
+                TriangleNpuZeroBoundaryKind.HALF_CYCLE ->
+                    isTriangleHalfCycleBoundary(phaseDurationMs, cycleMs)
+                TriangleNpuZeroBoundaryKind.NONE -> false
+            }
+    val cyclePosition = current % cycleMs
+    val normalizedCyclePosition = cyclePosition.toDouble() / cycleMs.toDouble()
+    val rawFraction = if (normalizedCyclePosition < 0.5) {
+        normalizedCyclePosition * 2.0
+    } else {
+        (1.0 - normalizedCyclePosition) * 2.0
+    }.toFloat().coerceIn(0f, 1f)
+    val currentFraction = (floor + (1f - floor) * rawFraction).coerceIn(0f, 1f)
+    val currentNpu = effectiveTriangleNpu(
+        start = safeOrigin,
+        end = safeTarget,
+        fraction = currentFraction,
+    )
+    return TriangleNpuZeroBoundaryDecision(
+        crossedZeroBoundaries = crossedZeroBoundaries,
+        zeroAcknowledgmentRequired = true,
+        positiveReattackAcknowledgmentRequired =
+            !terminalBoundary && currentNpu > MIN_EFFECTIVE_LOAD,
+        terminalBoundary = terminalBoundary,
+    )
+}
+
+private enum class TriangleNpuZeroBoundaryKind {
+    NONE,
+    FULL_CYCLE,
+    HALF_CYCLE,
+}
+
+/**
+ * Counts half-cycle boundaries in `[0, elapsedMs]` without doubling timestamps, which could
+ * overflow for hostile direct calls. For odd cycle lengths, the first integer millisecond after
+ * the mathematical midpoint is the synthetic exact-zero publication boundary.
+ */
+private fun triangleHalfCycleBoundaryCount(elapsedMs: Long, cycleMs: Long): Long {
+    val safeElapsedMs = elapsedMs.coerceAtLeast(0L)
+    val safeCycleMs = cycleMs.coerceAtLeast(1L)
+    val completedCycles = safeElapsedMs / safeCycleMs
+    val cycleRemainder = safeElapsedMs % safeCycleMs
+    val midpointCeilingMs = safeCycleMs / 2L + safeCycleMs % 2L
+    return completedCycles + if (cycleRemainder >= midpointCeilingMs) 1L else 0L
+}
+
+private fun isTriangleHalfCycleBoundary(elapsedMs: Long, cycleMs: Long): Boolean {
+    val safeCycleMs = cycleMs.coerceAtLeast(1L)
+    val midpointCeilingMs = safeCycleMs / 2L + safeCycleMs % 2L
+    return elapsedMs.coerceAtLeast(0L) % safeCycleMs == midpointCeilingMs
+}
+
+private fun effectiveTriangleNpu(
+    start: Float,
+    end: Float,
+    fraction: Float,
+): Float {
+    val boundedFraction = fraction.takeIf(Float::isFinite)?.coerceIn(0f, 1f) ?: 0f
+    val value = start * (1f - boundedFraction) + end * boundedFraction
+    return value.takeIf(Float::isFinite)
+        ?.coerceIn(0f, 1f)
+        ?.takeIf { it > MIN_EFFECTIVE_LOAD }
+        ?: 0f
+}
+
+internal fun runtimeLoadCommandOwnerStillActive(
+    owner: RuntimeLoadCommandOwner,
+    currentCommandEpoch: Long,
+    currentRunOwner: Any?,
+    runOwnerActive: Boolean,
+    currentProducerGeneration: Long,
+    producerRecoveryPaused: Boolean,
+): Boolean =
+    owner.commandEpoch == currentCommandEpoch &&
+        currentRunOwner === owner.runOwner &&
+        runOwnerActive &&
+        owner.producerGeneration == currentProducerGeneration &&
+        !producerRecoveryPaused
+
+private data class RuntimeLoadApplyResult(
+    val health: NpuControlHealth,
+    val commitAllowed: Boolean,
+    val orderedZeroConfirmed: Boolean,
+)
 
 class LabController internal constructor(
     private val activity: Activity,
@@ -1607,6 +1811,7 @@ class LabController internal constructor(
                 atMonotonicMs = committedBoundary.monotonicMs,
                 owner = PhasePauseOwner.PRODUCER_RECOVERY,
             )
+            progress = progressForProducerTopologyPending(progress)
             committedBoundary
         }
         val frameBudget = activeProducerFrameBudget ?: return
@@ -2739,7 +2944,20 @@ class LabController internal constructor(
             is HwcCapacityCalibrationAcquisition.Measure -> {
                 var published = false
                 var calibrationPriorityAcquired = false
+                var calibrationCapabilityIsolationToken:
+                    VendorCapabilityIsolationToken? = null
                 var priorityReleaseFailure: String? = null
+                var calibrationPrimaryFailure: Throwable? = null
+                var calibrationCleanupFatal: Error? = null
+                fun recordCalibrationCleanupFatal(error: Throwable) {
+                    val fatal = error as? Error ?: return
+                    val current = calibrationCleanupFatal
+                    if (current == null) {
+                        calibrationCleanupFatal = fatal
+                    } else if (current !== fatal) {
+                        runCatching { current.addSuppressed(fatal) }
+                    }
+                }
                 try {
                     if (calibrationScope.displayId == null) {
                         hwcCapacityCalibration = HwcCapacityCalibrationResult(
@@ -2760,6 +2978,12 @@ class LabController internal constructor(
                             )
                         }
                         calibrationPriorityAcquired = true
+                        calibrationCapabilityIsolationToken =
+                            systemMonitor.acquireCalibrationCapabilityIsolation()
+                                ?: throw PlanAbortException(
+                                    "HWC capacity 계측 전 vendor capability telemetry " +
+                                        "isolation owner를 획득하지 못했습니다.",
+                                )
                         telemetryWatchdogResumeGraceDeadlineMs = null
                         telemetryWatchdogCalibrationPaused = true
                         if (!awaitCalibrationTelemetryIsolation()) {
@@ -2804,6 +3028,9 @@ class LabController internal constructor(
                         "Completed HWC capacity session result was not reusable"
                     }
                     published = true
+                } catch (error: Throwable) {
+                    calibrationPrimaryFailure = error
+                    throw error
                 } finally {
                     if (calibrationPriorityAcquired) {
                         // Cancellation can arrive while the initial isolation barrier is waiting.
@@ -2813,7 +3040,8 @@ class LabController internal constructor(
                             withContext(NonCancellable) {
                                 awaitCalibrationTelemetryIsolation()
                             }
-                        } catch (error: Exception) {
+                        } catch (error: Throwable) {
+                            recordCalibrationCleanupFatal(error)
                             false
                         }
                         if (!finalIsolationConfirmed) {
@@ -2825,17 +3053,44 @@ class LabController internal constructor(
                             errorMessage = failure
                             priorityReleaseFailure = priorityReleaseFailure ?: failure
                         }
+                        val capabilityIsolationReleased =
+                            calibrationCapabilityIsolationToken?.let { token ->
+                                try {
+                                    systemMonitor.releaseCalibrationCapabilityIsolation(token)
+                                } catch (error: Throwable) {
+                                    recordCalibrationCleanupFatal(error)
+                                    false
+                                }
+                            } ?: true
+                        if (!capabilityIsolationReleased) {
+                            val failure =
+                                "HWC capacity vendor capability telemetry isolation owner " +
+                                    "해제/지연 retry 예약을 확인하지 못했습니다."
+                            telemetryLifecycleIntegrityConfirmed.set(false)
+                            cancellationReason = cancellationReason ?: failure
+                            errorMessage = failure
+                            priorityReleaseFailure = priorityReleaseFailure ?: failure
+                        }
                         telemetryWatchdogResumeGraceDeadlineMs =
-                            saturatingAddNonNegative(
-                                SystemClock.elapsedRealtime(),
-                                MONITOR_STALE_TIMEOUT_MS,
-                            )
+                            try {
+                                saturatingAddNonNegative(
+                                    SystemClock.elapsedRealtime(),
+                                    MONITOR_STALE_TIMEOUT_MS,
+                                )
+                            } catch (error: Throwable) {
+                                recordCalibrationCleanupFatal(error)
+                                null
+                            }
                         telemetryWatchdogCalibrationPaused = false
-                        if (
-                            !hwcCompositionProbePriorityGate.release(
+                        val priorityReleased = try {
+                            hwcCompositionProbePriorityGate.release(
                                 hwcCapacityCalibrationProbeOwner,
                             )
-                        ) {
+                        } catch (error: Throwable) {
+                            recordCalibrationCleanupFatal(error)
+                            false
+                        }
+                        if (!priorityReleased) {
                             priorityReleaseFailure = priorityReleaseFailure ?:
                                 "HWC capacity telemetry priority owner 해제를 확인하지 못했습니다."
                             telemetryLifecycleIntegrityConfirmed.set(false)
@@ -2858,6 +3113,19 @@ class LabController internal constructor(
                                     detail =
                                         "process-session one-shot ended without a reusable result",
                                 )
+                    }
+                    calibrationCleanupFatal?.let { cleanupFatal ->
+                        val primary = calibrationPrimaryFailure
+                        if (primary is Error) {
+                            if (primary !== cleanupFatal) {
+                                runCatching { primary.addSuppressed(cleanupFatal) }
+                            }
+                        } else {
+                            if (primary != null && primary !== cleanupFatal) {
+                                runCatching { cleanupFatal.addSuppressed(primary) }
+                            }
+                            throw cleanupFatal
+                        }
                     }
                 }
                 priorityReleaseFailure?.let { failure ->
@@ -3038,7 +3306,8 @@ class LabController internal constructor(
                     readinessAtSnapshot = readiness
                     break
                 }
-                if (nowMs >= deadlineMs || readiness.topologyMissed) {
+                val afterChecksMs = SystemClock.elapsedRealtime()
+                if (afterChecksMs >= deadlineMs || readiness.topologyMissed) {
                     unavailableReason =
                         "candidate topology readiness unavailable; " +
                             "expected=${candidatePhase.activeLayers}, " +
@@ -3047,6 +3316,12 @@ class LabController internal constructor(
                             "geometry=${readiness.geometryAppliedRevision}/" +
                             "${readiness.geometryRequestedRevision}, " +
                             "topologyMissed=${readiness.topologyMissed}"
+                    progress = progress.copy(
+                        phase = null,
+                        targetPhase = null,
+                        transitionFraction = 0f,
+                        statusText = "HWC capacity readiness deadline/teardown",
+                    )
                     break
                 }
                 progress = progress.copy(
@@ -3058,20 +3333,54 @@ class LabController internal constructor(
                     ),
                     observedProducerCount = readiness.observedCount,
                 )
-                delay(RENDERER_TEARDOWN_POLL_MS)
+                val pollWaitMs = hwcCapacityCalibrationWaitMs(
+                    remainingMs = remainingHwcCapacityCalibrationBudgetMs(
+                        deadlineMs = deadlineMs,
+                        nowMs = SystemClock.elapsedRealtime(),
+                    ),
+                    requestedWaitMs = RENDERER_TEARDOWN_POLL_MS,
+                    completionReserveMs =
+                        HWC_CAPACITY_CALIBRATION_STABILIZE_MS +
+                            HWC_CAPACITY_CALIBRATION_SAMPLE_RESERVE_MS,
+                )
+                if (pollWaitMs == null) {
+                    unavailableReason =
+                        "candidate topology was not ready before the stabilization/snapshot reserve"
+                    progress = progress.copy(
+                        phase = null,
+                        targetPhase = null,
+                        transitionFraction = 0f,
+                        statusText = "HWC capacity readiness budget exhausted/teardown",
+                    )
+                    break
+                }
+                delay(pollWaitMs)
             }
 
             if (readinessAtSnapshot != null) {
-                val remainingMs = deadlineMs - SystemClock.elapsedRealtime()
-                if (remainingMs < HWC_CAPACITY_CALIBRATION_STABILIZE_MS) {
+                val stabilizeWaitMs = hwcCapacityCalibrationWaitMs(
+                    remainingMs = remainingHwcCapacityCalibrationBudgetMs(
+                        deadlineMs = deadlineMs,
+                        nowMs = SystemClock.elapsedRealtime(),
+                    ),
+                    requestedWaitMs = HWC_CAPACITY_CALIBRATION_STABILIZE_MS,
+                    completionReserveMs = HWC_CAPACITY_CALIBRATION_SAMPLE_RESERVE_MS,
+                )
+                if (stabilizeWaitMs != HWC_CAPACITY_CALIBRATION_STABILIZE_MS) {
                     readinessAtSnapshot = null
                     unavailableReason =
-                        "candidate became ready without stabilization budget"
+                        "candidate became ready without stabilization/snapshot budget"
+                    progress = progress.copy(
+                        phase = null,
+                        targetPhase = null,
+                        transitionFraction = 0f,
+                        statusText = "HWC capacity stabilization budget exhausted/teardown",
+                    )
                 } else {
                     // First-buffer means that every producer submitted at least once; it does not
                     // prove that SurfaceFlinger has latched and validated the last transaction.
                     // Keep the snapshot count at one while allowing several vsyncs to settle.
-                    delay(HWC_CAPACITY_CALIBRATION_STABILIZE_MS)
+                    delay(stabilizeWaitMs)
                     currentCoroutineContext().ensureActive()
                     ensurePlanMemoryAvailable()
                     verifyPerformanceEnvironmentBeforeProducer()
@@ -3246,21 +3555,28 @@ class LabController internal constructor(
                 }
                 val confirmed =
                     telemetryQuiescent && loadsZero && rendererReleased
-                if (confirmed) {
-                    delay(HWC_CAPACITY_CALIBRATION_SETTLE_MS)
-                    if (cancellationReason == null) {
-                        ensurePlanMemoryAvailable()
-                        verifyPerformanceEnvironmentBeforeProducer(
-                            recordSuccessfulObservation = false,
-                        )
-                    }
-                }
                 confirmed
             }
         }
         if (!teardownConfirmed) {
             throw PlanAbortException(
                 "HWC capacity calibration producer/load teardown을 확인하지 못했습니다.",
+            )
+        }
+        currentCoroutineContext().ensureActive()
+        if (
+            shouldRunHwcCapacityCalibrationSettle(
+                teardownConfirmed = teardownConfirmed,
+                cancellationRequested = cancellationReason != null,
+            )
+        ) {
+            // The load and physical producers are already gone. Keep this optional thermal/bus
+            // settling delay cancellable so STOP can restore the Window/performance owner
+            // immediately instead of waiting inside a NonCancellable finalizer.
+            delay(HWC_CAPACITY_CALIBRATION_SETTLE_MS)
+            ensurePlanMemoryAvailable()
+            verifyPerformanceEnvironmentBeforeProducer(
+                recordSuccessfulObservation = false,
             )
         }
     }
@@ -3270,7 +3586,9 @@ class LabController internal constructor(
         var scenarioForReport = requestedScenario
         var cleanupConfirmed = false
         val pendingMediaSource = AtomicReference<PinnedMediaSource?>()
+        var escapingFailure: Throwable? = null
         try {
+            try {
             runEvents += event(
                 "SESSION_HWC_CAPACITY_CALIBRATION",
                 hwcCapacityCalibration.eventDetail(),
@@ -3680,18 +3998,70 @@ class LabController internal constructor(
                 unexpectedExceptionVerdict(),
                 pendingMediaSource,
             )
+            }
+        } catch (error: Throwable) {
+            // Keep the throwable that entered terminal cleanup so a later cleanup failure cannot
+            // replace an already active fatal identity. A cleanup-only fatal is still promoted
+            // below after every independent cleanup action has run.
+            escapingFailure = error
+            throw error
         } finally {
             activeProducerFrameBudget = null
             activeHwcCompositionCoverage.set(null)
+            var cleanupFailure: Throwable? = null
+            fun captureCleanupFailure(operation: String, error: Throwable) {
+                cleanupFailure =
+                    mergeControllerFailurePreservingFatal(cleanupFailure, error)
+                cleanupFailure = mergeControllerFailurePreservingFatal(
+                    cleanupFailure,
+                    recordCleanupFailurePreservingFatal(operation, error),
+                )
+            }
             // Scenario teardown is terminal: no typed phase may retain priority after any
             // cancellation, fatal error, or finalization failure that bypassed phase cleanup.
-            hwcCompositionProbePriorityGate.reset()
-            withContext(NonCancellable) {
-                if (!cleanupConfirmed) releaseActiveLoadsForRun()
-                resetDisplayModeSafely()
+            try {
+                hwcCompositionProbePriorityGate.reset()
+            } catch (error: Throwable) {
+                captureCleanupFailure("typed HWC priority reset", error)
             }
-            closeSelectedVideoDecoder()
-            pendingMediaSource.getAndSet(null)?.closeWithResult()
+            try {
+                withContext(NonCancellable) {
+                    if (!cleanupConfirmed) {
+                        try {
+                            releaseActiveLoadsForRun()
+                        } catch (error: Throwable) {
+                            captureCleanupFailure("terminal run load release", error)
+                        }
+                    }
+                    try {
+                        resetDisplayModeSafely()
+                    } catch (error: Throwable) {
+                        captureCleanupFailure("terminal display reset", error)
+                    }
+                }
+            } catch (error: Throwable) {
+                captureCleanupFailure("terminal NonCancellable cleanup dispatch", error)
+            }
+            try {
+                closeSelectedVideoDecoder()
+            } catch (error: Throwable) {
+                captureCleanupFailure("selected decoder descriptor release", error)
+            }
+            try {
+                pendingMediaSource.getAndSet(null)?.closeWithResult()
+            } catch (error: Throwable) {
+                captureCleanupFailure("pending media descriptor release", error)
+            }
+
+            val terminalFailure = cleanupFailure?.let { cleanup ->
+                mergeControllerFailurePreservingFatal(escapingFailure, cleanup)
+            } ?: escapingFailure
+            if (
+                terminalFailure is Error &&
+                (escapingFailure == null || terminalFailure !== escapingFailure)
+            ) {
+                throw terminalFailure
+            }
         }
     }
 
@@ -4150,6 +4520,7 @@ class LabController internal constructor(
             var postReadyControlTickApplied = false
             var transitionStarted = false
             var positiveNpuAcknowledged = false
+            var lastTriangleNpuControlElapsedMs: Long? = 0L
             var pendingControlCoverage: PendingControlCoverage? = null
             var hwcCompositionProbeResolved = false
             var forcedHwcCompositionProbeAttempts = 0
@@ -4171,6 +4542,11 @@ class LabController internal constructor(
             )
             activeProducerFrameBudget = producerFrameBudget
             val transitionCoverage = TransitionCoverageTracker(requestedPhase.transition)
+            val terminalLinearRampEndpoint =
+                TerminalLinearRampEndpointGate(
+                    acknowledgmentTimeoutMs = PRODUCER_STARTUP_GRACE_MS,
+                    monotonicNowMs = SystemClock::elapsedRealtime,
+                )
             var nextControlTickAtMs = phaseStarted
             var recoveryPaused = false
             var recoveryObservationRestarted = false
@@ -4189,8 +4565,19 @@ class LabController internal constructor(
                 // truthful acknowledgment. Drop it so the first post-recovery control tick can
                 // republish the same frozen phase time instead of waiting behind an impossible
                 // dynamic-profile match until the phase deadline.
+                val discardedControlCoverage = pendingControlCoverage
+                if (
+                    discardedControlCoverage?.expectedProducerControlRevision
+                        ?.let(terminalLinearRampEndpoint::rearmAfterProducerRecovery) == true
+                ) {
+                    runEvents += event(
+                        "LINEAR_RAMP_ENDPOINT_REARMED",
+                        "phase=${targetPhase.id}; staleControlRevision=" +
+                            discardedControlCoverage.expectedProducerControlRevision,
+                    )
+                }
                 pendingControlCoverage =
-                    discardPendingControlCoverageForProducerRecovery(pendingControlCoverage)
+                    discardPendingControlCoverageForProducerRecovery(discardedControlCoverage)
                 recoveryPaused = true
                 producerRecoveryPaused = true
                 phaseClock.pause(
@@ -4452,25 +4839,36 @@ class LabController internal constructor(
                     )
                     lastAppliedDisplayHz = null
                 } else {
-                    val initialNpuHealth = applyRuntimeWorkloads(
+                    val initialLoadApply = applyRuntimeWorkloads(
                         workloads = initialRuntime.workloads,
                         restartProfile = true,
-                        requirePositiveNpuAcknowledgment =
+                        requireNpuAcknowledgment =
                             initialRuntime.workloads.npu > MIN_EFFECTIVE_LOAD,
+                        producerGeneration = producerGeneration,
                     )
-                    throwForNpuControlFailure(
-                        phaseId = targetPhase.id,
-                        operation = "initial apply",
-                        health = initialNpuHealth,
-                        positiveAcknowledgmentRequired =
-                            initialRuntime.workloads.npu > MIN_EFFECTIVE_LOAD,
-                    )
-                    positiveNpuAcknowledged =
-                        initialRuntime.workloads.npu > MIN_EFFECTIVE_LOAD
-                    requestDisplayModeOrAbort(
-                        initialRuntime.requestedDisplayHz,
-                        "phase '${targetPhase.id}' initial target",
-                    )
+                    if (initialLoadApply.commitAllowed) {
+                        throwForNpuControlFailure(
+                            phaseId = targetPhase.id,
+                            operation = "initial apply",
+                            health = initialLoadApply.health,
+                            acknowledgmentRequired =
+                                initialRuntime.workloads.npu > MIN_EFFECTIVE_LOAD,
+                        )
+                        positiveNpuAcknowledged =
+                            initialRuntime.workloads.npu > MIN_EFFECTIVE_LOAD
+                        requestDisplayModeOrAbort(
+                            initialRuntime.requestedDisplayHz,
+                            "phase '${targetPhase.id}' initial target",
+                        )
+                    } else {
+                        throwForStaleRuntimeLoadReleaseFailure(
+                            phaseId = targetPhase.id,
+                            operation = "initial apply",
+                            orderedZeroConfirmed = initialLoadApply.orderedZeroConfirmed,
+                        )
+                        lastAppliedWorkloads = null
+                        lastAppliedDisplayHz = null
+                    }
                 }
                 while (true) {
                 currentCoroutineContext().ensureActive()
@@ -4766,10 +5164,6 @@ class LabController internal constructor(
                     )
                     continue
                 }
-                producerFrameBudget.observePhysicalFrames(
-                    totalFrames = frameTracker.totalPhysicalProducedFrames(),
-                    countAsActive = true,
-                )
                 val phaseElapsed = phaseClock.elapsedMs(nowMs)
                 var compositionVerificationBoundaryHandled = false
                 pendingControlCoverage?.let { pending ->
@@ -4834,14 +5228,141 @@ class LabController internal constructor(
                     throw PlanAbortException(reason)
                 }
                 if (pendingControlCoverage != null) {
+                    producerFrameBudget.observePhysicalFrames(
+                        totalFrames = frameTracker.totalPhysicalProducedFrames(),
+                        countAsActive = true,
+                    )
                     if (phaseElapsed >= targetPhase.durationMs) {
-                        throw InconclusiveRunException(
-                            "Phase '${targetPhase.id}' control tick의 physical producer " +
-                                "topology/buffer 적용이 phase deadline 안에 확인되지 않았습니다.",
-                        )
+                        if (
+                            terminalLinearRampEndpoint.published &&
+                            !terminalLinearRampEndpoint.acknowledgmentTimedOut()
+                        ) {
+                            delay(RENDERER_TEARDOWN_POLL_MS)
+                            continue
+                        } else {
+                            val detail = if (terminalLinearRampEndpoint.published) {
+                                "linear-ramp terminal target"
+                            } else {
+                                "control tick"
+                            }
+                            throw InconclusiveRunException(
+                                "Phase '${targetPhase.id}' $detail 의 physical producer " +
+                                    "topology/buffer 적용을 deadline 안에 확인하지 못했습니다.",
+                            )
+                        }
                     }
                     delay(RENDERER_TEARDOWN_POLL_MS)
                     continue
+                }
+                val publishTerminalLinearRampEndpoint =
+                    terminalLinearRampEndpoint.shouldPublish(
+                        spec = requestedPhase.transition,
+                        phaseElapsedMs = phaseElapsed,
+                        phaseDurationMs = targetPhase.durationMs,
+                    )
+                val thermalNpuFactor = if (thermalReduced) 0.50f else 1f
+                val triangleNpuBoundary =
+                    triangleNpuZeroBoundaryDecision(
+                        spec = requestedPhase.transition,
+                        previousPhaseElapsedMs = lastTriangleNpuControlElapsedMs,
+                        currentPhaseElapsedMs = phaseElapsed,
+                        phaseDurationMs = targetPhase.durationMs,
+                        originNpu =
+                            initialRawRuntime.workloads.npu * thermalNpuFactor,
+                        targetNpu =
+                            requestedPhase.workloads.npu * thermalNpuFactor,
+                    )
+                if (publishTerminalLinearRampEndpoint) {
+                    // The aggregate frame counter has no historical timestamp, so a late controller
+                    // tick cannot split its delta at the nominal deadline. Seal numerator and
+                    // denominator at this same conservative observed boundary before applying any
+                    // endpoint display/workload/renderer control; all later proof/hold frames are
+                    // excluded from both.
+                    val totalFramesAtObservedBoundary =
+                        frameTracker.totalPhysicalProducedFrames()
+                    producerFrameBudget.sealNominalActualWindow(
+                        atMonotonicMs = SystemClock.elapsedRealtime(),
+                        totalFrames = totalFramesAtObservedBoundary,
+                        useObservedExpectedBoundary = true,
+                    )
+                } else {
+                    producerFrameBudget.observePhysicalFrames(
+                        totalFrames = frameTracker.totalPhysicalProducedFrames(),
+                        countAsActive = true,
+                    )
+                }
+                if (triangleNpuBoundary.zeroAcknowledgmentRequired) {
+                    // A delayed 100 ms callback can jump over a full-cycle origin-zero boundary or
+                    // a half-cycle target-zero boundary and land on a positive sample. Publish one
+                    // exact zero first; never replay skipped ticks or mutate CPU/memory/GPU while
+                    // proving this NPU-only valley.
+                    val stableWorkloads =
+                        // A null applied snapshot is used only after an ordered all-load release
+                        // (for example producer recovery). Preserve that confirmed zero state;
+                        // restoring the phase origin here would turn an NPU-only valley proof into
+                        // an unrelated CPU/memory/GPU re-attack.
+                        lastAppliedWorkloads ?: LoadSetpoints()
+                    val valleyWorkloads = stableWorkloads.copy(npu = 0f)
+                    val valleyApply = applyRuntimeWorkloads(
+                        workloads = valleyWorkloads,
+                        restartProfile = false,
+                        requireNpuAcknowledgment = true,
+                        producerGeneration = producerGeneration,
+                    )
+                    if (!valleyApply.commitAllowed) {
+                        throwForStaleRuntimeLoadReleaseFailure(
+                            phaseId = targetPhase.id,
+                            operation = "triangle zero-valley apply",
+                            orderedZeroConfirmed = valleyApply.orderedZeroConfirmed,
+                        )
+                        lastAppliedWorkloads = null
+                        lastAppliedDisplayHz = null
+                        continue
+                    }
+                    throwForNpuControlFailure(
+                        phaseId = targetPhase.id,
+                        operation = "triangle zero-valley apply",
+                        health = valleyApply.health,
+                        acknowledgmentRequired = true,
+                    )
+                    currentCoroutineContext().ensureActive()
+                    if (runtimeControlPaused) {
+                        // Thermal control owns the newest ordered-zero/setpoint transaction. Keep
+                        // the previous elapsed boundary so the resumed loop proves it again only
+                        // if the triangle edge is still relevant.
+                        continue
+                    }
+                    positiveNpuAcknowledged = false
+                    lastAppliedWorkloads = valleyWorkloads
+                    if (triangleNpuBoundary.terminalBoundary) {
+                        lastRawRuntime = lastRawRuntime.copy(
+                            workloads = lastRawRuntime.workloads.copy(npu = 0f),
+                        )
+                    }
+                    runEvents += event(
+                        "NPU_TRIANGLE_ZERO_EDGE",
+                        "phase=${targetPhase.id}; elapsed=${phaseElapsed}ms; " +
+                            "crossedZeroBoundaries=" +
+                            "${triangleNpuBoundary.crossedZeroBoundaries}; " +
+                            "terminal=${triangleNpuBoundary.terminalBoundary}; " +
+                            "zeroAck=APPLIED",
+                    )
+                    if (triangleNpuBoundary.terminalBoundary) {
+                        // Frames produced while the terminal NPU zero acknowledgment was pending
+                        // are proof/cleanup tail, not extra active-phase fidelity frames.
+                        producerFrameBudget.observePhysicalFrames(
+                            totalFrames = frameTracker.totalPhysicalProducedFrames(),
+                            countAsActive = false,
+                        )
+                        lastTriangleNpuControlElapsedMs = targetPhase.durationMs
+                    }
+                    if (triangleNpuBoundary.crossedZeroBoundaries > 1L) {
+                        throw InconclusiveRunException(
+                            "Phase '${targetPhase.id}' triangle NPU control skipped " +
+                                "${triangleNpuBoundary.crossedZeroBoundaries} zero boundaries; " +
+                                "latest zero was confirmed without replaying a backlog.",
+                        )
+                    }
                 }
                 if (phaseElapsed >= targetPhase.durationMs) {
                     if (!producerReadiness.ready) {
@@ -4854,17 +5375,19 @@ class LabController internal constructor(
                     if (!postReadyControlTickApplied) {
                         throw InconclusiveRunException(
                             "Phase '${targetPhase.id}' producer 준비 뒤 active control tick을 " +
-                            "적용할 시간이 없었습니다.",
+                                "적용할 시간이 없었습니다.",
                         )
                     }
-                    break
+                    if (!publishTerminalLinearRampEndpoint) break
                 }
                 val transitionSample = LoadTransitionEvaluator.sampleAt(
                     spec = requestedPhase.transition,
                     // Do not replace the origin topology before it has posted at least one
                     // generation-scoped buffer. This removes the 1 ms STEP scheduling race that
                     // could otherwise mark the safely prepared origin as a missed topology.
-                    elapsedMs = if (transitionStarted || producerReadiness.ready) {
+                    elapsedMs = if (publishTerminalLinearRampEndpoint) {
+                        targetPhase.durationMs
+                    } else if (transitionStarted || producerReadiness.ready) {
                         phaseElapsed
                     } else {
                         0L
@@ -4911,21 +5434,46 @@ class LabController internal constructor(
                     lastAppliedDisplayHz = runtimePhase.requestedDisplayHz
                 }
                 if (firstControlTick || runtimePhase.workloads != lastAppliedWorkloads) {
-                    val positiveAcknowledgmentRequired =
-                        runtimePhase.workloads.npu > MIN_EFFECTIVE_LOAD &&
-                            !positiveNpuAcknowledged
-                    val npuHealth = applyRuntimeWorkloads(
+                    val npuEdgeDecision = npuSemanticEdgeDecision(
+                        previousNpu = lastAppliedWorkloads?.npu,
+                        currentNpu = runtimePhase.workloads.npu,
+                        positiveAcknowledged = positiveNpuAcknowledged,
+                    )
+                    if (
+                        triangleNpuBoundary.positiveReattackAcknowledgmentRequired &&
+                        (
+                            npuEdgeDecision.edge != NpuSemanticEdge.ZERO_TO_POSITIVE ||
+                                !npuEdgeDecision.acknowledgmentRequired
+                            )
+                    ) {
+                        throw InconclusiveRunException(
+                            "Phase '${targetPhase.id}' triangle NPU positive re-attack did not " +
+                                "retain its fresh acknowledgment boundary.",
+                        )
+                    }
+                    val runtimeLoadApply = applyRuntimeWorkloads(
                         workloads = runtimePhase.workloads,
                         restartProfile = firstControlTick,
-                        requirePositiveNpuAcknowledgment =
-                            positiveAcknowledgmentRequired,
+                        requireNpuAcknowledgment =
+                            npuEdgeDecision.acknowledgmentRequired,
+                        producerGeneration = producerGeneration,
                     )
+                    if (!runtimeLoadApply.commitAllowed) {
+                        throwForStaleRuntimeLoadReleaseFailure(
+                            phaseId = targetPhase.id,
+                            operation = "runtime apply",
+                            orderedZeroConfirmed = runtimeLoadApply.orderedZeroConfirmed,
+                        )
+                        lastAppliedWorkloads = null
+                        lastAppliedDisplayHz = null
+                        continue
+                    }
                     throwForNpuControlFailure(
                         phaseId = targetPhase.id,
                         operation = "runtime apply",
-                        health = npuHealth,
-                        positiveAcknowledgmentRequired =
-                            positiveAcknowledgmentRequired,
+                        health = runtimeLoadApply.health,
+                        acknowledgmentRequired =
+                            npuEdgeDecision.acknowledgmentRequired,
                     )
                     currentCoroutineContext().ensureActive()
                     if (runtimeControlPaused) {
@@ -4933,20 +5481,41 @@ class LabController internal constructor(
                         // suspended this tick. Never republish the stale pre-derate phase.
                         continue
                     }
-                    if (positiveAcknowledgmentRequired) positiveNpuAcknowledged = true
+                    // A semantic sample reaches PendingControlCoverage only after the exact
+                    // latest-command acknowledgment above. A zero edge also invalidates the
+                    // positive acknowledgment so the following re-attack must earn a new one.
+                    positiveNpuAcknowledged =
+                        npuEdgeDecision.positiveAcknowledgedAfterApply
                     lastAppliedWorkloads = runtimePhase.workloads
                 } else if (runtimePhase.workloads.npu > MIN_EFFECTIVE_LOAD) {
                     throwForNpuControlFailure(
                         phaseId = targetPhase.id,
                         operation = "runtime health",
                         health = loadManager.npuControlHealth(),
-                        positiveAcknowledgmentRequired = false,
+                        acknowledgmentRequired = false,
                     )
                 }
                 if (producerReadiness.ready) {
                     transitionStarted = true
                 }
                 firstControlTick = false
+                val producerControlRevision = if (publishTerminalLinearRampEndpoint) {
+                    val revision = terminalLinearRampEndpoint.markPublished()
+                    if (
+                        !frameTracker.requestProducerControlRevision(
+                            generation = producerGeneration,
+                            revision = revision,
+                        )
+                    ) {
+                        throw InconclusiveRunException(
+                            "Phase '${targetPhase.id}' linear-ramp terminal producer-control " +
+                                "revision을 현재 generation에 arm하지 못했습니다.",
+                        )
+                    }
+                    revision
+                } else {
+                    0L
+                }
                 val priorPublishedPhase = progress.phase
                 progress = RunProgress(
                     stage = RunnerStage.RUNNING,
@@ -4966,6 +5535,7 @@ class LabController internal constructor(
                     transitionFraction = transitionSample.fraction,
                     thermalDerated = thermalReduced,
                     producerGeneration = producerGeneration,
+                    producerControlRevision = producerControlRevision,
                     expectedProducerCount = visibleExpectedProducerCount(
                         committedExpectedCount = producerReadiness.expectedCount,
                         topologyPublished = producerReadiness.topologyPublished,
@@ -4996,9 +5566,12 @@ class LabController internal constructor(
                             }
                         } else {
                             producerReadiness.topologyRevision
-                        },
+                    },
                     expectedLayerSizeProfileOrdinal = runtimePhase.layerSizeProfile.ordinal,
+                    expectedProducerControlRevision = producerControlRevision,
                 )
+                lastTriangleNpuControlElapsedMs =
+                    phaseElapsed.coerceIn(0L, targetPhase.durationMs)
                 planProgress = planProgress.copy(
                     currentRunFraction = progress.overallFraction,
                 )
@@ -5085,16 +5658,28 @@ class LabController internal constructor(
             phaseEndWorkloads
                 ?.takeIf { it.npu > MIN_EFFECTIVE_LOAD }
                 ?.let { finalWorkloads ->
-                    val finalNpuHealth = applyRuntimeWorkloads(
+                    val finalLoadApply = applyRuntimeWorkloads(
                         workloads = finalWorkloads,
                         restartProfile = false,
-                        requirePositiveNpuAcknowledgment = true,
+                        requireNpuAcknowledgment = true,
+                        producerGeneration = producerGeneration,
                     )
+                    if (!finalLoadApply.commitAllowed) {
+                        throwForStaleRuntimeLoadReleaseFailure(
+                            phaseId = targetPhase.id,
+                            operation = "phase-end confirmation",
+                            orderedZeroConfirmed = finalLoadApply.orderedZeroConfirmed,
+                        )
+                        throw InconclusiveRunException(
+                            "Phase '${targetPhase.id}' phase-end NPU 확인 중 producer " +
+                                "topology가 변경되어 측정을 확정할 수 없습니다.",
+                        )
+                    }
                     throwForNpuControlFailure(
                         phaseId = targetPhase.id,
                         operation = "phase-end confirmation",
-                        health = finalNpuHealth,
-                        positiveAcknowledgmentRequired = true,
+                        health = finalLoadApply.health,
+                        acknowledgmentRequired = true,
                     )
                 }
             transitionCoverage.failureReason()?.let { reason ->
@@ -5163,28 +5748,28 @@ class LabController internal constructor(
             }
             val adaptiveBoundaryContinuityAfter =
                 adaptiveBoundaryAfter?.let { exactCounterContinuous } ?: false
-            previousRawRuntime = if (
-                requestedPhase.transition.mode == TransitionMode.SOAK_RECOVERY
-            ) {
-                val terminalSample = LoadTransitionEvaluator.sampleAt(
-                    spec = requestedPhase.transition,
-                    elapsedMs = requestedPhase.durationMs,
-                    phaseDurationMs = requestedPhase.durationMs,
-                )
-                allocationRouteSafePhase(
-                    initial = layerSizeProfileForActiveTransition(
-                        interpolated = LoadTransitionEvaluator.interpolate(
-                            previous = transitionOrigin,
+            previousRawRuntime = when (requestedPhase.transition.mode) {
+                TransitionMode.SOAK_RECOVERY -> {
+                    val terminalSample = LoadTransitionEvaluator.sampleAt(
+                        spec = requestedPhase.transition,
+                        elapsedMs = requestedPhase.durationMs,
+                        phaseDurationMs = requestedPhase.durationMs,
+                    )
+                    allocationRouteSafePhase(
+                        initial = layerSizeProfileForActiveTransition(
+                            interpolated = LoadTransitionEvaluator.interpolate(
+                                previous = transitionOrigin,
+                                target = requestedPhase,
+                                fraction = terminalSample.fraction,
+                            ),
                             target = requestedPhase,
-                            fraction = terminalSample.fraction,
+                            transitionStarted = true,
                         ),
                         target = requestedPhase,
-                        transitionStarted = true,
-                    ),
-                    target = requestedPhase,
-                )
-            } else {
-                lastRawRuntime
+                    )
+                }
+                TransitionMode.LINEAR_RAMP -> requestedPhase
+                else -> lastRawRuntime
             }
             scenarioElapsed = saturatingAdd(scenarioElapsed, targetPhase.durationMs)
             runEvents += event(
@@ -5358,42 +5943,105 @@ class LabController internal constructor(
      */
     private suspend fun releaseActiveLoadsForRun(): Boolean {
         controllerCloseCleanupConfirmed.get()?.let { return it }
-        if (progress.phase != null || progress.targetPhase != null) {
-            progress = progress.copy(
-                phase = null,
-                targetPhase = null,
-                transitionFraction = 0f,
-                statusText = "부하 해제 및 physical producer teardown 확인 중",
+        var cleanupFailure: Throwable? = null
+        fun captureCleanupFailure(operation: String, error: Throwable) {
+            cleanupFailure =
+                mergeControllerFailurePreservingFatal(cleanupFailure, error)
+            cleanupFailure = mergeControllerFailurePreservingFatal(
+                cleanupFailure,
+                recordCleanupFailurePreservingFatal(operation, error),
             )
         }
-        val loadsReleased = releaseGeneratedLoadsForRun()
-        val rendererReleased = awaitRendererTeardownBarrier()
-        val compressionReleased =
-            if (rendererReleased) releaseCompressionRouteForRun() else false
+        if (progress.phase != null || progress.targetPhase != null) {
+            try {
+                progress = progress.copy(
+                    phase = null,
+                    targetPhase = null,
+                    transitionFraction = 0f,
+                    statusText = "부하 해제 및 physical producer teardown 확인 중",
+                )
+            } catch (error: Throwable) {
+                captureCleanupFailure("run cleanup status publication", error)
+            }
+        }
+
+        val loadsReleased = try {
+            releaseGeneratedLoadsForRun()
+        } catch (error: Throwable) {
+            captureCleanupFailure("run load release", error)
+            false
+        }
+        val rendererReleased = try {
+            awaitRendererTeardownBarrier()
+        } catch (error: Throwable) {
+            captureCleanupFailure("run renderer teardown", error)
+            false
+        }
+        val compressionReleased = if (rendererReleased) {
+            try {
+                releaseCompressionRouteForRun()
+            } catch (error: Throwable) {
+                captureCleanupFailure("run compression reset", error)
+                false
+            }
+        } else {
+            false
+        }
+        cleanupFailure?.let { failure ->
+            if (failure is Error) throw failure
+        }
         return loadsReleased && rendererReleased && compressionReleased
     }
 
     private suspend fun releaseGeneratedLoadsForRun(): Boolean {
         controllerCloseCleanupConfirmed.get()?.let { return it }
-        var released = confirmGeneratedLoadRelease()
-        controllerCloseCleanupConfirmed.get()?.let { return it }
-        if (!released) released = confirmGeneratedLoadRelease()
+        var released = false
+        var cleanupFailure: Throwable? = null
+        repeat(2) {
+            if (!released && controllerCloseCleanupConfirmed.get() == null) {
+                try {
+                    released = confirmGeneratedLoadRelease()
+                } catch (error: Throwable) {
+                    cleanupFailure =
+                        mergeControllerFailurePreservingFatal(cleanupFailure, error)
+                }
+            }
+        }
+        cleanupFailure?.let { failure ->
+            if (failure is Error) throw failure
+        }
         return controllerCloseCleanupConfirmed.get() ?: released
     }
 
     private suspend fun releaseCompressionRouteForRun(): Boolean {
         controllerCloseCleanupConfirmed.get()?.let { return it }
-        var released = resetCompressionRoute()
-        controllerCloseCleanupConfirmed.get()?.let { return it }
-        if (!released) released = resetCompressionRoute()
+        var released = false
+        var cleanupFailure: Throwable? = null
+        repeat(2) {
+            if (!released && controllerCloseCleanupConfirmed.get() == null) {
+                try {
+                    released = resetCompressionRoute()
+                } catch (error: Throwable) {
+                    cleanupFailure =
+                        mergeControllerFailurePreservingFatal(cleanupFailure, error)
+                }
+            }
+        }
+        cleanupFailure?.let { failure ->
+            if (failure is Error) throw failure
+        }
         return controllerCloseCleanupConfirmed.get() ?: released
     }
 
     private suspend fun resetCompressionRoute(): Boolean {
-        val outcome = withContext(Dispatchers.IO) {
-            runCatching { systemMonitor.setCompressionRoute(PixelRoute.RGB_8888) }
-        }.getOrElse { error ->
-            recordCleanupFailure("compression reset", error)
+        val outcome = try {
+            withContext(Dispatchers.IO) {
+                systemMonitor.setCompressionRoute(PixelRoute.RGB_8888)
+            }
+        } catch (error: Throwable) {
+            val terminal =
+                recordCleanupFailurePreservingFatal("compression reset", error)
+            if (terminal is Error) throw terminal
             return false
         }
         val result = outcome.result
@@ -5436,11 +6084,12 @@ class LabController internal constructor(
     }
 
     private fun releaseGeneratedLoads(dropMemoryBuffers: Boolean = false): Boolean =
-        runCatching {
+        try {
             loadManager.releaseLoads(dropMemoryBuffers = dropMemoryBuffers)
             true
-        }.getOrElse { error ->
-            recordCleanupFailure("load release", error)
+        } catch (error: Throwable) {
+            val terminal = recordCleanupFailurePreservingFatal("load release", error)
+            if (terminal is Error) throw terminal
             false
         }
 
@@ -5449,13 +6098,16 @@ class LabController internal constructor(
     }
 
     private suspend fun confirmGeneratedLoadReleaseLocked(): Boolean {
-        val result = withContext(Dispatchers.IO) {
+        return try {
             // A successful prewarm pins reusable DRAM buffers for measurement fidelity. Every
             // run-boundary cleanup must explicitly drop them; ordinary phase quiesce keeps them.
-            runCatching { loadManager.releaseLoadsAndConfirm(dropMemoryBuffers = true) }
-        }
-        return result.getOrElse { error ->
-            recordCleanupFailure("load/NPU confirmed release", error)
+            withContext(Dispatchers.IO) {
+                loadManager.releaseLoadsAndConfirm(dropMemoryBuffers = true)
+            }
+        } catch (error: Throwable) {
+            val terminal =
+                recordCleanupFailurePreservingFatal("load/NPU confirmed release", error)
+            if (terminal is Error) throw terminal
             false
         }
     }
@@ -5465,14 +6117,22 @@ class LabController internal constructor(
     }
 
     private suspend fun confirmGeneratedLoadQuiesceLocked(): Boolean {
-        val result = withContext(Dispatchers.IO) {
-            runCatching { loadManager.releaseLoadsAndConfirm(dropMemoryBuffers = false) }
-        }
-        return result.getOrElse { error ->
-            runEvents += event(
-                "LOAD_QUIESCE_FAILURE",
-                "phase-boundary load/NPU release exception: ${error.javaClass.simpleName}",
-            )
+        return try {
+            withContext(Dispatchers.IO) {
+                loadManager.releaseLoadsAndConfirm(dropMemoryBuffers = false)
+            }
+        } catch (error: Throwable) {
+            var terminal: Throwable = error
+            try {
+                runEvents += event(
+                    "LOAD_QUIESCE_FAILURE",
+                    "phase-boundary load/NPU release exception: ${error.javaClass.simpleName}",
+                )
+            } catch (recordError: Throwable) {
+                terminal =
+                    mergeControllerFailurePreservingFatal(terminal, recordError)
+            }
+            if (terminal is Error) throw terminal
             false
         }
     }
@@ -5480,41 +6140,121 @@ class LabController internal constructor(
     private suspend fun applyRuntimeWorkloads(
         workloads: LoadSetpoints,
         restartProfile: Boolean,
-        requirePositiveNpuAcknowledgment: Boolean,
-    ): NpuControlHealth = loadControlMutex.withLock {
-        applyRuntimeWorkloadsLocked(
+        requireNpuAcknowledgment: Boolean,
+        producerGeneration: Long,
+    ): RuntimeLoadApplyResult = loadControlMutex.withLock {
+        val coroutineOwner = currentCoroutineContext()[Job]
+        if (coroutineOwner == null) {
+            return@withLock RuntimeLoadApplyResult(
+                health = NpuControlHealth.failed("Runtime load command has no coroutine owner"),
+                commitAllowed = false,
+                orderedZeroConfirmed = confirmGeneratedLoadQuiesceLocked(),
+            )
+        }
+        val commandOwner = RuntimeLoadCommandOwner(
+            commandEpoch = loadManager.npuCommandEpoch(),
+            runOwner = coroutineOwner,
+            producerGeneration = producerGeneration,
+        )
+        if (!isRuntimeLoadCommandOwnerActive(commandOwner)) {
+            return@withLock RuntimeLoadApplyResult(
+                health = NpuControlHealth.failed(
+                    "Runtime load owner changed before request publication",
+                ),
+                commitAllowed = false,
+                orderedZeroConfirmed = confirmGeneratedLoadQuiesceLocked(),
+            )
+        }
+        val health = applyRuntimeWorkloadsLocked(
             workloads = workloads,
             restartProfile = restartProfile,
-            requirePositiveNpuAcknowledgment = requirePositiveNpuAcknowledgment,
+            requireNpuAcknowledgment = requireNpuAcknowledgment,
+            expectedCommandEpoch = commandOwner.commandEpoch,
+        )
+        currentCoroutineContext().ensureActive()
+        if (!isRuntimeLoadCommandOwnerActive(commandOwner)) {
+            return@withLock RuntimeLoadApplyResult(
+                health = NpuControlHealth.failed(
+                    "Runtime load owner changed while apply confirmation was pending",
+                ),
+                commitAllowed = false,
+                orderedZeroConfirmed = confirmGeneratedLoadQuiesceLocked(),
+            )
+        }
+        RuntimeLoadApplyResult(
+            health = health,
+            commitAllowed = true,
+            orderedZeroConfirmed = true,
         )
     }
 
     private suspend fun applyRuntimeWorkloadsLocked(
         workloads: LoadSetpoints,
         restartProfile: Boolean,
-        requirePositiveNpuAcknowledgment: Boolean,
+        requireNpuAcknowledgment: Boolean,
+        expectedCommandEpoch: Long,
     ): NpuControlHealth {
         val effective = workloads.normalizedForExecution()
-        if (requirePositiveNpuAcknowledgment && effective.npu > MIN_EFFECTIVE_LOAD) {
+        if (requireNpuAcknowledgment) {
             return withContext(Dispatchers.IO) {
                 loadManager.applyAndConfirmNpu(
                     newSetpoints = effective,
                     restartProfile = restartProfile,
+                    expectedCommandEpoch = expectedCommandEpoch,
                 )
             }
         }
-        loadManager.apply(effective, restartProfile)
+        if (
+            !loadManager.applyIfNpuCommandEpoch(
+                newSetpoints = effective,
+                restartProfile = restartProfile,
+                expectedCommandEpoch = expectedCommandEpoch,
+            )
+        ) {
+            return NpuControlHealth.failed(
+                "NPU command epoch changed before runtime setpoint publication",
+            )
+        }
         return loadManager.npuControlHealth()
+    }
+
+    private fun isRuntimeLoadCommandOwnerActive(owner: RuntimeLoadCommandOwner): Boolean {
+        val ownerJob = owner.runOwner as? Job ?: return false
+        return runtimeLoadCommandOwnerStillActive(
+            owner = owner,
+            currentCommandEpoch = loadManager.npuCommandEpoch(),
+            currentRunOwner = runJob,
+            runOwnerActive =
+                ownerJob.isActive &&
+                    cancellationReason == null &&
+                    isRunning,
+            currentProducerGeneration = progress.producerGeneration,
+            producerRecoveryPaused = producerRecoveryPaused,
+        )
+    }
+
+    private fun throwForStaleRuntimeLoadReleaseFailure(
+        phaseId: String,
+        operation: String,
+        orderedZeroConfirmed: Boolean,
+    ) {
+        if (orderedZeroConfirmed) return
+        val reason =
+            "Phase '$phaseId' NPU $operation ownership 변경 뒤 ordered zero를 " +
+                "확인하지 못했습니다."
+        cancellationReason = reason
+        runEvents += event("PRODUCER_RECOVERY_SAFEPOINT_FAILED", reason)
+        throw PlanAbortException(reason)
     }
 
     private fun throwForNpuControlFailure(
         phaseId: String,
         operation: String,
         health: NpuControlHealth,
-        positiveAcknowledgmentRequired: Boolean,
+        acknowledgmentRequired: Boolean,
     ) {
         val failed = when {
-            positiveAcknowledgmentRequired -> health.state != NpuControlState.APPLIED
+            acknowledgmentRequired -> health.state != NpuControlState.APPLIED
             else ->
                 health.state == NpuControlState.FAILED ||
                     health.state == NpuControlState.UNAVAILABLE
@@ -5570,7 +6310,28 @@ class LabController internal constructor(
     private fun recordCleanupFailure(operation: String, error: Throwable) {
         val message = "$operation 실패: ${error.javaClass.simpleName}"
         errorMessage = message
-        runCatching { runEvents += event("CLEANUP_ERROR", message) }
+        try {
+            runEvents += event("CLEANUP_ERROR", message)
+        } catch (recordError: Throwable) {
+            if (recordError is Error) throw recordError
+        }
+    }
+
+    /**
+     * Cleanup diagnostics are secondary evidence. If recording them also fails, retain fatal
+     * precedence without allowing the diagnostic path to replace the cleanup failure identity.
+     */
+    private fun recordCleanupFailurePreservingFatal(
+        operation: String,
+        error: Throwable,
+    ): Throwable {
+        var terminal: Throwable = error
+        try {
+            recordCleanupFailure(operation, error)
+        } catch (recordError: Throwable) {
+            terminal = mergeControllerFailurePreservingFatal(terminal, recordError)
+        }
+        return terminal
     }
 
     private fun precheck(scenario: ScenarioSpec): String? {
@@ -5833,6 +6594,8 @@ class LabController internal constructor(
                 var workloadApplied = false
                 var displayApplied = false
                 var ownerStillActive: Boolean
+                var loadCommandOwner: RuntimeLoadCommandOwner? = null
+                var loadCommandCommitAllowed = true
                 try {
                     loadControlMutex.withLock {
                         orderedZeroConfirmed = confirmGeneratedLoadQuiesceLocked()
@@ -5846,14 +6609,37 @@ class LabController internal constructor(
                                 // post-recovery tick will use the same bounded NPU acknowledgment.
                                 workloadApplied = true
                             } else {
-                                val npuHealth = runCatching {
+                                val commandOwner = RuntimeLoadCommandOwner(
+                                    commandEpoch = loadManager.npuCommandEpoch(),
+                                    runOwner = derateOwner,
+                                    producerGeneration = derateGeneration,
+                                )
+                                loadCommandOwner = commandOwner
+                                val npuHealth = try {
                                     applyRuntimeWorkloadsLocked(
                                         workloads = reduced.workloads,
                                         restartProfile = false,
-                                        requirePositiveNpuAcknowledgment =
+                                        requireNpuAcknowledgment =
                                             reduced.workloads.npu > MIN_EFFECTIVE_LOAD,
+                                        expectedCommandEpoch = commandOwner.commandEpoch,
                                     )
-                                }.getOrElse { error ->
+                                } catch (error: Throwable) {
+                                    if (shouldRethrowRuntimeWorkloadApplyFailure(error)) {
+                                        if (error is Error) {
+                                            try {
+                                                orderedZeroConfirmed =
+                                                    confirmGeneratedLoadQuiesceLocked() &&
+                                                        orderedZeroConfirmed
+                                            } catch (cleanupError: Throwable) {
+                                                if (cleanupError !== error) {
+                                                    runCatching {
+                                                        error.addSuppressed(cleanupError)
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        throw error
+                                    }
                                     runEvents += event(
                                         "THERMAL_DERATE_APPLY_ERROR",
                                         "workload derate 실패: " +
@@ -5885,18 +6671,34 @@ class LabController internal constructor(
                             owner = derateOwner,
                             generation = derateGeneration,
                         )
-                        if (!ownerStillActive && workloadApplied) {
-                            // STOP/close may have won while the positive acknowledgment blocked.
-                            // Reassert ordered zero and never resurrect the cancelled run.
-                            workloadApplied = false
-                            confirmGeneratedLoadQuiesceLocked()
+                        val commandOwnerStillActive =
+                            loadCommandOwner?.let(::isRuntimeLoadCommandOwnerActive) ?: true
+                        if (!commandOwnerStillActive) {
+                            // STOP/close or producer recovery may have won while the positive
+                            // acknowledgment blocked. Reassert ordered zero and never resurrect
+                            // the stale load command.
+                            loadCommandCommitAllowed = false
+                            orderedZeroConfirmed =
+                                confirmGeneratedLoadQuiesceLocked() && orderedZeroConfirmed
+                            workloadApplied =
+                                orderedZeroConfirmed &&
+                                    ownerStillActive &&
+                                    producerRecoveryPaused
                         }
                     }
-                    if (ownerStillActive && workloadApplied) {
+                    if (ownerStillActive && workloadApplied && loadCommandCommitAllowed) {
                         displayApplied = requestDisplayModeSafely(
                             reduced.requestedDisplayHz,
                             "thermal display derate",
                         )
+                    } else if (
+                        ownerStillActive &&
+                        workloadApplied &&
+                        producerRecoveryPaused
+                    ) {
+                        // The topology callback already owns the lower display request. Do not
+                        // overwrite it with the stale pre-recovery thermal continuation.
+                        displayApplied = true
                     }
                     ownerStillActive = thermalDerateOwnerStillActive(
                         owner = derateOwner,
@@ -5970,9 +6772,17 @@ class LabController internal constructor(
                 return
             }
             progress = progress.copy(
-                phase = reduced,
+                phase = reduced?.let { phase ->
+                    if (producerRecoveryPaused) rendererPreparationPhase(phase) else phase
+                },
                 targetPhase = progress.targetPhase?.let(::applyPersistentSafety),
-                statusText = reduced?.let { "${it.label} · thermal derate" }
+                statusText = reduced?.let {
+                    if (producerRecoveryPaused) {
+                        "${it.label} · thermal derate · producer 복구 대기"
+                    } else {
+                        "${it.label} · thermal derate"
+                    }
+                }
                     ?: "${progress.statusText} · thermal derate",
                 thermalDerated = true,
             )
@@ -6813,6 +7623,11 @@ class LabController internal constructor(
         val abandoned = AtomicBoolean(false)
         val opened = AtomicReference<AssetFileDescriptor?>()
         val failure = AtomicReference<Throwable?>()
+        fun recordWorkerFailure(error: Throwable) {
+            failure.set(
+                mergeControllerFailurePreservingFatal(failure.get(), error),
+            )
+        }
         val workerLease = preflightLease.retain()
             ?: throw PlanAbortException("media preflight lease가 실행 전에 해제됐습니다.")
         val worker = try {
@@ -6823,8 +7638,7 @@ class LabController internal constructor(
                         local = resolver.openAssetFileDescriptor(uri, "r", cancellationSignal)
                         val openedDescriptor = local
                         if (openedDescriptor == null) {
-                            failure.compareAndSet(
-                                null,
+                            recordWorkerFailure(
                                 IllegalArgumentException("Provider returned no descriptor"),
                             )
                         } else if (abandoned.get()) {
@@ -6838,15 +7652,22 @@ class LabController internal constructor(
                             }
                         }
                     } catch (error: Throwable) {
-                        if (error is ThreadDeath) throw error
-                        failure.compareAndSet(null, error)
+                        // Relay the exact fatal identity to the owning coroutine after the worker
+                        // has completed descriptor and lease cleanup. Throwing only on this worker
+                        // would let the run continue with an ordinary "no descriptor" result.
+                        recordWorkerFailure(error)
                     } finally {
                         try {
                             local?.let(::closePinnedMediaDescriptor)
-                        } finally {
-                            completed.countDown()
-                            workerLease.close()
+                        } catch (error: Throwable) {
+                            recordWorkerFailure(error)
                         }
+                        try {
+                            workerLease.close()
+                        } catch (error: Throwable) {
+                            recordWorkerFailure(error)
+                        }
+                        completed.countDown()
                     }
                 },
                 "DpuLab-MediaProviderOpen",
@@ -6854,8 +7675,13 @@ class LabController internal constructor(
                 isDaemon = true
             }
         } catch (error: Throwable) {
-            workerLease.close()
-            if (error is ThreadDeath) throw error
+            val terminal = try {
+                workerLease.close()
+                error
+            } catch (cleanupError: Throwable) {
+                mergeControllerFailurePreservingFatal(error, cleanupError)
+            }
+            if (terminal is Error) throw terminal
             throw PlanAbortException(
                 "media provider worker를 생성할 수 없습니다 (${error.javaClass.simpleName}).",
             )
@@ -6863,39 +7689,77 @@ class LabController internal constructor(
         try {
             worker.start()
         } catch (error: Throwable) {
-            workerLease.close()
-            if (error is ThreadDeath) throw error
+            val terminal = try {
+                workerLease.close()
+                error
+            } catch (cleanupError: Throwable) {
+                mergeControllerFailurePreservingFatal(error, cleanupError)
+            }
+            if (terminal is Error) throw terminal
             throw PlanAbortException(
                 "media provider worker를 시작할 수 없습니다 (${error.javaClass.simpleName}).",
             )
         }
         fun abandonProviderOpen() {
             abandoned.set(true)
+            var cleanupFailure: Throwable? = null
             try {
                 opened.getAndSet(null)?.let(::closePinnedMediaDescriptor)
-            } finally {
-                try {
-                    try {
-                        cancellationSignal.cancel()
-                    } catch (error: Throwable) {
-                        if (error is ThreadDeath) throw error
-                    }
-                } finally {
-                    worker.interrupt()
-                }
+            } catch (error: Throwable) {
+                cleanupFailure =
+                    mergeControllerFailurePreservingFatal(cleanupFailure, error)
+            }
+            try {
+                cancellationSignal.cancel()
+            } catch (error: Throwable) {
+                cleanupFailure =
+                    mergeControllerFailurePreservingFatal(cleanupFailure, error)
+            }
+            try {
+                worker.interrupt()
+            } catch (error: Throwable) {
+                cleanupFailure =
+                    mergeControllerFailurePreservingFatal(cleanupFailure, error)
+            }
+            cleanupFailure?.let { error ->
+                if (error is Error) throw error
             }
         }
         val completedInTime = try {
             awaitLatchCancellable(completed, MEDIA_PROVIDER_OPEN_TIMEOUT_MS)
         } catch (cancelled: CancellationException) {
-            abandonProviderOpen()
+            var terminal: Throwable = cancelled
+            try {
+                abandonProviderOpen()
+            } catch (cleanupError: Throwable) {
+                terminal =
+                    mergeControllerFailurePreservingFatal(terminal, cleanupError)
+            }
+            failure.get()?.let { workerError ->
+                terminal =
+                    mergeControllerFailurePreservingFatal(terminal, workerError)
+            }
+            if (terminal is Error) throw terminal
             throw cancelled
         }
         if (!completedInTime) {
-            abandonProviderOpen()
+            var terminalFailure: Throwable? = null
+            try {
+                abandonProviderOpen()
+            } catch (cleanupError: Throwable) {
+                terminalFailure =
+                    mergeControllerFailurePreservingFatal(terminalFailure, cleanupError)
+            }
+            failure.get()?.let { workerError ->
+                terminalFailure =
+                    mergeControllerFailurePreservingFatal(terminalFailure, workerError)
+            }
+            terminalFailure?.let { terminal ->
+                if (terminal is Error) throw terminal
+            }
             throw PlanAbortException(
                 "media provider가 ${MEDIA_PROVIDER_OPEN_TIMEOUT_MS}ms 안에 descriptor를 " +
-                "반환하지 않아 안전 중단했습니다.",
+                    "반환하지 않아 안전 중단했습니다.",
             )
         }
         try {
@@ -6904,10 +7768,29 @@ class LabController internal constructor(
             // Cancellation can arrive after the provider worker has published its descriptor but
             // before ownership is transferred below. Reclaim that completed result as well as a
             // still-running provider open.
-            abandonProviderOpen()
+            var terminal: Throwable = cancelled
+            try {
+                abandonProviderOpen()
+            } catch (cleanupError: Throwable) {
+                terminal =
+                    mergeControllerFailurePreservingFatal(terminal, cleanupError)
+            }
+            failure.get()?.let { workerError ->
+                terminal =
+                    mergeControllerFailurePreservingFatal(terminal, workerError)
+            }
+            if (terminal is Error) throw terminal
             throw cancelled
         }
         failure.get()?.let { error ->
+            var terminal: Throwable = error
+            try {
+                opened.getAndSet(null)?.let(::closePinnedMediaDescriptor)
+            } catch (cleanupError: Throwable) {
+                terminal =
+                    mergeControllerFailurePreservingFatal(terminal, cleanupError)
+            }
+            controllerWorkerFailureOrThrow(terminal)
             throw UnsupportedRunException(
                 "선택한 영상 descriptor를 열 수 없습니다 (${error.javaClass.simpleName}).",
             )
@@ -6941,6 +7824,11 @@ class LabController internal constructor(
         val completed = CountDownLatch(1)
         val result = AtomicReference<MediaTrackInspection?>()
         val failure = AtomicReference<Throwable?>()
+        fun recordWorkerFailure(error: Throwable) {
+            failure.set(
+                mergeControllerFailurePreservingFatal(failure.get(), error),
+            )
+        }
         val workerLease = preflightLease.retain()
             ?: throw PlanAbortException("media preflight lease가 parser 실행 전에 해제됐습니다.")
         val worker = try {
@@ -6949,11 +7837,14 @@ class LabController internal constructor(
                     try {
                         result.set(inspectPinnedTrackOnCurrentThread(source))
                     } catch (error: Throwable) {
-                        if (error is ThreadDeath) throw error
-                        failure.compareAndSet(null, error)
+                        recordWorkerFailure(error)
                     } finally {
+                        try {
+                            workerLease.close()
+                        } catch (error: Throwable) {
+                            recordWorkerFailure(error)
+                        }
                         completed.countDown()
-                        workerLease.close()
                     }
                 },
                 "DpuLab-MediaPreflight",
@@ -6961,8 +7852,13 @@ class LabController internal constructor(
                 isDaemon = true
             }
         } catch (error: Throwable) {
-            workerLease.close()
-            if (error is ThreadDeath) throw error
+            val terminal = try {
+                workerLease.close()
+                error
+            } catch (cleanupError: Throwable) {
+                mergeControllerFailurePreservingFatal(error, cleanupError)
+            }
+            if (terminal is Error) throw terminal
             throw PlanAbortException(
                 "media parser worker를 생성할 수 없습니다 (${error.javaClass.simpleName}).",
             )
@@ -6970,8 +7866,13 @@ class LabController internal constructor(
         try {
             worker.start()
         } catch (error: Throwable) {
-            workerLease.close()
-            if (error is ThreadDeath) throw error
+            val terminal = try {
+                workerLease.close()
+                error
+            } catch (cleanupError: Throwable) {
+                mergeControllerFailurePreservingFatal(error, cleanupError)
+            }
+            if (terminal is Error) throw terminal
             throw PlanAbortException(
                 "media parser worker를 시작할 수 없습니다 (${error.javaClass.simpleName}).",
             )
@@ -6984,18 +7885,51 @@ class LabController internal constructor(
         val completedInTime = try {
             awaitLatchCancellable(completed, MEDIA_INSPECTION_TIMEOUT_MS)
         } catch (cancelled: CancellationException) {
-            abandonInspection()
+            var terminal: Throwable = cancelled
+            try {
+                abandonInspection()
+            } catch (cleanupError: Throwable) {
+                terminal =
+                    mergeControllerFailurePreservingFatal(terminal, cleanupError)
+            }
+            failure.get()?.let { workerError ->
+                terminal =
+                    mergeControllerFailurePreservingFatal(terminal, workerError)
+            }
+            if (terminal is Error) throw terminal
             throw cancelled
         }
         if (!completedInTime) {
-            abandonInspection()
+            var terminalFailure: Throwable? = null
+            try {
+                abandonInspection()
+            } catch (cleanupError: Throwable) {
+                terminalFailure =
+                    mergeControllerFailurePreservingFatal(terminalFailure, cleanupError)
+            }
+            failure.get()?.let { workerError ->
+                terminalFailure =
+                    mergeControllerFailurePreservingFatal(terminalFailure, workerError)
+            }
+            terminalFailure?.let { terminal ->
+                if (terminal is Error) throw terminal
+            }
             throw PlanAbortException(
                 "media parser가 ${MEDIA_INSPECTION_TIMEOUT_MS}ms 안에 반환하지 않아 " +
-                "안전 중단했습니다.",
+                    "안전 중단했습니다.",
             )
         }
-        currentCoroutineContext().ensureActive()
-        failure.get()?.let { error ->
+        try {
+            currentCoroutineContext().ensureActive()
+        } catch (cancelled: CancellationException) {
+            failure.get()?.let { workerError ->
+                val terminal =
+                    mergeControllerFailurePreservingFatal(cancelled, workerError)
+                if (terminal is Error) throw terminal
+            }
+            throw cancelled
+        }
+        controllerWorkerFailureOrThrow(failure.get())?.let { error ->
             return MediaTrackInspection(
                 detail = "track=${error.javaClass.simpleName.take(MAX_MEDIA_ERROR_TYPE_CHARS)}",
             )
@@ -8206,6 +9140,7 @@ internal data class PendingControlCoverage(
     val expectedProducerCount: Int,
     val expectedTopologyRevision: Long,
     val expectedLayerSizeProfileOrdinal: Int,
+    val expectedProducerControlRevision: Long = 0L,
 ) {
     fun isAcknowledgedBy(
         readiness: com.example.dpulayerlab.monitor.ProducerReadiness,
@@ -8214,7 +9149,16 @@ internal data class PendingControlCoverage(
             readiness.expectedCount == expectedProducerCount &&
             readiness.topologyRevision == expectedTopologyRevision &&
             readiness.geometryReady &&
-            readiness.geometryAppliedProfileOrdinal == expectedLayerSizeProfileOrdinal
+            readiness.geometryAppliedProfileOrdinal == expectedLayerSizeProfileOrdinal &&
+            (
+                expectedProducerControlRevision == 0L ||
+                    (
+                        readiness.producerControlReady &&
+                            readiness.producerControlAppliedCount == expectedProducerCount &&
+                            readiness.producerControlAppliedRevision ==
+                            expectedProducerControlRevision
+                        )
+                )
 }
 
 /**
@@ -8355,8 +9299,10 @@ internal fun rendererTeardownBarrierDecision(
  * Integrates the producer FPS that was actually applied during one phase.
  *
  * Calls are synchronized because a thermal callback can change the active rate between the
- * controller's 100 ms transition ticks. The phase duration bounds the integral even if a delayed
- * control tick arrives after the nominal end.
+ * controller's 100 ms transition ticks. Normal finish paths bound the integral by phase duration.
+ * A terminal linear endpoint detected by a delayed tick is the deliberate exception: actual and
+ * expected are sealed together at the same observed pre-publication boundary so scheduler delay
+ * cannot inflate only the numerator.
  */
 internal class AppliedProducerFrameBudget(
     private val phaseStartedMs: Long,
@@ -8372,6 +9318,7 @@ internal class AppliedProducerFrameBudget(
     private var lastPhysicalFrameTotal: Long? = null
     private var actualAggregateFrames = 0L
     private var physicalFrameCounterValid = true
+    private var nominalActualWindowSealed = false
     private var finished = false
 
     @Synchronized
@@ -8380,7 +9327,7 @@ internal class AppliedProducerFrameBudget(
         producerFps: Float,
         activeLayers: Int = 1,
     ) {
-        if (finished) return
+        if (finished || nominalActualWindowSealed) return
         accountThrough(atMonotonicMs)
         activeProducerFps = producerFps
             .takeIf { it.isFinite() && it > 0f }
@@ -8429,6 +9376,35 @@ internal class AppliedProducerFrameBudget(
         observePhysicalFramesLocked(totalFrames, countAsActive)
     }
 
+    /**
+     * Ends both producer-fidelity terms at one counter/time observation before endpoint controls
+     * are applied. When a delayed controller tick cannot timestamp the nominal deadline inside an
+     * aggregate counter delta, `useObservedExpectedBoundary` deliberately extends the denominator
+     * to this same observed boundary instead of letting pre-apply delay frames inflate the ratio.
+     * Terminal endpoint proof/hold frames remain observable by FrameTracker but affect neither term.
+     */
+    @Synchronized
+    fun sealNominalActualWindow(
+        atMonotonicMs: Long,
+        totalFrames: Long,
+        useObservedExpectedBoundary: Boolean = false,
+    ) {
+        if (finished) return
+        if (!nominalActualWindowSealed) {
+            observePhysicalFramesLocked(
+                totalFrames = totalFrames,
+                countAsActive = !activeClock.isPaused(),
+            )
+            accountThrough(
+                atMonotonicMs = atMonotonicMs,
+                useObservedBoundary = useObservedExpectedBoundary,
+            )
+            nominalActualWindowSealed = true
+        } else {
+            observePhysicalFramesLocked(totalFrames, countAsActive = false)
+        }
+    }
+
     @Synchronized
     fun pauseAtPhysicalBoundary(
         atMonotonicMs: Long,
@@ -8451,7 +9427,7 @@ internal class AppliedProducerFrameBudget(
             lastPhysicalFrameTotal = totalFrames.takeIf { it >= 0L }
             return
         }
-        if (previous != null && countAsActive) {
+        if (previous != null && countAsActive && !nominalActualWindowSealed) {
             val delta = totalFrames - previous
             actualAggregateFrames = if (actualAggregateFrames > Long.MAX_VALUE - delta) {
                 Long.MAX_VALUE
@@ -8468,9 +9444,17 @@ internal class AppliedProducerFrameBudget(
             physicalFrameCounterValid && lastPhysicalFrameTotal != null
         }
 
-    private fun accountThrough(atMonotonicMs: Long) {
-        val elapsedMs = activeClock.elapsedMs(atMonotonicMs)
-            .coerceAtMost(boundedDurationMs)
+    private fun accountThrough(
+        atMonotonicMs: Long,
+        useObservedBoundary: Boolean = false,
+    ) {
+        if (nominalActualWindowSealed) return
+        val observedElapsedMs = activeClock.elapsedMs(atMonotonicMs)
+        val elapsedMs = if (useObservedBoundary) {
+            observedElapsedMs
+        } else {
+            observedElapsedMs.coerceAtMost(boundedDurationMs)
+        }
         if (elapsedMs <= accountedElapsedMs) return
         val intervalMs = elapsedMs - accountedElapsedMs
         val primaryFrames =
@@ -8545,6 +9529,70 @@ internal fun requiredDecoderSourceFps(phases: List<PhaseSpec>): Float? {
         requiredFps = maxOf(requiredFps ?: 0f, boundaryFps)
     }
     return requiredFps?.takeIf { it.isFinite() && it > 0f }
+}
+
+/**
+ * A whole-phase linear ramp reaches fraction 1 only at its nominal deadline. The normal loop must
+ * publish that exact endpoint once and keep the phase alive for a bounded physical-producer
+ * acknowledgment instead of breaking on the deadline before the target is observable.
+ */
+internal class TerminalLinearRampEndpointGate(
+    acknowledgmentTimeoutMs: Long,
+    private val monotonicNowMs: () -> Long,
+) {
+    private val acknowledgmentTimeoutMs = acknowledgmentTimeoutMs.coerceAtLeast(1L)
+    private var publishedAtMs: Long? = null
+    private var publicationRevision = 0L
+
+    val published: Boolean
+        get() = publishedAtMs != null
+
+    fun shouldPublish(
+        spec: TransitionSpec,
+        phaseElapsedMs: Long,
+        phaseDurationMs: Long,
+    ): Boolean {
+        if (published || spec.mode != TransitionMode.LINEAR_RAMP || phaseDurationMs <= 0L) {
+            return false
+        }
+        val boundedSpec = spec.boundedFor(phaseDurationMs)
+        val spansWholePhase =
+            boundedSpec.transitionDurationMs == 0L ||
+                boundedSpec.transitionDurationMs >= phaseDurationMs
+        return spansWholePhase && phaseElapsedMs >= phaseDurationMs
+    }
+
+    fun markPublished(): Long {
+        if (publishedAtMs == null) {
+            publicationRevision =
+                if (publicationRevision == Long.MAX_VALUE) 1L else publicationRevision + 1L
+            publishedAtMs = monotonicNowMs().coerceAtLeast(0L)
+        }
+        return publicationRevision
+    }
+
+    /**
+     * A topology recovery invalidates every frame acknowledgment for the publication which was
+     * pending when recovery started. Keep the monotonic revision, but permit one exact republish
+     * after the recovered producer set has posted fresh first buffers.
+     */
+    fun rearmAfterProducerRecovery(pendingRevision: Long): Boolean {
+        if (
+            publishedAtMs == null ||
+            pendingRevision <= 0L ||
+            pendingRevision != publicationRevision
+        ) {
+            return false
+        }
+        publishedAtMs = null
+        return true
+    }
+
+    fun acknowledgmentTimedOut(): Boolean {
+        val publishedAt = publishedAtMs ?: return false
+        val deadline = saturatingAdd(publishedAt, acknowledgmentTimeoutMs)
+        return monotonicNowMs().coerceAtLeast(publishedAt) >= deadline
+    }
 }
 
 internal class TransitionCoverageTracker(
@@ -8626,8 +9674,11 @@ internal class TransitionCoverageTracker(
     fun failureReason(): String? = when (spec.mode) {
         TransitionMode.STEP ->
             if (sawTarget) null else "STEP target tick 누락"
-        TransitionMode.LINEAR_RAMP ->
-            if (sawRampUpIntermediate) null else "linear ramp intermediate tick 누락"
+        TransitionMode.LINEAR_RAMP -> when {
+            !sawRampUpIntermediate -> "linear ramp intermediate tick 누락"
+            !sawTarget -> "linear ramp target tick 누락"
+            else -> null
+        }
         TransitionMode.STAIRCASE -> {
             val missing = staircaseLevels.indices.filterNot { staircaseLevels[it] }
             if (missing.isEmpty()) null else "staircase levels 누락: ${missing.joinToString()}"
@@ -8827,6 +9878,30 @@ internal fun hwcCapacityCalibrationSampleLaneTimeoutMs(
     return min(hardTimeoutMs, remainingMs - completionReserveMs)
         .takeIf { it > 0L }
 }
+
+internal fun hwcCapacityCalibrationWaitMs(
+    remainingMs: Long,
+    requestedWaitMs: Long,
+    completionReserveMs: Long,
+): Long? {
+    if (
+        remainingMs <= 0L ||
+        requestedWaitMs <= 0L ||
+        completionReserveMs < 0L ||
+        remainingMs <= completionReserveMs
+    ) {
+        return null
+    }
+    // The downstream lane rejects `remaining <= reserve`, so leave at least one whole
+    // millisecond beyond the reserve instead of consuming the exact boundary.
+    return min(requestedWaitMs, remainingMs - completionReserveMs - 1L)
+        .takeIf { it > 0L }
+}
+
+internal fun shouldRunHwcCapacityCalibrationSettle(
+    teardownConfirmed: Boolean,
+    cancellationRequested: Boolean,
+): Boolean = teardownConfirmed && !cancellationRequested
 
 /**
  * Keeps calibration activation behind the same committed-topology and cleanup barriers as a
@@ -9633,6 +10708,9 @@ internal fun producerRecoverySafePointFailed(
     displayReduced: Boolean,
 ): Boolean = !loadsReleased || !displayReduced
 
+internal fun progressForProducerTopologyPending(progress: RunProgress): RunProgress =
+    progress.copy(expectedProducerCount = 0)
+
 internal fun visibleExpectedProducerCount(
     committedExpectedCount: Int,
     topologyPublished: Boolean,
@@ -9993,6 +11071,35 @@ internal fun shouldAbortTelemetryWatchdog(
 
 internal fun isFatalControllerStartupFailure(error: Throwable): Boolean =
     error is Error
+
+/**
+ * Retains the first ordinary failure, but promotes the first fatal [Error] over any earlier
+ * ordinary failure. Suppressed diagnostics are best effort so an active OOM cannot be replaced
+ * by another allocation failure while attaching evidence.
+ */
+internal fun mergeControllerFailurePreservingFatal(
+    current: Throwable?,
+    candidate: Throwable,
+): Throwable {
+    if (current == null || current === candidate) return current ?: candidate
+    val terminal = if (current is Error || candidate !is Error) current else candidate
+    val secondary = if (terminal === current) candidate else current
+    try {
+        terminal.addSuppressed(secondary)
+    } catch (_: Throwable) {
+        // Preserve the selected identity even when suppressed-state allocation is unavailable.
+    }
+    return terminal
+}
+
+/** Relays a bounded worker's fatal identity to its owning coroutine after worker cleanup. */
+internal fun controllerWorkerFailureOrThrow(error: Throwable?): Throwable? {
+    if (error is Error) throw error
+    return error
+}
+
+internal fun shouldRethrowRuntimeWorkloadApplyFailure(error: Throwable): Boolean =
+    error is CancellationException || isFatalControllerStartupFailure(error)
 
 internal fun isFatalTelemetryStartupFailure(error: Throwable): Boolean =
     isFatalControllerStartupFailure(error)

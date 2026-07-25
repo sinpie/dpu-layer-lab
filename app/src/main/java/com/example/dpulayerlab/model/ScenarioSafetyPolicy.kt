@@ -333,6 +333,9 @@ object ScenarioSafetyPolicy {
             if (loadValues.any { !it.isFinite() }) {
                 return "Phase '${phase.id}' workloads must be finite"
             }
+            if (loadValues.any { it < 0f }) {
+                return "Phase '${phase.id}' workloads must be non-negative"
+            }
             if (loadValues.any { it > 0f && it <= MIN_EFFECTIVE_LOAD }) {
                 return "Phase '${phase.id}' positive workloads must exceed " +
                     "$MIN_EFFECTIVE_LOAD to produce observable work"

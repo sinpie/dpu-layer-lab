@@ -417,37 +417,40 @@ class LayerStageViewMathTest {
     }
 
     @Test
-    fun capacityTilesKeepEveryTwentyLayerCandidateVisibleWithoutOverlap() {
-        val tiles = (0 until 20).map { index ->
-            checkNotNull(
-                capacityTileBounds(
-                    width = 1_000,
-                    height = 800,
-                    layerCount = 20,
-                    layerIndex = index,
-                ),
+    fun capacityTilesKeepEverySafetyCandidateVisibleAndCoverTheFullStage() {
+        listOf(1, 6, 12, 16, 20).forEach { layerCount ->
+            val tiles = (0 until layerCount).map { index ->
+                checkNotNull(
+                    capacityTileBounds(
+                        width = 1_000,
+                        height = 800,
+                        layerCount = layerCount,
+                        layerIndex = index,
+                    ),
+                )
+            }
+
+            assertEquals(layerCount, tiles.distinct().size)
+            assertTrue(tiles.all { it.right > it.left && it.bottom > it.top })
+            tiles.forEachIndexed { index, tile ->
+                tiles.drop(index + 1).forEach { other ->
+                    val overlaps =
+                        tile.left < other.right &&
+                            other.left < tile.right &&
+                            tile.top < other.bottom &&
+                            other.top < tile.bottom
+                    assertFalse(overlaps)
+                }
+            }
+            assertEquals(
+                "layerCount=$layerCount",
+                1_000L * 800L,
+                tiles.sumOf { tile ->
+                    (tile.right - tile.left).toLong() *
+                        (tile.bottom - tile.top).toLong()
+                },
             )
         }
-
-        assertEquals(20, tiles.distinct().size)
-        assertTrue(tiles.all { it.right > it.left && it.bottom > it.top })
-        tiles.forEachIndexed { index, tile ->
-            tiles.drop(index + 1).forEach { other ->
-                val overlaps =
-                    tile.left < other.right &&
-                        other.left < tile.right &&
-                        tile.top < other.bottom &&
-                        other.top < tile.bottom
-                assertFalse(overlaps)
-            }
-        }
-        assertEquals(
-            1_000L * 800L,
-            tiles.sumOf { tile ->
-                (tile.right - tile.left).toLong() *
-                    (tile.bottom - tile.top).toLong()
-            },
-        )
     }
 
     @Test
@@ -498,6 +501,7 @@ class LayerStageViewMathTest {
 
         assertFalse(
             shouldPublishExpectedProducerSet(
+                bindingsCommitted = true,
                 expectedTopologyDirty = true,
                 forceRepublish = false,
                 sameAsLastPublication = true,
@@ -505,6 +509,7 @@ class LayerStageViewMathTest {
         )
         assertTrue(
             shouldPublishExpectedProducerSet(
+                bindingsCommitted = true,
                 expectedTopologyDirty = false,
                 forceRepublish = true,
                 sameAsLastPublication = true,
@@ -512,9 +517,39 @@ class LayerStageViewMathTest {
         )
         assertTrue(
             shouldPublishExpectedProducerSet(
+                bindingsCommitted = true,
                 expectedTopologyDirty = true,
                 forceRepublish = false,
                 sameAsLastPublication = false,
+            ),
+        )
+        assertFalse(
+            shouldPublishExpectedProducerSet(
+                bindingsCommitted = false,
+                expectedTopologyDirty = true,
+                forceRepublish = true,
+                sameAsLastPublication = false,
+            ),
+        )
+        assertFalse(
+            producerControlRevisionIsValid(
+                requestedRevision = -1L,
+                currentRevision = 4L,
+                generationChanged = true,
+            ),
+        )
+        assertFalse(
+            producerControlRevisionIsValid(
+                requestedRevision = 3L,
+                currentRevision = 4L,
+                generationChanged = false,
+            ),
+        )
+        assertTrue(
+            producerControlRevisionIsValid(
+                requestedRevision = 0L,
+                currentRevision = 4L,
+                generationChanged = true,
             ),
         )
     }

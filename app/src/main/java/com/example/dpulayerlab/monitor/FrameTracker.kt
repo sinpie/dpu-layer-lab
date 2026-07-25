@@ -79,6 +79,20 @@ class FrameTracker : Choreographer.FrameCallback {
         )
     }
 
+    /**
+     * Arms an exact renderer-control publication. A later readiness snapshot becomes ready only
+     * after every producer in the committed topology posts a frame carrying this same revision.
+     */
+    fun requestProducerControlRevision(
+        generation: Long,
+        revision: Long,
+    ): Boolean =
+        producerGeneration.requestProducerControlRevision(
+            candidate = generation,
+            revision = revision,
+            nowMs = SystemClock.elapsedRealtime(),
+        )
+
     fun recordEquivalentLayerGeometryCoverage(
         generation: Long,
         profileOrdinal: Int,
@@ -110,12 +124,14 @@ class FrameTracker : Choreographer.FrameCallback {
         generation: Long,
         producerId: Long,
         primary: Boolean,
+        controlRevision: Long = 0L,
     ) {
         if (
             !producerGeneration.accept(
                 candidate = generation,
                 producerId = producerId,
                 nowMs = SystemClock.elapsedRealtime(),
+                controlRevision = controlRevision,
             )
         ) {
             return
@@ -196,9 +212,9 @@ class FrameTracker : Choreographer.FrameCallback {
 }
 
 /**
- * Small synchronized gate used only at primary-buffer callbacks (at most the bounded producer
- * rate). Keeping generation and count under one lock avoids losing the first frame in a
- * begin-vs-callback race.
+ * Small synchronized gate used by every physical-producer callback (at most the bounded aggregate
+ * producer rate). Keeping generation, per-producer heartbeat, and exact control revision under one
+ * lock avoids losing the first frame in begin/publish-vs-callback races.
  */
 internal class ProducerGenerationGate {
     private var generation = 0L
@@ -215,8 +231,14 @@ internal class ProducerGenerationGate {
     private var geometryAppliedProfileOrdinal = -1
     private val geometryCoverageMasks = IntArray(MAX_LAYER_SIZE_PROFILE_COUNT)
     private var geometryRequestedMs = -1L
-    private val expectedSinceMs = LongTimestampMap()
-    private val lastObservedMs = LongTimestampMap()
+    private var producerControlRequestedRevision = 0L
+    private var producerControlRequestedMs = -1L
+    // Reserve the documented 20-producer ceiling up front. First endpoint evidence must not grow
+    // primitive maps from inside the measured frame callback.
+    private val producerControlAppliedRevisions =
+        LongTimestampMap(MAX_TRACKED_PHYSICAL_PRODUCERS)
+    private val expectedSinceMs = LongTimestampMap(MAX_TRACKED_PHYSICAL_PRODUCERS)
+    private val lastObservedMs = LongTimestampMap(MAX_TRACKED_PHYSICAL_PRODUCERS)
     private var generationStartedMs = 0L
     private var topologyMissed = false
     private var teardownFailed = false
@@ -239,6 +261,9 @@ internal class ProducerGenerationGate {
         geometryAppliedProfileOrdinal = -1
         geometryCoverageMasks.fill(0)
         geometryRequestedMs = -1L
+        producerControlRequestedRevision = 0L
+        producerControlRequestedMs = -1L
+        producerControlAppliedRevisions.clear()
         expectedSinceMs.clear()
         lastObservedMs.clear()
         generationStartedMs = nowMs.coerceAtLeast(0L)
@@ -255,7 +280,13 @@ internal class ProducerGenerationGate {
         producerIds: Set<Long>,
         nowMs: Long,
     ): Boolean {
-        if (candidate != generation || producerIds.isEmpty()) return false
+        if (
+            candidate != generation ||
+            producerIds.isEmpty() ||
+            producerIds.size > MAX_TRACKED_PHYSICAL_PRODUCERS
+        ) {
+            return false
+        }
         val normalizedBuffer = LongArray(producerIds.size)
         var normalizedCount = 0
         for (id in producerIds) {
@@ -268,6 +299,7 @@ internal class ProducerGenerationGate {
             normalizedBuffer.copyOf(normalizedCount)
         }
         normalized.sort()
+        val wasTopologyPending = topologyPending
         if (!topologyDeclared) {
             topologyPublishedMs = nowMs.coerceAtLeast(0L)
         }
@@ -288,12 +320,45 @@ internal class ProducerGenerationGate {
             }
             expectedSinceMs.retainAll(normalized)
             lastObservedMs.retainAll(normalized)
+            producerControlAppliedRevisions.retainAll(normalized)
             val normalizedNow = nowMs.coerceAtLeast(0L)
             for (id in normalized) {
                 expectedSinceMs.putIfAbsent(id, normalizedNow)
             }
             expectedProducerIds = normalized
         }
+        if (wasTopologyPending) {
+            // A physical Surface/BufferQueue can be rebuilt without changing its relay producer
+            // ID. Once that lifecycle boundary has been published, pre-boundary heartbeats must
+            // never satisfy readiness for the replacement producer.
+            resetObservationWindow(nowMs)
+        }
+        return true
+    }
+
+    @Synchronized
+    fun requestProducerControlRevision(
+        candidate: Long,
+        revision: Long,
+        nowMs: Long,
+    ): Boolean {
+        if (
+            candidate != generation ||
+            activeEvidenceTerminal() ||
+            runtimeFailureReason != null ||
+            !topologyDeclared ||
+            topologyPending ||
+            !activated ||
+            expectedProducerIds.isEmpty() ||
+            revision <= 0L ||
+            revision < producerControlRequestedRevision
+        ) {
+            return false
+        }
+        if (revision == producerControlRequestedRevision) return true
+        producerControlRequestedRevision = revision
+        producerControlRequestedMs = nowMs.coerceAtLeast(0L)
+        producerControlAppliedRevisions.clear()
         return true
     }
 
@@ -382,6 +447,7 @@ internal class ProducerGenerationGate {
         if (!topologyPending) advanceTopologyDiscontinuitySerial()
         topologyPending = true
         teardownCompleted = false
+        producerControlAppliedRevisions.clear()
         return true
     }
 
@@ -430,6 +496,7 @@ internal class ProducerGenerationGate {
         candidate: Long,
         producerId: Long = 0L,
         nowMs: Long = 0L,
+        controlRevision: Long = 0L,
     ): Boolean {
         if (
             candidate != generation ||
@@ -444,6 +511,12 @@ internal class ProducerGenerationGate {
             return false
         }
         lastObservedMs.put(producerId, nowMs.coerceAtLeast(0L))
+        if (
+            producerControlRequestedRevision > 0L &&
+            controlRevision == producerControlRequestedRevision
+        ) {
+            producerControlAppliedRevisions.put(producerId, controlRevision)
+        }
         return true
     }
 
@@ -489,6 +562,7 @@ internal class ProducerGenerationGate {
         var observedCount = 0
         var oldestFrameAgeMs = 0L
         var longestMissingMs = 0L
+        var producerControlAppliedCount = 0
         for (id in effectiveExpected) {
             if (lastObservedMs.contains(id)) {
                 everObservedCount++
@@ -503,6 +577,13 @@ internal class ProducerGenerationGate {
                     ).coerceAtLeast(0L)
                 if (missingMs > longestMissingMs) longestMissingMs = missingMs
             }
+            if (
+                producerControlRequestedRevision > 0L &&
+                producerControlAppliedRevisions.valueOr(id, 0L) ==
+                producerControlRequestedRevision
+            ) {
+                producerControlAppliedCount++
+            }
         }
         val evidenceTerminal = activeEvidenceTerminal()
         val ready = topologyDeclared &&
@@ -512,6 +593,15 @@ internal class ProducerGenerationGate {
             everObservedCount == expected.size &&
             !evidenceTerminal &&
             runtimeFailureReason == null
+        val producerControlReady =
+            producerControlRequestedRevision > 0L &&
+                topologyDeclared &&
+                !topologyPending &&
+                activated &&
+                expected.isNotEmpty() &&
+                producerControlAppliedCount == expected.size &&
+                !evidenceTerminal &&
+                runtimeFailureReason == null
         val missingForMs = if (ready) {
             0L
         } else if (!topologyDeclared || !activated || effectiveExpected.isEmpty()) {
@@ -557,6 +647,20 @@ internal class ProducerGenerationGate {
             } else {
                 0L
             },
+            producerControlRequestedRevision = producerControlRequestedRevision,
+            producerControlAppliedRevision =
+                producerControlRequestedRevision.takeIf { producerControlReady } ?: 0L,
+            producerControlAppliedCount = producerControlAppliedCount,
+            producerControlReady = producerControlReady,
+            producerControlPendingForMs = if (
+                producerControlRequestedRevision > 0L &&
+                !producerControlReady
+            ) {
+                (normalizedNow - producerControlRequestedMs.coerceAtLeast(0L))
+                    .coerceAtLeast(0L)
+            } else {
+                0L
+            },
             topologyMissed = topologyMissed,
             teardownFailed = teardownFailed,
             teardownCompleted = teardownCompleted,
@@ -580,6 +684,7 @@ internal class ProducerGenerationGate {
         for (id in expectedProducerIds) {
             expectedSinceMs.put(id, normalizedNow)
         }
+        producerControlAppliedRevisions.clear()
         generationStartedMs = normalizedNow
     }
 
@@ -593,12 +698,14 @@ internal class ProducerGenerationGate {
         geometryAppliedProfileOrdinal = -1
         geometryCoverageMasks.fill(0)
         geometryRequestedMs = -1L
+        producerControlAppliedRevisions.clear()
     }
 
     private companion object {
         const val PRODUCER_FRESHNESS_WINDOW_MS = 3_000L
         const val MAX_RUNTIME_FAILURE_REASON_CHARS = 240
         const val MAX_LAYER_SIZE_PROFILE_COUNT = 16
+        const val MAX_TRACKED_PHYSICAL_PRODUCERS = 20
     }
 }
 
@@ -607,7 +714,19 @@ internal class ProducerGenerationGate {
  * timestamp without boxing Long keys/values, so renderer telemetry does not add GC/DRAM noise to
  * the experiment it is measuring.
  */
-private class LongTimestampMap(initialCapacity: Int = 8) {
+internal fun interface LongArrayExpansionAllocator {
+    fun copyOf(source: LongArray, newSize: Int): LongArray
+}
+
+private object DefaultLongArrayExpansionAllocator : LongArrayExpansionAllocator {
+    override fun copyOf(source: LongArray, newSize: Int): LongArray = source.copyOf(newSize)
+}
+
+internal class LongTimestampMap(
+    initialCapacity: Int = 8,
+    private val expansionAllocator: LongArrayExpansionAllocator =
+        DefaultLongArrayExpansionAllocator,
+) {
     private var ids = LongArray(initialCapacity.coerceAtLeast(1))
     private var timestamps = LongArray(ids.size)
     private var size = 0
@@ -666,8 +785,16 @@ private class LongTimestampMap(initialCapacity: Int = 8) {
     private fun ensureCapacity(required: Int) {
         if (required <= ids.size) return
         val newSize = (ids.size * 2).coerceAtLeast(required)
-        ids = ids.copyOf(newSize)
-        timestamps = timestamps.copyOf(newSize)
+        // Both copies are fallible under the deliberate memory-stress workload. Do not expose the
+        // first expansion until the timestamp copy also succeeds; otherwise a second-allocation
+        // OOME leaves the two hot-path arrays with different capacities.
+        val expandedIds = expansionAllocator.copyOf(ids, newSize)
+        val expandedTimestamps = expansionAllocator.copyOf(timestamps, newSize)
+        require(expandedIds.size >= newSize && expandedTimestamps.size >= newSize) {
+            "LongTimestampMap allocator returned an undersized array"
+        }
+        ids = expandedIds
+        timestamps = expandedTimestamps
     }
 }
 
@@ -697,6 +824,11 @@ data class ProducerReadiness(
     val geometryCoverageMask: Int = 0,
     val geometryReady: Boolean = false,
     val geometryPendingForMs: Long = 0L,
+    val producerControlRequestedRevision: Long = 0L,
+    val producerControlAppliedRevision: Long = 0L,
+    val producerControlAppliedCount: Int = 0,
+    val producerControlReady: Boolean = false,
+    val producerControlPendingForMs: Long = 0L,
     val topologyMissed: Boolean = false,
     val teardownFailed: Boolean = false,
     val teardownCompleted: Boolean = false,

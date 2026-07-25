@@ -104,6 +104,23 @@ Provider가 vendor partition에 있으면 제품은 mirrored stable AIDL/VINTF c
 사용해야 한다. Platform signing만으로 Binder service, sysfs 또는 debugfs 접근이
 생긴다고 가정하지 않는다.
 
+### Broker identity와 permission
+
+Portable APK는 action에 응답한 임의 service를 자동 신뢰하지 않는다. Product는
+`/product/etc/dpulayerlab/vendor_broker.conf`에 다음 exact trust contract를 설치한다.
+
+- fully-qualified service package/class
+- permission owner package
+- permission owner signing-lineage SHA-256 allowlist
+- service signing-lineage SHA-256 allowlist
+
+App은 `ACCESS_VENDOR_TELEMETRY`가 signature-base permission인지, 자신에게 실제
+grant됐는지, permission owner와 service signer가 설정된 lineage인지 확인한다. Service는
+system/updated-system app, enabled/exported, exact access permission이어야 한다. 어느
+하나라도 맞지 않으면 typed permanent `UNAVAILABLE`이며 implicit discovery나 반복
+reconnect로 낮추지 않는다. 자세한 파일 형식과 rotation/multi-signer 규칙은
+[System integration](SYSTEM_INTEGRATION.md)이 소유한다.
+
 ### 값 계약
 
 - unavailable count/frequency는 음수 또는 contract가 정한 unavailable로 반환한다.
@@ -133,10 +150,17 @@ Portable app은 임의 path를 탐색하지 않는다. 제품이 read-only allow
 - `dpu_frequency_hz`
 - `dpu_underrun`
 
+Generic DRM underrun node는 display scope와 ABI가 제품별로 모호하므로 automatic exact
+source가 아니다. Exact 승격은 제품이 검증한 typed contract와 allowlist를 요구한다.
+
 `dpu_frequency_hz`는 read-only counter다. 앱에 frequency/governor write path를
 추가하지 않는다. Xclipse, Qualcomm, MediaTek과 legacy Mali의 정확한 source selection은
 [Metrics](METRICS.md), path/SELinux 설정은 [System integration](SYSTEM_INTEGRATION.md)이
 소유한다.
+
+Custom probe path는 key별 `/sys` namespace allowlist와 canonical regular/readable
+attribute 검사를 모두 통과해야 한다. `/proc`, traversal, control/whitespace가 있는
+path는 wire input으로도 허용하지 않는다.
 
 ## Build variant와 signing
 

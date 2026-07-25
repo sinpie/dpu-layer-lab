@@ -4,6 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.CountDownLatch
@@ -248,6 +249,49 @@ class ControllerBackendCleanupCoordinatorTest {
             assertFalse(coordinator.failOwner(owner, "duplicate"))
         }
     }
+
+    @Test
+    fun cleanupRethrowsEveryFatalErrorWithOriginalIdentityAfterFailingClosed() {
+        listOf(
+            OutOfMemoryError("synthetic OOME"),
+            TestVirtualMachineError(),
+            ThreadDeath(),
+            AssertionError("synthetic Error"),
+        ).forEach(::assertFatalCleanupRethrown)
+    }
+
+    private fun assertFatalCleanupRethrown(fatal: Error) {
+        val uncaught = AtomicReference<Throwable>()
+        val uncaughtPublished = CountDownLatch(1)
+        val handler = Thread.UncaughtExceptionHandler { _, error ->
+            uncaught.set(error)
+            uncaughtPublished.countDown()
+        }
+        ControllerBackendCleanupCoordinator(
+            cleanupTimeoutMs = 1_000L,
+            cleanupUncaughtExceptionHandler = handler,
+        ).use { coordinator ->
+            val owner = requireNotNull(coordinator.tryAcquireOwner())
+            val completed = ControllerBackendCompletionBarrier(initiallyComplete = true)
+
+            assertEquals(
+                ControllerBackendCleanupStart.STARTED,
+                coordinator.beginCleanup(owner, completed, completed) {
+                    throw fatal
+                },
+            )
+            assertTrue(uncaughtPublished.await(1, TimeUnit.SECONDS))
+            assertSame(fatal, uncaught.get())
+            assertEquals(
+                ControllerBackendCleanupPhase.FAILED,
+                coordinator.snapshot().phase,
+            )
+            assertNull(coordinator.tryAcquireOwner())
+        }
+    }
+
+    private class TestVirtualMachineError :
+        VirtualMachineError("synthetic VirtualMachineError")
 
     private fun waitUntil(timeoutMs: Long, condition: () -> Boolean): Boolean {
         val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)

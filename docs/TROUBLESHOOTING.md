@@ -64,6 +64,17 @@ unsigned APK를 만들며 local keystore를 참조하면 안 된다.
 Platform signing만으로 vendor node 접근이 보장되지 않는다. Portable app에 root shell이나
 임의 path scan을 추가하지 않는다.
 
+Generic `/sys/class/drm/.../underrun_count`는 display scope와 counter 의미가 제품마다
+달라 portable build의 automatic exact source로 채택하지 않는다. 제품 BSP가 검증한
+typed vendor source 또는 key-specific allowlisted DPU sysfs contract를 제공해야 한다.
+
+`vendor_broker` source/status가 `CONFIG_MISSING`, permission/grant 오류, signer 또는
+service contract 불일치를 표시하면 transient timeout이 아니다.
+`/product/etc/dpulayerlab/vendor_broker.conf`의 explicit component와 signer digest,
+permission owner, app grant와 service manifest를 제품 이미지 기준으로 고친 뒤 새
+process에서 확인한다. App에서 implicit service scan을 켜거나 reconnect를 반복해
+우회하지 않는다.
+
 ### Samsung Xclipse GPU가 보이지 않음
 
 Xclipse는 Mali가 아니라 AMD RDNA 기반이다. 제품이 제공하는 DRM/driver counter 또는
@@ -113,6 +124,14 @@ Terminal detail에서 다음을 구분한다.
 HUD와 preflight adjustment를 확인한다. Runtime RAM, graphics budget, low-RAM과
 power-save envelope가 catalog 요청보다 우선한다. Hard cap을 올리거나 validation을
 우회하지 않는다.
+
+### Linear ramp가 끝까지 올라갔는데 `INCONCLUSIVE`
+
+명목상 phase 종료 뒤 exact endpoint target을 적용한 동일 control revision frame이
+committed physical producer 전부에서 확인되어야 한다. 일부 producer ACK가 없거나
+revision이 다르거나 topology recovery 뒤 fresh endpoint 재측정이 timeout되면 의도적으로
+`INCONCLUSIVE`다. Proof hold에서 추가된 frame은 producer-rate shortfall을 숨기는 데
+사용하지 않는다.
 
 ### YUV/P010/SBWC scenario가 거부됨
 

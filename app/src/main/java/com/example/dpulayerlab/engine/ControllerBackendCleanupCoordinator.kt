@@ -97,6 +97,7 @@ internal fun interface ControllerBackendCleanupOperation {
  */
 internal class ControllerBackendCleanupCoordinator(
     cleanupTimeoutMs: Long = DEFAULT_CLEANUP_TIMEOUT_MS,
+    cleanupUncaughtExceptionHandler: Thread.UncaughtExceptionHandler? = null,
 ) : AutoCloseable {
     private val cleanupTimeoutMs =
         cleanupTimeoutMs.coerceIn(MIN_CLEANUP_TIMEOUT_MS, MAX_CLEANUP_TIMEOUT_MS)
@@ -116,7 +117,10 @@ internal class ControllerBackendCleanupCoordinator(
         TimeUnit.MILLISECONDS,
         ArrayBlockingQueue(1),
         { runnable ->
-            Thread(runnable, CLEANUP_THREAD_NAME).apply { isDaemon = true }
+            Thread(runnable, CLEANUP_THREAD_NAME).apply {
+                isDaemon = true
+                uncaughtExceptionHandler = cleanupUncaughtExceptionHandler
+            }
         },
         ThreadPoolExecutor.AbortPolicy(),
     ).apply {
@@ -339,10 +343,10 @@ internal class ControllerBackendCleanupCoordinator(
         private val deadlineNanos = saturatingDeadlineNanos(cleanupTimeoutMs)
 
         override fun run() {
-            if (exited.get()) return
-            runner.set(Thread.currentThread())
-            var threadDeath: ThreadDeath? = null
+            var fatalError: Error? = null
             try {
+                if (exited.get()) return
+                runner.set(Thread.currentThread())
                 if (!awaitBarrier(runCompletion, "run completion")) return
                 if (!awaitBarrier(monitorCompletion, "monitor completion")) return
                 if (!mayInvokeCleanup(this)) return
@@ -366,16 +370,25 @@ internal class ControllerBackendCleanupCoordinator(
                 Thread.currentThread().interrupt()
                 finishFailure(this, "backend cleanup interrupted")
             } catch (error: Throwable) {
-                if (error is ThreadDeath) threadDeath = error
-                finishFailure(
-                    this,
-                    "backend cleanup failed: ${error.javaClass.simpleName}",
-                )
+                fatalError = retainFirstFatalError(fatalError, error)
+                try {
+                    finishFailure(this, cleanupFailureReason(error))
+                } catch (failure: Throwable) {
+                    fatalError = retainFirstFatalError(fatalError, failure)
+                }
             } finally {
-                runner.set(null)
-                publishExit()
+                try {
+                    runner.set(null)
+                } catch (failure: Throwable) {
+                    fatalError = retainFirstFatalError(fatalError, failure)
+                }
+                try {
+                    publishExit()
+                } catch (failure: Throwable) {
+                    fatalError = retainFirstFatalError(fatalError, failure)
+                }
             }
-            threadDeath?.let { throw it }
+            fatalError?.let { throw it }
         }
 
         fun timeout() {
@@ -439,6 +452,30 @@ internal class ControllerBackendCleanupCoordinator(
 
         fun boundedFailureReason(reason: String): String =
             reason.trim().ifBlank { "backend cleanup failed" }.take(MAX_FAILURE_REASON_CHARS)
+
+        fun cleanupFailureReason(error: Throwable): String = when (error) {
+            is OutOfMemoryError -> "backend cleanup failed: OutOfMemoryError"
+            is ThreadDeath -> "backend cleanup failed: ThreadDeath"
+            is VirtualMachineError -> "backend cleanup failed: VirtualMachineError"
+            is Error -> "backend cleanup failed: fatal Error"
+            else -> "backend cleanup failed: ${error.javaClass.simpleName}"
+        }
+
+        fun retainFirstFatalError(
+            primary: Error?,
+            candidate: Throwable,
+        ): Error? {
+            val candidateFatal = candidate as? Error ?: return primary
+            if (primary == null) return candidateFatal
+            if (primary !== candidateFatal) {
+                try {
+                    primary.addSuppressed(candidateFatal)
+                } catch (_: Throwable) {
+                    // The original fatal identity and precedence must survive suppression failure.
+                }
+            }
+            return primary
+        }
 
         fun saturatingDeadlineNanos(timeoutMs: Long): Long {
             val now = System.nanoTime()

@@ -35,7 +35,7 @@ DPULayerTest는 Android AP의 display pipeline에 제어 가능한 physical prod
 | FR-FORMAT-001 | RGB8888/565와 검증된 decoder-to-Surface YUV/P010/SBWC route를 구분해야 한다. | `VideoDecoderSelection.kt`, `LabController.kt` | `VideoDecoderSelectionTest`, controller tests |
 | FR-MEDIA-001 | 선택한 4K/8K media의 MIME, dimensions, FPS, profile, codec binding을 fail-closed 검증해야 한다. | `VideoDecoderSelection.kt`, `LabController.kt` | `VideoDecoderSelectionTest`, `LabControllerMathTest` |
 | FR-PACING-001 | producer FPS와 requested/actual display Hz를 독립적으로 제어·기록해야 한다. | `LabModels.kt`, `LabController.kt`, `FrameTracker.kt` | model/controller/frame tests |
-| FR-TRANSITION-001 | STEP, linear, staircase, pulse, triangle, soak/recovery를 bounded cadence로 실행해야 한다. | `LoadTransitionEvaluator.kt`, `LabController.kt` | `LoadTransitionEvaluatorTest`, controller tests |
+| FR-TRANSITION-001 | STEP, linear, staircase, pulse, triangle, soak/recovery를 bounded cadence로 실행하고, whole-phase linear endpoint는 모든 committed producer의 exact control revision frame으로 증명해야 한다. | `LoadTransitionEvaluator.kt`, `LabController.kt`, `FrameTracker.kt` | `LoadTransitionEvaluatorTest`, controller/producer tests |
 | FR-LOAD-001 | CPU와 memory/bus load를 bounded fixed-period worker로 올리고 내릴 수 있어야 한다. | `LoadGenerators.kt` | load manager/thread/prewarm tests |
 | FR-LOAD-002 | GLES workload와 실제 GL-backed producer를 통해 GPU 부하를 줄 수 있어야 한다. | `StressGlSurfaceView.kt`, `LayerStageView.kt` | renderer policy/math tests |
 | FR-LOAD-003 | vendor NPU adapter가 있을 때만 NPU load로 표시하고 latest-wins acknowledgment를 확인해야 한다. | `LoadGenerators.kt`, `VendorBridge.kt` | `LoadManagerNpuControlTest`, vendor tests |
@@ -51,7 +51,7 @@ DPULayerTest는 Android AP의 display pipeline에 제어 가능한 physical prod
 | FR-PERF-002 | 앱의 선제 thermal SEVERE derating은 plan-start immutable 선택값이며 기본 OFF여야 한다. OFF에서는 app setpoint를 유지하고 Android/kernel throttling에 맡기며, Intent로 값을 우회하지 못한다. CRITICAL·low-memory abort는 항상 유지해야 한다. | `PerformanceEnvironment.kt`, `LabController.kt` | controller/performance tests |
 | FR-AUTO-001 | explicit Intent로 SHOW, START, STOP, scenario ID 목록과 반복 횟수를 제어해야 한다. | `AutomationIntentContract.kt`, manifest | automation/main activity tests |
 | FR-REPORT-001 | phase/event/sample/verdict와 provenance를 schema v2 JSON으로 원자 발행·공유해야 한다. | `ReportWriter.kt`, `METRICS.md` | `ReportWriterMathTest` |
-| FR-SYSTEM-001 | platform-signed priv-app와 vendor AIDL/probe extension을 지원하되 portable fallback을 유지해야 한다. | `SYSTEM_INTEGRATION.md`, `VendorBridge.kt` | vendor/capability tests |
+| FR-SYSTEM-001 | platform-signed priv-app와 vendor AIDL/probe extension을 지원하되 portable fallback을 유지하고, explicit broker component·permission owner·signer trust가 검증될 때만 vendor service를 사용해야 한다. | `SYSTEM_INTEGRATION.md`, `VendorBridge.kt` | vendor/capability tests |
 
 ## 비기능 요구사항
 

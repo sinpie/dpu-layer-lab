@@ -3,6 +3,7 @@ package com.example.dpulayerlab
 import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Color
+import android.hardware.display.DisplayManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -11,10 +12,12 @@ import android.view.View
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.runtime.snapshotFlow
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.lifecycleScope
 import com.example.dpulayerlab.engine.AutomationCommand
 import com.example.dpulayerlab.engine.AutomationIntentContract
 import com.example.dpulayerlab.engine.AutomationIntentInput
@@ -48,7 +51,12 @@ import com.example.dpulayerlab.ui.DpuLayerLabApp
 import com.example.dpulayerlab.ui.theme.DpuLabTheme
 import com.example.dpulayerlab.util.currentDisplayCompat
 import java.util.ArrayDeque
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     private var controller: LabController? = null
@@ -63,10 +71,33 @@ class MainActivity : ComponentActivity() {
     private var activityStarted = false
     private var lastReceivedIntent: Intent? = null
     private var pendingAutomationOverflow = false
+    private var automationStartWaitingForInsets = false
+    private var automationWindowReadyDrainPosted = false
     private var lastDisplayEnvelopeIdentity: DisplayEnvelopeIdentity? = null
+    private var activeRunDisplayEnvelopeIdentity: DisplayEnvelopeIdentity? = null
+    private var displayEnvelopeInvalidationReported = false
+    private var displayListenerRegistered = false
+    private var displayRunStateJob: Job? = null
     private val pendingAutomation = ArrayDeque<AutomationIntentParseResult>()
     private val catalogIds: Set<String> =
         ScenarioCatalog.presets.mapTo(LinkedHashSet()) { it.id }
+    private val displayChangeCallbackHolder = DisplayChangeCallbackHolder()
+    private val displayListener = RuntimeDisplayListener(displayChangeCallbackHolder)
+    private val automationWindowReadyDrain = Runnable {
+        automationWindowReadyDrainPosted = false
+        if (!activityStarted || destroyed) {
+            return@Runnable
+        }
+        // The Activity display can be null before its Window is attached. Refresh the display
+        // identity after every delivered Insets state so a manual UI START also has an attached
+        // baseline. A deferred automation START is consumed only after that refresh.
+        validateCurrentDisplayEnvelope()
+        if (!automationStartWaitingForInsets || controller == null) {
+            return@Runnable
+        }
+        automationStartWaitingForInsets = false
+        drainPendingAutomation()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -76,6 +107,7 @@ class MainActivity : ComponentActivity() {
             contaminationCallback = { token, reason, eventType ->
                 controller?.onTestWindowIsolationLost(token, reason, eventType)
             },
+            windowInsetsReadyCallback = ::onAutomationWindowInsetsReady,
         )
         // Recreating an Activity must never replay a stress request that may already have run.
         if (savedInstanceState == null) enqueueAutomation(intent)
@@ -85,6 +117,7 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         activityStarted = true
+        registerDisplayListener()
         // Compare before overwriting: a fold/external-display move can happen while the Activity
         // is stopped without producing an in-process configuration callback.
         validateCurrentDisplayEnvelope()
@@ -99,11 +132,15 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         activityStarted = false
-        controller?.let { activeController ->
-            if (activeController.isRunning) {
-                activeController.stopScenario("앱이 백그라운드로 전환되어 안전 중단")
+        try {
+            controller?.let { activeController ->
+                if (activeController.isRunning) {
+                    activeController.stopScenario("앱이 백그라운드로 전환되어 안전 중단")
+                }
+                activeController.pause()
             }
-            activeController.pause()
+        } finally {
+            unregisterDisplayListener()
         }
         super.onStop()
     }
@@ -162,24 +199,135 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun validateCurrentDisplayEnvelope() {
+        if (destroyed) return
         val previous = lastDisplayEnvelopeIdentity
         val current = currentDisplayEnvelopeIdentity()
         lastDisplayEnvelopeIdentity = current
         if (displaySafetyEnvelopeChanged(previous, current)) {
             controller?.refreshHwcCapacityCalibrationDisplayProjection()
-            if (controller?.isRunning == true) {
-                controller?.invalidateSafetyEnvelope(
-                    "실행 중 display identity/physical size가 " +
-                        "${previous?.summary() ?: "unknown"} → ${current.summary()}로 변경됨",
-                )
+        }
+        val activeController = controller
+        if (activeController?.isRunning != true) {
+            clearActiveRunDisplayEnvelope()
+            return
+        }
+        val runSnapshot = selectRunDisplayEnvelopeSnapshot(
+            existingRunSnapshot = activeRunDisplayEnvelopeIdentity,
+            lastObserved = previous,
+            current = current,
+        ).also {
+            if (activeRunDisplayEnvelopeIdentity == null) {
+                activeRunDisplayEnvelopeIdentity = it
             }
         }
+        if (
+            runningDisplaySafetyEnvelopeChanged(runSnapshot, current) &&
+            !displayEnvelopeInvalidationReported
+        ) {
+            displayEnvelopeInvalidationReported = true
+            activeController.invalidateSafetyEnvelope(
+                "실행 중 display identity/physical size가 " +
+                    "${runSnapshot.summary()} → ${current.summary()}로 변경됨",
+            )
+        }
+    }
+
+    private fun registerDisplayListener() {
+        if (destroyed) return
+        if (!ProcessDisplayListenerCleanupState.isConfirmed()) return
+        displayChangeCallbackHolder.attach(::onRuntimeDisplayEvent)
+        if (displayListenerRegistered) return
+        val manager = getSystemService(DisplayManager::class.java)
+        if (manager == null) {
+            displayChangeCallbackHolder.detach()
+            return
+        }
+        displayListenerRegistered = runCatching {
+            manager.registerDisplayListener(displayListener, mainHandler)
+        }.isSuccess
+        if (!displayListenerRegistered) displayChangeCallbackHolder.detach()
+    }
+
+    private fun unregisterDisplayListener() {
+        // Detach the Activity callback first so a failed Binder unregister cannot retain this
+        // Activity or deliver a late safety mutation into a destroyed controller.
+        displayChangeCallbackHolder.detach()
+        if (!displayListenerRegistered) return
+        displayListenerRegistered = false
+        val manager = getSystemService(DisplayManager::class.java)
+        val cleanupConfirmed =
+            manager != null &&
+                runCatching { manager.unregisterDisplayListener(displayListener) }.isSuccess
+        if (!cleanupConfirmed) ProcessDisplayListenerCleanupState.markUnconfirmed()
+    }
+
+    private fun onRuntimeDisplayEvent() {
+        if (!activityStarted || destroyed) return
+        validateCurrentDisplayEnvelope()
+    }
+
+    private fun observeControllerRunDisplayEnvelope(activeController: LabController) {
+        displayRunStateJob?.cancel()
+        displayRunStateJob = lifecycleScope.launch {
+            snapshotFlow { activeController.isRunning }
+                .distinctUntilChanged()
+                .collect { running ->
+                    if (controller !== activeController || destroyed) return@collect
+                    if (!running) {
+                        clearActiveRunDisplayEnvelope()
+                        return@collect
+                    }
+                    val current = currentDisplayEnvelopeIdentity()
+                    val previous = lastDisplayEnvelopeIdentity
+                    val runSnapshot = selectRunDisplayEnvelopeSnapshot(
+                        existingRunSnapshot = activeRunDisplayEnvelopeIdentity,
+                        lastObserved = previous,
+                        current = current,
+                    ).also {
+                        if (activeRunDisplayEnvelopeIdentity == null) {
+                            activeRunDisplayEnvelopeIdentity = it
+                        }
+                    }
+                    lastDisplayEnvelopeIdentity = current
+                    if (displaySafetyEnvelopeChanged(previous, current)) {
+                        activeController.refreshHwcCapacityCalibrationDisplayProjection()
+                    }
+                    when {
+                        !displayListenerRegistered && !displayEnvelopeInvalidationReported -> {
+                            displayEnvelopeInvalidationReported = true
+                            activeController.invalidateSafetyEnvelope(
+                                "실행 중 display identity/physical size 변경 감시를 " +
+                                    "등록하지 못해 safety envelope를 보장할 수 없음",
+                            )
+                        }
+                        runningDisplaySafetyEnvelopeChanged(runSnapshot, current) &&
+                            !displayEnvelopeInvalidationReported -> {
+                            displayEnvelopeInvalidationReported = true
+                            activeController.invalidateSafetyEnvelope(
+                                "실행 시작 display identity/physical size " +
+                                    "${runSnapshot.summary()}와 현재 ${current.summary()}가 다름",
+                            )
+                        }
+                    }
+                }
+        }
+    }
+
+    private fun clearActiveRunDisplayEnvelope() {
+        activeRunDisplayEnvelopeIdentity = null
+        displayEnvelopeInvalidationReported = false
     }
 
     override fun onDestroy() {
         destroyed = true
         mainHandler.removeCallbacks(backendRetry)
         pendingAutomation.clear()
+        automationStartWaitingForInsets = false
+        window.decorView.removeCallbacks(automationWindowReadyDrain)
+        automationWindowReadyDrainPosted = false
+        displayRunStateJob?.cancel()
+        displayRunStateJob = null
+        unregisterDisplayListener()
         // Publish the process-wide stage-removal token before Compose disposal can detach its
         // AndroidView. The later stage callback clears the token; native worker leases remain
         // authoritative if any thread outlives the bounded join.
@@ -253,6 +401,7 @@ class MainActivity : ComponentActivity() {
                 initializedController.start()
             }
             controller = initializedController
+            observeControllerRunDisplayEnvelope(initializedController)
             if (activityStarted) drainPendingAutomation()
         } catch (error: Throwable) {
             if (candidate == null) {
@@ -272,6 +421,9 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+            displayRunStateJob?.cancel()
+            displayRunStateJob = null
+            clearActiveRunDisplayEnvelope()
             controller = null
             if (error is ThreadDeath || error is VirtualMachineError) throw error
             showBackendGate(
@@ -351,6 +503,21 @@ class MainActivity : ComponentActivity() {
     private fun drainPendingAutomation() {
         if (!activityStarted || controller == null) return
         while (pendingAutomation.isNotEmpty()) {
+            val next = pendingAutomation.first()
+            if (
+                shouldDeferAutomationUntilWindowReady(
+                    parsed = next,
+                    decorAttached =
+                        window.decorView.isAttachedToWindow,
+                    rootInsetsAvailable =
+                        testWindowIsolation.hasRootWindowInsets(),
+                )
+            ) {
+                automationStartWaitingForInsets = true
+                testWindowIsolation.requestRootWindowInsets()
+                return
+            }
+            automationStartWaitingForInsets = false
             when (val result = pendingAutomation.removeFirst()) {
                 AutomationIntentParseResult.Ignored -> Unit
                 is AutomationIntentParseResult.Rejected ->
@@ -365,6 +532,20 @@ class MainActivity : ComponentActivity() {
                 "대기 중인 automation 요청이 너무 많아 새 요청을 거부했습니다.",
             )
         }
+    }
+
+    private fun onAutomationWindowInsetsReady() {
+        if (
+            destroyed ||
+            automationWindowReadyDrainPosted
+        ) {
+            return
+        }
+        // Exit the Insets dispatch before display validation or startPlan() can request immersive
+        // Insets again. This avoids recursively entering the isolation state machine from its
+        // readiness callback.
+        automationWindowReadyDrainPosted =
+            window.decorView.post(automationWindowReadyDrain)
     }
 
     /**
@@ -459,8 +640,8 @@ class MainActivity : ComponentActivity() {
 
     @Suppress("DEPRECATION")
     private fun currentDisplayEnvelopeIdentity(): DisplayEnvelopeIdentity {
-        val display = currentDisplayCompat()
-        val mode = display?.mode
+        val display = runCatching { currentDisplayCompat() }.getOrNull()
+        val mode = runCatching { display?.mode }.getOrNull()
         val widthPx = mode?.physicalWidth
             ?.takeIf { it > 0 }
             ?: resources.displayMetrics.widthPixels.coerceAtLeast(1)
@@ -481,6 +662,43 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private object ProcessDisplayListenerCleanupState {
+    private val cleanupConfirmed = AtomicBoolean(true)
+
+    fun isConfirmed(): Boolean = cleanupConfirmed.get()
+
+    fun markUnconfirmed() {
+        cleanupConfirmed.set(false)
+    }
+}
+
+private class DisplayChangeCallbackHolder {
+    @Volatile
+    private var callback: (() -> Unit)? = null
+
+    fun attach(newCallback: () -> Unit) {
+        callback = newCallback
+    }
+
+    fun detach() {
+        callback = null
+    }
+
+    fun dispatch() {
+        callback?.invoke()
+    }
+}
+
+private class RuntimeDisplayListener(
+    private val callbackHolder: DisplayChangeCallbackHolder,
+) : DisplayManager.DisplayListener {
+    override fun onDisplayAdded(displayId: Int) = callbackHolder.dispatch()
+
+    override fun onDisplayRemoved(displayId: Int) = callbackHolder.dispatch()
+
+    override fun onDisplayChanged(displayId: Int) = callbackHolder.dispatch()
+}
+
 internal data class DisplayEnvelopeIdentity(
     val displayId: Int?,
     val shortEdgePx: Int,
@@ -496,6 +714,32 @@ internal fun displaySafetyEnvelopeChanged(
     current: DisplayEnvelopeIdentity?,
 ): Boolean = previous != current
 
+internal fun displayEnvelopeSnapshotAtRunStart(
+    lastObserved: DisplayEnvelopeIdentity?,
+    current: DisplayEnvelopeIdentity,
+): DisplayEnvelopeIdentity = lastObserved ?: current
+
+internal fun selectRunDisplayEnvelopeSnapshot(
+    existingRunSnapshot: DisplayEnvelopeIdentity?,
+    lastObserved: DisplayEnvelopeIdentity?,
+    current: DisplayEnvelopeIdentity,
+): DisplayEnvelopeIdentity =
+    existingRunSnapshot ?: displayEnvelopeSnapshotAtRunStart(lastObserved, current)
+
+internal fun runningDisplaySafetyEnvelopeChanged(
+    runSnapshot: DisplayEnvelopeIdentity?,
+    current: DisplayEnvelopeIdentity,
+): Boolean = runSnapshot != null && displaySafetyEnvelopeChanged(runSnapshot, current)
+
+internal fun shouldDeferAutomationUntilWindowReady(
+    parsed: AutomationIntentParseResult,
+    decorAttached: Boolean,
+    rootInsetsAvailable: Boolean,
+): Boolean =
+    parsed is AutomationIntentParseResult.Accepted &&
+        parsed.command is AutomationCommand.Start &&
+        (!decorAttached || !rootInsetsAvailable)
+
 /**
  * MainActivity owns SystemUI because only the Window can acknowledge actual Insets visibility.
  * Standard immersive mode cannot permanently block a user's edge swipe, so a post-confirmation
@@ -504,6 +748,7 @@ internal fun displaySafetyEnvelopeChanged(
 private class ActivityTestWindowIsolation(
     private val activity: ComponentActivity,
     private val contaminationCallback: (Long, String, String) -> Unit,
+    private val windowInsetsReadyCallback: () -> Unit,
 ) : TestWindowIsolationPort, AutoCloseable {
     private val decorView: View
         get() = activity.window.decorView
@@ -513,6 +758,7 @@ private class ActivityTestWindowIsolation(
     private var lastReleasedToken: Long? = null
     private var closing = false
     private var listenerAttached = true
+    private var rootInsetsRequestPosted = false
     private var foreignLeaseMasking = false
     private var foreignLeaseHideAttemptCount = 0
     private var foreignLeaseHideVerificationPending = false
@@ -547,15 +793,36 @@ private class ActivityTestWindowIsolation(
             }
         }
     }
+    private val rootInsetsRequest = Runnable {
+        rootInsetsRequestPosted = false
+        if (!closing) ViewCompat.requestApplyInsets(decorView)
+    }
 
     init {
         ProcessTestWindowIsolationLeaseRegistry.addReleaseListener(processLeaseReleaseListener)
         ViewCompat.setOnApplyWindowInsetsListener(decorView) { _, insets ->
             observeInsets(insets)
+            if (rootInsetsRequestPosted) {
+                decorView.removeCallbacks(rootInsetsRequest)
+                rootInsetsRequestPosted = false
+            }
+            windowInsetsReadyCallback()
             insets
         }
         if (ProcessTestWindowIsolationLeaseRegistry.hasActiveLease()) {
             hideSystemBarsForForeignLease()
+        }
+    }
+
+    fun hasRootWindowInsets(): Boolean =
+        ViewCompat.getRootWindowInsets(decorView) != null
+
+    fun requestRootWindowInsets() {
+        if (closing) return
+        if (decorView.isAttachedToWindow) {
+            ViewCompat.requestApplyInsets(decorView)
+        } else if (!rootInsetsRequestPosted) {
+            rootInsetsRequestPosted = decorView.post(rootInsetsRequest)
         }
     }
 
@@ -740,6 +1007,8 @@ private class ActivityTestWindowIsolation(
 
     override fun close() {
         closing = true
+        decorView.removeCallbacks(rootInsetsRequest)
+        rootInsetsRequestPosted = false
         state.token?.let { token ->
             ProcessTestWindowIsolationLeaseRegistry.removeOwnerFailureListener(
                 token,

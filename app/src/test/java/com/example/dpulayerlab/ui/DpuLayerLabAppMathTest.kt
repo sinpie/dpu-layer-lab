@@ -6,6 +6,8 @@ import com.example.dpulayerlab.model.HwcCompositionExpectation
 import com.example.dpulayerlab.model.LayerSizeProfile
 import com.example.dpulayerlab.model.LayerTrafficEstimate
 import com.example.dpulayerlab.model.MetricQuality
+import com.example.dpulayerlab.model.PlanState
+import com.example.dpulayerlab.model.RunnerStage
 import com.example.dpulayerlab.model.ScenarioCategory
 import com.example.dpulayerlab.model.ScenarioClassifier
 import com.example.dpulayerlab.model.ScenarioCondition
@@ -24,8 +26,8 @@ class DpuLayerLabAppMathTest {
     @Test
     fun visibleVersionKeepsSourceCandidateTimestampAndVariantSuffix() {
         assertEquals(
-            "BUILD 20260725_095708-debug",
-            visibleAppVersion("20260725_095708-debug"),
+            "BUILD 20260725_170750-debug",
+            visibleAppVersion("20260725_170750-debug"),
         )
     }
 
@@ -33,6 +35,51 @@ class DpuLayerLabAppMathTest {
     fun visibleVersionIsBoundedAndNeverBlank() {
         assertEquals("BUILD N/A", visibleAppVersion("   "))
         assertEquals("BUILD ${"v".repeat(64)}", visibleAppVersion("v".repeat(128)))
+    }
+
+    @Test
+    fun configurationRestoreKeepsOnlyUserNavigationSections() {
+        assertEquals(AppSection.CATALOG, restorableUserSection(AppSection.CATALOG))
+        assertEquals(AppSection.SYSTEM, restorableUserSection(AppSection.SYSTEM))
+        assertEquals(AppSection.DASHBOARD, restorableUserSection(AppSection.RUN))
+        assertEquals(AppSection.DASHBOARD, restorableUserSection(AppSection.RESULT))
+        assertEquals(AppSection.DASHBOARD, restorableUserSection(null))
+    }
+
+    @Test
+    fun controllerStateOverridesRestoredNavigationWithoutRestoringRunAsUserState() {
+        assertEquals(
+            AppSection.RUN,
+            sectionForRunnerState(
+                AppSection.CATALOG,
+                RunnerStage.PRECHECK,
+                PlanState.IDLE,
+            ),
+        )
+        assertEquals(
+            AppSection.RUN,
+            sectionForRunnerState(
+                AppSection.CATALOG,
+                RunnerStage.IDLE,
+                PlanState.RUNNING,
+            ),
+        )
+        assertEquals(
+            AppSection.RESULT,
+            sectionForRunnerState(
+                AppSection.CATALOG,
+                RunnerStage.COMPLETE,
+                PlanState.COMPLETE,
+            ),
+        )
+        assertEquals(
+            AppSection.CATALOG,
+            sectionForRunnerState(
+                AppSection.CATALOG,
+                RunnerStage.IDLE,
+                PlanState.REJECTED,
+            ),
+        )
     }
 
     @Test
@@ -45,6 +92,25 @@ class DpuLayerLabAppMathTest {
     @Test
     fun producerCountDoesNotExposeInvalidNegativeCounts() {
         assertEquals("0/\u2014P", producerCountDisplay(observed = -1, expected = -1))
+    }
+
+    @Test
+    fun flattenedLogicalLayersDoNotInflateCommittedPhysicalHudValue() {
+        assertEquals("LOGICAL 20L", logicalLayerHudLabel(logicalLayers = 20))
+        assertEquals(1f, committedPhysicalProducerHudValue(expected = 1))
+        assertEquals("1/1P", producerCountDisplay(observed = 1, expected = 1))
+    }
+
+    @Test
+    fun pendingPhysicalTopologyCreatesNullValueAndHistoryGap() {
+        val expectedCounts = listOf(4, 0, 4)
+
+        assertEquals(
+            listOf(4f, null, 4f),
+            expectedCounts.map { committedPhysicalProducerHudValue(expected = it) },
+        )
+        assertEquals(null, committedPhysicalProducerHudValue(expected = 0))
+        assertEquals("2/\u2014P", producerCountDisplay(observed = 2, expected = 0))
     }
 
     @Test
@@ -306,6 +372,97 @@ class DpuLayerLabAppMathTest {
         assertTrue(summary.contains("카테고리 Layer / HWC"))
         assertTrue(summary.contains("강도 높음 OR 매우 높음"))
         assertTrue(summary.contains("조건 CPU OR Memory"))
+    }
+
+    @Test
+    fun queuePreviewIsBoundedUntilTheUserExplicitlyExpandsIt() {
+        assertEquals(0, queuePreviewEntryCount(queueSize = -1, expanded = false))
+        assertEquals(3, queuePreviewEntryCount(queueSize = 3, expanded = false))
+        assertEquals(
+            COLLAPSED_QUEUE_ENTRY_LIMIT,
+            queuePreviewEntryCount(queueSize = 40, expanded = false),
+        )
+        assertEquals(40, queuePreviewEntryCount(queueSize = 40, expanded = true))
+    }
+
+    @Test
+    fun emptyCatalogQueueAlwaysResetsHiddenRepeatToOne() {
+        assertEquals(1, normalizedCatalogRepeatCount(queueSize = 0, requested = 10))
+        assertEquals(1, normalizedCatalogRepeatCount(queueSize = -1, requested = 4))
+        assertEquals(4, normalizedCatalogRepeatCount(queueSize = 2, requested = 4))
+        assertEquals(2, normalizedCatalogRepeatCount(queueSize = 20, requested = 10))
+    }
+
+    @Test
+    fun stalePositionEditsCannotDeleteOrMoveAnotherQueueOccurrence() {
+        val rendered = listOf("a", "b", "a")
+        val afterFirstDelete = removeQueueAtIfCurrent(
+            currentQueue = rendered,
+            expectedQueue = rendered,
+            index = 0,
+        )
+        assertEquals(listOf("b", "a"), afterFirstDelete)
+        assertEquals(
+            afterFirstDelete,
+            removeQueueAtIfCurrent(
+                currentQueue = afterFirstDelete,
+                expectedQueue = rendered,
+                index = 0,
+            ),
+        )
+        assertEquals(
+            afterFirstDelete,
+            moveQueueItemIfCurrent(
+                currentQueue = afterFirstDelete,
+                expectedQueue = rendered,
+                fromIndex = 0,
+                toIndex = 1,
+            ),
+        )
+        assertEquals(
+            listOf("a"),
+            removeQueueAtIfCurrent(
+                currentQueue = afterFirstDelete,
+                expectedQueue = afterFirstDelete,
+                index = 0,
+            ),
+        )
+    }
+
+    @Test
+    fun startSnapshotUsesLatestKnownQueueAndReappliesExpandedRunCap() {
+        val scenario = checkNotNull(ScenarioCatalog.byId("baseline-display-modes"))
+        val knownIds = ScenarioCatalog.presets.mapTo(LinkedHashSet()) { it.id }
+        val plan = checkNotNull(
+            catalogRunPlanSnapshot(
+                rawQueueIds = listOf("unknown") + List(5) { scenario.id },
+                knownScenarioIds = knownIds,
+                requestedRepeat = 10,
+            ),
+        )
+
+        assertEquals(List(5) { scenario.id }, plan.scenarios.map { it.id })
+        assertEquals(8, plan.repeatCount)
+        assertEquals(40, plan.totalRuns)
+        assertEquals(
+            null,
+            catalogRunPlanSnapshot(
+                rawQueueIds = listOf("unknown"),
+                knownScenarioIds = knownIds,
+                requestedRepeat = 10,
+            ),
+        )
+    }
+
+    @Test
+    fun mediaPickerIsRequiredOnlyWhenTheSelectedQueueUsesDecoderRoutes() {
+        val rgb = checkNotNull(ScenarioCatalog.byId("baseline-display-modes"))
+        val decoder = checkNotNull(ScenarioCatalog.byId("dvfs-video-shock"))
+
+        assertFalse(scenariosRequireSelectedMedia(emptyList()))
+        assertFalse(scenariosRequireSelectedMedia(listOf(rgb)))
+        assertTrue(scenariosRequireSelectedMedia(listOf(decoder)))
+        assertTrue(scenariosRequireSelectedMedia(listOf(rgb, decoder, rgb)))
     }
 
     @Test
