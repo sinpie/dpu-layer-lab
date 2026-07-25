@@ -1,6 +1,7 @@
 package com.example.dpulayerlab.engine
 
 import com.example.dpulayerlab.model.BufferSize
+import com.example.dpulayerlab.model.HwcCompositionExpectation
 import com.example.dpulayerlab.model.LayerBackend
 import com.example.dpulayerlab.model.LoadSetpoints
 import com.example.dpulayerlab.model.LoadShape
@@ -25,9 +26,12 @@ class ScenarioCatalogTest {
     fun presetIdsAreUniqueAndPhasesAreRunnable() {
         val presets = ScenarioCatalog.presets
         assertEquals(presets.size, presets.map { it.id }.distinct().size)
-        assertEquals(22, presets.size)
+        assertEquals(25, presets.size)
         assertTrue(
             setOf(
+                "dpu-device-envelope-burst",
+                "dpu-client-fallback-burst",
+                "dpu-only-repeat-shock",
                 "resource-pulse",
                 "instant-isolated-contention",
                 "gradual-load-transitions",
@@ -108,6 +112,9 @@ class ScenarioCatalogTest {
             "adaptive-underrun-hunt",
             "dvfs-single-layer-wake",
             "dvfs-composition-shock",
+            "dpu-device-envelope-burst",
+            "dpu-client-fallback-burst",
+            "dpu-only-repeat-shock",
             "mid-load-perturbation",
             "dvfs-video-shock",
             "mixed-soak",
@@ -133,6 +140,193 @@ class ScenarioCatalogTest {
                 assertTrue("${scenario.id} recovery layer count", last.activeLayers <= 4)
             }
         }
+    }
+
+    @Test
+    fun dpuCompositionBurstsUseTypedMeasuredExpectationsAndIsolatedDisplayPressure() {
+        val device = checkNotNull(ScenarioCatalog.byId("dpu-device-envelope-burst"))
+        val client = checkNotNull(ScenarioCatalog.byId("dpu-client-fallback-burst"))
+
+        assertEquals(ScenarioCategory.LAYER_HWC, device.category)
+        assertEquals(ScenarioCategory.LAYER_HWC, client.category)
+        assertTrue(device.name.contains("Candidate"))
+        assertTrue(client.name.contains("Candidate"))
+        assertTrue(device.description.contains("보장하지"))
+        assertTrue(client.description.contains("보장하지"))
+        assertTrue(device.description.contains("fresh HWC"))
+        assertTrue(client.description.contains("fresh HWC"))
+        listOf(device, client).forEach { scenario ->
+            assertTrue(
+                "${scenario.id} must make fresh HWC evidence mandatory for expectation verdicts",
+                scenario.requirements.any {
+                    it.contains("fresh HWC") &&
+                        it.contains("필수") &&
+                        it.contains("INCONCLUSIVE")
+                },
+            )
+        }
+
+        listOf(device, client).forEach { scenario ->
+            val first = scenario.phases.first()
+            val last = scenario.phases.last()
+            assertEquals(1, first.activeLayers)
+            assertEquals(30f, first.producerFps)
+            assertEquals(60f, first.requestedDisplayHz)
+            assertEquals(first.activeLayers, last.activeLayers)
+            assertEquals(first.producerFps, last.producerFps)
+            assertEquals(first.requestedDisplayHz, last.requestedDisplayHz)
+            assertEquals(HwcCompositionExpectation.NONE, last.hwcCompositionExpectation)
+
+            val measuredPhases = scenario.phases.filter {
+                it.hwcCompositionExpectation != HwcCompositionExpectation.NONE
+            }
+            assertEquals("${scenario.id} measured phase count", 4, measuredPhases.size)
+            measuredPhases.forEach { measured ->
+                assertTrue(
+                    "${scenario.id}/${measured.id} must preserve the bounded HWC probe window",
+                    measured.durationMs >=
+                        ScenarioSafetyPolicy.minimumHwcExpectationPhaseDurationMs(
+                            measured.hwcCompositionExpectation,
+                        ),
+                )
+                assertEquals(TransitionMode.STEP, measured.transition.mode)
+                assertEquals(PixelRoute.RGB_8888, measured.pixelRoute)
+                assertEquals(BufferSize.DISPLAY, measured.bufferSize)
+                assertEquals(LoadSetpoints(), measured.workloads)
+            }
+        }
+
+        assertEquals(
+            HwcCompositionExpectation.DEVICE_ONLY,
+            device.phases.first().hwcCompositionExpectation,
+        )
+        assertEquals(
+            HwcCompositionExpectation.DEVICE_ONLY,
+            client.phases.first().hwcCompositionExpectation,
+        )
+        val deviceBursts = device.phases.filter {
+            it.hwcCompositionExpectation == HwcCompositionExpectation.DEVICE_ONLY &&
+                it.producerFps == 120f
+        }
+        val clientBursts = client.phases.filter {
+            it.hwcCompositionExpectation == HwcCompositionExpectation.CLIENT_REQUIRED
+        }
+        assertEquals(2, deviceBursts.size)
+        assertEquals(2, clientBursts.size)
+        listOf(device, client).forEach { scenario ->
+            val expectedDurations = if (scenario === device) {
+                listOf(12_000L, 12_000L, 12_000L, 12_000L, 7_000L)
+            } else {
+                listOf(12_000L, 16_000L, 12_000L, 16_000L, 7_000L)
+            }
+            assertEquals(expectedDurations, scenario.phases.map { it.durationMs })
+            val burstExpectation = if (scenario === device) {
+                HwcCompositionExpectation.DEVICE_ONLY
+            } else {
+                HwcCompositionExpectation.CLIENT_REQUIRED
+            }
+            val burstIndices = scenario.phases.indices.filter { index ->
+                scenario.phases[index].hwcCompositionExpectation == burstExpectation &&
+                    scenario.phases[index].producerFps == 120f
+            }
+            assertEquals(2, burstIndices.size)
+            burstIndices.forEach { burstIndex ->
+                val baseline = scenario.phases[burstIndex - 1]
+                assertEquals(1, baseline.activeLayers)
+                assertEquals(30f, baseline.producerFps)
+                assertEquals(60f, baseline.requestedDisplayHz)
+                assertEquals(
+                    HwcCompositionExpectation.DEVICE_ONLY,
+                    baseline.hwcCompositionExpectation,
+                )
+            }
+        }
+        assertTrue(deviceBursts.all { it.activeLayers == 4 })
+        assertTrue(clientBursts.all { it.activeLayers == 20 })
+        assertTrue(
+            deviceBursts.all {
+                it.backend == LayerBackend.INDEPENDENT_SURFACES &&
+                    !it.alphaOverlap &&
+                    !it.includeGlLayer
+            },
+        )
+        assertTrue(
+            clientBursts.all {
+                it.backend == LayerBackend.MIXED_SURFACE_TEXTURE &&
+                    it.alphaOverlap &&
+                    it.includeGlLayer
+            },
+        )
+        assertTrue(clientBursts.minOf { it.activeLayers } > deviceBursts.maxOf { it.activeLayers })
+
+        val typedExpectationOwners = ScenarioCatalog.presets
+            .filter { scenario ->
+                scenario.phases.any {
+                    it.hwcCompositionExpectation != HwcCompositionExpectation.NONE
+                }
+            }
+            .mapTo(mutableSetOf()) { it.id }
+        assertEquals(setOf(device.id, client.id), typedExpectationOwners)
+    }
+
+    @Test
+    fun planeStaircaseIsBoundedRequestSweepSeparateFromPlanCalibration() {
+        val staircase = checkNotNull(ScenarioCatalog.byId("plane-staircase"))
+
+        assertEquals(
+            listOf(1, 2, 4, 6, 8, 12, 8, 4, 1),
+            staircase.phases.map(PhaseSpec::activeLayers),
+        )
+        assertTrue(staircase.phases.none { it.activeLayers == 20 })
+        assertTrue(staircase.description.contains("Plan-start 1회 capacity 관측과 별개"))
+        assertTrue(staircase.description.contains("최대 plane 수로 간주하지 않"))
+        assertTrue(staircase.description.contains("N/A"))
+    }
+
+    @Test
+    fun dpuOnlyRepeatShockChangesOnlyLayerFpsAndHzAndEndsRecovered() {
+        val scenario = checkNotNull(ScenarioCatalog.byId("dpu-only-repeat-shock"))
+        assertEquals(ScenarioCategory.TRANSITION, scenario.category)
+        assertEquals(7, scenario.phases.size)
+
+        val low = scenario.phases.first()
+        val burstIndices = listOf(1, 3, 5)
+        val lowIndices = listOf(0, 2, 4, 6)
+        lowIndices.forEach { index ->
+            val phase = scenario.phases[index]
+            assertEquals(1, phase.activeLayers)
+            assertEquals(30f, phase.producerFps)
+            assertEquals(60f, phase.requestedDisplayHz)
+        }
+        burstIndices.forEach { index ->
+            val phase = scenario.phases[index]
+            assertEquals(12, phase.activeLayers)
+            assertEquals(120f, phase.producerFps)
+            assertEquals(120f, phase.requestedDisplayHz)
+        }
+        scenario.phases.forEach { phase ->
+            assertEquals(LoadSetpoints(), phase.workloads)
+            assertEquals(LayerBackend.INDEPENDENT_SURFACES, phase.backend)
+            assertEquals(PixelRoute.RGB_8888, phase.pixelRoute)
+            assertEquals(BufferSize.DISPLAY, phase.bufferSize)
+            assertEquals(MotionProfile.STATIC, phase.motion)
+            assertTrue(!phase.alphaOverlap)
+            assertTrue(!phase.includeGlLayer)
+            assertEquals(TransitionMode.STEP, phase.transition.mode)
+            assertEquals(
+                HwcCompositionExpectation.NONE,
+                phase.hwcCompositionExpectation,
+            )
+        }
+        val stableVector = low.experimentVector().copy(
+            activeLayers = 12,
+            producerFps = 120f,
+            requestedDisplayHz = 120f,
+        )
+        burstIndices.forEach { index ->
+            assertEquals(stableVector, scenario.phases[index].experimentVector())
+        }
+        assertEquals(low.experimentVector(), scenario.phases.last().experimentVector())
     }
 
     @Test
@@ -422,7 +616,7 @@ class ScenarioCatalogTest {
         val scenarios = ScenarioCatalog.presets.filter {
             it.category == ScenarioCategory.TRANSITION
         }
-        assertEquals(5, scenarios.size)
+        assertEquals(6, scenarios.size)
         assertEquals(
             setOf(
                 "instant-isolated-contention",
@@ -430,6 +624,7 @@ class ScenarioCatalogTest {
                 "gradual-load-transitions",
                 "continuous-crossload-ramp",
                 "wave-soak-recovery",
+                "dpu-only-repeat-shock",
             ),
             scenarios.mapTo(mutableSetOf()) { it.id },
         )
@@ -721,7 +916,11 @@ class ScenarioCatalogTest {
         val motions = ScenarioCatalog.presets
             .flatMap { it.phases }
             .mapTo(mutableSetOf()) { it.motion }
-        assertTrue(MotionProfile.entries.all { it in motions })
+        assertTrue(
+            MotionProfile.entries
+                .filterNot { it == MotionProfile.CAPACITY_TILES }
+                .all { it in motions },
+        )
 
         val routes = ScenarioCatalog.presets
             .flatMap { it.phases }

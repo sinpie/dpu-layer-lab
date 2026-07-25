@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">DPULayerTest</string>
+    <string name="backend_gate_message">%1$s\n\n%2$s</string>
 </resources>

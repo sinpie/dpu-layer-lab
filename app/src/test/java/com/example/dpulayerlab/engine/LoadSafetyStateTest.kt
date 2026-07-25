@@ -215,6 +215,67 @@ class LoadSafetyStateTest {
     }
 
     @Test
+    fun fatalWorkerStartRollsBackOwnershipBeforeRethrow() {
+        val fatal = ThreadDeath()
+        val startCalls = AtomicInteger(0)
+        val manager = LoadManager(
+            npuAdapter = BlockingNpuAdapter(releaseResult = true),
+            cpuWorkerCount = 1,
+            memoryWorkerCount = 0,
+            memoryWorkingSetBytes = 0,
+            workerStarter = { worker ->
+                if (startCalls.incrementAndGet() == 1) throw fatal
+                worker.start()
+            },
+        )
+
+        var thrown: ThreadDeath? = null
+        try {
+            manager.start()
+        } catch (error: ThreadDeath) {
+            thrown = error
+        }
+
+        try {
+            assertTrue(thrown === fatal)
+            assertFalse(LoadSafetyState.hasLiveLocalWorkers())
+            assertTrue(manager.start())
+        } finally {
+            val shutdown = manager.closeWithResult()
+            assertTrue(shutdown.workersStopped)
+        }
+    }
+
+    @Test
+    fun allocationPressureDuringPartialStartReclaimsEveryRegisteredWorker() {
+        val startCalls = AtomicInteger(0)
+        val manager = LoadManager(
+            npuAdapter = BlockingNpuAdapter(releaseResult = true),
+            cpuWorkerCount = 2,
+            memoryWorkerCount = 0,
+            memoryWorkingSetBytes = 0,
+            workerStarter = { worker ->
+                if (startCalls.incrementAndGet() == 2) {
+                    throw OutOfMemoryError("synthetic worker-start allocation pressure")
+                }
+                worker.start()
+            },
+        )
+
+        try {
+            assertFalse(manager.start())
+            assertTrue(manager.hasMemoryAllocationFailure())
+            assertFalse(LoadSafetyState.hasLiveLocalWorkers())
+
+            manager.clearMemoryAllocationFailure()
+            assertTrue(manager.start())
+        } finally {
+            val shutdown = manager.closeWithResult()
+            assertTrue(shutdown.workersStopped)
+        }
+    }
+
+    @Test
     fun releaseFirstFailureIsSerializedBeforeCloseRescuePublication() {
         val releaseEntered = CountDownLatch(1)
         val allowReleaseReturn = CountDownLatch(1)

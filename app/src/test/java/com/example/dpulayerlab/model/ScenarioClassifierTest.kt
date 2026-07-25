@@ -163,6 +163,129 @@ class ScenarioClassifierTest {
     }
 
     @Test
+    fun dpuBurstConditionUsesTypedLowToHighStepInsteadOfNamesOrTags() {
+        val low = phase("low").copy(
+            activeLayers = 1,
+            producerFps = 30f,
+            requestedDisplayHz = 60f,
+            transition = TransitionSpec(mode = TransitionMode.STEP),
+        )
+        val high = low.copy(
+            id = "high",
+            activeLayers = 4,
+            producerFps = 120f,
+            requestedDisplayHz = 120f,
+            transition = TransitionSpec(mode = TransitionMode.STEP),
+        )
+        val burst = scenario("typed-burst", low).copy(
+            tags = emptySet(),
+            phases = listOf(low, high),
+        )
+        val misleadingTag = scenario("tag-only", low).copy(
+            tags = setOf("DPU low→high burst"),
+            phases = listOf(low, low.copy(id = "still-low")),
+        )
+        val gradual = burst.copy(
+            id = "gradual",
+            phases = listOf(
+                low,
+                high.copy(
+                    transition = TransitionSpec(
+                        mode = TransitionMode.LINEAR_RAMP,
+                        transitionDurationMs = 2_000L,
+                    ),
+                ),
+            ),
+        )
+        val fpsOnly = burst.copy(
+            id = "fps-only",
+            phases = listOf(low, high.copy(activeLayers = low.activeLayers)),
+        )
+
+        assertTrue(ScenarioCondition.DPU_BURST in ScenarioClassifier.conditions(burst))
+        assertFalse(
+            ScenarioCondition.DPU_BURST in ScenarioClassifier.conditions(misleadingTag),
+        )
+        assertFalse(ScenarioCondition.DPU_BURST in ScenarioClassifier.conditions(gradual))
+        assertFalse(ScenarioCondition.DPU_BURST in ScenarioClassifier.conditions(fpsOnly))
+    }
+
+    @Test
+    fun dpuBurstRequiresMeaningfulLayerTargetAndDeltaAtTheBoundary() {
+        val lowOne = phase("low-one").copy(
+            activeLayers = 1,
+            producerFps = 30f,
+            requestedDisplayHz = 60f,
+            transition = TransitionSpec(mode = TransitionMode.STEP),
+        )
+        val lowTwo = lowOne.copy(id = "low-two", activeLayers = 2)
+        fun hasBurst(from: PhaseSpec, targetLayers: Int): Boolean {
+            val high = from.copy(
+                id = "high-$targetLayers",
+                activeLayers = targetLayers,
+                producerFps = 90f,
+                requestedDisplayHz = 90f,
+            )
+            val candidate = scenario("candidate-$targetLayers", from).copy(
+                phases = listOf(from, high),
+            )
+            return ScenarioCondition.DPU_BURST in ScenarioClassifier.conditions(candidate)
+        }
+
+        assertFalse(hasBurst(lowOne, 2))
+        assertFalse(hasBurst(lowOne, 3))
+        assertTrue(hasBurst(lowOne, 4))
+        assertFalse(hasBurst(lowTwo, 4))
+        assertTrue(hasBurst(lowTwo, 5))
+    }
+
+    @Test
+    fun hwcCompositionConditionsUseTypedExpectationsInsteadOfTags() {
+        val base = phase("base")
+        val device = scenario(
+            "device",
+            base.copy(
+                hwcCompositionExpectation = HwcCompositionExpectation.DEVICE_ONLY,
+            ),
+        )
+        val client = scenario(
+            "client",
+            base.copy(
+                hwcCompositionExpectation = HwcCompositionExpectation.CLIENT_REQUIRED,
+            ),
+        )
+        val both = device.copy(phases = device.phases + client.phases)
+        val tagOnly = scenario("tag-only", base).copy(
+            tags = setOf("DEVICE_ONLY", "CLIENT_REQUIRED"),
+        )
+
+        assertTrue(
+            ScenarioCondition.HWC_DEVICE_ONLY in ScenarioClassifier.conditions(device),
+        )
+        assertFalse(
+            ScenarioCondition.HWC_CLIENT_REQUIRED in ScenarioClassifier.conditions(device),
+        )
+        assertTrue(
+            ScenarioCondition.HWC_CLIENT_REQUIRED in ScenarioClassifier.conditions(client),
+        )
+        assertFalse(
+            ScenarioCondition.HWC_DEVICE_ONLY in ScenarioClassifier.conditions(client),
+        )
+        assertTrue(
+            setOf(
+                ScenarioCondition.HWC_DEVICE_ONLY,
+                ScenarioCondition.HWC_CLIENT_REQUIRED,
+            ).all(ScenarioClassifier.conditions(both)::contains),
+        )
+        assertFalse(
+            ScenarioCondition.HWC_DEVICE_ONLY in ScenarioClassifier.conditions(tagOnly),
+        )
+        assertFalse(
+            ScenarioCondition.HWC_CLIENT_REQUIRED in ScenarioClassifier.conditions(tagOnly),
+        )
+    }
+
+    @Test
     fun nonFiniteAndHostilePhaseValuesProduceBoundedScore() {
         val score = ScenarioClassifier.intensityScore(
             phase("hostile").copy(

@@ -4,6 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import com.example.dpulayerlab.model.LoadSetpoints
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -93,6 +94,44 @@ class LoadManagerPrewarmTest {
             allowAllocation.countDown()
             requester.interrupt()
             requester.join(1_000L)
+            assertTrue(manager.closeWithResult().workersStopped)
+        }
+    }
+
+    @Test
+    fun dropRacingSlowMeasuredAllocationCannotRepublishOrGenerateTraffic() {
+        val allocationEntered = CountDownLatch(1)
+        val allowAllocation = CountDownLatch(1)
+        val allocationCalls = AtomicInteger(0)
+        val manager = manager(
+            memoryWorkerCount = 1,
+            allocator = { size ->
+                if (allocationCalls.incrementAndGet() == 1) {
+                    allocationEntered.countDown()
+                    allowAllocation.await(1, TimeUnit.SECONDS)
+                }
+                ByteArray(size)
+            },
+        )
+
+        try {
+            assertTrue(manager.start())
+            manager.apply(LoadSetpoints(memory = 1f))
+            assertTrue(allocationEntered.await(1, TimeUnit.SECONDS))
+
+            manager.releaseLoads(dropMemoryBuffers = true)
+            allowAllocation.countDown()
+            Thread.sleep(50L)
+
+            assertEquals(0L, manager.sampleAndResetBandwidthBytes())
+            assertTrue(manager.prewarmMemoryWorkingSet(timeoutMs = 1_000L))
+            assertEquals(
+                "revoked measured pair must be discarded before prewarm",
+                4,
+                allocationCalls.get(),
+            )
+        } finally {
+            allowAllocation.countDown()
             assertTrue(manager.closeWithResult().workersStopped)
         }
     }

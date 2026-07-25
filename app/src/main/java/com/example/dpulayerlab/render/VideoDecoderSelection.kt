@@ -5,9 +5,12 @@ import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.system.Os
 import android.system.OsConstants
+import java.io.Closeable
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Immutable binding between the inspected media source and the exact hardware codec accepted by
@@ -129,10 +132,13 @@ data class VideoDecoderSelection(
     val maxEncodedHeightPx: Int?
         get() = videoDimensionCeiling(expectedEncodedHeightPx)
 
-    fun openSourceDuplicate(): AssetFileDescriptor = pinnedSource.openDuplicate()
+    internal fun openSourceDuplicate(): BoundedOwnedResource<AssetFileDescriptor> =
+        pinnedSource.openDuplicate()
+
+    fun closeWithResult(): Boolean = pinnedSource.closeWithResult()
 
     override fun close() {
-        pinnedSource.close()
+        closeWithResult()
     }
 
     private companion object {
@@ -152,8 +158,14 @@ class PinnedMediaSource internal constructor(
 ) : AutoCloseable {
     private val lock = Any()
     private var closed = false
+    private val closeState = BoundedCloseState(
+        closer = { descriptor.close() },
+    )
 
     init {
+        check(!PinnedMediaCleanupState.hasUnconfirmedCleanup()) {
+            "A previous pinned media descriptor cleanup is unconfirmed"
+        }
         require(descriptor.startOffset >= 0L) { "Negative asset offset" }
         require(
             descriptor.declaredLength >= 0L || descriptor.startOffset == 0L
@@ -175,26 +187,171 @@ class PinnedMediaSource internal constructor(
         }
     }
 
-    fun openDuplicate(): AssetFileDescriptor = synchronized(lock) {
+    internal fun openDuplicate(): BoundedOwnedResource<AssetFileDescriptor> = synchronized(lock) {
         check(!closed) { "Pinned media source is closed" }
+        check(!PinnedMediaCleanupState.hasUnconfirmedCleanup()) {
+            "Pinned media descriptor cleanup is unconfirmed"
+        }
         val duplicate = ParcelFileDescriptor.dup(descriptor.parcelFileDescriptor.fileDescriptor)
-        AssetFileDescriptor(
-            duplicate,
-            descriptor.startOffset,
-            descriptor.declaredLength,
-        )
+        constructWithOwnedCloseOnFailure(
+            resource = duplicate,
+            onCloseFailure = { error ->
+                PinnedMediaCleanupState.markUnconfirmed(
+                    error.javaClass.simpleName.ifBlank { error.javaClass.name },
+                )
+            },
+        ) { ownedDuplicate ->
+            trackedPinnedMediaDescriptor(
+                AssetFileDescriptor(
+                    ownedDuplicate,
+                    descriptor.startOffset,
+                    descriptor.declaredLength,
+                ),
+            )
+        }
+    }
+
+    fun closeWithResult(): Boolean {
+        val result = synchronized(lock) {
+            closed = true
+            closeState.closeWithResult()
+        }
+        if (!result) {
+            PinnedMediaCleanupState.markUnconfirmed(
+                closeState.lastFailureClass() ?: "unknown",
+            )
+        }
+        return result
     }
 
     override fun close() {
-        val shouldClose = synchronized(lock) {
-            if (closed) {
-                false
-            } else {
-                closed = true
-                true
+        closeWithResult()
+    }
+}
+
+/**
+ * Keeps the first descriptor cleanup failure process-sticky. Continuing with another selected
+ * video after a master FD could not be closed would hide a native/provider resource leak and can
+ * accumulate one leaked descriptor per run.
+ */
+internal object PinnedMediaCleanupState {
+    private val failureClass = AtomicReference<String?>(null)
+
+    fun hasUnconfirmedCleanup(): Boolean = failureClass.get() != null
+
+    fun detail(): String? = failureClass.get()
+
+    fun markUnconfirmed(failure: String) {
+        failureClass.compareAndSet(null, failure.take(MAX_FAILURE_CLASS_CHARS))
+    }
+
+    private const val MAX_FAILURE_CLASS_CHARS = 96
+}
+
+/**
+ * Owns a successfully constructed closeable until its bounded close is confirmed.
+ *
+ * [close] throws after publishing the sticky failure so Kotlin's `use` aborts the current
+ * preflight/decoder path instead of allowing a leaked duplicate descriptor to look successful.
+ * Callers that are already on a cancellation/finalization path can use [closeWithResult] to keep
+ * the original terminal reason while still preserving the process-wide cleanup latch.
+ */
+internal class BoundedOwnedResource<T : AutoCloseable>(
+    val resource: T,
+    private val onTerminalCloseFailure: (String) -> Unit = {},
+) : Closeable {
+    private val closeState = BoundedCloseState(resource::close)
+    private val failurePublished = AtomicBoolean(false)
+
+    fun closeWithResult(): Boolean {
+        val confirmed = closeState.closeWithResult()
+        if (!confirmed && failurePublished.compareAndSet(false, true)) {
+            onTerminalCloseFailure(closeState.lastFailureClass() ?: "unknown")
+        }
+        return confirmed
+    }
+
+    override fun close() {
+        check(closeWithResult()) {
+            "Owned resource cleanup could not be confirmed " +
+                "(${closeState.lastFailureClass() ?: "unknown"})"
+        }
+    }
+}
+
+internal fun trackedPinnedMediaDescriptor(
+    descriptor: AssetFileDescriptor,
+): BoundedOwnedResource<AssetFileDescriptor> =
+    BoundedOwnedResource(descriptor, PinnedMediaCleanupState::markUnconfirmed)
+
+internal fun closePinnedMediaDescriptor(descriptor: AssetFileDescriptor): Boolean =
+    trackedPinnedMediaDescriptor(descriptor).closeWithResult()
+
+/**
+ * Close is attempted a small fixed number of times and the terminal result is stable for all
+ * later callers. ParcelFileDescriptor.close() is idempotent; the second attempt covers transient
+ * close failures without introducing an unbounded cleanup loop.
+ */
+internal class BoundedCloseState(
+    private val closer: () -> Unit,
+    private val maxAttempts: Int = DEFAULT_CLOSE_ATTEMPTS,
+) {
+    private val lock = Any()
+    private var result: Boolean? = null
+    private var failureClass: String? = null
+
+    init {
+        require(maxAttempts in 1..MAX_CLOSE_ATTEMPTS)
+    }
+
+    fun closeWithResult(): Boolean = synchronized(lock) {
+        result?.let { return it }
+        var confirmed = false
+        var attemptsRemaining = maxAttempts
+        while (!confirmed && attemptsRemaining > 0) {
+            attemptsRemaining -= 1
+            try {
+                closer()
+                confirmed = true
+            } catch (error: Throwable) {
+                if (error is ThreadDeath) throw error
+                failureClass = error.javaClass.simpleName.ifBlank {
+                    error.javaClass.name
+                }
             }
         }
-        if (shouldClose) runCatching { descriptor.close() }
+        result = confirmed
+        confirmed
+    }
+
+    fun lastFailureClass(): String? = synchronized(lock) { failureClass }
+
+    private companion object {
+        const val DEFAULT_CLOSE_ATTEMPTS = 2
+        const val MAX_CLOSE_ATTEMPTS = 3
+    }
+}
+
+/**
+ * Transfers [resource] to [factory]. If construction fails before ownership transfer completes,
+ * the resource is closed and any close failure is attached to the original exception.
+ */
+internal inline fun <T : AutoCloseable, R> constructWithOwnedCloseOnFailure(
+    resource: T,
+    onCloseFailure: (Throwable) -> Unit = {},
+    factory: (T) -> R,
+): R {
+    try {
+        return factory(resource)
+    } catch (error: Throwable) {
+        try {
+            resource.close()
+        } catch (cleanupError: Throwable) {
+            if (cleanupError is ThreadDeath) throw cleanupError
+            onCloseFailure(cleanupError)
+            if (cleanupError !== error) error.addSuppressed(cleanupError)
+        }
+        throw error
     }
 }
 

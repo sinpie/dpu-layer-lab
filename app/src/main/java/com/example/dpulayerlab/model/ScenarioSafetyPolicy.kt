@@ -58,6 +58,19 @@ object ScenarioSafetyPolicy {
     const val MAX_LABEL_CHARS = 256
     const val MAX_DESCRIPTION_CHARS = 4_096
     const val MAX_METADATA_ITEMS = 64
+    // DEVICE_ONLY needs one fresh probe; CLIENT_REQUIRED needs two distinct fresh samples.
+    // Both include the 3 s first-buffer readiness bound, a possible 4 s in-flight periodic sample
+    // mutex drain, and a post-probe control tick inside the active phase budget.
+    const val MIN_DEVICE_ONLY_PHASE_DURATION_MS = 12_000L
+    const val MIN_CLIENT_REQUIRED_PHASE_DURATION_MS = 16_000L
+
+    fun minimumHwcExpectationPhaseDurationMs(
+        expectation: HwcCompositionExpectation,
+    ): Long = when (expectation) {
+        HwcCompositionExpectation.NONE -> 0L
+        HwcCompositionExpectation.DEVICE_ONLY -> MIN_DEVICE_ONLY_PHASE_DURATION_MS
+        HwcCompositionExpectation.CLIENT_REQUIRED -> MIN_CLIENT_REQUIRED_PHASE_DURATION_MS
+    }
 
     private const val RGBA_BYTES_PER_PIXEL = 4L
     // EGL requests a 16-bit depth buffer, but drivers may round the attachment up to 24/32 bits.
@@ -135,6 +148,22 @@ object ScenarioSafetyPolicy {
                 phase.includeGlLayer &&
                     phase.backend != LayerBackend.FLATTENED_TEXTURE &&
                     !(phase.activeLayers > 1 && budgetCapped == 1)
+            if (phase.hwcCompositionExpectation != HwcCompositionExpectation.NONE) {
+                val changedContractField = when {
+                    budgetCapped != phase.activeLayers -> "layer topology"
+                    producerFps != phase.producerFps -> "producer FPS"
+                    displayHz != phase.requestedDisplayHz -> "display pacing"
+                    includeGlLayer != phase.includeGlLayer -> "GL producer topology"
+                    workloads.gpu != phase.workloads.gpu -> "GPU/GL pressure"
+                    else -> null
+                }
+                if (changedContractField != null) {
+                    return rejected(
+                        "Phase '${phase.id}' HWC composition expectation cannot preserve its " +
+                            "$changedContractField under the active safety limits",
+                    )
+                }
+            }
             if (
                 phase.includeGlLayer &&
                 !includeGlLayer &&
@@ -338,6 +367,13 @@ object ScenarioSafetyPolicy {
                 if (cyclic && boundedFloor >= 1f) {
                     return "Phase '${phase.id}' transition floor leaves no dynamic range"
                 }
+            }
+            if (
+                phase.hwcCompositionExpectation != HwcCompositionExpectation.NONE &&
+                phase.transition.mode != TransitionMode.STEP
+            ) {
+                return "Phase '${phase.id}' HWC composition expectation requires a stable " +
+                    "STEP target for fresh DEVICE/CLIENT evidence"
             }
         }
         return null
@@ -656,6 +692,13 @@ object ScenarioSafetyPolicy {
     private fun validateEffectiveTransitions(phases: List<PhaseSpec>): String? {
         for ((index, phase) in phases.withIndex()) {
             val previous = phases.getOrNull(index - 1)
+            val minimumHwcDurationMs =
+                minimumHwcExpectationPhaseDurationMs(phase.hwcCompositionExpectation)
+            if (phase.durationMs < minimumHwcDurationMs) {
+                return "Phase '${phase.id}' is too short for " +
+                    "${phase.hwcCompositionExpectation.name} bounded fresh HWC evidence and " +
+                    "a post-target observation window (minimum ${minimumHwcDurationMs}ms)"
+            }
             val cyclic =
                 phase.transition.mode == TransitionMode.PULSE_BURST ||
                     phase.transition.mode == TransitionMode.TRIANGLE_WAVE

@@ -41,4 +41,11 @@ class MainActivityMathTest {
         assertTrue(displaySafetyEnvelopeChanged(null, cover))
         assertFalse(displaySafetyEnvelopeChanged(null, null))
     }
+
+    @Test
+    fun isolationTokenNeverPublishesZeroAndWrapsAtLongMax() {
+        assertTrue(nextIsolationToken(0L) == 1L)
+        assertTrue(nextIsolationToken(41L) == 42L)
+        assertTrue(nextIsolationToken(Long.MAX_VALUE) == 1L)
+    }
 }

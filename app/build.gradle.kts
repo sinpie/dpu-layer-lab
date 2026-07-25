@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.dpulayerlab"
         minSdk = 29
         targetSdk = 36
-        versionCode = 3
-        versionName = "20260724_111816"
+        versionCode = 4
+        versionName = "20260725_090252"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true

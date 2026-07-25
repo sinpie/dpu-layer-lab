@@ -1,16 +1,29 @@
 package com.example.dpulayerlab.ui
 
+import com.example.dpulayerlab.engine.ScenarioCatalog
 import com.example.dpulayerlab.model.Gauge
+import com.example.dpulayerlab.model.HwcCompositionExpectation
 import com.example.dpulayerlab.model.MetricQuality
+import com.example.dpulayerlab.model.ScenarioCategory
+import com.example.dpulayerlab.model.ScenarioClassifier
+import com.example.dpulayerlab.model.ScenarioCondition
+import com.example.dpulayerlab.model.ScenarioLoadBand
+import com.example.dpulayerlab.model.ScenarioPlanPolicy
+import com.example.dpulayerlab.model.ScenarioQueueEditor
+import com.example.dpulayerlab.model.ScenarioSelectionFilter
+import com.example.dpulayerlab.model.TelemetrySnapshot
+import com.example.dpulayerlab.monitor.HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class DpuLayerLabAppMathTest {
     @Test
     fun visibleVersionKeepsReleaseTimestampAndVariantSuffix() {
         assertEquals(
-            "BUILD 20260724_111816-debug",
-            visibleAppVersion("20260724_111816-debug"),
+            "BUILD 20260725_090252-debug",
+            visibleAppVersion("20260725_090252-debug"),
         )
     }
 
@@ -56,8 +69,14 @@ class DpuLayerLabAppMathTest {
     }
 
     @Test
-    fun gaugeProvenanceLabelIsBoundedAndNeverInventsUnavailableSource() {
+    fun gaugeProvenanceLabelIsBoundedAndExplainsUnavailableSourceWhenKnown() {
         assertEquals("N/A", gaugeProvenanceLabel(Gauge()))
+        assertEquals(
+            "N/A · kernel probe missi",
+            gaugeProvenanceLabel(
+                Gauge(source = "kernel probe missing"),
+            ),
+        )
         assertEquals(
             "HW · ${"x".repeat(18)}",
             gaugeProvenanceLabel(
@@ -67,6 +86,305 @@ class DpuLayerLabAppMathTest {
                     source = "x".repeat(64),
                 ),
             ),
+        )
+    }
+
+    @Test
+    fun purposeFiltersUseTypedClassifierConditionsAndPreserveCatalogOrder() {
+        val scenarios = ScenarioCatalog.presets
+        val device = scenariosForCatalogPurpose(scenarios, CatalogPurpose.DEVICE_STABLE)
+        val client = scenariosForCatalogPurpose(scenarios, CatalogPurpose.CLIENT_TRANSITION)
+        val burst = scenariosForCatalogPurpose(scenarios, CatalogPurpose.DPU_BURST)
+
+        assertTrue(device.any { it.id == "dpu-device-envelope-burst" })
+        assertTrue(client.any { it.id == "dpu-client-fallback-burst" })
+        assertTrue(burst.any { it.id == "dpu-only-repeat-shock" })
+        assertEquals(
+            listOf("dpu-device-envelope-burst"),
+            device.map { it.id },
+        )
+        assertEquals(
+            listOf("dpu-client-fallback-burst"),
+            client.map { it.id },
+        )
+        assertFalse(device.any { candidate ->
+            candidate.phases.any {
+                it.hwcCompositionExpectation == HwcCompositionExpectation.CLIENT_REQUIRED
+            }
+        })
+        assertTrue(
+            device.all {
+                ScenarioCondition.HWC_DEVICE_ONLY in
+                    com.example.dpulayerlab.model.ScenarioClassifier.conditions(it)
+            },
+        )
+        assertTrue(
+            client.all {
+                ScenarioCondition.HWC_CLIENT_REQUIRED in
+                    com.example.dpulayerlab.model.ScenarioClassifier.conditions(it)
+            },
+        )
+        assertEquals(
+            scenarios.filter { it in burst },
+            burst,
+        )
+    }
+
+    @Test
+    fun purposeAndFacetRowsComposeWithAndWhileEachFacetRowUsesOr() {
+        val device = checkNotNull(ScenarioCatalog.byId("dpu-device-envelope-burst"))
+        val client = checkNotNull(ScenarioCatalog.byId("dpu-client-fallback-burst"))
+        val clientOnly = client.copy(
+            id = "client-only-test",
+            phases = client.phases.filter {
+                it.hwcCompositionExpectation == HwcCompositionExpectation.CLIENT_REQUIRED
+            },
+        )
+        val wrongCategoryDevice = device.copy(
+            id = "wrong-category-device",
+            category = ScenarioCategory.TRANSITION,
+        )
+        val facetMatches = ScenarioClassifier.filter(
+            listOf(device, clientOnly, wrongCategoryDevice),
+            ScenarioSelectionFilter(
+                categories = setOf(ScenarioCategory.LAYER_HWC),
+                conditions = setOf(
+                    ScenarioCondition.HWC_DEVICE_ONLY,
+                    ScenarioCondition.HWC_CLIENT_REQUIRED,
+                ),
+            ),
+        )
+
+        assertEquals(listOf(device, clientOnly), facetMatches)
+        assertEquals(
+            listOf(device),
+            scenariosForCatalogPurpose(facetMatches, CatalogPurpose.DEVICE_STABLE),
+        )
+        assertEquals(
+            listOf(clientOnly),
+            scenariosForCatalogPurpose(facetMatches, CatalogPurpose.CLIENT_TRANSITION),
+        )
+    }
+
+    @Test
+    fun dashboardQuickRunUsesPurposeRepresentativesAndTypedHwcPresets() {
+        val entries = dashboardPurposeScenarios(ScenarioCatalog.presets)
+
+        assertEquals(
+            listOf("급격한 DPU 부하", "DEVICE 후보 유지", "CLIENT 전환 목표"),
+            CatalogPurpose.entries.map { it.title },
+        )
+        assertEquals(
+            listOf(
+                CatalogPurpose.DPU_BURST,
+                CatalogPurpose.DEVICE_STABLE,
+                CatalogPurpose.CLIENT_TRANSITION,
+            ),
+            entries.map { it.purpose },
+        )
+        assertEquals(
+            listOf(
+                "dpu-only-repeat-shock",
+                "dpu-device-envelope-burst",
+                "dpu-client-fallback-burst",
+            ),
+            entries.map { it.scenario.id },
+        )
+    }
+
+    @Test
+    fun queuePreviewKeepsDuplicatesAndUsesRangesWithoutImplyingDirection() {
+        val device = checkNotNull(ScenarioCatalog.byId("dpu-device-envelope-burst"))
+        val client = checkNotNull(ScenarioCatalog.byId("dpu-client-fallback-burst"))
+
+        val preview = scenarioSelectionPreview(listOf(device, client, device))
+
+        assertEquals(3, preview.queueEntries)
+        assertEquals(2, preview.uniqueScenarios)
+        assertEquals(1, preview.duplicateEntries)
+        assertTrue(preview.inputChange.contains("1–20L"))
+        assertFalse(preview.inputChange.contains("1→20L"))
+        assertEquals(
+            "DEVICE 유지 검증 ↔ CLIENT 전환 검증",
+            preview.compositionTarget,
+        )
+    }
+
+    @Test
+    fun queuePreviewDoesNotInferHwcPathWithoutTypedExpectation() {
+        val baseline = checkNotNull(ScenarioCatalog.byId("baseline-display-modes"))
+
+        val preview = scenarioSelectionPreview(listOf(baseline))
+
+        assertEquals("HWC 자동 배정/검증 목표 없음", preview.compositionTarget)
+    }
+
+    @Test
+    fun collapsedAdvancedFilterSummaryKeepsActiveFacetMeaningVisible() {
+        val summary = advancedFilterSummary(
+            purpose = CatalogPurpose.DPU_BURST,
+            categoryKeys = setOf(ScenarioCategory.LAYER_HWC.name),
+            patternKeys = emptySet(),
+            loadBandKeys = setOf(ScenarioLoadBand.HIGH.name, ScenarioLoadBand.VERY_HIGH.name),
+            conditionKeys = setOf(ScenarioCondition.CPU.name, ScenarioCondition.MEMORY.name),
+        )
+
+        assertTrue(summary.contains("목적 급격한 DPU 부하"))
+        assertTrue(summary.contains("카테고리 Layer / HWC"))
+        assertTrue(summary.contains("강도 높음 OR 매우 높음"))
+        assertTrue(summary.contains("조건 CPU OR Memory"))
+    }
+
+    @Test
+    fun typedHwcExpectationBadgesAreExplicit() {
+        assertEquals(
+            "DEVICE 유지 검증",
+            HwcCompositionExpectation.DEVICE_ONLY.validationBadge(),
+        )
+        assertEquals(
+            "CLIENT 전환 검증",
+            HwcCompositionExpectation.CLIENT_REQUIRED.validationBadge(),
+        )
+        assertEquals(
+            "HWC 자동 배정",
+            HwcCompositionExpectation.NONE.validationBadge(),
+        )
+    }
+
+    @Test
+    fun runningHwcSummaryKeepsUnavailableValuesAgeAndSourceVisible() {
+        val summary = hwcExpectationLiveSummary(
+            expectation = HwcCompositionExpectation.DEVICE_ONLY,
+            telemetry = TelemetrySnapshot(
+                hwcDeviceLayers = null,
+                hwcDeviceLayersSource = "kernel probe missing",
+                hwcClientLayers = null,
+                hwcClientLayersSource = "",
+                hwcCompositionEvidenceAgeMs = null,
+            ),
+        )
+
+        assertTrue(summary.contains("HWC RAW N/A"))
+        assertTrue(summary.contains("D N/A/C N/A"))
+        assertTrue(summary.contains("AGE N/A"))
+        assertTrue(summary.contains("SRC D N/A:kernel pro"))
+        assertTrue(summary.contains("C N/A:source N/A"))
+        assertTrue(summary.contains("target-fresh 최종 판정 별도"))
+    }
+
+    @Test
+    fun rawHwcStateMatchesOnlyAtomicFreshPairAtExactAgeBoundary() {
+        val telemetry = atomicHwcTelemetry(
+            device = 4,
+            client = 0,
+            evidenceAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
+        )
+
+        assertEquals(
+            RawHwcExpectationState.MATCH,
+            rawHwcExpectationState(HwcCompositionExpectation.DEVICE_ONLY, telemetry),
+        )
+        assertEquals(
+            RawHwcExpectationState.WAIT,
+            rawHwcExpectationState(HwcCompositionExpectation.CLIENT_REQUIRED, telemetry),
+        )
+    }
+
+    @Test
+    fun rawHwcStateRejectsStaleOrInconsistentTimestamp() {
+        val stale = atomicHwcTelemetry(
+            device = 4,
+            client = 0,
+            evidenceAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS + 1L,
+        )
+        val inconsistent = atomicHwcTelemetry(device = 4, client = 0).copy(
+            hwcCompositionEvidenceAgeMs = 999L,
+        )
+        val future = atomicHwcTelemetry(device = 4, client = 0).copy(
+            hwcCompositionEvidenceMonotonicMs = 10_001L,
+            hwcCompositionEvidenceAgeMs = 0L,
+        )
+
+        assertEquals(
+            RawHwcExpectationState.N_A,
+            rawHwcExpectationState(HwcCompositionExpectation.DEVICE_ONLY, stale),
+        )
+        assertEquals(
+            RawHwcExpectationState.N_A,
+            rawHwcExpectationState(HwcCompositionExpectation.DEVICE_ONLY, inconsistent),
+        )
+        assertEquals(
+            RawHwcExpectationState.N_A,
+            rawHwcExpectationState(HwcCompositionExpectation.DEVICE_ONLY, future),
+        )
+    }
+
+    @Test
+    fun rawHwcStateRejectsMixedSourceOrQualityAndDistinguishesWait() {
+        val clientMatch = atomicHwcTelemetry(device = 2, client = 3)
+        val mixedSource = clientMatch.copy(hwcClientLayersSource = "vendor display")
+        val mixedQuality = clientMatch.copy(
+            hwcClientLayersQuality = MetricQuality.HARDWARE_COUNTER,
+        )
+
+        assertEquals(
+            RawHwcExpectationState.MATCH,
+            rawHwcExpectationState(HwcCompositionExpectation.CLIENT_REQUIRED, clientMatch),
+        )
+        assertEquals(
+            RawHwcExpectationState.WAIT,
+            rawHwcExpectationState(HwcCompositionExpectation.DEVICE_ONLY, clientMatch),
+        )
+        assertEquals(
+            RawHwcExpectationState.N_A,
+            rawHwcExpectationState(HwcCompositionExpectation.CLIENT_REQUIRED, mixedSource),
+        )
+        assertEquals(
+            RawHwcExpectationState.N_A,
+            rawHwcExpectationState(HwcCompositionExpectation.CLIENT_REQUIRED, mixedQuality),
+        )
+        assertEquals(
+            RawHwcExpectationState.N_A,
+            rawHwcExpectationState(HwcCompositionExpectation.NONE, clientMatch),
+        )
+    }
+
+    @Test
+    fun quickPurposeAppendKeepsQueueDuplicatesCatalogOrderAndHardCap() {
+        val purposeIds = scenariosForCatalogPurpose(
+            ScenarioCatalog.presets,
+            CatalogPurpose.DPU_BURST,
+        ).map { it.id }
+        val duplicate = checkNotNull(purposeIds.firstOrNull())
+        val existing = listOf(duplicate, duplicate)
+        val appended = ScenarioQueueEditor.appendAll(existing, purposeIds)
+
+        assertEquals(existing, appended.take(existing.size))
+        assertEquals(purposeIds, appended.drop(existing.size))
+
+        val almostFull = List(ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS - 1) { duplicate }
+        val capped = ScenarioQueueEditor.appendAll(almostFull, purposeIds)
+        assertEquals(ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS, capped.size)
+        assertEquals(almostFull, capped.take(almostFull.size))
+        assertEquals(purposeIds.first(), capped.last())
+    }
+
+    private fun atomicHwcTelemetry(
+        device: Int,
+        client: Int,
+        evidenceAgeMs: Long = 1_000L,
+    ): TelemetrySnapshot {
+        val observedMs = 10_000L
+        return TelemetrySnapshot(
+            monotonicMs = observedMs,
+            hwcDeviceLayers = device,
+            hwcDeviceLayersQuality = MetricQuality.SYSTEM_SERVICE,
+            hwcDeviceLayersSource = "SurfaceFlinger display 0",
+            hwcClientLayers = client,
+            hwcClientLayersQuality = MetricQuality.SYSTEM_SERVICE,
+            hwcClientLayersSource = "SurfaceFlinger display 0",
+            hwcCompositionEvidenceMonotonicMs = observedMs - evidenceAgeMs,
+            hwcCompositionEvidenceAgeMs = evidenceAgeMs,
         )
     }
 }

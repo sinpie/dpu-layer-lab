@@ -173,6 +173,10 @@ object ReportWriter {
                 )
                 append(""""alphaOverlap": ${phase.alphaOverlap}, """)
                 append(""""includeGlLayer": ${phase.includeGlLayer}, """)
+                append(
+                    """"hwcCompositionExpectation": """ +
+                        "${quote(phase.hwcCompositionExpectation.name)}, ",
+                )
                 append(""""workloads": {""")
                 append(""""cpu": ${jsonNumber(phase.workloads.cpu)}, """)
                 append(""""memory": ${jsonNumber(phase.workloads.memory)}, """)
@@ -325,6 +329,16 @@ object ReportWriter {
                 append(
                     """"hwcClientLayersSource": ${quote(sample.hwcClientLayersSource)}, """,
                 )
+                append(
+                    """"hwcCompositionEvidenceMonotonicMs": ${
+                        sample.hwcCompositionEvidenceMonotonicMs ?: "null"
+                    }, """,
+                )
+                append(
+                    """"hwcCompositionEvidenceAgeMs": ${
+                        sample.hwcCompositionEvidenceAgeMs ?: "null"
+                    }, """,
+                )
                 append(""""surfaceFlingerHwcMissed": ${sample.surfaceFlingerHwcMissed ?: "null"}, """)
                 append(""""surfaceFlingerGpuMissed": ${sample.surfaceFlingerGpuMissed ?: "null"}, """)
                 append(
@@ -342,6 +356,16 @@ object ReportWriter {
                 append(
                     """"surfaceFlingerMissSource": ${
                         quote(sample.surfaceFlingerMissSource)
+                    }, """,
+                )
+                append(
+                    """"surfaceFlingerEvidenceMonotonicMs": ${
+                        sample.surfaceFlingerEvidenceMonotonicMs ?: "null"
+                    }, """,
+                )
+                append(
+                    """"surfaceFlingerEvidenceAgeMs": ${
+                        sample.surfaceFlingerEvidenceAgeMs ?: "null"
                     }, """,
                 )
                 append(""""generatedBandwidthGbps": ${number(sample.generatedBandwidth.value)}, """)

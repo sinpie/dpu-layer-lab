@@ -49,6 +49,9 @@ enum class ScenarioCondition(val label: String) {
     TRANSFORM("Scroll/Zoom/Rotate"),
     HIGH_REFRESH("> 60 FPS/Hz"),
     DVFS("DVFS/저전력"),
+    DPU_BURST("DPU 저→고 burst"),
+    HWC_DEVICE_ONLY("DEVICE 유지 목표"),
+    HWC_CLIENT_REQUIRED("CLIENT 전환 목표"),
 }
 
 data class ScenarioSelectionFilter(
@@ -213,6 +216,23 @@ object ScenarioClassifier {
         ) {
             result += ScenarioCondition.DVFS
         }
+        if (scenario.phases.zipWithNext().any(::isDpuLowToHighBurst)) {
+            result += ScenarioCondition.DPU_BURST
+        }
+        if (
+            scenario.phases.any {
+                it.hwcCompositionExpectation == HwcCompositionExpectation.DEVICE_ONLY
+            }
+        ) {
+            result += ScenarioCondition.HWC_DEVICE_ONLY
+        }
+        if (
+            scenario.phases.any {
+                it.hwcCompositionExpectation == HwcCompositionExpectation.CLIENT_REQUIRED
+            }
+        ) {
+            result += ScenarioCondition.HWC_CLIENT_REQUIRED
+        }
         return result
     }
 
@@ -262,6 +282,23 @@ object ScenarioClassifier {
             from.motion != to.motion ||
             from.workloads.normalized() != to.workloads.normalized()
 
+    /**
+     * A catalog-selectable DPU burst is derived from typed control values rather than names/tags.
+     * It deliberately describes only the requested display-pressure edge; it does not imply that
+     * DPU clocks, DEVICE composition, or an underrun changed.
+     */
+    private fun isDpuLowToHighBurst(phases: Pair<PhaseSpec, PhaseSpec>): Boolean {
+        val (from, to) = phases
+        return to.transition.mode == TransitionMode.STEP &&
+            from.activeLayers in 1..2 &&
+            from.producerFps.finiteOrZero() in 1f..30f &&
+            from.requestedDisplayHz.finiteOrZero() in 1f..60f &&
+            to.activeLayers >= MIN_DPU_BURST_TARGET_LAYERS &&
+            to.activeLayers - from.activeLayers >= MIN_DPU_BURST_LAYER_DELTA &&
+            to.producerFps.finiteOrZero() >= 90f &&
+            to.requestedDisplayHz.finiteOrZero() >= 90f
+    }
+
     private fun unitRatio(value: Float, denominator: Float): Float =
         value.takeIf(Float::isFinite)
             ?.div(denominator)
@@ -281,4 +318,7 @@ object ScenarioClassifier {
         LoadShape.RAMP,
         LoadShape.SAW,
     )
+
+    private const val MIN_DPU_BURST_TARGET_LAYERS = 4
+    private const val MIN_DPU_BURST_LAYER_DELTA = 3
 }

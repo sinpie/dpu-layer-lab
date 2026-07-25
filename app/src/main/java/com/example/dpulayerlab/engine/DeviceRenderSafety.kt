@@ -67,7 +67,10 @@ object DeviceRenderSafety {
         val availableBytes: Long,
     )
 
-    fun detect(activity: Activity): RenderSafetyLimits {
+    fun detect(
+        activity: Activity,
+        originalPowerSaveMode: Boolean = false,
+    ): RenderSafetyLimits {
         val activityManager = activity.getSystemService(ActivityManager::class.java)
         val powerManager = activity.getSystemService(PowerManager::class.java)
         val memory = ActivityManager.MemoryInfo().also(activityManager::getMemoryInfo)
@@ -75,7 +78,14 @@ object DeviceRenderSafety {
         val totalRam = memory.totalMem.takeIf { it > 0L } ?: heapFallback * 4L
         val availableRam = memory.availMem.takeIf { it > 0L } ?: heapFallback
         val lowRam = activityManager.isLowRamDevice
-        val constrainedPower = powerManager.isPowerSaveMode
+        // A product broker may temporarily suppress Battery Saver during the run. Preserve the
+        // producer-before-BEGIN state so that temporary policy mutation cannot expand the approved
+        // workload envelope beyond the conditions in which the user started the test.
+        val constrainedPower =
+            effectivePowerSaveConstraint(
+                currentPowerSaveMode = powerManager.isPowerSaveMode,
+                originalPowerSaveMode = originalPowerSaveMode,
+            )
         val lowMemory = memory.lowMemory
 
         val displayMode = activity.currentDisplayCompat()?.mode
@@ -343,3 +353,8 @@ object DeviceRenderSafety {
             "${limits.maxGraphicsBytes / MIB}MiB graphics budget" +
             if (limits.powerSaveMode) " · power-save cap" else ""
 }
+
+internal fun effectivePowerSaveConstraint(
+    currentPowerSaveMode: Boolean,
+    originalPowerSaveMode: Boolean,
+): Boolean = currentPowerSaveMode || originalPowerSaveMode

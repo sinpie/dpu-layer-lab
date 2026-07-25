@@ -10,6 +10,8 @@ import android.opengl.EGLDisplay
 import android.opengl.EGLSurface
 import android.opengl.GLES20
 import android.opengl.Matrix
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.view.Surface
 import android.view.SurfaceHolder
@@ -21,6 +23,7 @@ import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.nio.ShortBuffer
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.LockSupport
 import kotlin.math.roundToInt
 
@@ -35,7 +38,6 @@ class StressGlSurfaceView(
     private val onRuntimeFailure: ((String) -> Unit)? = null,
 ) : SurfaceView(context), SurfaceHolder.Callback {
 
-    private val labRenderer = CubeRenderer(complexity)
     private val explicitlyReleased = AtomicBoolean(false)
     private val restartWhenStopped = AtomicBoolean(false)
     @Volatile
@@ -67,7 +69,10 @@ class StressGlSurfaceView(
         if (normalized == targetFps) return
         targetFps = normalized
         applyFrameRateHint()
-        glSession?.thread?.let(LockSupport::unpark)
+        glSession?.let { session ->
+            session.workload.targetFps = normalized
+            LockSupport.unpark(session.thread)
+        }
     }
 
     fun setLoad(load: Float, shape: LoadShape, restartProfile: Boolean = false) {
@@ -80,7 +85,12 @@ class StressGlSurfaceView(
             loadStartedMs = SystemClock.elapsedRealtime()
         }
         if (restartProfile || loadChanged || shapeChanged) {
-            glSession?.thread?.let(LockSupport::unpark)
+            glSession?.let { session ->
+                session.workload.baseLoad = baseLoad
+                session.workload.loadShape = loadShape
+                session.workload.loadStartedMs = loadStartedMs
+                LockSupport.unpark(session.thread)
+            }
         }
     }
 
@@ -105,7 +115,11 @@ class StressGlSurfaceView(
         surfaceWidth = width.coerceAtLeast(1)
         surfaceHeight = height.coerceAtLeast(1)
         applyFrameRateHint()
-        glSession?.thread?.let(LockSupport::unpark)
+        glSession?.let { session ->
+            session.workload.width = surfaceWidth
+            session.workload.height = surfaceHeight
+            LockSupport.unpark(session.thread)
+        }
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
@@ -149,14 +163,18 @@ class StressGlSurfaceView(
             glSession = null
         }
         restartWhenStopped.set(false)
-        val running = AtomicBoolean(true)
-        lateinit var session: GlSession
-        val thread = Thread(
-            {
-                val runtimeFailure = runGlLoop(windowSurface, running)
-                running.set(false)
-                post {
-                    val wasCurrent = glSession === session
+        val session = GlSession(
+            workload = GlWorkloadState(
+                targetFps = targetFps,
+                baseLoad = baseLoad,
+                loadShape = loadShape,
+                loadStartedMs = loadStartedMs,
+                width = surfaceWidth,
+                height = surfaceHeight,
+            ),
+            uiCallbacks = GlUiCallbacks(
+                onCompleted = { completed, runtimeFailure ->
+                    val wasCurrent = glSession === completed
                     if (wasCurrent) glSession = null
                     if (
                         wasCurrent &&
@@ -173,19 +191,31 @@ class StressGlSurfaceView(
                     ) {
                         scheduleDeferredRestart()
                     }
-                }
-            },
-            "DpuLab-GLProducer",
+                },
+                onTeardownFailure = onTeardownFailure,
+            ),
+            captureFrameCommit = captureFrameCommit,
         )
-        session = GlSession(running, thread)
+        val thread = try {
+            Thread(GlProducerWorker(windowSurface, session), "DpuLab-GLProducer")
+        } catch (error: Throwable) {
+            session.detachUiCallbacks()
+            if (error is ThreadDeath || error is VirtualMachineError) throw error
+            onRuntimeFailure?.invoke(
+                "GL thread create ${error.javaClass.simpleName}",
+            )
+            return
+        }
+        session.thread = thread
         glSession = session
         val threadStarted = startRendererThread(thread) { error ->
-            running.set(false)
-            if (glSession === session) glSession = null
-            restartWhenStopped.set(false)
             onRuntimeFailure?.invoke(
                 "GL thread start ${error.javaClass.simpleName}",
             )
+            session.detachUiCallbacks()
+            session.running.set(false)
+            if (glSession === session) glSession = null
+            restartWhenStopped.set(false)
         }
         if (!threadStarted) {
             return
@@ -258,170 +288,12 @@ class StressGlSurfaceView(
     }
 
     private fun requestStop(session: GlSession) {
+        // Detach every View/Activity callback before entering the bounded native EGL hand-off.
+        // A slow driver thread then retains only Surface + scalar workload/session state.
+        session.detachUiCallbacks()
         session.running.set(false)
         session.thread.interrupt()
         LockSupport.unpark(session.thread)
-    }
-
-    private fun runGlLoop(windowSurface: Surface, running: AtomicBoolean): String? {
-        var display: EGLDisplay = EGL14.EGL_NO_DISPLAY
-        var context: EGLContext = EGL14.EGL_NO_CONTEXT
-        var eglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
-        var runtimeFailure: String? = null
-        try {
-            display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
-            check(display != EGL14.EGL_NO_DISPLAY) { "No EGL display" }
-            val versions = IntArray(2)
-            check(EGL14.eglInitialize(display, versions, 0, versions, 1)) {
-                "EGL initialize failed"
-            }
-            val config = chooseEglConfig(display)
-            context = EGL14.eglCreateContext(
-                display,
-                config,
-                EGL14.EGL_NO_CONTEXT,
-                intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE),
-                0,
-            )
-            check(context != EGL14.EGL_NO_CONTEXT) { "EGL context creation failed" }
-            eglSurface = EGL14.eglCreateWindowSurface(
-                display,
-                config,
-                windowSurface,
-                intArrayOf(EGL14.EGL_NONE),
-                0,
-            )
-            check(eglSurface != EGL14.EGL_NO_SURFACE) { "EGL window surface creation failed" }
-            check(EGL14.eglMakeCurrent(display, eglSurface, eglSurface, context)) {
-                "EGL makeCurrent failed"
-            }
-
-            labRenderer.onSurfaceCreated()
-            var appliedWidth = 0
-            var appliedHeight = 0
-            var nextFrameNanos = System.nanoTime()
-            while (running.get() && windowSurface.isValid) {
-                val width = surfaceWidth
-                val height = surfaceHeight
-                if (width != appliedWidth || height != appliedHeight) {
-                    labRenderer.onSurfaceChanged(width, height)
-                    appliedWidth = width
-                    appliedHeight = height
-                }
-                val now = System.nanoTime()
-                if (now < nextFrameNanos) {
-                    LockSupport.parkNanos(
-                        (nextFrameNanos - now).coerceAtMost(MAX_PARK_NANOS),
-                    )
-                    if (Thread.interrupted() && !running.get()) break
-                    continue
-                }
-                labRenderer.setComplexity(
-                    LoadShapeEvaluator.intensityAt(
-                        base = baseLoad,
-                        shape = loadShape,
-                        elapsedMs = SystemClock.elapsedRealtime() - loadStartedMs,
-                    ),
-                )
-                val frameCommit = captureFrameCommit?.invoke()
-                labRenderer.onDrawFrame()
-                if (!EGL14.eglSwapBuffers(display, eglSurface)) {
-                    runtimeFailure =
-                        "EGL swap failed (0x${EGL14.eglGetError().toString(16)})"
-                    break
-                }
-                runCatching { frameCommit?.invoke() }
-
-                val interval = (1_000_000_000L / targetFps).toLong()
-                val completed = System.nanoTime()
-                nextFrameNanos = if (completed - nextFrameNanos >= interval) {
-                    completed + MIN_YIELD_NANOS
-                } else {
-                    nextFrameNanos + interval
-                }
-            }
-        } catch (error: Throwable) {
-            if (error is ThreadDeath) throw error
-            runtimeFailure = glRuntimeFailureReason(error)
-        } finally {
-            val cleanupFailures = mutableListOf<String>()
-            if (display != EGL14.EGL_NO_DISPLAY) {
-                val clearedCurrent = runCatching {
-                    EGL14.eglMakeCurrent(
-                        display,
-                        EGL14.EGL_NO_SURFACE,
-                        EGL14.EGL_NO_SURFACE,
-                        EGL14.EGL_NO_CONTEXT,
-                    )
-                }.getOrElse {
-                    cleanupFailures += "eglMakeCurrent=${it.javaClass.simpleName}"
-                    false
-                }
-                if (!clearedCurrent) cleanupFailures += "eglMakeCurrent=false"
-                if (eglSurface != EGL14.EGL_NO_SURFACE) {
-                    val destroyedSurface =
-                        runCatching { EGL14.eglDestroySurface(display, eglSurface) }
-                            .getOrElse {
-                                cleanupFailures +=
-                                    "eglDestroySurface=${it.javaClass.simpleName}"
-                                false
-                            }
-                    if (!destroyedSurface) cleanupFailures += "eglDestroySurface=false"
-                }
-                if (context != EGL14.EGL_NO_CONTEXT) {
-                    val destroyedContext =
-                        runCatching { EGL14.eglDestroyContext(display, context) }
-                            .getOrElse {
-                                cleanupFailures +=
-                                    "eglDestroyContext=${it.javaClass.simpleName}"
-                                false
-                            }
-                    if (!destroyedContext) cleanupFailures += "eglDestroyContext=false"
-                }
-                val terminated = runCatching { EGL14.eglTerminate(display) }
-                    .getOrElse {
-                        cleanupFailures += "eglTerminate=${it.javaClass.simpleName}"
-                        false
-                    }
-                if (!terminated) cleanupFailures += "eglTerminate=false"
-            }
-            if (cleanupFailures.isNotEmpty()) {
-                RendererSafetyState.markCleanupFailure(
-                    component = "EGL native cleanup",
-                    detail = cleanupFailures.distinct().joinToString(","),
-                )
-                runtimeFailure = runtimeFailure ?: "EGL native cleanup unconfirmed"
-                post { onTeardownFailure?.invoke() }
-            }
-        }
-        return runtimeFailure.takeIf {
-            running.get() &&
-                windowSurface.isValid &&
-                !explicitlyReleased.get()
-        }
-    }
-
-    private fun chooseEglConfig(display: EGLDisplay): EGLConfig {
-        val configs = arrayOfNulls<EGLConfig>(1)
-        val count = IntArray(1)
-        val attributes = intArrayOf(
-            EGL14.EGL_RED_SIZE,
-            8,
-            EGL14.EGL_GREEN_SIZE,
-            8,
-            EGL14.EGL_BLUE_SIZE,
-            8,
-            EGL14.EGL_ALPHA_SIZE,
-            8,
-            EGL14.EGL_DEPTH_SIZE,
-            16,
-            EGL14.EGL_RENDERABLE_TYPE,
-            EGL14.EGL_OPENGL_ES2_BIT,
-            EGL14.EGL_NONE,
-        )
-        check(EGL14.eglChooseConfig(display, attributes, 0, configs, 0, 1, count, 0))
-        check(count[0] > 0)
-        return checkNotNull(configs[0])
     }
 
     private fun applyFrameRateHint() {
@@ -445,9 +317,350 @@ class StressGlSurfaceView(
         private const val TICKER_JOIN_TIMEOUT_NANOS = 100_000_000L
     }
 
-    private data class GlSession(
+    /**
+     * Deliberately static/nested: a process-leased EGL thread must not own the SurfaceView. The
+     * callback holder is atomically cleared before join, leaving only Surface and scalar state.
+     */
+    private class GlProducerWorker(
+        private val windowSurface: Surface,
+        private val session: GlSession,
+    ) : Runnable {
+        override fun run() {
+            try {
+                val runtimeFailure = runGlLoop()
+                session.running.set(false)
+                if (!session.postCompleted(runtimeFailure)) {
+                    session.detachUiCallbacks()
+                }
+            } catch (fatal: Throwable) {
+                // runGlLoop has already executed its native EGL finally block. Complete the
+                // Activity-free session transaction before rethrowing fatal VM errors so a live
+                // SurfaceView cannot retain a dead current session or its Controller callbacks.
+                session.running.set(false)
+                val completionPosted = try {
+                    session.postCompleted(FATAL_GL_WORKER_FAILURE)
+                } catch (_: Throwable) {
+                    false
+                }
+                if (!completionPosted) session.detachUiCallbacks()
+                try {
+                    RendererSafetyState.markCleanupFailure(
+                        component = "EGL worker fatal exit",
+                        detail = fatal.javaClass.simpleName,
+                    )
+                } catch (_: Throwable) {
+                    // Callback detachment and running=false above are the allocation-free
+                    // ownership rollback. Preserve the original fatal throwable.
+                }
+                throw fatal
+            }
+        }
+
+        private fun runGlLoop(): String? {
+            val workload = session.workload
+            val renderer = CubeRenderer(workload.baseLoad)
+            var display: EGLDisplay = EGL14.EGL_NO_DISPLAY
+            var context: EGLContext = EGL14.EGL_NO_CONTEXT
+            var eglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
+            var runtimeFailure: String? = null
+            var fatalFailure: Throwable? = null
+            try {
+                display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+                check(display != EGL14.EGL_NO_DISPLAY) { "No EGL display" }
+                val versions = IntArray(2)
+                check(EGL14.eglInitialize(display, versions, 0, versions, 1)) {
+                    "EGL initialize failed"
+                }
+                val config = chooseEglConfig(display)
+                context = EGL14.eglCreateContext(
+                    display,
+                    config,
+                    EGL14.EGL_NO_CONTEXT,
+                    intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE),
+                    0,
+                )
+                check(context != EGL14.EGL_NO_CONTEXT) { "EGL context creation failed" }
+                eglSurface = EGL14.eglCreateWindowSurface(
+                    display,
+                    config,
+                    windowSurface,
+                    intArrayOf(EGL14.EGL_NONE),
+                    0,
+                )
+                check(eglSurface != EGL14.EGL_NO_SURFACE) {
+                    "EGL window surface creation failed"
+                }
+                check(EGL14.eglMakeCurrent(display, eglSurface, eglSurface, context)) {
+                    "EGL makeCurrent failed"
+                }
+
+                renderer.onSurfaceCreated()
+                var appliedWidth = 0
+                var appliedHeight = 0
+                var nextFrameNanos = System.nanoTime()
+                while (session.running.get() && windowSurface.isValid) {
+                    val width = workload.width
+                    val height = workload.height
+                    if (width != appliedWidth || height != appliedHeight) {
+                        renderer.onSurfaceChanged(width, height)
+                        appliedWidth = width
+                        appliedHeight = height
+                    }
+                    val now = System.nanoTime()
+                    if (now < nextFrameNanos) {
+                        LockSupport.parkNanos(
+                            (nextFrameNanos - now).coerceAtMost(MAX_PARK_NANOS),
+                        )
+                        if (Thread.interrupted() && !session.running.get()) break
+                        continue
+                    }
+                    renderer.setComplexity(
+                        LoadShapeEvaluator.intensityAt(
+                            base = workload.baseLoad,
+                            shape = workload.loadShape,
+                            elapsedMs = SystemClock.elapsedRealtime() - workload.loadStartedMs,
+                        ),
+                    )
+                    val frameCommit = session.captureFrameCommit()
+                    renderer.onDrawFrame()
+                    if (!EGL14.eglSwapBuffers(display, eglSurface)) {
+                        runtimeFailure =
+                            "EGL swap failed (0x${EGL14.eglGetError().toString(16)})"
+                        break
+                    }
+                    runCatching { frameCommit?.invoke() }
+
+                    val interval =
+                        (1_000_000_000L / safeGlFps(workload.targetFps)).toLong()
+                    val completed = System.nanoTime()
+                    nextFrameNanos = if (completed - nextFrameNanos >= interval) {
+                        completed + MIN_YIELD_NANOS
+                    } else {
+                        nextFrameNanos + interval
+                    }
+                }
+            } catch (error: Throwable) {
+                if (error is ThreadDeath || error is VirtualMachineError) {
+                    fatalFailure = error
+                    throw error
+                }
+                runtimeFailure = glRuntimeFailureReason(error)
+            } finally {
+                var cleanupFailed = false
+                var firstCleanupOperation: String? = null
+                var firstCleanupError: Throwable? = null
+                var cleanupFatalFailure: Throwable? = null
+                if (display != EGL14.EGL_NO_DISPLAY) {
+                    val clearedCurrent = try {
+                        EGL14.eglMakeCurrent(
+                            display,
+                            EGL14.EGL_NO_SURFACE,
+                            EGL14.EGL_NO_SURFACE,
+                            EGL14.EGL_NO_CONTEXT,
+                        )
+                    } catch (error: Throwable) {
+                        cleanupFailed = true
+                        firstCleanupOperation = "eglMakeCurrent"
+                        firstCleanupError = error
+                        if (error is ThreadDeath || error is VirtualMachineError) {
+                            cleanupFatalFailure = error
+                        }
+                        false
+                    }
+                    if (!clearedCurrent) {
+                        cleanupFailed = true
+                        if (firstCleanupOperation == null) firstCleanupOperation = "eglMakeCurrent"
+                    }
+                    if (eglSurface != EGL14.EGL_NO_SURFACE) {
+                        val destroyed = try {
+                            EGL14.eglDestroySurface(display, eglSurface)
+                        } catch (error: Throwable) {
+                            cleanupFailed = true
+                            if (
+                                cleanupFatalFailure == null &&
+                                (error is ThreadDeath || error is VirtualMachineError)
+                            ) {
+                                cleanupFatalFailure = error
+                            }
+                            if (firstCleanupOperation == null) {
+                                firstCleanupOperation = "eglDestroySurface"
+                                firstCleanupError = error
+                            }
+                            false
+                        }
+                        if (!destroyed) {
+                            cleanupFailed = true
+                            if (firstCleanupOperation == null) {
+                                firstCleanupOperation = "eglDestroySurface"
+                            }
+                        }
+                    }
+                    if (context != EGL14.EGL_NO_CONTEXT) {
+                        val destroyed = try {
+                            EGL14.eglDestroyContext(display, context)
+                        } catch (error: Throwable) {
+                            cleanupFailed = true
+                            if (
+                                cleanupFatalFailure == null &&
+                                (error is ThreadDeath || error is VirtualMachineError)
+                            ) {
+                                cleanupFatalFailure = error
+                            }
+                            if (firstCleanupOperation == null) {
+                                firstCleanupOperation = "eglDestroyContext"
+                                firstCleanupError = error
+                            }
+                            false
+                        }
+                        if (!destroyed) {
+                            cleanupFailed = true
+                            if (firstCleanupOperation == null) {
+                                firstCleanupOperation = "eglDestroyContext"
+                            }
+                        }
+                    }
+                    val terminated = try {
+                        EGL14.eglTerminate(display)
+                    } catch (error: Throwable) {
+                        cleanupFailed = true
+                        if (
+                            cleanupFatalFailure == null &&
+                            (error is ThreadDeath || error is VirtualMachineError)
+                        ) {
+                            cleanupFatalFailure = error
+                        }
+                        if (firstCleanupOperation == null) {
+                            firstCleanupOperation = "eglTerminate"
+                            firstCleanupError = error
+                        }
+                        false
+                    }
+                    if (!terminated) {
+                        cleanupFailed = true
+                        if (firstCleanupOperation == null) {
+                            firstCleanupOperation = "eglTerminate"
+                        }
+                    }
+                }
+                if (cleanupFailed) {
+                    runtimeFailure = runtimeFailure ?: "EGL native cleanup unconfirmed"
+                    try {
+                        val operation = firstCleanupOperation ?: "unknown"
+                        val errorName = firstCleanupError?.javaClass?.simpleName
+                        val detail = if (errorName == null) {
+                            "$operation=false"
+                        } else {
+                            "$operation=$errorName"
+                        }
+                        RendererSafetyState.markCleanupFailure(
+                            component = "EGL native cleanup",
+                            detail = detail,
+                        )
+                    } catch (_: Throwable) {
+                        // Native cleanup above is the required rollback. Diagnostics are best effort
+                        // when the VM is already failing to allocate.
+                    }
+                    try {
+                        session.dispatchTeardownFailure()
+                    } catch (_: Throwable) {
+                        // Preserve the original fatal failure after detaching native ownership.
+                    }
+                }
+                val cleanupFatal = cleanupFatalFailure
+                if (
+                    fatalFailure == null &&
+                    (cleanupFatal is ThreadDeath || cleanupFatal is VirtualMachineError)
+                ) {
+                    throw cleanupFatal
+                }
+            }
+            return runtimeFailure.takeIf {
+                session.running.get() && windowSurface.isValid
+            }
+        }
+
+        private fun chooseEglConfig(display: EGLDisplay): EGLConfig {
+            val configs = arrayOfNulls<EGLConfig>(1)
+            val count = IntArray(1)
+            val attributes = intArrayOf(
+                EGL14.EGL_RED_SIZE,
+                8,
+                EGL14.EGL_GREEN_SIZE,
+                8,
+                EGL14.EGL_BLUE_SIZE,
+                8,
+                EGL14.EGL_ALPHA_SIZE,
+                8,
+                EGL14.EGL_DEPTH_SIZE,
+                16,
+                EGL14.EGL_RENDERABLE_TYPE,
+                EGL14.EGL_OPENGL_ES2_BIT,
+                EGL14.EGL_NONE,
+            )
+            check(EGL14.eglChooseConfig(display, attributes, 0, configs, 0, 1, count, 0))
+            check(count[0] > 0)
+            return checkNotNull(configs[0])
+        }
+
+        private companion object {
+            const val FATAL_GL_WORKER_FAILURE = "EGL/GL fatal worker exit"
+        }
+    }
+
+    private class GlSession(
         val running: AtomicBoolean,
-        val thread: Thread,
+        val workload: GlWorkloadState,
+        uiCallbacks: GlUiCallbacks,
+        captureFrameCommit: (() -> (() -> Unit)?)?,
+    ) {
+        lateinit var thread: Thread
+        private val callbacks = AtomicReference<GlUiCallbacks?>(uiCallbacks)
+        private val frameCommitCaptureRef =
+            AtomicReference<(() -> (() -> Unit)?)?>(captureFrameCommit)
+        private val mainHandler = Handler(Looper.getMainLooper())
+
+        constructor(
+            workload: GlWorkloadState,
+            uiCallbacks: GlUiCallbacks,
+            captureFrameCommit: (() -> (() -> Unit)?)?,
+        ) : this(
+            running = AtomicBoolean(true),
+            workload = workload,
+            uiCallbacks = uiCallbacks,
+            captureFrameCommit = captureFrameCommit,
+        )
+
+        fun detachUiCallbacks() {
+            callbacks.set(null)
+            frameCommitCaptureRef.set(null)
+        }
+
+        fun captureFrameCommit(): (() -> Unit)? = frameCommitCaptureRef.get()?.invoke()
+
+        fun dispatchTeardownFailure() {
+            mainHandler.post {
+                callbacks.get()?.onTeardownFailure?.invoke()
+            }
+        }
+
+        fun postCompleted(runtimeFailure: String?): Boolean =
+            mainHandler.post {
+                callbacks.get()?.onCompleted?.invoke(this, runtimeFailure)
+            }
+    }
+
+    private data class GlUiCallbacks(
+        val onCompleted: ((GlSession, String?) -> Unit)?,
+        val onTeardownFailure: (() -> Unit)?,
+    )
+
+    private data class GlWorkloadState(
+        @Volatile var targetFps: Float,
+        @Volatile var baseLoad: Float,
+        @Volatile var loadShape: LoadShape,
+        @Volatile var loadStartedMs: Long,
+        @Volatile var width: Int,
+        @Volatile var height: Int,
     )
 }
 

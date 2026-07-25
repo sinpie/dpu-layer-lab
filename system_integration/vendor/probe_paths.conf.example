@@ -1,11 +1,24 @@
-# Bring-up fallback only. Prefer IDpuLabVendorService in production.
+# Bring-up fallback only. Prefer IDpuLabVendorService API v2 in production.
 # Values must be readable under both DAC and SELinux policy.
 
-gpu_busy=/sys/vendor/path/to/gpu_busy
-# Choose exactly one typed unit key. This example node reports kHz.
-gpu_frequency_khz=/sys/vendor/path/to/gpu_cur_freq_khz
-bus_busy=/sys/vendor/path/to/ddr_busy
-dpu_busy=/sys/vendor/path/to/dpu_active_percent
+# Uncomment exactly one busy format for the target product. Leaving every line commented keeps
+# the validated built-in candidates enabled. Qualcomm KGSL gpubusy is a per-window pair:
+# gpu_busy_window=/sys/class/kgsl/kgsl-3d0/gpubusy
+# Exynos Xclipse (AMD RDNA) direct percentage example:
+# gpu_busy_percent=/sys/class/drm/card0/device/gpu_busy_percent
+# Legacy/non-Xclipse Exynos Mali direct percentage:
+# gpu_busy_percent=/sys/class/misc/mali0/device/utilization
+# MediaTek direct percentage is built in when readable:
+# gpu_busy_percent=/sys/module/ged/parameters/gpu_loading
+# Strict MediaTek "loading blocking idle" product path, if deliberately exposed:
+# gpu_busy_mtk_triplet=/sys/vendor/path/to/ged_gpu_utilization
+
+# Choose exactly one typed unit key. This placeholder example node reports kHz.
+# gpu_frequency_khz=/sys/vendor/path/to/gpu_cur_freq_khz
+# MediaTek "<OPP index> <frequency kHz>" product path:
+# gpu_frequency_index_khz=/sys/vendor/path/to/current_freqency
+# bus_busy=/sys/vendor/path/to/ddr_busy
+# dpu_busy=/sys/vendor/path/to/dpu_active_percent
 # Explicit unit contract: this value must be Hz.
-dpu_frequency_hz=/sys/vendor/path/to/dpu_cur_freq_hz
-dpu_underrun=/sys/vendor/path/to/dpu_underrun_count
+# dpu_frequency_hz=/sys/vendor/path/to/dpu_cur_freq_hz
+# dpu_underrun=/sys/vendor/path/to/dpu_underrun_count

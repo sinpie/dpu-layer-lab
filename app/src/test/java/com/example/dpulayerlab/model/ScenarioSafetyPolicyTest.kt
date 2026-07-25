@@ -154,6 +154,43 @@ class ScenarioSafetyPolicyTest {
     }
 
     @Test
+    fun hwcCompositionExpectationRequiresStableStepTarget() {
+        HwcCompositionExpectation.entries
+            .filterNot { it == HwcCompositionExpectation.NONE }
+            .forEach { expectation ->
+                val minimumDurationMs =
+                    ScenarioSafetyPolicy.minimumHwcExpectationPhaseDurationMs(expectation)
+                assertAccepted(
+                    ScenarioSafetyPolicy.evaluate(
+                        scenario(
+                            phases = listOf(
+                                phase(
+                                    durationMs = minimumDurationMs,
+                                    hwcCompositionExpectation = expectation,
+                                ),
+                            ),
+                        ),
+                        limits(),
+                    ),
+                )
+                assertRejected(
+                    scenario(
+                        phases = listOf(
+                            phase(
+                                durationMs = minimumDurationMs,
+                                transition = TransitionSpec(
+                                    mode = TransitionMode.LINEAR_RAMP,
+                                    transitionDurationMs = 500L,
+                                ),
+                                hwcCompositionExpectation = expectation,
+                            ),
+                        ),
+                    ),
+                )
+            }
+    }
+
+    @Test
     fun transitionParametersAreBoundedToTheEffectivePhase() {
         val decision = ScenarioSafetyPolicy.evaluate(
             scenario(
@@ -301,6 +338,138 @@ class ScenarioSafetyPolicyTest {
                     ),
                 ),
             )
+        }
+    }
+
+    @Test
+    fun hwcCompositionExpectationRejectsSafetyMutationOfItsTargetContract() {
+        val target = phase(
+            durationMs = 16_000L,
+            activeLayers = 4,
+            producerFps = 120f,
+            requestedDisplayHz = 120f,
+            backend = LayerBackend.MIXED_SURFACE_TEXTURE,
+            workloads = LoadSetpoints(gpu = 0.8f),
+            includeGlLayer = true,
+            hwcCompositionExpectation = HwcCompositionExpectation.CLIENT_REQUIRED,
+        )
+        val constrainedDecisions = listOf(
+            ScenarioSafetyPolicy.evaluate(
+                scenario(phases = listOf(target)),
+                limits(maxLayers = 3),
+            ),
+            ScenarioSafetyPolicy.evaluate(
+                scenario(phases = listOf(target)),
+                limits(maxProducerFps = 90f),
+            ),
+            ScenarioSafetyPolicy.evaluate(
+                scenario(phases = listOf(target)),
+                limits(maxGraphicsBytes = 360_000L),
+            ),
+            ScenarioSafetyPolicy.evaluate(
+                scenario(phases = listOf(target)),
+                limits(maxGpuLoad = 0.4f),
+            ),
+            ScenarioSafetyPolicy.evaluate(
+                scenario(
+                    phases = listOf(
+                        target.copy(requestedDisplayHz = 300f),
+                    ),
+                ),
+                limits(),
+            ),
+            ScenarioSafetyPolicy.evaluate(
+                scenario(
+                    phases = listOf(
+                        target.copy(
+                            activeLayers = 1,
+                            backend = LayerBackend.FLATTENED_TEXTURE,
+                        ),
+                    ),
+                ),
+                limits(),
+            ),
+        )
+
+        constrainedDecisions.forEach { decision ->
+            assertRejected(decision)
+            assertTrue(decision.rejectionReason!!.contains("HWC composition expectation"))
+        }
+    }
+
+    @Test
+    fun hwcCompositionExpectationKeepsBoundedProbeAndPostTargetDuration() {
+        assertEquals(
+            0L,
+            ScenarioSafetyPolicy.minimumHwcExpectationPhaseDurationMs(
+                HwcCompositionExpectation.NONE,
+            ),
+        )
+        listOf(
+            HwcCompositionExpectation.DEVICE_ONLY to 12_000L,
+            HwcCompositionExpectation.CLIENT_REQUIRED to 16_000L,
+        ).forEach { (expectation, minimumDurationMs) ->
+            assertEquals(
+                minimumDurationMs,
+                ScenarioSafetyPolicy.minimumHwcExpectationPhaseDurationMs(expectation),
+            )
+            val target = phase(
+                durationMs = minimumDurationMs + 1_000L,
+                hwcCompositionExpectation = expectation,
+            )
+            val acceptedAtBoundary = ScenarioSafetyPolicy.evaluate(
+                scenario(phases = listOf(target)),
+                limits(
+                    maxPhaseDurationMs = minimumDurationMs,
+                    maxScenarioDurationMs = minimumDurationMs,
+                ),
+            )
+            val rejectedBelowBoundary = ScenarioSafetyPolicy.evaluate(
+                scenario(phases = listOf(target)),
+                limits(
+                    maxPhaseDurationMs = minimumDurationMs - 1L,
+                    maxScenarioDurationMs = minimumDurationMs - 1L,
+                ),
+            )
+
+            assertEquals(
+                minimumDurationMs,
+                assertAccepted(acceptedAtBoundary).phases.single().durationMs,
+            )
+            assertRejected(rejectedBelowBoundary)
+            assertTrue(rejectedBelowBoundary.rejectionReason!!.contains("fresh HWC evidence"))
+        }
+    }
+
+    @Test
+    fun totalDurationCapCannotShrinkTypedHwcPhaseBelowProbeWindow() {
+        listOf(
+            HwcCompositionExpectation.DEVICE_ONLY to 12_000L,
+            HwcCompositionExpectation.CLIENT_REQUIRED to 16_000L,
+        ).forEach { (expectation, minimumDurationMs) ->
+            val phases = listOf(
+                phase(id = "plain", durationMs = minimumDurationMs),
+                phase(
+                    id = "typed",
+                    durationMs = minimumDurationMs,
+                    hwcCompositionExpectation = expectation,
+                ),
+            )
+            val accepted = ScenarioSafetyPolicy.evaluate(
+                scenario(phases = phases),
+                limits(maxScenarioDurationMs = minimumDurationMs * 2L),
+            )
+            val rejected = ScenarioSafetyPolicy.evaluate(
+                scenario(phases = phases),
+                limits(maxScenarioDurationMs = minimumDurationMs * 2L - 1L),
+            )
+
+            assertEquals(
+                listOf(minimumDurationMs, minimumDurationMs),
+                assertAccepted(accepted).phases.map { it.durationMs },
+            )
+            assertRejected(rejected)
+            assertTrue(rejected.rejectionReason!!.contains("fresh HWC evidence"))
         }
     }
 
@@ -1131,6 +1300,8 @@ class ScenarioSafetyPolicyTest {
         includeGlLayer: Boolean = false,
         transition: TransitionSpec = TransitionSpec(),
         pixelRoute: PixelRoute = PixelRoute.RGB_8888,
+        hwcCompositionExpectation: HwcCompositionExpectation =
+            HwcCompositionExpectation.NONE,
     ) = PhaseSpec(
         id = id,
         label = id,
@@ -1145,6 +1316,7 @@ class ScenarioSafetyPolicyTest {
         workloads = workloads,
         includeGlLayer = includeGlLayer,
         transition = transition,
+        hwcCompositionExpectation = hwcCompositionExpectation,
     )
 
     private fun limits(

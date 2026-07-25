@@ -19,6 +19,11 @@ dist/
 *.apks
 *.aab
 
+# Device-exported lab reports (repository fixtures must use non-managed names/paths)
+**/dpu-layer-lab-*.json
+**/*.json.part
+**/reports/
+
 # Local UI / emulator captures
 window*.xml
 *.hprof

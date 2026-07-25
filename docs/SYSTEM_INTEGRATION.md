@@ -1,9 +1,9 @@
 # System / BSP 통합
 
 사용자에게 보이는 launcher/Gradle project 이름은 **DPULayerTest**이고 release version은
-`20260724_111816`(`versionCode 3`), debug version은 `20260724_111816-debug`입니다.
+`20260725_090252`(`versionCode 4`), debug version은 `20260725_090252-debug`입니다.
 `yyyyMMdd_HHmmss`는 KST build 시각입니다. 앱 상단·실행 HUD·보고서에 같은 version이
-표시됩니다. release tag는 `v20260724_111816`이고 canonical source remote는
+표시됩니다. release tag는 `v20260725_090252`이고 canonical source remote는
 `sinpie/dpu-layer-lab`입니다. 아래 `DpuLayerLab` directory/Soong module,
 package `com.example.dpulayerlab`, automation action/component, vendor action/AIDL과
 `dpu-layer-lab-` report prefix는 기존 제품 이미지·harness·consumer 호환성을 위한 stable
@@ -17,10 +17,12 @@ Product image
 ├─ /product/etc/permissions/privapp-permissions-com.example.dpulayerlab.xml
 └─ vendor telemetry service
    ├─ DPU driver underrun/active-cycle counter
+   ├─ GPU active-cycle + GPU/DPU clock counter
    ├─ DDR/interconnect PMU
    ├─ HWC composition snapshot
    ├─ gralloc/SBWC control + allocation verification
-   └─ vendor NPU SDK workload
+   ├─ vendor NPU SDK workload
+   └─ API v3 Battery Saver lease + exact restore
 ```
 
 앱을 platform key로 서명하고 `priv-app`에 넣는 것만으로 vendor sysfs/debugfs가 열리지는 않습니다. vendor service에 최소 권한을 부여하고 앱에는 typed Binder API만 노출하는 구성이 권장됩니다.
@@ -40,10 +42,10 @@ Product image
 
 샘플 `Android.bp`는 Soong이 platform certificate로 다시 서명하는 구성입니다. 외부에서 이미 platform key로 서명한 APK를 쓴다면 `certificate: "PRESIGNED"`로 바꿉니다.
 
-GitHub의 `DPULayerTest-20260724_111816-debug.apk`는 Android debug key로 서명된
+GitHub의 `DPULayerTest-20260725_090252-debug.apk`는 Android debug key로 서명된
 lab-only 산출물이며 debug manifest가 automation alias의 `CONTROL_TESTS` permission을
 제거합니다. 제품 이미지에 넣지 마세요.
-`DPULayerTest-20260724_111816-release-unsigned.apk`는 Soong 또는 secure signing
+`DPULayerTest-20260725_090252-release-unsigned.apk`는 Soong 또는 secure signing
 pipeline 입력용이며 그대로 설치하는 최종 제품 APK가 아닙니다. Platform key,
 certificate, keystore, password/token은 저장소, GitHub Release, `dist/`에 두지 않고
 제품 보안 환경에서만 사용합니다. Release에는 두 APK와 `SHA256SUMS.txt`만 배포합니다.
@@ -51,9 +53,11 @@ certificate, keystore, password/token은 저장소, GitHub Release, `dist/`에 �
 현재 APK가 요청하는 privileged permission은 SurfaceFlinger 진단 snapshot용 `DUMP`
 하나이며 APK와 같은 partition의 allowlist에 선언해야 합니다. portable refresh 경로는
 window의 preferred display mode API를 사용하므로 `DEVICE_POWER`를 요청하지 않습니다.
-BSP별 privileged power/mode adapter를 실제로 추가할 때만 manifest와 allowlist 양쪽에
-`DEVICE_POWER`를 함께 추가하세요. 부팅 시 `privapp-permissions` 위반 로그가 없는지
-확인하세요.
+Battery Saver 같은 system-wide policy 변경 권한을 앱에 직접 추가하지 마세요.
+Platform signing/`priv-app` 배치만으로 system-server private API, SELinux/DAC 또는
+vendor node 접근이 생긴다고 가정할 수 없습니다. 필요한 제품 권한은 최소 권한의
+system-side broker가 소유하고, 앱에는 아래 typed API v3 acknowledgment만 노출합니다.
+부팅 시 `privapp-permissions` 위반 로그가 없는지 확인하세요.
 
 ### Test automation 권한
 
@@ -162,14 +166,19 @@ backend health를 확인합니다. Provider는 ticket이 가리키는 setpoint�
 적용됐는지 또는 명시적으로 거부됐는지를 bounded하게 반환해야 합니다. Timeout, 거부,
 ticket 불일치나 health 상실은 앱에서 `NPU_WORKLOAD_APPLY_FAILED`로 fail-closed합니다.
 
-Thermal `SEVERE` derating은 기존 generated/NPU load의 ordered zero 확인, 축소된
-workload의 ticket/acknowledgment, display 감속 acknowledgment 순서입니다. Provider가
-zero 또는 reduced positive setpoint를 확인하지 못하면 앱은 일부 derating 상태로
-계속하지 않고 `THERMAL_DERATE_FAILED`로 중단합니다. `CRITICAL` 이상에서는 즉시
-안전값으로 복구해야 합니다.
+앱 선제 thermal `SEVERE` derating은 plan 시작 시 immutable snapshot으로 고정하는
+선택형이며 기본 OFF입니다. OFF에서는 앱 setpoint를 유지하고 Android/kernel thermal
+mitigation을 방해하지 않습니다. ON일 때만 기존 generated/NPU load의 ordered zero
+확인, 축소 workload의 ticket/acknowledgment, display 감속 acknowledgment 순서로
+적용합니다. Provider가 zero 또는 reduced positive setpoint를 확인하지 못하면 앱은
+일부 derating 상태로 계속하지 않고 `THERMAL_DERATE_FAILED`로 중단합니다. Thermal
+`CRITICAL`, low-memory, local-worker failure와 power/display/SystemUI 격리 무결성
+fail-safe는 이 옵션과 무관하게 항상 활성이고 즉시 안전값으로 복구합니다.
 
 ### 값 계약
 
+- `getApiVersion()`: 기본 계약은 `1`, 아래 GPU/DPU clock getter를 구현하면 `2` 이상,
+  performance-policy session 네 메서드까지 구현하면 `3` 이상
 - `getDpuUnderrunCount()`: boot 이후 monotonic 누적값, 미지원이면 `-1`
 - `getDpuUtilizationPercent()`: 동일 sampling interval의 active/total cycle, 미지원이면 음수
 - `getMemoryBusUtilizationPercent()`: DDR/interconnect 기준 busy %, 미지원이면 음수
@@ -179,6 +188,102 @@ zero 또는 reduced positive setpoint를 확인하지 못하면 앱은 일부 de
 - `setCompressionMode(2)`: SBWC required; 실제로 강제·검증할 수 없으면 `false`
 - `getLastCompressionState()`: allocator/mapper가 확인한 실제 상태
 - `setNpuLoad()`: accelerator 이름/모델/throughput이 `getNpuStatus()`에 포함되어야 함
+- API v2 `getGpuUtilizationPercent()`: 동일 sampling interval의 GPU active/total cycle,
+  미지원이면 음수
+- API v2 `getGpuFrequencyHz()`, `getDpuFrequencyHz()`: read-only Hz counter, 미지원이면
+  음수. 앱은 0~20 GHz만 허용하고 MHz로 표시
+- API v3 `beginPerformanceSession()`, `renewPerformanceSession()`,
+  `getPerformanceSessionState()`, `endPerformanceSession()`: 아래 Battery Saver
+  bounded-lease 계약 전체를 구현한 경우에만 광고
+
+API v2 메서드는 기존 AIDL 메서드 뒤에 append되어 API v1 transaction ID를 유지합니다.
+클라이언트는 `getApiVersion() >= 2`를 확인한 경우에만 세 신규 transaction을
+호출합니다. Provider가 v2를 광고하면 세 메서드가 짧고 non-blocking이어야 하며,
+지원하지 않는 개별 값은 음수로 반환해야 합니다. 유효한 vendor GPU/DPU clock은
+`HARDWARE_COUNTER`로 kernel fallback보다 우선합니다.
+
+클라이언트는 optional v2 transaction을 v1/exact-counter lane과 분리된 bounded
+no-backlog lane에서 호출하되, v1과 v2를 하나의 snapshot deadline과 service session에
+결속합니다. 개별 v2 getter의 예외·timeout 또는 이미 실행 중인 v2 호출은 그 getter를
+`N/A`로 만들지만 같은 session에서 완료된 v1 sample은 유지합니다. 대기 작업은 쌓지
+않으며, 읽는 동안 provider registration/session이 바뀌면 v1을 포함한 snapshot 전체를
+폐기합니다. 따라서 provider는 다음 sample의 v2 값이 오래된 호출 결과로 오염되지
+않도록 각 getter 자체도 bounded/non-blocking으로 구현해야 합니다.
+
+제품이 이 계약을 VINTF-stable `aidl_interface`로 배포한다면 app-side 파일만 바꾸면
+안 됩니다. v2/v3 API dump를 순서대로 생성·review한 뒤 freeze하고 hash/version metadata,
+`versions_with_info`, VINTF manifest와 compatibility matrix를 함께 갱신해야 합니다.
+Provider/client product branch에는 같은 frozen 정의를 사용하고, v1/v2 provider와 v3
+client 조합에서 광고된 version보다 뒤의 transaction이 호출되지 않는 호환성 test를
+제품 빌드에 포함하세요.
+
+Exynos DECON, Qualcomm SDE, MediaTek DISP에는 Galaxy 제품 전체에서 공통으로 쓸 수 있는
+안정적 DPU utilization sysfs ABI가 없습니다. HWC DEVICE layer 수, GPU busy, 예상
+traffic, DPU frequency를 utilization로 변환하지 말고 제품의 PMU/driver sampling
+interval에서 직접 계산한 값만 반환하세요.
+
+### API v3 Battery Saver performance-policy 계약
+
+현재 v3 control bit는 `DISABLE_BATTERY_SAVER = 1` 하나뿐입니다. Thermal mitigation,
+low-memory safety, Doze/device-idle, CPU/GPU/DPU DVFS, devfreq governor와 frequency
+lock/write는 요청 bit로 정의되어 있지 않습니다. Provider는 알 수 없는 bit나 복합
+요청을 거부해야 하며, 앱도 지원되지 않는 제어를 자동 fallback이나 성공으로
+표시하지 않습니다. Doze/device-idle은 현재 start/continuity 조건으로만 검사합니다.
+
+앱은 BEGIN 전에 `PowerManager.isPowerSaveMode`를 읽어 original state를 별도로
+보존합니다. Original이 ON이면 broker가 테스트 동안 OFF로 바꿔도 앱의 power-save
+layer/FPS/workload cap은 계속 적용됩니다. Provider는 요청을 받은 시점의 system policy를
+원상복구 authority로 capture하고 실제 Battery Saver OFF를 확인한 뒤에만 BEGIN의
+`commandVersion`을 그대로 반환해야 합니다. 단순 enqueue나 setting write 성공은
+acknowledgment가 아닙니다.
+
+Session identity는 `(clientToken, sessionId)`이고 command version은 같은 session에서
+단조 증가합니다. Provider는 새 version을 policy commit과 원자적으로 비교·기록해,
+늦게 끝난 낮은 version의 BEGIN/RENEW가 더 높은 version의 END를 되돌리지 못하게 해야
+합니다. Mutating method는 요청 상태가 실제 적용된 뒤에만 입력 `commandVersion`을
+반환하고, 실패·stale·unknown은 그 값과 구분되는 결과를 반환해야 합니다.
+`getPerformanceSessionState()`는 `minimumAppliedVersion` 이상인 같은 session이
+유효할 때만 `1`, original state 복구/expiry가 확인됐으면 `0`, 판단할 수 없으면
+음수를 반환합니다.
+
+앱의 lease duration은 10초이고 정상 renewal cadence는 2초입니다. Provider는 renewal
+한 번마다 deadline을 bounded하게 연장하되 expired/ended session을 재활성화해서는 안
+됩니다. `clientToken`에는 mutation 전에 `linkToDeath`를 연결하고, Binder death,
+lease expiry와 명시적 END에서 BEGIN 직전의 exact original state를 복구합니다.
+END는 idempotent이며 실제 복구 뒤에만 해당 command version을 acknowledge합니다.
+Original이 ON이면 restore 결과도 ON이어야 하고, original이 OFF이면 OFF를 유지해야
+합니다. 앱은 restore가 불명확한 동안 process-wide latch로 다음 plan을 막습니다.
+Timeout으로 더 높은 version의 END가 재시도되는 동안 이미 in-flight이던 같은 session의
+이전 END가 exact acknowledgment를 반환할 수 있습니다. 앱은 active ownership이 이미
+종료되어 그 사이에 BEGIN/RENEW가 들어갈 수 없고 newer command가 모두 END retry인
+경우에만 그 응답을 복구 증거로 받습니다. 그 뒤에도 renewal Job의 실제 종료와 직접
+읽은 Battery Saver의 BEGIN 전 상태 일치를 확인해야 controller owner가 해제됩니다.
+
+Battery Saver는 앱/session별 속성이 아니라 user의 system-wide policy입니다. 따라서
+provider는 다음 두 모델 중 하나를 제품 계약으로 고정해야 합니다.
+
+- 해당 user/policy scope에 active performance lease를 하나만 허용하고 overlap을
+  명시적으로 거부합니다.
+- 첫 lease가 capture한 original baseline 하나와 active-session refcount를 공유하고,
+  각 lease의 END/death/expiry를 독립 정산한 뒤 마지막 lease가 끝날 때만 original
+  baseline으로 복구합니다.
+
+두 모델 모두 두 번째 BEGIN이 이미 임시 OFF인 값을 새 original baseline으로 저장하면
+안 됩니다. Caller UID/signature, Android user와 policy scope를 검증하고, 서로 다른
+UID/user의 lease가 한 전역 상태를 독립적으로 복구하는 race를 허용하지 마세요.
+Provider process crash가 Battery Saver를 OFF에 남기지 않도록 policy owner와 같은
+신뢰 경계의 watchdog 또는 restart-safe lease/baseline 보존도 제품에서 구현해야
+합니다. 앱의 Binder timeout만으로 system-wide policy를 되돌릴 수는 없습니다.
+
+Broker가 없고 Battery Saver가 이미 OFF면 앱은 policy를 바꾸지 않는 app-only
+monitoring으로 실행할 수 있습니다. Saver가 ON이거나 BEGIN이 timeout/ambiguous
+ticket을 남겼으면 producer를 시작하지 않습니다. Active session 중 Saver 재활성화,
+interactive/device-idle 조건 변화, renewal/health 실패 또는 provider service-session
+변경은 fail-closed 중단 사유입니다. 정상 END에서 original ON이 복원되는 전이는
+RESTORING 상태로 분리해 실행 중 격리 상실로 오인하지 않아야 합니다.
+Renewal/health/service-session integrity가 한 번 실패한 process는 이후 exact END로
+원래 Battery Saver가 복구되더라도 새 session을 시작하지 않으며, 앱 process 재시작과
+제품-side failure 원인 확인이 필요합니다.
 
 서비스가 SBWC required 요청을 받았지만 최종 buffer modifier/metadata를 확인하지
 못했다면 성공을 반환하면 안 됩니다. 앱은 모든 phase의 route 응답을
@@ -302,27 +407,41 @@ Android 12 이상 production 빌드에서는 debugfs 의존을 피하고 sysfs �
 지원 key:
 
 ```ini
-gpu_busy=/sys/...
-gpu_frequency_hz=/sys/...
-# 또는 정확히 하나만 선택:
+# GPU busy format 중 정확히 하나만 선택:
+# gpu_busy=/sys/...
+# gpu_busy_percent=/sys/...
+# gpu_busy_window=/sys/...
+# gpu_busy_mtk_triplet=/sys/...
+# GPU frequency unit/format 중 정확히 하나만 선택:
+# gpu_frequency_hz=/sys/...
 # gpu_frequency_khz=/sys/...
 # gpu_frequency_mhz=/sys/...
-bus_busy=/sys/...
-dpu_busy=/sys/...
-dpu_frequency_hz=/sys/...
-dpu_underrun=/sys/...
+# gpu_frequency_index_khz=/sys/...
+# bus_busy=/sys/...
+# dpu_busy=/sys/...
+# dpu_frequency_hz=/sys/...
+# dpu_underrun=/sys/...
 ```
 
 값의 포맷:
 
-- `*_busy`: 단일 0~100 값 또는 `busy total` 두 정수
+- legacy `gpu_busy`: 단일 0~100 값 또는 **누적** `busy total` 두 정수
+- `gpu_busy_percent`: 단일 0~100 direct percentage
+- `gpu_busy_window`: 한 sampling window의 `busy total`. Qualcomm KGSL `gpubusy`는
+  이 형식이며 이전 sample과 다시 delta를 계산하지 않음. `0 0`은 powered-off 0%
+- `gpu_busy_mtk_triplet`: MediaTek GED의 정확한 `loading blocking idle` 3개 정수.
+  세 값 모두 0~100일 때 첫 값을 GPU busy로 사용
+- `bus_busy`, `dpu_busy`: 단일 0~100 값 또는 누적 `busy total` 두 정수
 - `gpu_frequency_hz`, `gpu_frequency_khz`, `gpu_frequency_mhz`: key suffix에 명시된
   단위의 0 이상 정수. 세 typed key와 legacy key 중 정확히 하나만 설정해야 하며 둘
   이상이면 단위를 추측하지 않고 GPU clock을 `N/A`로 처리함
 - legacy `gpu_frequency`는 호환성을 위해 **Hz로만** 해석함. 새 BSP 설정에는 typed
   key를 사용함
-- 앱에 내장된 KGSL/Mali `cur_freq` 후보는 해당 kernel ABI의 Hz 값으로만 해석하며
-  크기 기반 Hz/kHz/MHz 추측을 하지 않음
+- 앱에 내장된 KGSL `cur_freq`/`gpuclk`와 legacy Mali `devfreq0/cur_freq`는 Hz,
+  `clock_mhz`와 Samsung compatibility `gpu_clock`은 MHz로만 해석하며 크기 기반
+  Hz/kHz/MHz 추측을 하지 않음
+- `gpu_frequency_index_khz`: 정확한 `<OPP index> <frequency kHz>` 두 정수. MediaTek
+  GED bring-up에서 exact product path를 검증한 경우에만 사용
 - `dpu_frequency_hz`: 반드시 Hz 단위인 0 이상의 정수. 제품에서 명시적으로 설정한
   경로만 읽으며, 단위가 불명확한 일반 경로를 자동 탐색하지 않음
 - `dpu_underrun`: monotonic 누적 정수
@@ -335,6 +454,31 @@ devfreq/governor 또는 전원 상태를 쓰거나 고정하지 않습니다. DV
 예제는 `system_integration/vendor/probe_paths.conf.example`에 있습니다. 이 fallback은
 파일 값을 그대로 읽을 뿐 SELinux를 우회하지 않습니다. `/data/local/tmp` 설정은
 bring-up용 debug convenience이며 release APK에서는 로드되지 않습니다.
+
+내장 GPU 후보는 임의 directory scan 없이 다음 검증된 고정 ABI만 시도합니다.
+
+- Qualcomm: KGSL `gpu_busy_percentage`, `gpubusy` window pair;
+  `cur_freq`/`gpuclk` Hz와 `clock_mhz`/`gpu_clock` MHz
+- Exynos Xclipse(AMD RDNA): `/sys/class/drm/card0/device/gpu_busy_percent` direct
+  percent. 다른 DRM minor를 쓰는 제품은 `gpu_busy_percent`로 exact path를 지정
+- 구형/비-Xclipse Exynos Mali: `/sys/class/misc/mali0/device/utilization` direct percent와
+  `devfreq/devfreq0/cur_freq` Hz
+- MediaTek: `/sys/module/ged/parameters/gpu_loading` direct percent
+- 호환 SKI `/sys/kernel/gpu/gpu_busy`는 위 architecture-specific ABI를 가리지 않도록
+  마지막 direct-percent 후보로만 사용
+
+GED debugfs와 address가 포함된 devfreq/platform directory는 기본 탐색하지 않습니다.
+제품이 explicit typed key를 하나 설정하면 그 경로가 authoritative하며 unreadable,
+malformed, 단위 충돌일 때 다른 기본 probe로 우회하지 않고 `N/A`입니다. 여러 GPU
+busy format key 또는 여러 GPU frequency unit key를 동시에 선언해도 의미가 충돌하므로
+`N/A`입니다. Platform signing만으로 이 node들의 SELinux/DAC 접근이 생기지 않으므로
+locked Samsung 제품은 위 API v2 broker를 우선 구현하세요.
+
+예제 probe 설정은 모든 항목이 주석 상태입니다. 필요한 target 항목만 정확히 하나
+활성화해야 하며, placeholder나 다른 SoC용 항목을 그대로 배포하면 authoritative
+explicit probe가 정상 built-in 후보를 차단합니다. Legacy `gpu_busy`가 scalar와 누적
+pair 중 어떤 형식으로 해석됐는지는 source에 `observed=…`로 남겨 형식 전환 시
+graph/peak continuity를 끊습니다.
 
 ## Exact counter와 report 계약
 
@@ -413,6 +557,42 @@ Workload setpoint는 정확한 0 또는 `0.001`보다 큰 값만 허용합니다
 flattened GPU-backed producer 또는 독립 GL producer가 실제 topology에 있어야 하며,
 graphics budget 때문에 이를 제거해야 하면 load를 0으로 낮춰 성공처럼 보이지 않고
 plan을 거부합니다.
+
+`DEVICE_ONLY`/`CLIENT_REQUIRED` phase는 topology를 강제한다는 뜻이 아니라 fresh
+DEVICE/CLIENT 원자 쌍으로 확인할 관측 계약입니다. Runtime safety policy가 계약
+phase의 layer topology, producer FPS, display pacing, GL producer 또는 GPU pressure를
+clamp해야 하면 축소된 topology로 우연히 조건을 통과시키지 않고 preflight에서
+거부합니다. 3초 first-buffer readiness, 최대 4초의 pre-target periodic sample mutex
+drain, probe당 4초 bounded telemetry와 post-target 관측 tick을 포함하도록 한 번의
+fresh evidence가 필요한 `DEVICE_ONLY`는 최소 12초, 서로 다른 fresh evidence 2회가
+필요한 `CLIENT_REQUIRED`는 최소 16초를 유지해야 합니다.
+Target arm 중 periodic telemetry는 mutex에 blocking waiter를 만들지 않고 try-lock
+실패를 drop하는 latest-wins 방식으로 동작합니다. CLIENT forced sample 2회는 같은
+serialized ownership에서 수행하며 각 sample 사이에 cancellation, thermal contract,
+fresh producer count와 topology revision을 재검증합니다. 각 forced sample은 전체
+safety/exact telemetry를 함께 갱신하고, terminal/cancel/error/phase-finally에서는
+matching priority owner를 반드시 해제합니다.
+
+START plan은 첫 scenario 전에 전체 queue/repeat가 공유하는 capacity 관측을 한 번
+수행합니다. Safety/graphics budget이 승인한 최대 20개의 30fps opaque RGB Surface를
+non-overlap tile로 배치하고 모든 first buffer/topology publish 뒤 100ms 안정화한 다음
+fresh composition 원자 쌍을 한 번만 읽습니다. 준비/쌍 실패는 retry나 0으로 바꾸지 않고
+N/A입니다. 이어서 load zero, renderer teardown과 3초 settle을 확인한 뒤 기존 1L
+scenario warm-up/fresh baseline을 시작하므로 calibration traffic/frame/counter는
+scenario evidence에 포함되지 않습니다.
+
+관측값은 해당 candidate topology의 D/C일 뿐 maximum plane 수가 아닙니다. matching
+opaque RGB topology의 DEVICE/CLIENT boundary 참고로만 queue/repeat에서 공유하고
+ScenarioSafetyPolicy hard cap은 변경하지 않습니다. Format, transform, alpha, scaling,
+display 또는 system surface가 바뀌면 fresh vendor evidence가 필요합니다.
+
+Composition source는 API v1 `compositionLayerCounts`의 같은-snapshot 원자 쌍을
+우선합니다. Dashboard/idle은 3-sample cadence의 bounded `dumpsys SurfaceFlinger
+--hwclayers`를 사용할 수 있고 plan-start capacity 관측은 cache를 우회한 fresh fallback
+한 번을 허용합니다(child 800ms/전체 sample 4초 상한). Active scenario에서는 periodic과
+typed target boundary 모두 dump를 억제하며 fresh vendor 원자 쌍만 인정합니다. 따라서
+capacity cache가 phase 증거가 되지 않고 vendor pair가 없으면 N/A/INCONCLUSIVE가
+올바른 결과입니다. HWC count를 logcat 또는 임의 sysfs/debugfs path에서 추론하지 마세요.
 
 Transition controller는 absolute-deadline 100 ms fixed period를 사용하고 늦은 tick을
 busy catch-up하지 않습니다. Preflight window 검증과 별도로 runtime coverage가 ramp
@@ -527,12 +707,30 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   acknowledgment가 compression reset보다 먼저인지
 - NPU/SBWC lease expiry, client death와 provider watchdog이 load/default state를
   복구하는지
+- API v3가 original Battery Saver ON/OFF 각각에서 BEGIN/2초 renewal/10초 expiry/
+  client death/idempotent END 뒤 exact prior state를 복구하는지. Original ON을
+  임시 해제해도 앱의 power-save cap이 유지되고, late/stale BEGIN이 더 높은 END를
+  되돌리지 않는지
+- Battery Saver system-wide arbitration이 single-lease 또는 shared baseline/refcount
+  중 문서화한 모델을 따르고, overlapping UID/session, provider restart와 마지막
+  lease expiry에서도 임시 OFF 상태를 남기지 않는지
+- Broker unavailable+Saver OFF는 monitor-only, Saver ON/ambiguous mutation은
+  producer 전 거부인지. Doze/device-idle을 강제 해제하거나 thermal/low-memory
+  보호를 끄거나 DVFS/governor/frequency를 쓰지 않는지
 - 양의 NPU command ticket/acknowledgment와 active health failure가
-  `NPU_WORKLOAD_APPLY_FAILED`로 fail-closed하고, thermal SEVERE에서 ordered zero →
-  reduced workload acknowledgment → display acknowledgment 순서를 지키는지
+  `NPU_WORKLOAD_APPLY_FAILED`로 fail-closed하는지. Plan-start immutable 앱 선제
+  SEVERE 옵션이 기본 OFF이고 OFF에서는 Android/kernel mitigation을 방해하지 않으며,
+  ON에서만 ordered zero → reduced workload acknowledgment → display acknowledgment
+  순서를 지키는지
+- Thermal CRITICAL, low-memory, local-worker failure와 power/display/SystemUI 격리
+  무결성 fail-safe가 SEVERE 옵션과 무관하게 항상 활성인지
 - local CPU/memory worker의 예상하지 못한 `Throwable` 또는 active external interrupt가
   first-wins process latch, `LOCAL_WORKER_FAILURE`, `ABORTED`를 만들고 process 재시작
   전까지 후속 worker/plan을 차단하는지, partial start 뒤 same-owner overlap도 막는지
+- Activity 재생성/partial start/cancel에서 receiver callback이 먼저 detach되고
+  backend job/thread/process/descriptor의 실제 terminal 증거 전에는 cleanup gate가
+  다음 controller/run을 막으며, application context 경로가 파괴된 Activity를
+  보존하지 않는지
 - memory workload의 worker별 allocation/page-touch prewarm이 measured byte baseline
   전에 끝나고 generated traffic에 포함되지 않는지, allocation/ack timeout이
   fail-closed인지

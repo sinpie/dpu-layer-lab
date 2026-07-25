@@ -1,9 +1,11 @@
 package com.example.dpulayerlab.render
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProducerFrameRelayTest {
@@ -36,7 +38,7 @@ class ProducerFrameRelayTest {
     }
 
     @Test
-    fun frameCapturedBeforeGenerationRebindStaysInOldGeneration() {
+    fun frameCapturedBeforeGenerationRebindIsDetachedFromOldOwner() {
         val generations = mutableListOf<Long>()
         val relay = ProducerFrameRelay(
             producerId = 9L,
@@ -49,7 +51,7 @@ class ProducerFrameRelayTest {
         oldFrameCommit?.invoke()
         relay.captureCallback()?.invoke()
 
-        assertEquals(listOf(100L, 101L), generations)
+        assertEquals(listOf(101L), generations)
     }
 
     @Test
@@ -78,13 +80,7 @@ class ProducerFrameRelayTest {
         firstCapture?.invoke()
         secondCapture?.invoke()
 
-        assertEquals(
-            listOf(
-                Triple(200L, 17L, true),
-                Triple(201L, 17L, true),
-            ),
-            events,
-        )
+        assertTrue(events.isEmpty())
     }
 
     @Test
@@ -160,5 +156,76 @@ class ProducerFrameRelayTest {
         reusedRelay.activeGenerationForFailure()?.let(failures::add)
 
         assertEquals(listOf(5L), failures)
+    }
+
+    @Test
+    fun queuedRuntimeFailureIsDroppedAfterDisableAndSameGenerationRebind() {
+        val failures = mutableListOf<Long>()
+        val relay = ProducerFrameRelay(
+            producerId = 31L,
+            generation = 9L,
+            primary = false,
+        ) { _, _, _ -> Unit }
+
+        // The worker captures this identity before posting its runtime failure to main.
+        val staleDispatch = checkNotNull(relay.captureFailureDispatch())
+        relay.disable()
+        // An in-phase topology update can reuse the same generation. Comparing only the number
+        // would let the removed producer abort this replacement.
+        relay.update(9L) { _, _, _ -> Unit }
+        val currentDispatch = checkNotNull(relay.captureFailureDispatch())
+
+        if (relay.isFailureDispatchCurrent(staleDispatch)) {
+            failures += staleDispatch.generation
+        }
+        if (relay.isFailureDispatchCurrent(currentDispatch)) {
+            failures += currentDispatch.generation
+        }
+
+        assertFalse(relay.isFailureDispatchCurrent(staleDispatch))
+        assertTrue(relay.isFailureDispatchCurrent(currentDispatch))
+        assertEquals(listOf(9L), failures)
+    }
+
+    @Test
+    fun closedDecoderFrameGateDropsCallbacksQueuedBeforeTeardown() {
+        val gate = DecoderFrameCallbackGate()
+
+        assertTrue(gate.isOpen())
+        gate.close()
+        assertFalse(gate.isOpen())
+    }
+
+    @Test
+    fun callbackQuitRequestedBeforeLooperPublicationAppliesExactlyOnce() {
+        val quitTargets = mutableListOf<Any>()
+        val handshake = DeferredQuitHandshake<Any>(quitTargets::add)
+        val target = Any()
+
+        handshake.request()
+        assertNull(handshake.current())
+        assertTrue(quitTargets.isEmpty())
+
+        handshake.publish(target)
+        handshake.request()
+
+        assertSame(target, handshake.current())
+        assertEquals(listOf(target), quitTargets)
+    }
+
+    @Test
+    fun callbackQuitRequestedAfterLooperPublicationAppliesExactlyOnce() {
+        val quitTargets = mutableListOf<Any>()
+        val handshake = DeferredQuitHandshake<Any>(quitTargets::add)
+        val target = Any()
+
+        handshake.publish(target)
+        assertSame(target, handshake.current())
+        assertTrue(quitTargets.isEmpty())
+
+        handshake.request()
+        handshake.request()
+
+        assertEquals(listOf(target), quitTargets)
     }
 }

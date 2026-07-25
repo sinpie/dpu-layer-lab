@@ -29,6 +29,20 @@ enum class LayerBackend(val label: String) {
     FLATTENED_TEXTURE("GPU 단일 합성"),
 }
 
+/**
+ * A measured HWC composition condition requested by a phase.
+ *
+ * This is an observation contract, not a claim that a topology will force a hardware path.
+ * Device plane count and per-plane format/transform limits are product-specific. The runner must
+ * therefore use fresh DEVICE/CLIENT evidence and treat missing or mismatched coverage as
+ * inconclusive.
+ */
+enum class HwcCompositionExpectation {
+    NONE,
+    DEVICE_ONLY,
+    CLIENT_REQUIRED,
+}
+
 enum class PixelRoute(val label: String, val detail: String) {
     RGB_8888("RGB 8888", "Canvas → RGBA BufferQueue"),
     RGB_565("RGB 565", "16-bit RGB BufferQueue"),
@@ -74,6 +88,8 @@ enum class MotionProfile(
     val semantics: MotionSemantics = MotionSemantics.VIEW_TRANSFORM,
 ) {
     STATIC("Static"),
+    /** Controller-only non-overlapping crop grid for the one-shot HWC capacity candidate. */
+    CAPACITY_TILES("Capacity tiles"),
     SCROLL("Scroll"),
     ZOOM_PAN("Zoom + Pan"),
     ROTATE("Rotate"),
@@ -263,6 +279,8 @@ data class PhaseSpec(
     val alphaOverlap: Boolean = false,
     val includeGlLayer: Boolean = false,
     val transition: TransitionSpec = TransitionSpec(),
+    val hwcCompositionExpectation: HwcCompositionExpectation =
+        HwcCompositionExpectation.NONE,
 )
 
 data class ScenarioSpec(
@@ -536,9 +554,20 @@ data class TelemetrySnapshot(
     val hwcClientLayers: Int? = null,
     val hwcClientLayersQuality: MetricQuality = MetricQuality.UNAVAILABLE,
     val hwcClientLayersSource: String = "",
+    /**
+     * Completion time for the atomically selected DEVICE/CLIENT pair. This follows the selected
+     * vendor or SurfaceFlinger source and must not be inferred from an unrelated probe.
+     */
+    val hwcCompositionEvidenceMonotonicMs: Long? = null,
+    /** Age of the selected DEVICE/CLIENT pair at [monotonicMs]. */
+    val hwcCompositionEvidenceAgeMs: Long? = null,
     val surfaceFlingerHwcMissed: Long? = null,
     val surfaceFlingerGpuMissed: Long? = null,
     val surfaceFlingerMissSource: String = "",
+    /** Completion time of the independent SurfaceFlinger evidence, not this full sample. */
+    val surfaceFlingerEvidenceMonotonicMs: Long? = null,
+    /** Age of that evidence at [monotonicMs]; stale evidence is retained only as provenance. */
+    val surfaceFlingerEvidenceAgeMs: Long? = null,
     val thermalStatus: Int = 0,
     val thermalLabel: String = "정상",
     val memoryLow: Boolean = false,
@@ -595,6 +624,8 @@ private val TERMINAL_RUN_EVENT_TYPES = setOf(
     "ABORTED",
     "ERROR",
     "PRODUCER_TEARDOWN_UNCONFIRMED",
+    "PERFORMANCE_RESTORE_FAILED",
+    "PERFORMANCE_RESTORE_REPORT_WRITE_FAILED",
 )
 
 /**

@@ -2,6 +2,7 @@ package com.example.dpulayerlab.engine
 
 import com.example.dpulayerlab.model.DeviceIdentity
 import com.example.dpulayerlab.model.Gauge
+import com.example.dpulayerlab.model.HwcCompositionExpectation
 import com.example.dpulayerlab.model.MetricQuality
 import com.example.dpulayerlab.model.RunSummary
 import com.example.dpulayerlab.model.RunVerdict
@@ -133,8 +134,22 @@ class ReportWriterMathTest {
 
     @Test
     fun reportMarksViewZOrderProxyAsNotChangingPhysicalHwcOrder() {
+        val scenario = checkNotNull(ScenarioCatalog.byId("transform-storm")).let { preset ->
+            preset.copy(
+                phases = preset.phases.mapIndexed { index, phase ->
+                    if (index == 0) {
+                        phase.copy(
+                            hwcCompositionExpectation =
+                                HwcCompositionExpectation.CLIENT_REQUIRED,
+                        )
+                    } else {
+                        phase
+                    }
+                },
+            )
+        }
         val summary = RunSummary(
-            scenario = ScenarioCatalog.byId("transform-storm")!!,
+            scenario = scenario,
             startedEpochMs = 1_000L,
             finishedEpochMs = 2_000L,
             verdict = RunVerdict.INCONCLUSIVE,
@@ -158,6 +173,35 @@ class ReportWriterMathTest {
                     """"physicalHwcZOrderChange": false""",
             ),
         )
+        assertTrue(
+            json.contains(
+                """"hwcCompositionExpectation": "CLIENT_REQUIRED"""",
+            ),
+        )
+    }
+
+    @Test
+    fun reportPreservesTypedHwcCompositionExpectation() {
+        val summary = RunSummary(
+            scenario = ScenarioCatalog.byId("dpu-client-fallback-burst")!!,
+            startedEpochMs = 1_000L,
+            finishedEpochMs = 2_000L,
+            verdict = RunVerdict.INCONCLUSIVE,
+            exactUnderrunDelta = null,
+            exactUnderrunSource = null,
+            exactUnderrunQuality = MetricQuality.UNAVAILABLE,
+            suspectedUnderrunDelta = 0L,
+            peakCpu = null,
+            peakMemoryUsed = null,
+            peakGeneratedBandwidth = null,
+            events = emptyList(),
+            samples = emptyList(),
+        )
+
+        val json = ReportWriter.toJson(summary, TEST_DEVICE)
+
+        assertTrue(json.contains(""""hwcCompositionExpectation": "DEVICE_ONLY""""))
+        assertTrue(json.contains(""""hwcCompositionExpectation": "CLIENT_REQUIRED""""))
     }
 
     @Test
@@ -189,10 +233,14 @@ class ReportWriterMathTest {
             hwcDeviceLayersQuality = MetricQuality.HARDWARE_COUNTER,
             hwcDeviceLayersSource = "IDpuLabVendorService",
             hwcClientLayers = 2,
-            hwcClientLayersQuality = MetricQuality.SYSTEM_SERVICE,
-            hwcClientLayersSource = "SurfaceFlinger",
+            hwcClientLayersQuality = MetricQuality.HARDWARE_COUNTER,
+            hwcClientLayersSource = "IDpuLabVendorService",
+            hwcCompositionEvidenceMonotonicMs = 9L,
+            hwcCompositionEvidenceAgeMs = 1L,
             surfaceFlingerHwcMissed = 1L,
             surfaceFlingerMissSource = "SurfaceFlinger latency",
+            surfaceFlingerEvidenceMonotonicMs = 9L,
+            surfaceFlingerEvidenceAgeMs = 1L,
             generatedBandwidth = Gauge(
                 8.5f,
                 " Gbps",
@@ -208,6 +256,11 @@ class ReportWriterMathTest {
             hwcDeviceLayers = 5,
             hwcDeviceLayersQuality = MetricQuality.SYSTEM_SERVICE,
             hwcDeviceLayersSource = "SurfaceFlinger",
+            hwcClientLayers = 1,
+            hwcClientLayersQuality = MetricQuality.SYSTEM_SERVICE,
+            hwcClientLayersSource = "SurfaceFlinger",
+            hwcCompositionEvidenceMonotonicMs = 18L,
+            hwcCompositionEvidenceAgeMs = 2L,
         )
         val summary = RunSummary(
             scenario = ScenarioCatalog.presets.first(),
@@ -245,7 +298,15 @@ class ReportWriterMathTest {
         assertTrue(json.contains(""""dpuBusyQuality": "KERNEL""""))
         assertTrue(json.contains(""""dpuBusySource": "/sys/class/dpu/busy""""))
         assertTrue(json.contains(""""hwcDeviceLayersSource": "IDpuLabVendorService""""))
+        assertTrue(json.contains(""""hwcClientLayersSource": "IDpuLabVendorService""""))
+        assertTrue(json.contains(""""hwcCompositionEvidenceMonotonicMs": 9"""))
+        assertTrue(json.contains(""""hwcCompositionEvidenceAgeMs": 1"""))
+        assertTrue(json.contains(""""hwcDeviceLayersSource": "SurfaceFlinger""""))
         assertTrue(json.contains(""""hwcClientLayersSource": "SurfaceFlinger""""))
+        assertTrue(json.contains(""""hwcCompositionEvidenceMonotonicMs": 18"""))
+        assertTrue(json.contains(""""hwcCompositionEvidenceAgeMs": 2"""))
+        assertTrue(json.contains(""""surfaceFlingerEvidenceMonotonicMs": 9"""))
+        assertTrue(json.contains(""""surfaceFlingerEvidenceAgeMs": 1"""))
         assertTrue(json.contains(""""powerSaveMode": true"""))
         assertTrue(
             json.contains(

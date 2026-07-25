@@ -11,8 +11,8 @@ service를 연결하면 DPU·DDR·HWC·SBWC·NPU와 같은 제품 전용 기능�
 있습니다.
 
 현재 launcher/Gradle project 표시 이름과 release 앱 버전은
-**DPULayerTest 20260724_111816**(`versionCode 3`)입니다. Debug 변형은 화면과
-보고서에 `20260724_111816-debug`로 표시됩니다. Version name은 KST build 시각을
+**DPULayerTest 20260725_090252**(`versionCode 4`)입니다. Debug 변형은 화면과
+보고서에 `20260725_090252-debug`로 표시됩니다. Version name은 KST build 시각을
 `yyyyMMdd_HHmmss`로 고정한 형식입니다. 앱 상단과 실행 HUD에 같은 build version을
 노출해 결과를 만든 바이너리를 현장에서 바로 식별할 수 있습니다.
 소스 저장소는 계속 [sinpie/dpu-layer-lab](https://github.com/sinpie/dpu-layer-lab)을
@@ -45,6 +45,9 @@ Soong module/APK 통합 이름 `DpuLayerLab`은 이름을 바꾸지 않는 호�
   올렸다가 해제
 - vendor AIDL 또는 제품 classpath adapter를 통한 NPU workload
 - CPU, app CPU, memory/PSS, producer FPS, display Hz, thermal, GPU/bus/DPU dashboard
+- plan 시작 전에 status/navigation bar가 실제로 숨겨졌는지 확인하는 test-only immersive
+  fullscreen. Multi-window/PiP에서는 시작을 거부하고, 확인 뒤 bar 재등장이나 window
+  focus 손실은 측정 오염으로 즉시 중단
 - 실행 중 좌측 상단 build version, layer/DPU/CPU/GPU 숫자·점유율·60-sample 그래프
   (`observed/—P`는 topology commit 대기, `observed/expected P`는 commit 완료).
   각 gauge는 source/quality를 함께 표시하고 provenance 변경이나 unavailable 구간에서는
@@ -74,6 +77,64 @@ level, pulse ON/OFF, triangle 상승/하강, soak attack/hold/recovery를 실제
 soak 같은 one-shot transition에 0이 아닌 `floor`를 넣은 runnable plan은 의미가
 모호하므로 safety policy가 거부합니다. 순수 evaluator의 defensive bounding만 잘못된
 직접 호출이 origin을 건너뛰지 않도록 floor를 0으로 지웁니다.
+
+### 테스트 전체 화면과 HWC layer
+
+앱의 일반 탐색 화면은 system bar를 유지하지만, test plan을 시작하면 Window 단위
+immersive session을 획득합니다. `statusBars`와 `navigationBars`가 모두 invisible인
+Insets acknowledgment를 받은 뒤에만 warm-up Surface와 physical producer를 만듭니다.
+이 상태는 queue/loop 전체, cooldown, 최종 counter sample과 producer teardown까지
+유지합니다. STOP·실패·백그라운드 전환·Activity 종료 시에도 `show()` 반환만 믿지
+않고 시작 전의 status/navigation visibility mask가 실제 Insets로 다시 관측될 때까지
+token과 process-wide lease를 유지합니다. Hide가 부분 실패해도 cleanup token을
+버리지 않으며 복원 미확인 동안 다음 plan을 차단합니다. Activity가 재생성돼도 새
+Window는 이전 Window의 process-wide lease가 해제되기 전까지 system bar hide를
+적극적으로 유지하고, matching release와 visible Insets를 확인한 뒤 일반 탐색 UI를
+복구합니다. 새 Window의 hide가 100 ms 간격의 4회 확인에도 적용되지 않으면 무한
+재시도하지 않고 원래 lease owner를 fail-closed 중단하며 다음 START도 계속 막습니다.
+
+Android의 표준 immersive API는 사용자의 edge swipe를 영구 차단하지 않습니다. 최초
+hide 대기 중 보이는 bar는 정상 전이지만, 숨김 확인 뒤 transient bar가 다시 보이거나
+session 획득 뒤 notification shade/다른 overlay 때문에 window focus를 잃으면
+`SYSTEM_UI_REVEALED`/`WINDOW_FOCUS_LOST` event를 남기고 현재 plan을 `ABORTED`로
+종료합니다. 재현성 때문에 multi-window와 PiP에서는 plan을 시작하지 않으며 실행 중
+해당 mode로 전환돼도 안전 중단합니다.
+
+이 동작은 status bar, notification shade entry surface, navigation bar/taskbar가
+HWC 후보를 차지하는 영향을 줄입니다. 그러나 좌측 상단 HUD를 포함한 앱 control
+window/client target 한 장은 의도적으로 남고, 각 `SurfaceView`가 최종적으로
+DEVICE/CLIENT 중 어디에 배치되는지는 여전히 HWC 정책이 결정합니다. Insets hidden은
+SystemUI surface 제거 요청의 확인이지 physical overlay plane 배치의 증거가 아니므로
+HUD의 DEVICE/CLIENT 또는 제품 typed snapshot으로 함께 확인해야 합니다.
+
+### 테스트 중 성능 환경 격리
+
+테스트 중 정책 변경 범위는 **Battery Saver의 임시 해제 하나**입니다. 일반 APK나
+platform signing만으로 이 전역 정책을 바꿀 수 있다고 가정하지 않으며, 제품이
+`IDpuLabVendorService` API v3의 typed performance-policy broker를 구현한 경우에만
+변경을 요청합니다. 앱은 `BEGIN` 전에 원래 Battery Saver 상태를 별도로 보존합니다.
+원래 상태가 켜짐이었다면 broker가 실행 중에 이를 꺼도 power-save safety envelope는
+계속 적용되므로, 임시 정책 변경이 layer/FPS/memory 상한을 우회하지 않습니다.
+
+API v3 session은 10초 bounded lease이며 앱은 정상 실행 중 2초 cadence로 갱신합니다.
+Provider는 client Binder death, lease expiry 또는 명시적 `END`에서 **BEGIN 직전의
+정확한 상태**로 복구해야 합니다. 원래 상태가 켜짐이면 종료 뒤 다시 켜져야 합니다.
+앱은 command version과 session/service identity를 확인하고, 갱신·상태 확인·복구가
+불명확하면 다음 plan으로 넘어가지 않습니다. Broker가 없더라도 Battery Saver가 이미
+꺼져 있으면 app-only monitoring으로 실행할 수 있지만, 켜져 있거나 remote mutation
+가능성이 남은 모호한 응답이면 producer를 시작하지 않습니다.
+Timeout 뒤 같은 session에 더 높은 version의 `END`만 재시도된 경우에는 이미 실행
+중이던 이전 `END`의 exact acknowledgment도 복구 증거로 사용할 수 있습니다. 단,
+process restore latch가 비었고 renewal Job이 실제 종료됐으며, 직접 읽은
+`PowerManager.isPowerSaveMode`가 BEGIN 전 상태와 일치해야 controller의 소유권을
+해제합니다. 늦은 응답이나 UI 상태 문자열만으로 복구를 추정하지 않습니다.
+
+Battery Saver 외 정책은 이 계약의 제어 대상이 아닙니다. Thermal 보호와
+low-memory 중단은 항상 유지되고, DPU/GPU/CPU frequency·DVFS·devfreq governor를
+쓰거나 고정하지 않습니다. Doze/device-idle도 강제로 해제하지 않으며 interactive이고
+non-idle이라는 시작 조건을 확인한 뒤 실행 중 변화를 감시합니다. 해당 조건을
+제어해야 하는 제품은 향후 별도의 typed BSP 계약과 원상복구·death/expiry 의미를 먼저
+정의해야 하며, 현재 앱은 지원하지 않는 제어를 성공처럼 표시하지 않습니다.
 
 ## 런타임 안전 정책
 
@@ -118,22 +179,33 @@ soak 같은 one-shot transition에 0이 아닌 `floor`를 넣은 runnable plan�
   worker acknowledgment 누락은 부하가 실행된 것처럼 계속하지 않고 plan을 fail-closed로
   중단합니다. 확인된 buffer는 run 동안 pin해 5초가 넘는 idle/settle 뒤에도 measured
   phase에서 재할당되지 않으며, run 종료·low-memory·명시적 drop에서만 해제합니다.
-- thermal `SEVERE`부터 layer/FPS/Hz와 CPU·memory·GPU·NPU 부하를 줄이며, 이
-  derating은 뒤 phase에도 유지됩니다. Derating은 기존 generated/NPU load의 ordered
-  zero를 먼저 확인하고, 축소된 workload의 ticket/acknowledgment를 받은 뒤 display
-  감속 acknowledgment를 확인하는 순서입니다. 어느 단계든 실패하면 일부만 감속된
-  상태로 계속하지 않고 `THERMAL_DERATE_FAILED`로 중단합니다.
+- 앱의 선제 thermal `SEVERE` 감속은 테스트 설정에서 선택할 수 있으며 기본값은
+  **OFF**입니다. OFF이면 SEVERE에서도 앱이 요청 layer/FPS/Hz/workload를 임의로
+  낮추지 않지만 Android/kernel thermal throttling은 그대로 동작합니다. ON이면 시작 전
+  SEVERE를 거부하고, 실행 중에는 generated/NPU load ordered zero → 축소 workload
+  ticket/acknowledgment → display 감속 acknowledgment 순서로 적용한 뒤 남은 phase에도
+  유지합니다. 하나라도 실패하면 `THERMAL_DERATE_FAILED`로 중단합니다.
 - thermal `CRITICAL` 이상이면 test를 즉시 중단합니다.
-- 시작 시 Battery Saver가 켜져 있으면 보수적인 power-save envelope를 적용합니다.
-  더 넓은 envelope로 실행 중 Battery Saver가 새로 켜지면 기존 메모리/layer/FPS
-  승인을 재사용하지 않고 `SAFETY_ENVELOPE_CHANGED`로 즉시 중단합니다. 다시 시작할 때
-  현재 전원 상태로 전체 plan을 재검증합니다.
+- 이 선택 설정은 plan 시작 시 immutable snapshot으로 고정되며 보호된 외부 Intent도
+  현재 앱 설정을 그대로 사용합니다. `CRITICAL`, low-memory, local-worker failure,
+  Battery Saver/display/device-idle/SystemUI 격리 무결성 중단은 선택 설정과 무관하게
+  항상 활성입니다.
+- `BEGIN` 전에 관측한 원래 Battery Saver가 켜져 있으면 v3 broker가 실행 중 이를
+  임시 해제해도 보수적인 power-save envelope를 적용합니다. 실행 중 Battery Saver가
+  예기치 않게 켜지거나 session continuity를 잃으면 기존 메모리/layer/FPS 승인을
+  재사용하지 않고 `SAFETY_ENVELOPE_CHANGED` 또는 performance-isolation failure로
+  즉시 중단합니다. 원래 상태의 exact restore가 확인되기 전에는 다음 plan을
+  시작하지 않습니다.
 - 실행 중 display ID 또는 정규화한 physical pixel dimensions가 바뀌면 작은 화면에서
   승인한 graphics envelope를 재사용하지 않고 `SAFETY_ENVELOPE_CHANGED`로 중단합니다.
   같은 display에서 가로/세로 축만 교환되는 회전은 같은 envelope로 봅니다.
-- telemetry가 5초 이상 멈추거나 physical producer 중 하나라도 3초 안에 buffer를
-  게시하지 못하거나 3초 동안 heartbeat가 끊기면 run을 중단합니다. Ramp/triangle에서
-  게시되지 않은 layer가 사라진 peak topology도 정상 완료로 세지 않습니다.
+- 마지막으로 완료된 telemetry evidence가 5초 이상 stale이면 run을 중단합니다. 단,
+  single-flight lane에 이미 수락된 sample은 4초 operation timeout과 다음 500 ms
+  watchdog tick까지의 bounded completion window만 보호하며, 그 deadline을 넘기면
+  이전 성공 sample이 있더라도 중단합니다. Physical producer 중 하나라도 3초 안에
+  buffer를 게시하지 못하거나 3초 동안 heartbeat가 끊겨도 중단합니다.
+  Ramp/triangle에서 게시되지 않은 layer가 사라진 peak topology도 정상 완료로 세지
+  않습니다.
 - Phase마다 generation이 승인한 모든 physical producer의 실제 buffer 수를 합산하고,
   실제 적용한 `producer FPS × physical producer 수`를 시간 적분한 기대값과 비교합니다.
   Flattened backend는 logical layer 수와 무관하게 producer 한 개입니다. 기대값이
@@ -158,6 +230,10 @@ soak 같은 one-shot transition에 0이 아닌 `floor`를 넣은 runnable plan�
   deadline을 넘기면 전체 plan을 중단하고 해당
   thread가 실제 종료될 때까지 후속 plan을 차단합니다. GL은
   `GLSurfaceView`의 무기한 pause/detach wait 대신 app-owned EGL thread를 사용합니다.
+  Texture Canvas loop가 시작된 뒤에는 `Surface` wrapper와 backing `SurfaceTexture`의
+  최종 `release()`도 그 worker의 실제 `finally`가 소유합니다. 16 ms hand-off
+  timeout에서 UI/framework가 같은 native producer를 먼저 해제해 `lock/unlock`과
+  경쟁하지 않습니다.
   명시적으로 제거한 Surface/Texture/codec view는 늦은 lifecycle callback이 와도
   producer를 다시 시작하지 않으며, 제거된 producer의 늦은 teardown callback을 새
   generation 실패로 잘못 귀속하지 않습니다. Active producer의 실패만 relay에 결합된
@@ -233,19 +309,73 @@ soak 같은 one-shot transition에 0이 아닌 `floor`를 넣은 runnable plan�
 storage를 완전히 알 수 없으므로 보수적 휴리스틱입니다. “허용됨”은 해당 SoC가 지속적으로
 처리할 수 있다는 성능 인증이 아닙니다.
 
+### 메모리 소유권과 디버깅 기준
+
+순간적인 부하 변화는 measured phase에서 buffer나 worker를 반복 생성하는 대신,
+검증된 graphics budget 안에서 working set을 미리 할당·page-touch하고 worker와
+buffer를 재사용해 만듭니다. Frame hot path는 per-frame 객체 할당을 피하고, setpoint
+변경은 bounded latest-wins/fixed-period 경로를 사용합니다. 이 방식은 transition
+응답성을 높이면서 GC와 allocator churn이 DPU 부하 결과를 왜곡하는 정도를 줄입니다.
+
+Activity, renderer container, receiver, coroutine, worker, codec/EGL/Surface,
+media descriptor와 vendor session에는 각각 명시적인 owner와 종료 증거가 있어야
+합니다. Activity보다 오래 살 수 있는 backend는 application context 또는
+Activity-free callback만 보유하고, detach/cancel 뒤 실제 terminal acknowledgment가
+확인되기 전에는 process-wide cleanup gate가 다음 run을 막습니다. Timeout은 자원을
+해제했다는 증거가 아니며, 미확인 cleanup을 성공으로 바꾸지 않습니다.
+Renderer topology는 모든 child의 생성·`addView`·초기 control 적용이 끝난 뒤에만
+한 번에 publish합니다. 중간 실패나 OOM에서는 만들어진 prefix의 frame/failure
+callback을 먼저 끊고 모든 producer에 stop을 요청한 뒤 하나의 bounded deadline으로
+회수합니다. Canvas/EGL이 네이티브 호출 안에서 늦게 끝나더라도 이미 capture한 frame
+completion token의 callback을 detach할 수 있어 Activity/controller graph를 붙잡거나
+제거된 generation에 frame을 귀속하지 않습니다.
+주기 telemetry와 watchdog의 completion ticket 및 LAZY Job 두 개도 하나의 start
+transaction으로 생성·게시·시작합니다. Partial start 실패 시 두 Job을 모두 취소하지만
+ticket은 각 Job의 실제 completion callback 뒤에만 실패 완료됩니다. Fatal `Error`도
+같은 rollback을 먼저 기록한 뒤 다시 throw합니다. 두 Job이 모두 active일 때만 기존
+pair를 재사용하며, 한쪽의 비정상 종료는 다른 쪽도 중단하고 active run을 즉시
+fail-closed합니다. 빠른 pause/resume은 이전 두 Job의 실제 completion 뒤 한 번만
+재시작하고, lifecycle integrity 실패는 process 재시작 전 새 plan을 차단합니다.
+
+Decoder 종료는 frame callback gate를 먼저 닫고 queue를 비운 뒤 duplicate FD/
+`MediaExtractor`, listener, codec 순으로 해제합니다. Preflight master descriptor는
+bounded 2회 close에도 실패하면 process-sticky 오류로 남아 이후 selected-media plan을
+차단하고 report/UI에 cleanup 실패를 표시합니다. Memory copy worker는 8 ms bounded
+burst의 copy loop 안에서 원자 카운터를 매 block 갱신하지 않고 burst당 한 번만
+publish해, 실제 DRAM burst는 유지하면서 계측용 cache-line contention을 줄입니다.
+
+Plan-wide Battery Saver `END`는 scenario의 terminal counter/producer teardown 이후에
+발생하므로, 마지막 report를 다시 원자 발행해 `PERFORMANCE_RESTORE_CONFIRMED` 또는
+`PERFORMANCE_RESTORE_FAILED`를 남깁니다. 첫 복원이 실패한 뒤 finalizer 재시도가
+성공하면 두 사실을 모두 보존하며, 첫 cleanup boundary가 실패한 run의 `ABORTED`
+판정을 성공으로 덮지 않습니다. Plan-wide 복원이 확인되지 않으면 이미 완료된 앞
+scenario도 안전한 plan 종료를 증명할 수 없으므로 결과를 `ABORTED`로 바꾸고 기존
+report 경로를 철회하며, managed JSON은 best-effort로 삭제합니다.
+Renewal/health/service-session integrity가 한 번 깨진 경우에는 나중에 exact
+Battery Saver 복원만 성공해도 같은 process의 새 plan을 허용하지 않습니다. Restore
+결과 JSON 재발행이 실패한 경우도 메모리의 summary를 `ABORTED`로 고정해 finalizer가
+이전 `CLEAN`/`PASSED` 내용을 다시 발행하지 못하게 합니다.
+
+검토는 먼저 pure helper와 한 함수의 경계값·state transition·idempotent close를
+unit test하고, 그 다음 전체 흐름에서 partial start, STOP/cancel, Activity 재생성,
+provider disconnect/death/expiry, low-memory/thermal abort, producer teardown과
+Battery Saver exact restore 순서를 조합해 확인합니다. Host 검증은 수명주기·소유권
+회귀를 찾는 수단이며, 실제 BSP의 정책 복구와 DPU underrun 판정은 전용 실기기에서
+별도로 검증해야 합니다.
+
 ## 시나리오
 
-`20260724_111816` catalog에는 다음 **22개 preset**이 있습니다. Custom은 catalog preset 수에
+`20260725_090252` catalog에는 다음 **25개 preset**이 있습니다. Custom은 catalog preset 수에
 포함하지 않습니다.
 
 | 카테고리 | 대표 테스트 |
 |---|---|
-| Layer / HWC | HWC Plane Staircase, backend만 바꾸는 HWC ↔ GPU Composition Pivot |
+| Layer / HWC | HWC Plane Staircase, backend만 바꾸는 HWC ↔ GPU Composition Pivot, 4L DEVICE Candidate Burst, 20L CLIENT Fallback Candidate |
 | Transform | 12-layer Transform Storm |
 | Video / Format | 4K YUV + RGB Overlay, 8K30 YUV / 8K60 P010 Decoder Pressure, Linear ↔ SBWC |
 | Refresh | 60 → 90 → 120 Hz baseline, mixed producer pacing |
 | Resource | Fixed-topology Resource Pulse, NPU Cross-load |
-| Load Transition | Instant Isolated Contention, Instant Step & Burst, Topology + Load Combined Ramp, Continuous Fixed-topology Cross-load Ramp, Triangle Wave & Soak Recovery |
+| Load Transition | DPU-only Repeated Step Shock, Instant Isolated Contention, Instant Step & Burst, Topology + Load Combined Ramp, Continuous Fixed-topology Cross-load Ramp, Triangle Wave & Soak Recovery |
 | Mixed | 사용자 custom 단일 phase |
 | DVFS / Adaptive | Low-clock Single-layer Wake, Idle → Composition/4K Shock, Paired Mid-load Perturbation Matrix, Multidimensional Adaptive Underrun Hunt |
 | Soak | mixed load/thermal regression cycle |
@@ -253,6 +383,44 @@ storage를 완전히 알 수 없으므로 보수적 휴리스틱입니다. “�
 각 stress preset에는 부하를 다시 내리는 recovery phase가 포함됩니다. 런타임 안전 정책이
 phase를 clamp하거나 거부할 수 있으므로, 보고서의 실행 event를 원래 preset과 함께
 확인해야 합니다.
+`DPU 4L DEVICE Candidate Burst`는 1L/30fps/60Hz에서 불투명 독립 Surface
+4L/120fps/120Hz로, `DPU 20L CLIENT Fallback Candidate`는 같은 저부하 기준에서
+mixed/alpha/GL 20L/120fps/120Hz로 STEP 전환합니다. 전자는 `DEVICE_ONLY`, 후자는
+각 burst 직전 저부하 기준의 `DEVICE_ONLY`와 peak의 `CLIENT_REQUIRED`라는 typed 관측
+계약을 phase에 보존합니다. 이는 HWC 배치를 강제하거나 제품별 plane 수를 보장하는
+설정이 아닙니다. 4L도 단말의 DEVICE 한도라는 뜻이 아니라 보수적인 candidate입니다.
+계약 phase는 target topology와 첫 buffer가 확인된 뒤 fresh 동일-snapshot
+DEVICE/CLIENT 쌍을 수집합니다. 한 번의 fresh probe가 필요한 `DEVICE_ONLY` 구간은
+최대 4초의 pre-target periodic sample mutex drain까지 포함해 최소 12초, 서로 다른
+fresh sample 2회가 필요한 `CLIENT_REQUIRED` peak는 최소 16초를 사용합니다. Runtime
+safety cap이 계약의 layer/FPS/display pacing/GL producer 또는 GPU pressure를 바꾸거나
+expectation별 최소 duration 아래로 줄이면 다른 실험으로 조용히 실행하지 않고
+preflight에서 거부합니다. Fresh 쌍이 조건을 충족하지 않거나 계측할 수 없으면 성공으로
+추정하지 않고 `INCONCLUSIVE`입니다.
+Target이 arm된 동안 일반 periodic telemetry는 mutex에 대기열을 만들지 않는
+latest-wins try-lock/drop 방식으로 전환됩니다. CLIENT의 두 forced sample은 하나의
+serialized ownership 안에서 수집하되 각 sample 사이에 cancellation, thermal contract,
+fresh producer topology를 다시 확인하므로 periodic sample이 두 probe 사이를 선점하지
+않습니다. Forced sample 자체가 전체 safety/exact telemetry를 갱신합니다.
+`DPU-only Repeated Step Shock`는 CPU/memory/GPU/NPU cross-load 없이
+1L/30fps/60Hz ↔ 12L/120fps/120Hz를 세 번 왕복해 DPU 요청 부하의 상승과 회복만
+비교합니다.
+
+사용자가 START한 plan은 첫 scenario 전에 전체 queue/repeat가 공유하는 HWC capacity
+관측을 정확히 한 번 수행합니다. Runtime safety/graphics budget이 허용하는 범위에서 최대
+20개의 30fps RGB 독립 Surface를 불투명 non-overlap tile로 준비하고, 모든 first
+buffer와 topology publish를 확인한 뒤 100ms 안정화하고 fresh DEVICE/CLIENT snapshot을
+한 번만 수집합니다. 준비 또는 원자 쌍이 불완전하면 재시도 부하를 만들지 않고 `N/A`로
+남깁니다. 이어서 producer와 cross-load zero를 확인하고 teardown 뒤 3초 settle한 다음
+각 scenario의 기존 1L warm-up과 fresh exact baseline을 시작하므로 calibration의 frame,
+traffic, counter delta는 scenario evidence에 섞이지 않습니다.
+
+이 값은 해당 opaque RGB/display/system-surface 조합의 “candidate에서 관측된 D/C”이지
+보편적인 hardware maximum이 아닙니다. 같은 topology를 해석할 때 DEVICE/CLIENT 경계
+참고값으로만 queue/repeat에 재사용하며 safety hard cap을 바꾸지 않습니다. format,
+scale, transform, alpha 또는 display mode가 바뀐 typed phase는 fresh vendor evidence로
+다시 판정합니다. `HWC Plane Staircase`도 1→2→4→6→8→12→8→4→1L의 별도 bounded
+request sweep입니다.
 8K60 preset은 decoder primary 한 장, RGB overlay 6장과 GL tail 한 장으로 총 8개의
 physical layer를 구성합니다. 8K30 preset과 분리되어 있으므로 8K30-only 장치가 8K60
 capability 때문에 불필요하게 거부되지 않습니다.
@@ -306,16 +474,21 @@ DVFS preset의 settle 구간은 작은 layer/FPS/Hz 부하를 유지해 governor
    adapter 연결 상태를 확인합니다.
 2. YUV/P010/SBWC/4K/8K decoder test라면 **시나리오** 탭에서 실험용 로컬 영상을
    선택합니다. 선택·pin·preflight된 media가 없으면 decoder preset은 실행되지 않습니다.
-3. **카테고리 · 부하 · 조건 조합**에서 카테고리, 변화 파형, 예상 강도와
-   부하/조건을 고릅니다. 같은 행의 복수 선택은 OR, 서로 다른 행은 AND입니다.
-   부하/조건에는 CPU/memory/GPU/NPU, RGB/YUV/P010/SBWC, 4K/8K,
-   scroll/zoom/rotate, high refresh와 DVFS가 포함됩니다.
-4. 필터 결과를 기존 queue 뒤에 **결과 추가**하거나 **결과로 교체**합니다. 개별 항목을
-   중복 추가할 수 있고 `←`/`→`로 순서를 옮기거나 `×`로 한 항목만 제거할 수 있습니다.
-   저장 상태에 더 이상 catalog에 없는 ID가 있으면 UI와 실행 index가 어긋나지 않도록
-   복원 시 제거합니다.
+3. 먼저 목적 카드의 **급격한 DPU 부하**, **DEVICE 후보 유지**,
+   **CLIENT 전환 목표** 중 하나를 고릅니다. DEVICE 목적은 `CLIENT_REQUIRED` phase가
+   섞인 preset을 제외합니다. DPU burst는 이름이나 tag가 아니라 1~2L/30fps 이하의
+   저부하에서 최소 4L, layer delta 3 이상, 90fps/90Hz 이상으로 STEP하는 typed 값으로
+   분류합니다.
+4. 더 좁혀야 할 때만 접힌 **고급 필터**를 펼쳐 카테고리, 변화 파형, 예상 강도와
+   부하/조건을 고릅니다. 같은 행의 복수 선택은 OR, 목적과 서로 다른 행은 AND입니다.
+   필터 결과를 기존 queue 뒤에 **결과 추가**하거나 **결과로 교체**할 수 있고, 개별
+   항목은 중복 추가·`←`/`→` 이동·`×` 제거가 가능합니다. 저장 상태에 더 이상 catalog에
+   없는 ID가 있으면 복원 시 제거합니다.
 5. 전체 queue 반복 횟수를 1~10회에서 선택합니다. queue × repeat로 확장한 총 run은
    40회를 넘을 수 없으며 UI가 허용 가능한 반복 상한을 함께 제한합니다.
+   같은 화면의 **실행 보호 정책**에서 선택형 SEVERE 앱 감속 상태를 확인합니다.
+   기본 OFF는 SEVERE에서 요청 부하를 유지한다는 뜻이며, CRITICAL/low-memory 등의
+   필수 중단을 끄는 설정은 아닙니다.
 6. 냉각 상태에서 `Baseline 60 → Max`, 다음 `Low-clock Single-layer Wake`와
    `Idle → Composition Shock`, `HWC Plane Staircase`를 실행합니다.
 7. transform, resource pulse, composition pivot, gradual transition 순서로 실패 경계를
@@ -326,6 +499,10 @@ DVFS preset의 settle 구간은 작은 layer/FPS/Hz 부하를 유지해 governor
    layer, DPU/CPU/GPU 숫자와 60-sample 그래프, DPU read/producer write 예상 traffic을
    표시합니다. 숫자에는 source/quality가 붙고 provenance 전환·unavailable 구간은
    graph gap으로 보존됩니다.
+   Typed HWC phase의 `RAW MATCH/WAIT/N/A`는 2.5초 이내의 동일 source·quality·timestamp
+   DEVICE/CLIENT 쌍을 즉시 해석한 보조 표시입니다. Target topology 이후의 distinct
+   fresh sample 수와 phase 간 방향성까지 확인하는 controller 최종 판정은 결과 event를
+   사용하므로 `RAW MATCH`만으로 phase 성공을 확정하면 안 됩니다.
    `STOP`은 작은 화면/landscape의 스크롤 아래로 숨지 않도록 상단 실행 header에 항상
    표시됩니다.
 9. 종료 후 run별 결과와 report를 확인하고 안전 clamp/reject/derate/abort event가
@@ -426,6 +603,33 @@ miss는 DPU underrun의 **proxy**일 뿐입니다. CPU scheduling, GC, codec, GP
 throttling 또는 다른 프로세스도 같은 현상을 만들 수 있습니다. Exact counter가 없으면
 최종 verdict도 `SUSPECTED / PROXY` 또는 `INCONCLUSIVE` 범위를 벗어나지 않습니다.
 
+GPU fallback은 값 형식을 path와 함께 고정합니다. Qualcomm KGSL은
+`gpu_busy_percentage`를 우선하고 `gpubusy`는 누적 delta가 아니라 현재
+`busy total` window의 비율로 계산합니다. Exynos Xclipse(AMD RDNA)는 표준 DRM
+`card0/device/gpu_busy_percent` direct-percent ABI를 우선하며, Mali `utilization`은
+구형/비-Xclipse Exynos 호환 후보로만 남기고 Mali devfreq clock은 Hz로 고정
+해석합니다. MediaTek GED는 read-only module
+parameter `gpu_loading`을 direct 0~100 값으로 사용합니다. MediaTek의 3-field
+`loading blocking idle`와 `index frequency_kHz` 형식은
+제품이 exact path를 typed config로 지정한 경우에만 사용하며 debugfs를 기본 탐색하지
+않습니다. Samsung 공통 `/sys/kernel/gpu/gpu_busy` 호환 node는 Xclipse/GED/Mali
+전용 ABI 뒤에서만 검사합니다. Legacy direct/cumulative 형식의 실제 선택도 source에
+남겨 형식이 바뀌면 그래프와 peak continuity가 끊깁니다. 읽을 수 있으나 형식이 다른
+값, 단위가 모호한 값, explicit config 실패는
+추측하거나 다른 기본 경로로 조용히 우회하지 않고 source가 포함된 `N/A`입니다.
+
+Locked Samsung BSP에서는 SELinux/DAC 때문에 위 read-only node도 앱에서 보이지 않을 수
+있습니다. `IDpuLabVendorService` API v2는 GPU busy, GPU frequency Hz, DPU frequency
+Hz를 추가하며 유효한 vendor 값(`HW counter`)을 kernel fallback보다 우선합니다. v2
+optional getter는 v1/exact-counter 호출과 분리된 no-backlog lane에서 같은 전체
+snapshot deadline 안에 읽습니다. 개별 v2 호출의 예외·timeout·busy는 같은 service
+session의 v1 sample을 지우거나 다음 sample을 밀어내지 않으며, 해당 v2 값만 `N/A`로
+남깁니다. 읽는 도중 service session이 바뀌면 snapshot 전체를 폐기합니다.
+Exynos DECON, Qualcomm SDE, MediaTek DISP에 공통인 안정적 DPU busy sysfs ABI는 없으므로
+DPU utilization은 제품 broker가 PMU/driver active-cycle을 제공하거나 명시적으로
+검증된 probe가 있을 때만 표시합니다. GPU busy, HWC layer 수, 예상 traffic을 DPU
+점유율로 대체하지 않습니다.
+
 Exact counter baseline은 Surface/codec warm-up이 끝난 뒤 실제 scenario phase 직전에
 잡습니다. 1초 HUD sampler와 같은 직렬화 lane에서 fresh sample을 완료한 값만 baseline으로
 사용하며, run generation 이전에 요청된 in-flight sample은 다음 queue 항목의 sample/peak/
@@ -436,9 +640,12 @@ counter에 포함하지 않습니다. baseline 이후 source와 `MetricQuality`�
 끝까지 연속성이 유지된 경우에만 가능합니다. 정상 verdict를 계산하기 전에는 마지막
 physical producer의 teardown을 확인하고 serialized fresh terminal counter sample을 한 번
 더 수집합니다. 이 sample 또는 periodic telemetry 실패는 telemetry gap으로 exact
-continuity를 무효화하고, 5초 stale은 run도 중단합니다. Source/quality 변경이나
-reset/regress도 continuity를 무효화합니다. 신뢰할 delta가 없으면 delta provenance도
-이전 baseline source를 남기지 않고 `N/A`/`UNAVAILABLE`입니다.
+continuity를 무효화합니다. Sample timestamp는 모든 counter/state read가 끝난 시각의
+evidence이며 CPU utilization interval의 시작 시각과 분리됩니다. 마지막 완료 evidence가
+5초 stale이면 run을 중단하되, 이미 수락된 sample의 예외는 위의 bounded
+4초+watchdog-one-tick deadline까지만 유효합니다. Source/quality 변경이나 reset/regress도
+continuity를 무효화합니다. 신뢰할 delta가 없으면 delta provenance도 이전 baseline
+source를 남기지 않고 `N/A`/`UNAVAILABLE`입니다.
 JSON report는 `schemaVersion: 2`이며
 exact delta/source/quality, telemetry source, phase transition, event와 sample을
 분리해 기록합니다. 유한하지 않은 숫자는 JSON의 `null`입니다.
@@ -465,8 +672,37 @@ DEVICE·CLIENT peak는 유효 sample의 `MetricQuality`와 source가 run 동안 
 (`source changed`)로 표시합니다. DPU/GPU/bus/FPS/HWC peak는 JSON에 별도 고정 peak
 필드를 추가하는 대신 report에 보존된 run sample에서 계산합니다.
 
-SurfaceFlinger text dump의 DEVICE/CLIENT layer count는 Android 및 BSP 버전에 따라
-형식이 달라질 수 있습니다. 제품 판정에는 vendor typed API를 우선하세요.
+DEVICE/CLIENT layer count는 반드시 하나의 vendor snapshot 또는 하나의 SurfaceFlinger
+dump에서 얻은 **원자 쌍**으로 선택합니다. Vendor의 한쪽 count와 SurfaceFlinger의 다른
+쪽 count를 섞지 않으며, 완전하고 fresh한 vendor 쌍을 우선하고 그 다음 완전하고 fresh한
+SurfaceFlinger 쌍을 사용합니다. 둘 다 불완전하거나 2.5초 freshness 범위를 넘으면 두
+값 모두 `N/A`입니다. 선택한 쌍의 completion monotonic timestamp와 age는 HUD/report에
+같이 보존됩니다.
+
+SurfaceFlinger text dump 형식은 Android 및 BSP 버전에 따라 달라질 수 있습니다. 이
+dump는 전체 telemetry sample과 별도 completion 시각과 age를 가집니다. Dashboard/idle
+일반 모니터링은 3개 telemetry snapshot cadence로 bounded 재수집할 수 있고, plan-start
+capacity 관측은 준비가 끝난 뒤 cache를 우회해 정확히 한 번 fresh fallback을 허용합니다.
+Dump child는 800ms, 전체 telemetry는 4초로 제한됩니다. 같은 snapshot의 vendor 원자
+쌍이 있으면 그것이 우선합니다.
+
+실제 scenario active load에서는 periodic뿐 아니라 typed boundary도 SurfaceFlinger
+child를 만들지 않고 현재 vendor service session의 fresh 원자 쌍만 사용합니다. 따라서
+관측 프로세스가 target load를 교란하거나 calibration cache가 phase evidence로 재사용되지
+않습니다. Vendor pair가 없으면 typed 판정과 untyped `HWC Plane Staircase`의 단계별
+DEVICE/CLIENT는 `N/A`/`INCONCLUSIVE`이며, plan-start 참고값으로 채우지 않습니다.
+
+HWC composition count를 위해 logcat을 읽거나 임의 sysfs/debugfs를 탐색하지 않습니다.
+Portable 경로는 `dumpsys SurfaceFlinger --hwclayers`, 제품 경로는
+`IDpuLabVendorService.compositionLayerCounts`뿐입니다. 별도 allowlist sysfs는 DPU/GPU/
+bus/frequency/exact counter용이며 overlay plane maximum source로 사용하지 않습니다.
+2.5초를 넘은 cached DEVICE/CLIENT/missed-frame evidence는 최신 sample 시각으로 다시
+찍지 않고 `N/A` gap으로 남깁니다. 제품 판정에는 vendor typed API를 우선하세요.
+CPU counter도
+`HardwarePropertiesManager`와 `/proc/stat` 사이 source가 바뀌거나 read gap이 생긴
+구간은 `N/A`로 두고 다음 같은-source interval부터 다시 계산합니다. 앱 layer 이름만
+찾았지만 각 layer의 composition type을 모두 유일하게 분류하지 못한 dump도 0개로
+간주하지 않고 DEVICE/CLIENT 모두 `N/A`로 둡니다.
 
 ### 예상 layer traffic
 
@@ -626,14 +862,14 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 - debug: `app/build/outputs/apk/debug/app-debug.apk`
 - release: `app/build/outputs/apk/release/app-release-unsigned.apk`
 
-### `20260724_111816` 릴리스 산출물의 의미
+### `20260725_090252` 릴리스 산출물의 의미
 
-- release tag는 `v20260724_111816`입니다.
-- `DPULayerTest-20260724_111816-debug.apk`는 Android debug key로 서명되어 바로 설치 가능한
+- release tag는 `v20260725_090252`입니다.
+- `DPULayerTest-20260725_090252-debug.apk`는 Android debug key로 서명되어 바로 설치 가능한
   **전용 lab/개발용** APK입니다. Explicit automation alias에는 debug manifest에서
   `CONTROL_TESTS` permission이 제거되어 있으므로 ADB 사용이 쉽지만, 신뢰 경계가 열린
   이 동작을 제품 release 보안으로 간주하거나 일반 사용자 단말에 배포하면 안 됩니다.
-- `DPULayerTest-20260724_111816-release-unsigned.apk`는 제품 빌드/서명 파이프라인
+- `DPULayerTest-20260725_090252-release-unsigned.apk`는 제품 빌드/서명 파이프라인
   입력을 위한 **서명되지 않은 통합 산출물**입니다. 그대로 설치 가능한 최종 제품
   APK가 아닙니다.
 - 실제 제품 APK는 secure product build 환경에서 platform/product key로 서명하고
@@ -644,11 +880,11 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   signing token을 넣지 않습니다. 배포한 APK와 `SHA256SUMS.txt`만 공개 검증
   산출물로 취급합니다.
 
-이 timestamp build에서 host unit test **356개**가 모두 통과했고, `lintDebug`는 error
-0개(도구/의존성 업데이트 알림 warning 6개)로 통과했습니다. `assembleDebug`와
-`assembleRelease`도 성공했습니다. 이번 작업에서는 emulator/실기기 stress를 자동
-실행하지 않았으며, host 결과는 exact DPU counter가 있는 실기기 underrun 검증을
-대체하지 않습니다.
+이 timestamp build에서 41개 suite의 host unit test **575개**가 실패·오류·skip 없이
+통과했고, `lintDebug`는 error 0개(버전/도구 업데이트 알림 warning 6개)로
+통과했습니다. `assembleDebug`와 `assembleRelease`도 성공했습니다. 이번 작업에서는
+emulator/실기기 stress를 자동 실행하지 않았으며, host 결과는 exact DPU counter가
+있는 실기기 underrun 검증을 대체하지 않습니다.
 
 Debug build는 package suffix가 `.debug`이므로 제품의 release privapp allowlist와
 동일하게 취급되지 않습니다. 실제 system integration 검증은 release package로
@@ -749,8 +985,12 @@ MainActivity
 - SBWC 선택·검증은 vendor gralloc/codec adapter가 필요합니다.
 - NPU는 vendor service 또는 실제 accelerator adapter가 필요합니다. CPU fallback을
   NPU로 표시하지 않습니다.
-- 20 layer는 앱의 hard cap이지 SoC의 overlay plane 수가 아닙니다. 실제 DEVICE/CLIENT
-  배치는 HWC 정책, format, transform, alpha, scale, secure/HDR 조건에 따라 달라집니다.
+- 20 layer는 앱의 hard cap이지 SoC의 overlay plane 수가 아닙니다. Plan-start 1회
+  관측도 safety-approved candidate topology의 D/C 결과일 뿐이고 실제 배치는 HWC 정책,
+  format, transform, alpha, scale, secure/HDR 조건에 따라 달라집니다.
+- Plan-start 관측은 보편적인 maximum을 계산하거나 후속 safety cap을 변경하지 않습니다.
+  Active load에서는 SurfaceFlinger dump를 억제하므로 fresh vendor snapshot이 없는 typed/
+  untyped phase의 HWC count는 `N/A`일 수 있습니다.
 - View/client Z-order swap은 앱 content의 client-side ordering proxy이며 physical HWC
   plane의 Z-order가 바뀌었다는 증거가 아닙니다. 실제 배치는 typed vendor/HWC snapshot으로
   확인해야 합니다.
@@ -759,6 +999,8 @@ MainActivity
 - DPU frequency는 명시된 제품 counter에서 읽기만 하며 앱이 governor frequency를
   강제로 낮추거나 고정하지 않습니다.
 - portable 앱만으로 AP 전체 bus 점유율 또는 DPU active cycle을 알 수 없습니다.
+- 표준 immersive mode는 transient system-bar swipe 자체를 막지 못하며, 앱은 이를
+  감지하면 측정 오염으로 중단합니다. 실행 HUD 때문에 앱 client target 한 장은 남습니다.
 - exact counter라도 counter reset/wrap, display scope와 sampling interval은 vendor
   계약에서 명확히 정의해야 합니다.
 - 화면 녹화, profiler, ADB tracing 자체가 측정 대상에 영향을 줄 수 있습니다.

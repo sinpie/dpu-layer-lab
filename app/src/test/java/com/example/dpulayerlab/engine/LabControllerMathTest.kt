@@ -3,22 +3,30 @@ package com.example.dpulayerlab.engine
 import android.media.MediaCodecInfo
 import com.example.dpulayerlab.model.BufferSize
 import com.example.dpulayerlab.model.Gauge
+import com.example.dpulayerlab.model.HwcCompositionExpectation
 import com.example.dpulayerlab.model.LayerBackend
 import com.example.dpulayerlab.model.LoadTransitionEvaluator
 import com.example.dpulayerlab.model.LoadSetpoints
 import com.example.dpulayerlab.model.MetricQuality
 import com.example.dpulayerlab.model.MotionProfile
+import com.example.dpulayerlab.model.PhaseSpec
 import com.example.dpulayerlab.model.PixelRoute
+import com.example.dpulayerlab.model.PlanRunResult
 import com.example.dpulayerlab.model.RunProgress
+import com.example.dpulayerlab.model.RunEvent
+import com.example.dpulayerlab.model.RunSummary
 import com.example.dpulayerlab.model.RunVerdict
 import com.example.dpulayerlab.model.RunnerStage
 import com.example.dpulayerlab.model.ScenarioRunPlan
+import com.example.dpulayerlab.model.ScenarioSafetyPolicy
 import com.example.dpulayerlab.model.TelemetrySnapshot
 import com.example.dpulayerlab.model.TransitionMode
 import com.example.dpulayerlab.model.TransitionSample
 import com.example.dpulayerlab.model.TransitionSegment
 import com.example.dpulayerlab.model.TransitionSpec
+import com.example.dpulayerlab.model.terminalReason
 import com.example.dpulayerlab.monitor.CompressionControlResult
+import com.example.dpulayerlab.monitor.SurfaceFlingerProbePolicy
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
@@ -34,6 +42,248 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class LabControllerMathTest {
+    @Test
+    fun scenarioWarmupRemainsOneLayerAfterSeparatePlanCalibration() {
+        val target = PhaseSpec(
+            id = "maximum-client-target",
+            label = "Maximum client target",
+            durationMs = 16_000L,
+            activeLayers = ScenarioSafetyPolicy.HARD_MAX_LAYERS,
+            producerFps = ScenarioSafetyPolicy.HARD_MAX_PRODUCER_FPS,
+            requestedDisplayHz = 120f,
+            backend = LayerBackend.MIXED_SURFACE_TEXTURE,
+            pixelRoute = PixelRoute.RGB_8888,
+            bufferSize = BufferSize.DISPLAY,
+            motion = MotionProfile.TRANSFORM_STORM,
+            alphaOverlap = true,
+            includeGlLayer = true,
+            workloads = LoadSetpoints(cpu = 1f, memory = 1f, gpu = 1f, npu = 1f),
+            hwcCompositionExpectation = HwcCompositionExpectation.CLIENT_REQUIRED,
+        )
+
+        val warmup = safeWarmupPhaseFor(target)
+
+        assertEquals(1, warmup.activeLayers)
+        assertEquals(LayerBackend.INDEPENDENT_SURFACES, warmup.backend)
+        assertEquals(PixelRoute.RGB_8888, warmup.pixelRoute)
+        assertEquals(BufferSize.DISPLAY, warmup.bufferSize)
+        assertEquals(LoadSetpoints(), warmup.workloads)
+        assertFalse(warmup.alphaOverlap)
+        assertFalse(warmup.includeGlLayer)
+        assertEquals(HwcCompositionExpectation.NONE, warmup.hwcCompositionExpectation)
+    }
+
+    @Test
+    fun activeRunUsesVendorOnlyTypedPolicyAndSuppressesUnforcedProbe() {
+        assertEquals(
+            SurfaceFlingerProbePolicy.PERIODIC,
+            surfaceFlingerProbePolicy(
+                forceCompositionProbe = false,
+                activeRun = false,
+            ),
+        )
+        assertEquals(
+            SurfaceFlingerProbePolicy.SUPPRESS_DURING_LOAD,
+            surfaceFlingerProbePolicy(
+                forceCompositionProbe = false,
+                activeRun = true,
+            ),
+        )
+        assertEquals(
+            SurfaceFlingerProbePolicy.TYPED_BOUNDARY,
+            surfaceFlingerProbePolicy(
+                forceCompositionProbe = true,
+                activeRun = true,
+            ),
+        )
+    }
+
+    @Test
+    fun capacityGenerationActivatesOnlyAfterCommittedTopologyAndOnlyOnce() {
+        assertEquals(
+            HwcCapacityGenerationAction.WAIT,
+            hwcCapacityGenerationAction(
+                generationActivated = false,
+                topologyPublished = false,
+                topologyPending = false,
+                expectedProducerCount = 20,
+                candidateLayers = 20,
+                rendererCleanupPending = false,
+            ),
+        )
+        assertEquals(
+            HwcCapacityGenerationAction.WAIT,
+            hwcCapacityGenerationAction(
+                generationActivated = false,
+                topologyPublished = true,
+                topologyPending = true,
+                expectedProducerCount = 20,
+                candidateLayers = 20,
+                rendererCleanupPending = false,
+            ),
+        )
+        assertEquals(
+            HwcCapacityGenerationAction.WAIT,
+            hwcCapacityGenerationAction(
+                generationActivated = false,
+                topologyPublished = true,
+                topologyPending = false,
+                expectedProducerCount = 19,
+                candidateLayers = 20,
+                rendererCleanupPending = false,
+            ),
+        )
+        assertEquals(
+            HwcCapacityGenerationAction.WAIT,
+            hwcCapacityGenerationAction(
+                generationActivated = false,
+                topologyPublished = true,
+                topologyPending = false,
+                expectedProducerCount = 20,
+                candidateLayers = 20,
+                rendererCleanupPending = true,
+            ),
+        )
+        assertEquals(
+            HwcCapacityGenerationAction.ACTIVATE,
+            hwcCapacityGenerationAction(
+                generationActivated = false,
+                topologyPublished = true,
+                topologyPending = false,
+                expectedProducerCount = 20,
+                candidateLayers = 20,
+                rendererCleanupPending = false,
+            ),
+        )
+        // A failed atomic activation attempt leaves the local state false, so the same committed
+        // topology remains retryable until the caller's bounded deadline.
+        assertEquals(
+            HwcCapacityGenerationAction.ACTIVATE,
+            hwcCapacityGenerationAction(
+                generationActivated = false,
+                topologyPublished = true,
+                topologyPending = false,
+                expectedProducerCount = 20,
+                candidateLayers = 20,
+                rendererCleanupPending = false,
+            ),
+        )
+        assertEquals(
+            HwcCapacityGenerationAction.OBSERVE,
+            hwcCapacityGenerationAction(
+                generationActivated = true,
+                topologyPublished = false,
+                topologyPending = true,
+                expectedProducerCount = 0,
+                candidateLayers = 20,
+                rendererCleanupPending = true,
+            ),
+        )
+    }
+
+    @Test
+    fun capacityCalibrationRequiresReadyCandidateAndFreshAtomicPair() {
+        val valid = hwcCapacityCalibrationResult(
+            candidateLayers = 20,
+            expectedProducerCount = 20,
+            observedProducerCount = 20,
+            sampleStartedMonotonicMs = 100L,
+            snapshot = hwcSnapshot(
+                sampleMonotonicMs = 130L,
+                evidenceMonotonicMs = 120L,
+                deviceLayers = 8,
+                clientLayers = 12,
+            ),
+        )
+        assertEquals(
+            HwcCapacityCalibrationStatus.OBSERVED_AT_CANDIDATE,
+            valid.status,
+        )
+        assertEquals(20, valid.candidateLayers)
+        assertEquals(8, valid.observedDeviceLayers)
+        assertEquals(12, valid.observedClientLayers)
+        assertTrue(valid.detail.contains("not a universal"))
+
+        val preCalibrationCache = hwcCapacityCalibrationResult(
+            candidateLayers = 20,
+            expectedProducerCount = 20,
+            observedProducerCount = 20,
+            sampleStartedMonotonicMs = 121L,
+            snapshot = hwcSnapshot(
+                sampleMonotonicMs = 130L,
+                evidenceMonotonicMs = 120L,
+                deviceLayers = 8,
+                clientLayers = 12,
+            ),
+        )
+        assertEquals(
+            HwcCapacityCalibrationStatus.UNAVAILABLE,
+            preCalibrationCache.status,
+        )
+        assertNull(preCalibrationCache.observedDeviceLayers)
+
+        val incompletePair = hwcCapacityCalibrationResult(
+            candidateLayers = 12,
+            expectedProducerCount = 12,
+            observedProducerCount = 12,
+            sampleStartedMonotonicMs = 100L,
+            snapshot = hwcSnapshot(
+                sampleMonotonicMs = 130L,
+                evidenceMonotonicMs = 120L,
+                deviceLayers = 0,
+                clientLayers = 12,
+            ).copy(
+                hwcClientLayers = null,
+                hwcClientLayersSource = "",
+            ),
+        )
+        assertEquals(HwcCapacityCalibrationStatus.UNAVAILABLE, incompletePair.status)
+        assertNull(incompletePair.observedDeviceLayers)
+        assertNull(incompletePair.observedClientLayers)
+
+        val topologyShortfall = hwcCapacityCalibrationResult(
+            candidateLayers = 20,
+            expectedProducerCount = 20,
+            observedProducerCount = 19,
+            sampleStartedMonotonicMs = 100L,
+            snapshot = hwcSnapshot(
+                sampleMonotonicMs = 130L,
+                evidenceMonotonicMs = 120L,
+                deviceLayers = 8,
+                clientLayers = 11,
+            ),
+        )
+        assertEquals(HwcCapacityCalibrationStatus.UNAVAILABLE, topologyShortfall.status)
+    }
+
+    @Test
+    fun capacityReuseIsAdvisoryAndUnavailableNeverFabricatesBoundary() {
+        val observed = HwcCapacityCalibrationResult(
+            status = HwcCapacityCalibrationStatus.OBSERVED_AT_CANDIDATE,
+            candidateLayers = 20,
+            observedDeviceLayers = 8,
+            observedClientLayers = 12,
+            source = "vendor:test",
+            quality = MetricQuality.HARDWARE_COUNTER,
+        )
+
+        val guidance = capacityReuseGuidance(observed)
+        assertEquals(8, guidance.deviceCandidateCeiling)
+        assertEquals(9, guidance.clientPressureCandidate)
+        assertTrue(guidance.detail.contains("advisory only"))
+        assertTrue(observed.uiSummary().contains("HARDWARE_COUNTER@vendor:test"))
+
+        val unavailable = capacityReuseGuidance(
+            HwcCapacityCalibrationResult(
+                status = HwcCapacityCalibrationStatus.UNAVAILABLE,
+                candidateLayers = 20,
+                detail = "no fresh pair",
+            ),
+        )
+        assertNull(unavailable.deviceCandidateCeiling)
+        assertNull(unavailable.clientPressureCandidate)
+    }
+
     @Test
     fun mediaPreflightLatchWaitIsCancellableAndCompletionWinsAtZeroTimeout() =
         runBlocking {
@@ -551,6 +801,171 @@ class LabControllerMathTest {
     }
 
     @Test
+    fun overlappingThermalAndProducerRecoveryPauseOwnersCannotResumeEachOther() {
+        val clock = ActivePhaseClock(startedAtMs = 1_000L)
+        clock.pause(1_100L, PhasePauseOwner.THERMAL_DERATE)
+        clock.pause(1_200L, PhasePauseOwner.PRODUCER_RECOVERY)
+
+        clock.resume(1_300L, PhasePauseOwner.THERMAL_DERATE)
+        assertEquals(100L, clock.elapsedMs(1_500L))
+        assertEquals(
+            300L,
+            clock.currentPauseMs(1_500L, PhasePauseOwner.PRODUCER_RECOVERY),
+        )
+
+        clock.resume(1_600L, PhasePauseOwner.PRODUCER_RECOVERY)
+        assertEquals(500L, clock.totalPausedMs(1_600L))
+        assertEquals(200L, clock.elapsedMs(1_700L))
+
+        val budget = AppliedProducerFrameBudget(
+            phaseStartedMs = 1_000L,
+            phaseDurationMs = 1_000L,
+        )
+        budget.apply(1_000L, producerFps = 60f, activeLayers = 1)
+        budget.pause(1_100L, PhasePauseOwner.THERMAL_DERATE)
+        budget.pause(1_200L, PhasePauseOwner.PRODUCER_RECOVERY)
+        budget.resume(1_300L, PhasePauseOwner.THERMAL_DERATE)
+        budget.resume(1_600L, PhasePauseOwner.PRODUCER_RECOVERY)
+        assertEquals(12.0, budget.finish(1_700L), 0.001)
+    }
+
+    @Test
+    fun hwcProbeNeedsAFullBoundedWindowAndDoesNotCreateHiddenPhaseTime() {
+        assertFalse(
+            hwcCompositionProbeCanStart(
+                remainingActiveMs = 4_099L,
+                sampleTimeoutMs = 4_000L,
+                completionReserveMs = 100L,
+            ),
+        )
+        assertTrue(
+            hwcCompositionProbeCanStart(
+                remainingActiveMs = 4_100L,
+                sampleTimeoutMs = 4_000L,
+                completionReserveMs = 100L,
+            ),
+        )
+        assertFalse(
+            hwcCompositionProbeCanStart(
+                remainingActiveMs = Long.MAX_VALUE,
+                sampleTimeoutMs = Long.MAX_VALUE,
+                completionReserveMs = 1L,
+            ),
+        )
+
+        // Probe work keeps the target active, so the ordinary phase clock/frame budget integrates
+        // the entire observation interval instead of pausing it as unreported time.
+        val clock = ActivePhaseClock(startedAtMs = 1_000L)
+        val budget = AppliedProducerFrameBudget(
+            phaseStartedMs = 1_000L,
+            phaseDurationMs = 4_000L,
+        )
+        budget.apply(1_000L, producerFps = 60f, activeLayers = 4)
+        assertEquals(4_000L, clock.elapsedMs(5_000L))
+        assertEquals(240.0, budget.finish(5_000L), 0.001)
+        assertEquals(960.0, budget.expectedAggregateFrames(), 0.001)
+    }
+
+    @Test
+    fun clientHwcProbeForcesTwoBoundedAttemptsUnlessEvidenceCompletesEarlier() {
+        assertEquals(
+            HwcCompositionProbeAction.FORCE_SAMPLE,
+            hwcCompositionProbeAction(
+                expectation = HwcCompositionExpectation.CLIENT_REQUIRED,
+                matchingEvidenceCount = 0,
+                terminalFailure = false,
+                forcedAttempts = 0,
+            ),
+        )
+        assertEquals(
+            HwcCompositionProbeAction.FORCE_SAMPLE,
+            hwcCompositionProbeAction(
+                expectation = HwcCompositionExpectation.CLIENT_REQUIRED,
+                matchingEvidenceCount = 1,
+                terminalFailure = false,
+                forcedAttempts = 1,
+            ),
+        )
+        assertEquals(
+            HwcCompositionProbeAction.COMPLETE,
+            hwcCompositionProbeAction(
+                expectation = HwcCompositionExpectation.CLIENT_REQUIRED,
+                matchingEvidenceCount = 2,
+                terminalFailure = false,
+                forcedAttempts = 1,
+            ),
+        )
+        assertEquals(
+            HwcCompositionProbeAction.EXHAUSTED,
+            hwcCompositionProbeAction(
+                expectation = HwcCompositionExpectation.CLIENT_REQUIRED,
+                matchingEvidenceCount = 1,
+                terminalFailure = false,
+                forcedAttempts = 2,
+            ),
+        )
+        assertEquals(
+            HwcCompositionProbeAction.COMPLETE,
+            hwcCompositionProbeAction(
+                expectation = HwcCompositionExpectation.CLIENT_REQUIRED,
+                matchingEvidenceCount = 0,
+                terminalFailure = true,
+                forcedAttempts = 0,
+            ),
+        )
+        assertEquals(
+            HwcCompositionProbeAction.EXHAUSTED,
+            hwcCompositionProbeAction(
+                expectation = HwcCompositionExpectation.DEVICE_ONLY,
+                matchingEvidenceCount = 0,
+                terminalFailure = false,
+                forcedAttempts = 1,
+            ),
+        )
+    }
+
+    @Test
+    fun typedHwcPriorityDropsPeriodicWaitersAndReleasesOnlyItsOwner() {
+        assertEquals(
+            PeriodicTelemetryArbitration.SAMPLE,
+            periodicTelemetryArbitration(
+                mutexAcquired = true,
+                typedHwcProbePriority = false,
+            ),
+        )
+        assertEquals(
+            PeriodicTelemetryArbitration.DROP_BUSY,
+            periodicTelemetryArbitration(
+                mutexAcquired = false,
+                typedHwcProbePriority = false,
+            ),
+        )
+        assertEquals(
+            PeriodicTelemetryArbitration.DROP_TYPED_HWC_PRIORITY,
+            periodicTelemetryArbitration(
+                mutexAcquired = true,
+                typedHwcProbePriority = true,
+            ),
+        )
+
+        val gate = HwcCompositionProbePriorityGate()
+        val firstOwner = Any()
+        val foreignOwner = Any()
+        assertTrue(gate.acquire(firstOwner))
+        assertTrue(gate.acquire(firstOwner))
+        assertTrue(gate.isActive())
+        assertFalse(gate.acquire(foreignOwner))
+        assertFalse(gate.release(foreignOwner))
+        assertTrue(gate.isActive())
+        assertTrue(gate.release(firstOwner))
+        assertFalse(gate.isActive())
+
+        assertTrue(gate.acquire(firstOwner))
+        gate.reset()
+        assertFalse(gate.isActive())
+    }
+
+    @Test
     fun producerRecoveryDeadlineAllowsClearAtExactBoundaryOnly() {
         assertFalse(
             producerRecoveryDeadlineExceeded(
@@ -740,6 +1155,7 @@ class LabControllerMathTest {
             bufferSize = BufferSize.UHD_4K,
             alphaOverlap = true,
             includeGlLayer = true,
+            hwcCompositionExpectation = HwcCompositionExpectation.CLIENT_REQUIRED,
         )
 
         val warmup = safeWarmupPhaseFor(target)
@@ -749,6 +1165,11 @@ class LabControllerMathTest {
         assertEquals(BufferSize.DISPLAY, warmup.bufferSize)
         assertFalse(warmup.alphaOverlap)
         assertFalse(warmup.includeGlLayer)
+        assertEquals(HwcCompositionExpectation.NONE, warmup.hwcCompositionExpectation)
+        assertEquals(
+            HwcCompositionExpectation.NONE,
+            rendererPreparationPhase(target).hwcCompositionExpectation,
+        )
         assertTrue(rendererAllocationRouteChanges(warmup, target))
         assertFalse(rendererAllocationRouteChanges(null, warmup))
 
@@ -1015,6 +1436,31 @@ class LabControllerMathTest {
                 stageRemovalAcknowledged = false,
                 processLeaseActive = false,
                 deadlineReached = false,
+            ),
+        )
+    }
+
+    @Test
+    fun anyPinnedMediaCleanupUncertaintyOverridesSuccessfulMasterCloses() {
+        assertTrue(
+            mediaDescriptorCleanupConfirmed(
+                selectedDescriptorReleased = true,
+                pendingDescriptorReleased = true,
+                processCleanupUnconfirmed = false,
+            ),
+        )
+        assertFalse(
+            mediaDescriptorCleanupConfirmed(
+                selectedDescriptorReleased = true,
+                pendingDescriptorReleased = true,
+                processCleanupUnconfirmed = true,
+            ),
+        )
+        assertFalse(
+            mediaDescriptorCleanupConfirmed(
+                selectedDescriptorReleased = false,
+                pendingDescriptorReleased = true,
+                processCleanupUnconfirmed = false,
             ),
         )
     }
@@ -1434,6 +1880,223 @@ class LabControllerMathTest {
     }
 
     @Test
+    fun telemetryWatchdogProtectsOnlyTheBoundedInFlightWindow() {
+        val inFlightDeadline = telemetrySampleDeadlineMs(
+            sampleStartedMs = 6_000L,
+            sampleTimeoutMs = 4_000L,
+            completionGraceMs = 500L,
+        )
+        assertEquals(10_500L, inFlightDeadline)
+
+        // The last success is stale, but the accepted sample still owns its bounded deadline.
+        assertFalse(
+            shouldAbortTelemetryWatchdog(
+                nowMs = 10_000L,
+                lastSuccessfulSampleMs = 4_000L,
+                staleTimeoutMs = 5_000L,
+                inFlightDeadlineMs = inFlightDeadline,
+            ),
+        )
+        assertFalse(
+            shouldAbortTelemetryWatchdog(
+                nowMs = inFlightDeadline,
+                lastSuccessfulSampleMs = 4_000L,
+                staleTimeoutMs = 5_000L,
+                inFlightDeadlineMs = inFlightDeadline,
+            ),
+        )
+        assertTrue(
+            shouldAbortTelemetryWatchdog(
+                nowMs = inFlightDeadline + 1L,
+                lastSuccessfulSampleMs = 4_000L,
+                staleTimeoutMs = 5_000L,
+                inFlightDeadlineMs = inFlightDeadline,
+            ),
+        )
+    }
+
+    @Test
+    fun telemetryWatchdogStillAbortsStaleMonitorWithoutAnInFlightOwner() {
+        assertFalse(
+            shouldAbortTelemetryWatchdog(
+                nowMs = 6_000L,
+                lastSuccessfulSampleMs = 1_000L,
+                staleTimeoutMs = 5_000L,
+                inFlightDeadlineMs = null,
+            ),
+        )
+        assertTrue(
+            shouldAbortTelemetryWatchdog(
+                nowMs = 6_001L,
+                lastSuccessfulSampleMs = 1_000L,
+                staleTimeoutMs = 5_000L,
+                inFlightDeadlineMs = null,
+            ),
+        )
+        assertEquals(
+            Long.MAX_VALUE,
+            telemetrySampleDeadlineMs(
+                sampleStartedMs = Long.MAX_VALUE - 1L,
+                sampleTimeoutMs = 4_000L,
+                completionGraceMs = 500L,
+            ),
+        )
+    }
+
+    @Test
+    fun fatalTelemetryStartupFailuresAreRethrownAfterRollback() {
+        assertTrue(isFatalTelemetryStartupFailure(OutOfMemoryError("oom")))
+        assertTrue(isFatalTelemetryStartupFailure(ThreadDeath()))
+        assertTrue(isFatalTelemetryStartupFailure(AssertionError("fatal")))
+        assertTrue(isFatalControllerStartupFailure(OutOfMemoryError("oom")))
+        assertFalse(
+            isFatalTelemetryStartupFailure(
+                IllegalStateException("recoverable startup failure"),
+            ),
+        )
+        assertFalse(
+            isFatalControllerStartupFailure(
+                IllegalStateException("recoverable startup failure"),
+            ),
+        )
+    }
+
+    @Test
+    fun unexpectedJobCompletionDistinguishesCancellationFromBackendFailure() {
+        assertNull(unexpectedJobCompletionReason("plan", null))
+        assertNull(
+            unexpectedJobCompletionReason(
+                "plan",
+                CancellationException("expected stop"),
+            ),
+        )
+        assertEquals(
+            "performance renewal Job failed unexpectedly: OutOfMemoryError",
+            unexpectedJobCompletionReason(
+                "performance renewal",
+                OutOfMemoryError("oom"),
+            ),
+        )
+    }
+
+    @Test
+    fun telemetryPairNeverReusesOrOverwritesOnlyOneLiveWorker() {
+        assertEquals(
+            TelemetryPairStartDecision.START_NEW_PAIR,
+            telemetryPairStartDecision(
+                monitorPresent = false,
+                monitorActive = false,
+                watchdogPresent = false,
+                watchdogActive = false,
+                lifecycleIntegrityConfirmed = true,
+            ),
+        )
+        assertEquals(
+            TelemetryPairStartDecision.REUSE_ACTIVE_PAIR,
+            telemetryPairStartDecision(
+                monitorPresent = true,
+                monitorActive = true,
+                watchdogPresent = true,
+                watchdogActive = true,
+                lifecycleIntegrityConfirmed = true,
+            ),
+        )
+        assertEquals(
+            TelemetryPairStartDecision.WAIT_FOR_TERMINATION,
+            telemetryPairStartDecision(
+                monitorPresent = true,
+                monitorActive = true,
+                watchdogPresent = false,
+                watchdogActive = false,
+                lifecycleIntegrityConfirmed = true,
+            ),
+        )
+        assertEquals(
+            TelemetryPairStartDecision.WAIT_FOR_TERMINATION,
+            telemetryPairStartDecision(
+                monitorPresent = true,
+                monitorActive = false,
+                watchdogPresent = true,
+                watchdogActive = false,
+                lifecycleIntegrityConfirmed = true,
+            ),
+        )
+        assertEquals(
+            TelemetryPairStartDecision.REJECT_UNTRUSTED_LIFECYCLE,
+            telemetryPairStartDecision(
+                monitorPresent = true,
+                monitorActive = true,
+                watchdogPresent = true,
+                watchdogActive = true,
+                lifecycleIntegrityConfirmed = false,
+            ),
+        )
+    }
+
+    @Test
+    fun longLivedTelemetryWorkersFailClosedOnUnownedExit() {
+        assertNull(
+            unexpectedLongLivedWorkerCompletionReason(
+                operation = "monitor",
+                cause = CancellationException("pause"),
+                expectedStop = true,
+            ),
+        )
+        assertEquals(
+            "watchdog Job was cancelled without an owning stop request",
+            unexpectedLongLivedWorkerCompletionReason(
+                operation = "watchdog",
+                cause = CancellationException("external"),
+                expectedStop = false,
+            ),
+        )
+        assertEquals(
+            "monitor Job exited while continuous monitoring was required",
+            unexpectedLongLivedWorkerCompletionReason(
+                operation = "monitor",
+                cause = null,
+                expectedStop = false,
+            ),
+        )
+        assertEquals(
+            "watchdog Job failed unexpectedly: OutOfMemoryError",
+            unexpectedLongLivedWorkerCompletionReason(
+                operation = "watchdog",
+                cause = OutOfMemoryError("oom"),
+                expectedStop = true,
+            ),
+        )
+    }
+
+    @Test
+    fun renewalFailureOnlyAbortsTheMatchingActiveRunAndNeverAStaleOwner() {
+        assertTrue(
+            shouldFailPerformanceIsolationAfterRenewalCompletion(
+                operationFailure = "renew worker failed",
+                runOwnerMatches = true,
+                runOwnerActive = true,
+                isolationMonitoringExpected = true,
+            ),
+        )
+        assertFalse(
+            shouldFailPerformanceIsolationAfterRenewalCompletion(
+                operationFailure = "stale renew worker failed",
+                runOwnerMatches = false,
+                runOwnerActive = true,
+                isolationMonitoringExpected = true,
+            ),
+        )
+        assertFalse(
+            shouldFailPerformanceIsolationAfterRenewalCompletion(
+                operationFailure = null,
+                runOwnerMatches = true,
+                runOwnerActive = true,
+                isolationMonitoringExpected = true,
+            ),
+        )
+    }
+
+    @Test
     fun firstCancellationReasonPreservesSafetyButRecordsAStandaloneUserStop() {
         val thermalReason = "thermal CRITICAL 안전 중단"
         assertEquals(
@@ -1499,6 +2162,192 @@ class LabControllerMathTest {
         } finally {
             root.deleteRecursively()
         }
+    }
+
+    @Test
+    fun obsoleteReportCleanupDeletesOnlyManagedCompletedArtifact() {
+        val root = Files.createTempDirectory("dpu-report-cleanup-test").toFile()
+        try {
+            val reports = File(root, "reports").apply { mkdirs() }
+            val managed = File(
+                reports,
+                "dpu-layer-lab-20260724-111816-124-scenario.json",
+            ).apply { writeText("{}") }
+            val foreignInReports = File(reports, "foreign.json").apply { writeText("{}") }
+            val outside = File(root, managed.name).apply { writeText("{}") }
+            val resolvedManaged = checkNotNull(
+                resolveManagedReportFile(reports, managed.absolutePath),
+            )
+            assertTrue(
+                isPublishedReportForSharing(
+                    reportFile = resolvedManaged,
+                    lastReportFile = managed,
+                    planResultPaths = emptySequence(),
+                ),
+            )
+            assertTrue(
+                isPublishedReportForSharing(
+                    reportFile = resolvedManaged,
+                    lastReportFile = null,
+                    planResultPaths = sequenceOf(managed.absolutePath),
+                ),
+            )
+            assertFalse(
+                isPublishedReportForSharing(
+                    reportFile = resolvedManaged,
+                    lastReportFile = null,
+                    planResultPaths = emptySequence(),
+                ),
+            )
+
+            assertFalse(
+                deleteManagedCompletedReportBestEffort(
+                    reportsDirectory = reports,
+                    reportFile = foreignInReports,
+                ),
+            )
+            assertTrue(foreignInReports.isFile)
+            assertFalse(
+                deleteManagedCompletedReportBestEffort(
+                    reportsDirectory = reports,
+                    reportFile = outside,
+                ),
+            )
+            assertTrue(outside.isFile)
+
+            assertTrue(
+                deleteManagedCompletedReportBestEffort(
+                    reportsDirectory = reports,
+                    reportFile = managed,
+                ),
+            )
+            assertFalse(managed.exists())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun planRestoreFailureWithdrawsEveryEarlierReportButKeepsCurrentForRewrite() {
+        val first = ScenarioCatalog.presets[0]
+        val current = ScenarioCatalog.presets[1]
+        val results = listOf(
+            PlanRunResult(
+                runIndex = 0,
+                repeatIndex = 0,
+                queueIndex = 0,
+                scenario = first,
+                verdict = RunVerdict.CLEAN,
+                startedEpochMs = 100L,
+                finishedEpochMs = 200L,
+                exactUnderrunDelta = 0L,
+                suspectedUnderrunDelta = 0L,
+                reportPath = "/reports/first.json",
+            ),
+            PlanRunResult(
+                runIndex = 1,
+                repeatIndex = 0,
+                queueIndex = 1,
+                scenario = current,
+                verdict = RunVerdict.CLEAN,
+                startedEpochMs = 300L,
+                finishedEpochMs = 400L,
+                exactUnderrunDelta = 0L,
+                suspectedUnderrunDelta = 0L,
+                reportPath = "/reports/current.json",
+            ),
+        )
+
+        val invalidation = invalidateEarlierPlanResultsForRestoreFailure(
+            results = results,
+            currentStartedEpochMs = 300L,
+            currentScenarioId = current.id,
+            terminalReason = "restore failed",
+        )
+
+        assertEquals(listOf("/reports/first.json"), invalidation.invalidatedReportPaths)
+        assertEquals(RunVerdict.ABORTED, invalidation.updatedResults[0].verdict)
+        assertNull(invalidation.updatedResults[0].reportPath)
+        assertEquals("restore failed", invalidation.updatedResults[0].terminalReason)
+        assertEquals(results[1], invalidation.updatedResults[1])
+    }
+
+    @Test
+    fun missingCurrentResultFailsClosedByWithdrawingAllPublishedReports() {
+        val scenario = ScenarioCatalog.presets[0]
+        val result = PlanRunResult(
+            runIndex = 0,
+            repeatIndex = 0,
+            queueIndex = 0,
+            scenario = scenario,
+            verdict = RunVerdict.CLEAN,
+            startedEpochMs = 100L,
+            finishedEpochMs = 200L,
+            exactUnderrunDelta = 0L,
+            suspectedUnderrunDelta = 0L,
+            reportPath = "/reports/only.json",
+        )
+
+        val invalidation = invalidateEarlierPlanResultsForRestoreFailure(
+            results = listOf(result),
+            currentStartedEpochMs = 999L,
+            currentScenarioId = "missing",
+            terminalReason = "restore failed",
+        )
+
+        assertEquals(listOf("/reports/only.json"), invalidation.invalidatedReportPaths)
+        assertEquals(RunVerdict.ABORTED, invalidation.updatedResults.single().verdict)
+        assertNull(invalidation.updatedResults.single().reportPath)
+    }
+
+    @Test
+    fun restoreReportPublicationFailureCannotBeRetriedAsClean() {
+        val summary = RunSummary(
+            scenario = ScenarioCatalog.presets.first(),
+            startedEpochMs = 100L,
+            finishedEpochMs = 200L,
+            verdict = RunVerdict.CLEAN,
+            exactUnderrunDelta = 0L,
+            exactUnderrunSource = "test",
+            exactUnderrunQuality = MetricQuality.HARDWARE_COUNTER,
+            suspectedUnderrunDelta = 0L,
+            peakCpu = null,
+            peakMemoryUsed = null,
+            peakGeneratedBandwidth = null,
+            events = listOf(
+                RunEvent(
+                    monotonicMs = 50L,
+                    type = PERFORMANCE_RESTORE_CONFIRMED_EVENT,
+                    message = "restore confirmed",
+                ),
+            ),
+            samples = emptyList(),
+        )
+
+        val failed = markPerformanceRestoreReportPublicationFailed(
+            summary = summary,
+            finishedEpochMs = 300L,
+            monotonicMs = 75L,
+            failureType = "IOException",
+        )
+        val retried = markPerformanceRestoreReportPublicationFailed(
+            summary = failed,
+            finishedEpochMs = 400L,
+            monotonicMs = 90L,
+            failureType = "IOException",
+        )
+
+        assertEquals(RunVerdict.ABORTED, failed.verdict)
+        assertEquals(
+            1,
+            retried.events.count {
+                it.type == PERFORMANCE_RESTORE_REPORT_WRITE_FAILED_EVENT
+            },
+        )
+        assertEquals(
+            "Performance restore outcome report publication failed: IOException",
+            retried.terminalReason(),
+        )
     }
 
     @Test
@@ -1596,6 +2445,605 @@ class LabControllerMathTest {
 
         assertTrue(pulse.failureReason()!!.contains("동일 cycle"))
     }
+
+    @Test
+    fun reportTelemetryUsesOneRunRelativeMonotonicAxis() {
+        val relative = TelemetrySnapshot(
+            monotonicMs = 1_200L,
+            hwcCompositionEvidenceMonotonicMs = 1_100L,
+            hwcCompositionEvidenceAgeMs = 100L,
+            surfaceFlingerEvidenceMonotonicMs = 1_150L,
+            surfaceFlingerEvidenceAgeMs = 50L,
+        ).toRunRelativeTelemetry(runStartMonotonicMs = 1_000L)
+
+        assertEquals(200L, relative.monotonicMs)
+        assertEquals(100L, relative.hwcCompositionEvidenceMonotonicMs)
+        assertEquals(100L, relative.hwcCompositionEvidenceAgeMs)
+        assertEquals(150L, relative.surfaceFlingerEvidenceMonotonicMs)
+        assertEquals(50L, relative.surfaceFlingerEvidenceAgeMs)
+
+        val invalidEvidence = TelemetrySnapshot(
+            monotonicMs = 1_200L,
+            hwcDeviceLayers = 2,
+            hwcDeviceLayersQuality = MetricQuality.SYSTEM_SERVICE,
+            hwcDeviceLayersSource = "SurfaceFlinger",
+            hwcClientLayers = 0,
+            hwcClientLayersQuality = MetricQuality.SYSTEM_SERVICE,
+            hwcClientLayersSource = "SurfaceFlinger",
+            hwcCompositionEvidenceMonotonicMs = 999L,
+            hwcCompositionEvidenceAgeMs = 201L,
+            surfaceFlingerHwcMissed = 3L,
+            surfaceFlingerGpuMissed = 4L,
+            surfaceFlingerMissSource = "SurfaceFlinger",
+            surfaceFlingerEvidenceMonotonicMs = 1_201L,
+            surfaceFlingerEvidenceAgeMs = 0L,
+        ).toRunRelativeTelemetry(runStartMonotonicMs = 1_000L)
+        // A valid pre-run cache keeps a signed timestamp and its atomic pair.
+        assertEquals(-1L, invalidEvidence.hwcCompositionEvidenceMonotonicMs)
+        assertEquals(201L, invalidEvidence.hwcCompositionEvidenceAgeMs)
+        assertEquals(2, invalidEvidence.hwcDeviceLayers)
+        assertEquals(MetricQuality.SYSTEM_SERVICE, invalidEvidence.hwcDeviceLayersQuality)
+        // A future timestamp clears all related values/provenance atomically.
+        assertNull(invalidEvidence.surfaceFlingerEvidenceMonotonicMs)
+        assertNull(invalidEvidence.surfaceFlingerEvidenceAgeMs)
+        assertNull(invalidEvidence.surfaceFlingerHwcMissed)
+        assertNull(invalidEvidence.surfaceFlingerGpuMissed)
+        assertEquals("", invalidEvidence.surfaceFlingerMissSource)
+
+        val preRunSample = TelemetrySnapshot(
+            monotonicMs = 900L,
+            hwcDeviceLayers = 1,
+            hwcDeviceLayersQuality = MetricQuality.SYSTEM_SERVICE,
+            hwcDeviceLayersSource = "SurfaceFlinger",
+            hwcClientLayers = 0,
+            hwcClientLayersQuality = MetricQuality.SYSTEM_SERVICE,
+            hwcClientLayersSource = "SurfaceFlinger",
+            hwcCompositionEvidenceMonotonicMs = 900L,
+            hwcCompositionEvidenceAgeMs = 0L,
+        ).toRunRelativeTelemetry(runStartMonotonicMs = 1_000L)
+        assertEquals(0L, preRunSample.monotonicMs)
+        assertNull(preRunSample.hwcCompositionEvidenceMonotonicMs)
+        assertNull(preRunSample.hwcCompositionEvidenceAgeMs)
+        assertNull(preRunSample.hwcDeviceLayers)
+        assertNull(preRunSample.hwcClientLayers)
+        assertEquals(MetricQuality.UNAVAILABLE, preRunSample.hwcDeviceLayersQuality)
+        assertEquals("", preRunSample.hwcDeviceLayersSource)
+
+        val inconsistentAge = TelemetrySnapshot(
+            monotonicMs = 1_200L,
+            hwcDeviceLayers = 1,
+            hwcDeviceLayersQuality = MetricQuality.SYSTEM_SERVICE,
+            hwcDeviceLayersSource = "SurfaceFlinger",
+            hwcClientLayers = 0,
+            hwcClientLayersQuality = MetricQuality.SYSTEM_SERVICE,
+            hwcClientLayersSource = "SurfaceFlinger",
+            hwcCompositionEvidenceMonotonicMs = 1_100L,
+            hwcCompositionEvidenceAgeMs = 99L,
+        ).toRunRelativeTelemetry(runStartMonotonicMs = 1_000L)
+        assertNull(inconsistentAge.hwcCompositionEvidenceMonotonicMs)
+        assertNull(inconsistentAge.hwcDeviceLayers)
+        assertEquals(MetricQuality.UNAVAILABLE, inconsistentAge.hwcDeviceLayersQuality)
+        assertEquals("", inconsistentAge.hwcDeviceLayersSource)
+    }
+
+    @Test
+    fun hwcTargetArmRequiresOneFreshStableProducerTopologySnapshot() {
+        fun ready(
+            topologyPending: Boolean = false,
+            processLeaseActive: Boolean = false,
+            pendingBoundaryExists: Boolean = false,
+            observedProducerCount: Int = 4,
+            observedTopologyRevision: Long = 9L,
+        ) = hwcCompositionTargetReadyForArm(
+            ready = true,
+            topologyPublished = true,
+            topologyPending = topologyPending,
+            processLeaseActive = processLeaseActive,
+            pendingBoundaryExists = pendingBoundaryExists,
+            teardownFailed = false,
+            runtimeFailurePresent = false,
+            expectedProducerCount = 4,
+            observedProducerCount = observedProducerCount,
+            expectedTopologyRevision = 9L,
+            observedTopologyRevision = observedTopologyRevision,
+        )
+
+        assertTrue(ready())
+        assertFalse(ready(topologyPending = true))
+        assertFalse(ready(processLeaseActive = true))
+        assertFalse(ready(pendingBoundaryExists = true))
+        assertFalse(ready(observedProducerCount = 3))
+        assertFalse(ready(observedTopologyRevision = 8L))
+    }
+
+    @Test
+    fun runtimeThermalClampInvalidatesTypedHwcContractBeforeOrDuringTarget() {
+        val requested = ScenarioCatalog.presets.first().phases.first().copy(
+            activeLayers = 20,
+            producerFps = 120f,
+            requestedDisplayHz = 120f,
+            workloads = LoadSetpoints(gpu = 0.8f),
+            includeGlLayer = true,
+            hwcCompositionExpectation = HwcCompositionExpectation.CLIENT_REQUIRED,
+        )
+        val reduced = requested.copy(
+            activeLayers = 10,
+            producerFps = 60f,
+            requestedDisplayHz = 60f,
+            workloads = requested.workloads.copy(gpu = 0.4f),
+        )
+        assertTrue(hwcCompositionContractPreserved(requested, requested))
+        assertFalse(hwcCompositionContractPreserved(requested, reduced))
+        assertTrue(
+            hwcCompositionContractPreserved(
+                requested.copy(
+                    hwcCompositionExpectation = HwcCompositionExpectation.NONE,
+                ),
+                reduced.copy(
+                    hwcCompositionExpectation = HwcCompositionExpectation.NONE,
+                ),
+            ),
+        )
+        assertTrue(
+            hwcCompositionContractDeltaSummary(requested, reduced)
+                .contains("layers=20→10"),
+        )
+
+        val tracker = HwcCompositionCoverageTracker(
+            HwcCompositionExpectation.CLIENT_REQUIRED,
+        )
+        tracker.recordContractFailure("typed HWC target changed during thermal derate")
+        tracker.activateTarget(100L)
+        repeat(2) { index ->
+            val evidenceMs = 110L + index * 20L
+            tracker.observe(
+                sampleStartedMonotonicMs = evidenceMs,
+                snapshot = hwcSnapshot(
+                    sampleMonotonicMs = evidenceMs,
+                    evidenceMonotonicMs = evidenceMs,
+                    deviceLayers = 2,
+                    clientLayers = 2,
+                ),
+            )
+        }
+        val result = tracker.result()
+        assertFalse(result.satisfied)
+        assertTrue(result.failureReason!!.contains("thermal derate"))
+        // Reduced-target observations remain reportable auxiliary evidence.
+        assertEquals(2, result.matchingEvidenceCount)
+        assertEquals(2, result.validClientLayers)
+        val chain = advanceHwcCompositionChain(
+            prior = null,
+            coverage = result,
+            // Directional history keeps the declared contract, not the thermal-effective 10L.
+            requestedActiveLayers = requested.activeLayers,
+        )
+        assertEquals(20, chain.nextAnchor!!.requestedActiveLayers)
+    }
+
+    @Test
+    fun hwcDeviceOnlyCoverageStartsAfterTargetReadyAndCountsCachedEvidenceOnce() {
+        val tracker = HwcCompositionCoverageTracker(
+            HwcCompositionExpectation.DEVICE_ONLY,
+        )
+        assertTrue(tracker.activateTarget(100L))
+        assertFalse(tracker.activateTarget(101L))
+
+        // Even though the dump completed later, a request issued before target readiness cannot
+        // classify the new target.
+        tracker.observe(
+            sampleStartedMonotonicMs = 90L,
+            snapshot = hwcSnapshot(
+                sampleMonotonicMs = 110L,
+                evidenceMonotonicMs = 110L,
+                deviceLayers = 4,
+                clientLayers = 0,
+            ),
+        )
+        tracker.observe(
+            sampleStartedMonotonicMs = 120L,
+            snapshot = hwcSnapshot(
+                sampleMonotonicMs = 130L,
+                evidenceMonotonicMs = 130L,
+                deviceLayers = 4,
+                clientLayers = 0,
+            ),
+        )
+        // A later full telemetry sample may project the same independently timestamped evidence.
+        tracker.observe(
+            sampleStartedMonotonicMs = 140L,
+            snapshot = hwcSnapshot(
+                sampleMonotonicMs = 150L,
+                evidenceMonotonicMs = 130L,
+                deviceLayers = 4,
+                clientLayers = 0,
+            ),
+        )
+
+        val result = tracker.result()
+        assertTrue(result.satisfied)
+        assertEquals(1, result.freshEvidenceCount)
+        assertEquals(1, result.matchingEvidenceCount)
+    }
+
+    @Test
+    fun hwcDeviceOnlyCoverageFailsOnAnyClientCompositionObservation() {
+        val tracker = HwcCompositionCoverageTracker(
+            HwcCompositionExpectation.DEVICE_ONLY,
+        )
+        tracker.activateTarget(100L)
+        tracker.observe(
+            sampleStartedMonotonicMs = 100L,
+            snapshot = hwcSnapshot(
+                sampleMonotonicMs = 110L,
+                evidenceMonotonicMs = 110L,
+                deviceLayers = 3,
+                clientLayers = 1,
+            ),
+        )
+        tracker.observe(
+            sampleStartedMonotonicMs = 120L,
+            snapshot = hwcSnapshot(
+                sampleMonotonicMs = 130L,
+                evidenceMonotonicMs = 130L,
+                deviceLayers = 4,
+                clientLayers = 0,
+            ),
+        )
+
+        val result = tracker.result()
+        assertFalse(result.satisfied)
+        assertTrue(result.failureReason!!.contains("client==0"))
+        assertEquals(1, result.matchingEvidenceCount)
+    }
+
+    @Test
+    fun hwcClientCoverageRequiresClientAndStablePairProvenance() {
+        val missingClient = HwcCompositionCoverageTracker(
+            HwcCompositionExpectation.CLIENT_REQUIRED,
+        )
+        missingClient.activateTarget(100L)
+        missingClient.observe(
+            sampleStartedMonotonicMs = 100L,
+            snapshot = hwcSnapshot(
+                sampleMonotonicMs = 110L,
+                evidenceMonotonicMs = 110L,
+                deviceLayers = 4,
+                clientLayers = 0,
+            ),
+        )
+        assertTrue(missingClient.result().failureReason!!.contains("client>0"))
+
+        val changedSource = HwcCompositionCoverageTracker(
+            HwcCompositionExpectation.CLIENT_REQUIRED,
+        )
+        changedSource.activateTarget(100L)
+        changedSource.observe(
+            sampleStartedMonotonicMs = 100L,
+            snapshot = hwcSnapshot(
+                sampleMonotonicMs = 110L,
+                evidenceMonotonicMs = 110L,
+                deviceLayers = 2,
+                clientLayers = 2,
+            ),
+        )
+        changedSource.observe(
+            sampleStartedMonotonicMs = 120L,
+            snapshot = hwcSnapshot(
+                sampleMonotonicMs = 130L,
+                evidenceMonotonicMs = 130L,
+                deviceLayers = 2,
+                clientLayers = 2,
+                quality = MetricQuality.HARDWARE_COUNTER,
+                source = "vendor-session-1",
+            ),
+        )
+        assertTrue(changedSource.result().failureReason!!.contains("changed"))
+    }
+
+    @Test
+    fun hwcClientCoverageNeedsTwoDistinctFreshEvidenceTimestamps() {
+        val tracker = HwcCompositionCoverageTracker(
+            HwcCompositionExpectation.CLIENT_REQUIRED,
+        )
+        tracker.activateTarget(1_100L)
+        tracker.observe(
+            sampleStartedMonotonicMs = 1_100L,
+            snapshot = hwcSnapshot(
+                sampleMonotonicMs = 1_200L,
+                evidenceMonotonicMs = 1_200L,
+                deviceLayers = 2,
+                clientLayers = 3,
+            ),
+        )
+        assertFalse(tracker.hasSatisfiedEvidence())
+        assertTrue(tracker.result().failureReason!!.contains("requires 2"))
+
+        // Reprojecting a cache entry is not a second observation.
+        tracker.observe(
+            sampleStartedMonotonicMs = 1_250L,
+            snapshot = hwcSnapshot(
+                sampleMonotonicMs = 1_300L,
+                evidenceMonotonicMs = 1_200L,
+                deviceLayers = 2,
+                clientLayers = 3,
+            ),
+        )
+        assertFalse(tracker.hasSatisfiedEvidence())
+
+        tracker.observe(
+            sampleStartedMonotonicMs = 1_350L,
+            snapshot = hwcSnapshot(
+                sampleMonotonicMs = 1_400L,
+                evidenceMonotonicMs = 1_400L,
+                deviceLayers = 2,
+                clientLayers = 3,
+            ),
+        )
+        val result = tracker.result()
+        assertTrue(result.satisfied)
+        assertEquals(2, result.matchingEvidenceCount)
+        val event = result.eventSummary(runStartMonotonicMs = 1_000L)
+        assertTrue(event.contains("targetReadyRunMs=100"))
+        assertTrue(event.contains("evidenceRunMs=400"))
+        assertFalse(event.contains("targetReadyAtMs"))
+    }
+
+    @Test
+    fun hwcCompositionChainRequiresSameProvenanceAndDirectionalDeltas() {
+        fun deviceCoverage(
+            device: Int,
+            evidenceMs: Long,
+            source: String = "SurfaceFlinger",
+        ): HwcCompositionCoverageResult {
+            val tracker = HwcCompositionCoverageTracker(
+                HwcCompositionExpectation.DEVICE_ONLY,
+            )
+            tracker.activateTarget(evidenceMs - 10L)
+            tracker.observe(
+                sampleStartedMonotonicMs = evidenceMs - 10L,
+                snapshot = hwcSnapshot(
+                    sampleMonotonicMs = evidenceMs,
+                    evidenceMonotonicMs = evidenceMs,
+                    deviceLayers = device,
+                    clientLayers = 0,
+                    source = source,
+                ),
+            )
+            return tracker.result()
+        }
+
+        val baseline = advanceHwcCompositionChain(
+            prior = null,
+            coverage = deviceCoverage(device = 1, evidenceMs = 1_100L),
+            requestedActiveLayers = 1,
+        )
+        assertNull(baseline.failureReason)
+        val high = advanceHwcCompositionChain(
+            prior = baseline.nextAnchor,
+            coverage = deviceCoverage(device = 4, evidenceMs = 1_200L),
+            requestedActiveLayers = 4,
+        )
+        assertNull(high.failureReason)
+        val release = advanceHwcCompositionChain(
+            prior = high.nextAnchor,
+            coverage = deviceCoverage(device = 1, evidenceMs = 1_300L),
+            requestedActiveLayers = 1,
+        )
+        assertNull(release.failureReason)
+
+        val wrongDirection = advanceHwcCompositionChain(
+            prior = release.nextAnchor,
+            coverage = deviceCoverage(device = 1, evidenceMs = 1_400L),
+            requestedActiveLayers = 4,
+        )
+        assertTrue(wrongDirection.failureReason!!.contains("did not increase"))
+
+        val changedSource = advanceHwcCompositionChain(
+            prior = release.nextAnchor,
+            coverage = deviceCoverage(
+                device = 4,
+                evidenceMs = 1_400L,
+                source = "vendor-hwc",
+            ),
+            requestedActiveLayers = 4,
+        )
+        assertTrue(changedSource.failureReason!!.contains("changed across"))
+        assertEquals(release.nextAnchor, changedSource.nextAnchor)
+    }
+
+    @Test
+    fun hwcClientChainRequiresAnEarlierBaselineAndClientCountIncrease() {
+        fun clientCoverage(
+            client: Int,
+            firstEvidenceMs: Long,
+        ): HwcCompositionCoverageResult {
+            val tracker = HwcCompositionCoverageTracker(
+                HwcCompositionExpectation.CLIENT_REQUIRED,
+            )
+            tracker.activateTarget(firstEvidenceMs - 10L)
+            repeat(2) { index ->
+                val evidenceMs = firstEvidenceMs + index * 100L
+                tracker.observe(
+                    sampleStartedMonotonicMs = evidenceMs - 10L,
+                    snapshot = hwcSnapshot(
+                        sampleMonotonicMs = evidenceMs,
+                        evidenceMonotonicMs = evidenceMs,
+                        deviceLayers = 2,
+                        clientLayers = client,
+                    ),
+                )
+            }
+            return tracker.result()
+        }
+
+        val withoutBaseline = advanceHwcCompositionChain(
+            prior = null,
+            coverage = clientCoverage(client = 2, firstEvidenceMs = 1_100L),
+            requestedActiveLayers = 20,
+        )
+        assertTrue(withoutBaseline.failureReason!!.contains("no prior"))
+
+        val baseline = HwcCompositionChainAnchor(
+            expectation = HwcCompositionExpectation.DEVICE_ONLY,
+            quality = MetricQuality.SYSTEM_SERVICE,
+            source = "SurfaceFlinger",
+            deviceLayers = 1,
+            clientLayers = 0,
+            evidenceMonotonicMs = 1_000L,
+            requestedActiveLayers = 1,
+        )
+        val increased = advanceHwcCompositionChain(
+            prior = baseline,
+            coverage = clientCoverage(client = 2, firstEvidenceMs = 1_100L),
+            requestedActiveLayers = 20,
+        )
+        assertNull(increased.failureReason)
+
+        val releaseTracker = HwcCompositionCoverageTracker(
+            HwcCompositionExpectation.DEVICE_ONLY,
+        )
+        releaseTracker.activateTarget(1_300L)
+        releaseTracker.observe(
+            sampleStartedMonotonicMs = 1_300L,
+            snapshot = hwcSnapshot(
+                sampleMonotonicMs = 1_400L,
+                evidenceMonotonicMs = 1_400L,
+                // A normal CLIENT→DEVICE recovery can keep the same DEVICE count while CLIENT
+                // falls to zero; it must not be judged as a failed high→low DEVICE sweep.
+                deviceLayers = 2,
+                clientLayers = 0,
+            ),
+        )
+        val released = advanceHwcCompositionChain(
+            prior = increased.nextAnchor,
+            coverage = releaseTracker.result(),
+            requestedActiveLayers = 1,
+        )
+        assertNull(released.failureReason)
+
+        val nonIncreasingBaseline = baseline.copy(
+            clientLayers = 2,
+        )
+        val nonIncreasing = advanceHwcCompositionChain(
+            prior = nonIncreasingBaseline,
+            coverage = clientCoverage(client = 2, firstEvidenceMs = 1_100L),
+            requestedActiveLayers = 20,
+        )
+        assertTrue(nonIncreasing.failureReason!!.contains("did not increase"))
+    }
+
+    @Test
+    fun hwcCoverageRejectsActiveGapStaleAgeAndMixedPairSources() {
+        val gap = HwcCompositionCoverageTracker(
+            HwcCompositionExpectation.CLIENT_REQUIRED,
+        )
+        gap.activateTarget(100L)
+        gap.observe(
+            sampleStartedMonotonicMs = 100L,
+            snapshot = TelemetrySnapshot(monotonicMs = 110L),
+        )
+        assertTrue(gap.result().failureReason!!.contains("timestamp"))
+
+        val stale = HwcCompositionCoverageTracker(
+            HwcCompositionExpectation.CLIENT_REQUIRED,
+        )
+        stale.activateTarget(100L)
+        stale.observe(
+            sampleStartedMonotonicMs = 100L,
+            snapshot = hwcSnapshot(
+                sampleMonotonicMs = 3_000L,
+                evidenceMonotonicMs = 110L,
+                deviceLayers = 2,
+                clientLayers = 1,
+            ),
+        )
+        assertTrue(stale.result().failureReason!!.contains("stale"))
+
+        val cachedThenStale = HwcCompositionCoverageTracker(
+            HwcCompositionExpectation.DEVICE_ONLY,
+        )
+        cachedThenStale.activateTarget(100L)
+        cachedThenStale.observe(
+            sampleStartedMonotonicMs = 100L,
+            snapshot = hwcSnapshot(
+                sampleMonotonicMs = 110L,
+                evidenceMonotonicMs = 110L,
+                deviceLayers = 2,
+                clientLayers = 0,
+            ),
+        )
+        cachedThenStale.observe(
+            sampleStartedMonotonicMs = 3_000L,
+            snapshot = hwcSnapshot(
+                sampleMonotonicMs = 3_000L,
+                evidenceMonotonicMs = 110L,
+                deviceLayers = 2,
+                clientLayers = 0,
+            ),
+        )
+        assertTrue(cachedThenStale.result().failureReason!!.contains("stale"))
+
+        val mixed = HwcCompositionCoverageTracker(
+            HwcCompositionExpectation.CLIENT_REQUIRED,
+        )
+        mixed.activateTarget(100L)
+        mixed.observe(
+            sampleStartedMonotonicMs = 100L,
+            snapshot = hwcSnapshot(
+                sampleMonotonicMs = 110L,
+                evidenceMonotonicMs = 110L,
+                deviceLayers = 2,
+                clientLayers = 1,
+            ).copy(hwcClientLayersSource = "different-source"),
+        )
+        assertTrue(mixed.result().failureReason!!.contains("mixed provenance"))
+    }
+
+    @Test
+    fun exactUnderrunVerdictOutranksMissingHwcCoverage() {
+        assertEquals(
+            RunVerdict.UNDERRUN_DETECTED,
+            verdictWithHwcCompositionCoverage(
+                evidenceVerdict = RunVerdict.UNDERRUN_DETECTED,
+                coverageFailureReason = "missing DEVICE-only coverage",
+            ),
+        )
+        assertEquals(
+            RunVerdict.INCONCLUSIVE,
+            verdictWithHwcCompositionCoverage(
+                evidenceVerdict = RunVerdict.CLEAN,
+                coverageFailureReason = "missing DEVICE-only coverage",
+            ),
+        )
+        assertEquals(
+            RunVerdict.SUSPECTED_PROXY,
+            verdictWithHwcCompositionCoverage(
+                evidenceVerdict = RunVerdict.SUSPECTED_PROXY,
+                coverageFailureReason = null,
+            ),
+        )
+    }
+
+    private fun hwcSnapshot(
+        sampleMonotonicMs: Long,
+        evidenceMonotonicMs: Long,
+        deviceLayers: Int,
+        clientLayers: Int,
+        quality: MetricQuality = MetricQuality.SYSTEM_SERVICE,
+        source: String = "SurfaceFlinger",
+    ) = TelemetrySnapshot(
+        monotonicMs = sampleMonotonicMs,
+        hwcDeviceLayers = deviceLayers,
+        hwcDeviceLayersQuality = quality,
+        hwcDeviceLayersSource = source,
+        hwcClientLayers = clientLayers,
+        hwcClientLayersQuality = quality,
+        hwcClientLayersSource = source,
+        hwcCompositionEvidenceMonotonicMs = evidenceMonotonicMs,
+        hwcCompositionEvidenceAgeMs =
+            (sampleMonotonicMs - evidenceMonotonicMs).coerceAtLeast(0L),
+    )
 
     private fun decoderRatePhase(
         id: String,

@@ -16,6 +16,7 @@ import java.lang.reflect.Method
 import java.util.IdentityHashMap
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.FutureTask
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
@@ -37,10 +38,12 @@ import kotlin.math.sin
 class LoadManager private constructor(
     dependencies: LoadManagerDependencies,
 ) : AutoCloseable {
-    constructor(context: Context) : this(loadManagerDependencies(context))
+    constructor(context: Context) : this(
+        loadManagerDependencies(context.applicationContext),
+    )
 
     internal constructor(npuAdapter: NpuWorkloadAdapter) : this(
-        LoadManagerDependencies(
+        ownedLoadManagerDependencies(
             npuAdapter = npuAdapter,
             cpuWorkerCount = 0,
             memoryWorkerCount = 0,
@@ -59,7 +62,7 @@ class LoadManager private constructor(
         memoryBufferAllocator: (Int) -> ByteArray = { ByteArray(it) },
         monotonicNowMs: () -> Long = { 0L },
     ) : this(
-        LoadManagerDependencies(
+        ownedLoadManagerDependencies(
             npuAdapter = npuAdapter,
             cpuWorkerCount = cpuWorkerCount,
             memoryWorkerCount = memoryWorkerCount,
@@ -77,28 +80,26 @@ class LoadManager private constructor(
     private val monotonicNowMs = dependencies.monotonicNowMs
     private val workerStarter = dependencies.workerStarter
     private val memoryBufferAllocator = dependencies.memoryBufferAllocator
-    private val running = AtomicBoolean(false)
-    private val closed = AtomicBoolean(false)
-    private val runtimeConfig = AtomicReference(
-        RuntimeLoadConfig(
-            setpoints = LoadSetpoints(),
-            phaseStartedMs = monotonicNowMs(),
-        ),
-    )
-    private val threads = ConcurrentLinkedQueue<Thread>()
-    private val copiedBytes = AtomicLong(0)
-    private val memoryAllocationFailed = AtomicBoolean(false)
-    private val memoryBufferDropGeneration = AtomicLong(0L)
-    private val memoryPrewarmGeneration = AtomicLong(0L)
-    private val memoryPrewarmRequest = AtomicReference<MemoryPrewarmRequest?>(null)
-    private val memoryPrewarmAcknowledgedGenerations = AtomicLongArray(memoryWorkerCount)
-    private val memoryPrewarmStateLock = Any()
-    private val memoryBuffersPinned = AtomicBoolean(false)
-    private val shutdownResult = AtomicReference<LoadShutdownResult?>(null)
-    private val latestPositiveNpuRequest = AtomicReference<NpuControlRequest?>(null)
-    private val npuRequestContractMissing = AtomicBoolean(false)
-    private val localWorkerOwner = Any()
-    private val localWorkerStateLock = Any()
+    private val running = dependencies.runtimeState.running
+    private val closed = dependencies.runtimeState.closed
+    private val runtimeConfig = dependencies.runtimeState.runtimeConfig
+    private val threads = dependencies.runtimeState.threads
+    private val copiedBytes = dependencies.runtimeState.copiedBytes
+    private val memoryAllocationFailed = dependencies.runtimeState.memoryAllocationFailed
+    private val memoryBufferDropGeneration =
+        dependencies.runtimeState.memoryBufferDropGeneration
+    private val memoryPrewarmGeneration = dependencies.runtimeState.memoryPrewarmGeneration
+    private val memoryPrewarmRequest = dependencies.runtimeState.memoryPrewarmRequest
+    private val memoryPrewarmAcknowledgedGenerations =
+        dependencies.runtimeState.memoryPrewarmAcknowledgedGenerations
+    private val memoryPrewarmStateLock = dependencies.runtimeState.memoryPrewarmStateLock
+    private val memoryBuffersPinned = dependencies.runtimeState.memoryBuffersPinned
+    private val shutdownResult = dependencies.runtimeState.shutdownResult
+    private val latestPositiveNpuRequest = dependencies.runtimeState.latestPositiveNpuRequest
+    private val npuRequestContractMissing =
+        dependencies.runtimeState.npuRequestContractMissing
+    private val localWorkerOwner = dependencies.runtimeState.localWorkerOwner
+    private val localWorkerStateLock = dependencies.runtimeState.localWorkerStateLock
 
     @Synchronized
     fun start(): Boolean {
@@ -142,39 +143,40 @@ class LoadManager private constructor(
                     add(createWorker("DpuLab-Memory-$index") { memoryCycle(index) })
                 }
             }
-        } catch (_: OutOfMemoryError) {
-            memoryAllocationFailed.set(true)
+        } catch (error: Throwable) {
+            if (error is OutOfMemoryError) memoryAllocationFailed.set(true)
             markLocalWorkersStopping()
             LoadSafetyState.releaseLocalWorkerLeaseIfEmpty(localWorkerOwner)
-            return false
-        } catch (_: Exception) {
-            markLocalWorkersStopping()
-            LoadSafetyState.releaseLocalWorkerLeaseIfEmpty(localWorkerOwner)
+            if (error is ThreadDeath || (error is VirtualMachineError && error !is OutOfMemoryError)) {
+                throw error
+            }
             return false
         }
-        if (
-            pendingWorkers.any {
-                !LoadSafetyState.registerLocalWorker(localWorkerOwner, it)
+        return try {
+            if (
+                pendingWorkers.any {
+                    !LoadSafetyState.registerLocalWorker(localWorkerOwner, it)
+                }
+            ) {
+                cleanupPartiallyStartedWorkers(pendingWorkers)
+                return false
             }
-        ) {
-            markLocalWorkersStopping()
-            pendingWorkers.forEach {
-                LoadSafetyState.recordLocalWorkerStopped(localWorkerOwner, it)
-            }
-            LoadSafetyState.releaseLocalWorkerLeaseIfEmpty(localWorkerOwner)
-            return false
-        }
-        threads.addAll(pendingWorkers)
-        return runCatching {
+            // Registration, queue publication, and Thread.start form one ownership transaction.
+            // OOM/fatal failure in any of these steps must reclaim every registered NEW/started
+            // worker before the owner lease can be retried.
+            threads.addAll(pendingWorkers)
             pendingWorkers.forEach(workerStarter)
             // Test/product variants with no local workers must not retain the process-wide lease.
             LoadSafetyState.releaseLocalWorkerLeaseIfEmpty(localWorkerOwner)
             synchronized(localWorkerStateLock) {
                 running.get() && LoadSafetyState.localWorkerFailure() == null
             }
-        }.getOrElse { error ->
+        } catch (error: Throwable) {
             if (error is OutOfMemoryError) memoryAllocationFailed.set(true)
             cleanupPartiallyStartedWorkers(pendingWorkers)
+            if (error is ThreadDeath || (error is VirtualMachineError && error !is OutOfMemoryError)) {
+                throw error
+            }
             false
         }
     }
@@ -513,8 +515,12 @@ class LoadManager private constructor(
                         // otherwise unexpected and permanently invalidates workload fidelity.
                         stopLocalWorkersAfterUnexpectedFailure(name, error)
                         break
-                    } catch (_: OutOfMemoryError) {
+                    } catch (error: OutOfMemoryError) {
+                        // Memory-worker buffer allocation OOM is handled inside memoryCycle.
+                        // Reaching this outer boundary means a CPU/local worker itself failed and
+                        // must never disappear as a silent reduction in requested load.
                         memoryAllocationFailed.set(true)
+                        stopLocalWorkersAfterUnexpectedFailure(name, error)
                         break
                     } catch (error: Exception) {
                         stopLocalWorkersAfterUnexpectedFailure(name, error)
@@ -548,7 +554,11 @@ class LoadManager private constructor(
         // LoadSafetyState while any registered worker remains, so an old interrupt handler can
         // never observe a new run's running=true and poison the permanent failure latch.
         markLocalWorkersStopping()
-        pendingWorkers.forEach { thread ->
+        // This function is also the rollback for an OOM during queue publication/Thread.start.
+        // Indexed traversal avoids allocating ArrayList iterators after allocation pressure.
+        var index = 0
+        while (index < pendingWorkers.size) {
+            val thread = pendingWorkers[index]
             when (thread.state) {
                 Thread.State.NEW -> {
                     threads.remove(thread)
@@ -559,9 +569,12 @@ class LoadManager private constructor(
                     LockSupport.unpark(thread)
                 }
             }
+            index++
         }
         val joinDeadlineNanos = System.nanoTime() + WORKER_JOIN_TIMEOUT_NANOS
-        pendingWorkers.forEach { thread ->
+        index = 0
+        while (index < pendingWorkers.size) {
+            val thread = pendingWorkers[index]
             val remainingNanos = joinDeadlineNanos - System.nanoTime()
             if (remainingNanos > 0L && thread.isAlive) {
                 val millis = remainingNanos / NANOS_PER_MILLI
@@ -570,9 +583,10 @@ class LoadManager private constructor(
                     thread.join(millis, nanos)
                 } catch (_: InterruptedException) {
                     Thread.currentThread().interrupt()
-                    return@forEach
+                    break
                 }
             }
+            index++
         }
         LoadSafetyState.releaseLocalWorkerLeaseIfEmpty(localWorkerOwner)
     }
@@ -734,6 +748,16 @@ class LoadManager private constructor(
                         destination = candidateDestination,
                         workerIndex = workerIndex,
                     )
+                    if (
+                        !running.get() ||
+                        memoryBufferDropGeneration.get() != observedDropGeneration
+                    ) {
+                        // A low-memory/drop request may race a slow allocation/page-touch. Never
+                        // republish that now-revoked pair or begin a measured copy with it.
+                        source = null
+                        destination = null
+                        continue
+                    }
                     source = candidateSource
                     destination = candidateDestination
                 } catch (_: OutOfMemoryError) {
@@ -747,12 +771,21 @@ class LoadManager private constructor(
             val activeDestination = destination
             val burstStart = System.nanoTime()
             val busyDeadline = burstStart + (MEMORY_PERIOD_NANOS * intensity).toLong()
-            while (running.get() && System.nanoTime() < busyDeadline) {
+            var burstTrafficBytes = 0L
+            while (
+                running.get() &&
+                memoryBufferDropGeneration.get() == observedDropGeneration &&
+                System.nanoTime() < busyDeadline
+            ) {
                 if (cursor + COPY_BLOCK_BYTES > workingSet) cursor = 0
                 System.arraycopy(activeSource, cursor, activeDestination, cursor, COPY_BLOCK_BYTES)
-                copiedBytes.addAndGet(COPY_BLOCK_BYTES.toLong() * 2L)
+                // Keep the bandwidth counter out of the copy hot path. A single atomic publish per
+                // bounded duty-cycle burst preserves exact generated-byte accounting while
+                // avoiding cache-line contention that would distort the intended DRAM load.
+                burstTrafficBytes += COPY_TRAFFIC_BYTES_PER_BLOCK
                 cursor += COPY_BLOCK_BYTES
             }
+            if (burstTrafficBytes > 0L) copiedBytes.addAndGet(burstTrafficBytes)
             memoryFence = activeDestination[(cursor - 1).coerceAtLeast(0)]
             parkUntil(burstStart + MEMORY_PERIOD_NANOS)
         }
@@ -803,14 +836,10 @@ class LoadManager private constructor(
         return LoadShapeEvaluator.intensityAt(base, shape, elapsedMs)
     }
 
-    private data class RuntimeLoadConfig(
-        val setpoints: LoadSetpoints,
-        val phaseStartedMs: Long,
-    )
-
     companion object {
         private const val MIB = 1024L * 1024L
         private const val COPY_BLOCK_BYTES = 256 * 1024
+        private const val COPY_TRAFFIC_BYTES_PER_BLOCK = COPY_BLOCK_BYTES * 2L
         private const val PAGE_TOUCH_BYTES = 4 * 1024
         private const val CPU_BATCH_SIZE = 64
         private const val CPU_PERIOD_NANOS = 12_000_000L
@@ -837,10 +866,6 @@ class LoadManager private constructor(
         private var memoryFence: Byte = 0
     }
 
-    private data class MemoryPrewarmRequest(
-        val generation: Long,
-        val bufferDropGeneration: Long,
-    )
 }
 
 private data class LoadManagerDependencies(
@@ -851,7 +876,41 @@ private data class LoadManagerDependencies(
     val monotonicNowMs: () -> Long,
     val workerStarter: (Thread) -> Unit,
     val memoryBufferAllocator: (Int) -> ByteArray = { ByteArray(it) },
+    val runtimeState: LoadManagerRuntimeState,
 )
+
+/**
+ * All allocation-bearing LoadManager state is built before the adapter is transferred to the
+ * manager object. The primary constructor then only copies references, so a later field
+ * initializer cannot orphan an already-created NPU backend.
+ */
+private class LoadManagerRuntimeState(
+    memoryWorkerCount: Int,
+    initialPhaseStartedMs: Long,
+) {
+    val running = AtomicBoolean(false)
+    val closed = AtomicBoolean(false)
+    val runtimeConfig = AtomicReference(
+        RuntimeLoadConfig(
+            setpoints = LoadSetpoints(),
+            phaseStartedMs = initialPhaseStartedMs,
+        ),
+    )
+    val threads = ConcurrentLinkedQueue<Thread>()
+    val copiedBytes = AtomicLong(0)
+    val memoryAllocationFailed = AtomicBoolean(false)
+    val memoryBufferDropGeneration = AtomicLong(0L)
+    val memoryPrewarmGeneration = AtomicLong(0L)
+    val memoryPrewarmRequest = AtomicReference<MemoryPrewarmRequest?>(null)
+    val memoryPrewarmAcknowledgedGenerations = AtomicLongArray(memoryWorkerCount)
+    val memoryPrewarmStateLock = Any()
+    val memoryBuffersPinned = AtomicBoolean(false)
+    val shutdownResult = AtomicReference<LoadShutdownResult?>(null)
+    val latestPositiveNpuRequest = AtomicReference<NpuControlRequest?>(null)
+    val npuRequestContractMissing = AtomicBoolean(false)
+    val localWorkerOwner = Any()
+    val localWorkerStateLock = Any()
+}
 
 private fun loadManagerDependencies(context: Context): LoadManagerDependencies {
     val activityManager = checkNotNull(
@@ -871,15 +930,60 @@ private fun loadManagerDependencies(context: Context): LoadManagerDependencies {
     val workingSetBytes = (totalArrayBudget / (memoryWorkerCount * 2L))
         .coerceIn(4L * mib, 24L * mib)
         .toInt()
-    return LoadManagerDependencies(
-        npuAdapter = CompositeNpuWorkloadAdapter(context),
-        cpuWorkerCount = (processorCount - 1).coerceIn(1, 8),
+    val cpuWorkerCount = (processorCount - 1).coerceIn(1, 8)
+    val monotonicNowMs: () -> Long = SystemClock::elapsedRealtime
+    val runtimeState = LoadManagerRuntimeState(
         memoryWorkerCount = memoryWorkerCount,
-        memoryWorkingSetBytes = workingSetBytes,
-        monotonicNowMs = SystemClock::elapsedRealtime,
-        workerStarter = Thread::start,
+        initialPhaseStartedMs = monotonicNowMs(),
     )
+    val adapter = CompositeNpuWorkloadAdapter.create(context)
+    return constructWithNpuAdapterRollback(adapter) { ownedAdapter ->
+        LoadManagerDependencies(
+            npuAdapter = ownedAdapter,
+            cpuWorkerCount = cpuWorkerCount,
+            memoryWorkerCount = memoryWorkerCount,
+            memoryWorkingSetBytes = workingSetBytes,
+            monotonicNowMs = monotonicNowMs,
+            workerStarter = Thread::start,
+            runtimeState = runtimeState,
+        )
+    }
 }
+
+private fun ownedLoadManagerDependencies(
+    npuAdapter: NpuWorkloadAdapter,
+    cpuWorkerCount: Int,
+    memoryWorkerCount: Int,
+    memoryWorkingSetBytes: Int,
+    monotonicNowMs: () -> Long,
+    workerStarter: (Thread) -> Unit,
+    memoryBufferAllocator: (Int) -> ByteArray = { ByteArray(it) },
+): LoadManagerDependencies =
+    constructWithNpuAdapterRollback(npuAdapter) { ownedAdapter ->
+        LoadManagerDependencies(
+            npuAdapter = ownedAdapter,
+            cpuWorkerCount = cpuWorkerCount,
+            memoryWorkerCount = memoryWorkerCount,
+            memoryWorkingSetBytes = memoryWorkingSetBytes,
+            monotonicNowMs = monotonicNowMs,
+            workerStarter = workerStarter,
+            memoryBufferAllocator = memoryBufferAllocator,
+            runtimeState = LoadManagerRuntimeState(
+                memoryWorkerCount = memoryWorkerCount,
+                initialPhaseStartedMs = monotonicNowMs(),
+            ),
+        )
+    }
+
+private data class RuntimeLoadConfig(
+    val setpoints: LoadSetpoints,
+    val phaseStartedMs: Long,
+)
+
+private data class MemoryPrewarmRequest(
+    val generation: Long,
+    val bufferDropGeneration: Long,
+)
 
 /**
  * Product teams can ship a class named `com.vendor.dpulayerlab.NpuStressAdapter` in the system
@@ -993,6 +1097,41 @@ data class NpuShutdownResult(
             mayRemainActive = true,
             detail = detail,
         )
+    }
+}
+
+/**
+ * Transfers an already-created NPU adapter only after [factory] completes. Constructor failures,
+ * including allocation failures, synchronously attempt ordered adapter cleanup and retain the
+ * original throwable. An unconfirmed rollback becomes process-sticky so recreation cannot
+ * accumulate another backend.
+ */
+internal fun <T : NpuWorkloadAdapter, R> constructWithNpuAdapterRollback(
+    adapter: T,
+    factory: (T) -> R,
+): R {
+    try {
+        return factory(adapter)
+    } catch (error: Throwable) {
+        try {
+            val cleanup = adapter.closeWithResult()
+            if (!cleanup.releaseConfirmed) {
+                LoadSafetyState.recordNpuLoadIdle(confirmed = false)
+            }
+            if (!cleanup.backendCloseConfirmed) {
+                LoadSafetyState.recordNpuBackendCleanup(confirmed = false)
+            }
+        } catch (cleanupError: Throwable) {
+            LoadSafetyState.markNpuCleanupUnconfirmed()
+            if (cleanupError !== error) {
+                try {
+                    error.addSuppressed(cleanupError)
+                } catch (_: Throwable) {
+                    // Preserve the construction failure even under extreme allocation pressure.
+                }
+            }
+        }
+        throw error
     }
 }
 
@@ -1207,10 +1346,40 @@ internal class ReflectionKnownIdleState(initiallyKnownIdle: Boolean) {
     }
 }
 
+/**
+ * Thread.start() can fail after a Thread object and its captured resources have been prepared.
+ * Callers keep ownership until this function returns null; on failure they must synchronously
+ * rollback or publish a process-sticky cleanup failure.
+ */
+internal fun startLoadThread(
+    thread: Thread,
+    starter: (Thread) -> Unit = Thread::start,
+): Throwable? =
+    try {
+        starter(thread)
+        null
+    } catch (error: Throwable) {
+        if (error is ThreadDeath) throw error
+        error
+    }
+
+internal fun shutdownLoadExecutorAndAwait(
+    executor: ExecutorService,
+    timeoutMs: Long,
+): Boolean {
+    executor.shutdownNow()
+    return try {
+        executor.awaitTermination(timeoutMs.coerceAtLeast(0L), TimeUnit.MILLISECONDS)
+    } catch (_: InterruptedException) {
+        Thread.currentThread().interrupt()
+        false
+    }
+}
+
 private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapter {
-    private val instance: Any?
-    private val setIntensityMethod: Method?
-    private val closeMethod: Method?
+    private var instance: Any? = null
+    private var setIntensityMethod: Method? = null
+    private var closeMethod: Method? = null
     private val initializationCleanupUnknown: Boolean
     private val cachedStatus = AtomicReference("NPU adapter 초기화 중")
     private val controlVersion = AtomicLong(0L)
@@ -1254,25 +1423,86 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
     init {
         val initialization = initializeBackend(context.applicationContext)
         val backend = initialization.backend
+        var cleanupUnknown = initialization.cleanupUnknown
+        var initializationStatus = initialization.status
+        var startedWaveformThread: Thread? = null
+        // Publish immutable-in-practice backend fields before Thread.start(). The JVM start
+        // happens-before edge then guarantees the waveform/control lane cannot observe a
+        // half-initialized adapter.
         instance = backend?.instance
         setIntensityMethod = backend?.setIntensityMethod
         closeMethod = backend?.closeMethod
-        initializationCleanupUnknown = initialization.cleanupUnknown
+        val initializedBackend = backend
+        if (initializedBackend != null) {
+            var threadConstructionFailure: Throwable? = null
+            var fatalStartFailure: ThreadDeath? = null
+            val candidateThread = try {
+                Thread(::runWaveformControl, "DpuLab-NpuWaveform").apply {
+                    isDaemon = true
+                }
+            } catch (error: Throwable) {
+                if (error is ThreadDeath) fatalStartFailure = error
+                threadConstructionFailure = error
+                null
+            }
+            val startFailure = threadConstructionFailure ?: candidateThread?.let { thread ->
+                try {
+                    startLoadThread(thread)
+                } catch (error: ThreadDeath) {
+                    fatalStartFailure = error
+                    error
+                }
+            }
+            if (candidateThread != null && startFailure == null) {
+                startedWaveformThread = candidateThread
+            } else {
+                // The reflection constructor has already returned a live vendor object. Do not
+                // throw out of this initializer and orphan it when the waveform thread cannot be
+                // created/started; force zero then close it before publishing an unavailable
+                // adapter. This is an exceptional rollback path, not part of the load hot path.
+                val rollback = closeReflectionBackendBounded(initializedBackend)
+                val rollbackConfirmed = rollback.closeConfirmed
+                cleanupUnknown = cleanupUnknown || !rollbackConfirmed
+                initializationStatus =
+                    if (rollbackConfirmed) {
+                        "NPU adapter 비활성 · waveform thread 시작 실패"
+                    } else {
+                        "NPU adapter 비활성 · waveform thread/cleanup 실패"
+                    }
+                if (rollbackConfirmed) {
+                    instance = null
+                    setIntensityMethod = null
+                    closeMethod = null
+                } else if (fatalStartFailure != null) {
+                    // This object will not finish construction, so publish the failed rollback
+                    // before preserving fatal ThreadDeath semantics.
+                    LoadSafetyState.markNpuCleanupUnconfirmed()
+                }
+                val executorStopped = shutdownLoadExecutorAndAwait(
+                    executor = executor,
+                    timeoutMs = REFLECTION_EXECUTOR_JOIN_TIMEOUT_MS,
+                )
+                if (!executorStopped) {
+                    cleanupUnknown = true
+                    LoadSafetyState.markNpuCleanupUnconfirmed()
+                    initializationStatus =
+                        "NPU adapter 비활성 · waveform thread/executor cleanup 실패"
+                }
+                fatalStartFailure?.let { throw it }
+            }
+        }
+        initializationCleanupUnknown = cleanupUnknown
         if (initializationCleanupUnknown) {
             LoadSafetyState.markNpuCleanupUnconfirmed()
         }
-        cachedStatus.set(initialization.status)
-        waveformThread = if (backend != null) {
-            Thread(::runWaveformControl, "DpuLab-NpuWaveform").apply {
-                isDaemon = true
-                start()
-            }
-        } else {
-            null
-        }
+        cachedStatus.set(initializationStatus)
+        waveformThread = startedWaveformThread
     }
 
-    override fun isAvailable(): Boolean = instance != null && !closed.get()
+    override fun isAvailable(): Boolean =
+        instance != null &&
+            waveformThread?.isAlive == true &&
+            !closed.get()
 
     fun isInitiallyKnownIdle(): Boolean = !initializationCleanupUnknown
 
@@ -1377,10 +1607,12 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
         }
+        val waveformStopped = waveformThread?.isAlive != true
         pendingIntensity.set(null)
         executor.queue.clear()
         if (instance == null) {
             executor.shutdownNow()
+            val executorStopped = awaitReflectionExecutorTermination()
             val result = if (initializationCleanupUnknown) {
                 NpuShutdownResult.unconfirmed(
                     "Reflection NPU 초기화/후보 cleanup 완료를 확인할 수 없음",
@@ -1388,9 +1620,12 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
             } else {
                 NpuShutdownResult(
                     releaseConfirmed = true,
-                    backendCloseConfirmed = true,
+                    backendCloseConfirmed = waveformStopped && executorStopped,
                     mayRemainActive = false,
-                    detail = "Reflection NPU adapter 없음",
+                    detail =
+                        "Reflection NPU adapter 없음; " +
+                            "waveformStopped=$waveformStopped; " +
+                            "executorStopped=$executorStopped",
                 )
             }
             cachedStatus.set(
@@ -1434,9 +1669,12 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
             executor.shutdownNow()
             ReflectionCloseOutcome()
         }
+        val executorStopped = awaitReflectionExecutorTermination()
         val loadReleased = closeOutcome.zeroConfirmed || closeOutcome.closeConfirmed
+        val backendClosed =
+            closeOutcome.closeConfirmed && waveformStopped && executorStopped
         cachedStatus.set(
-            if (loadReleased && closeOutcome.closeConfirmed) {
+            if (loadReleased && backendClosed) {
                 "NPU adapter 종료됨"
             } else if (loadReleased) {
                 "NPU load 해제 확인 · adapter close 미확인"
@@ -1446,12 +1684,49 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
         )
         return NpuShutdownResult(
             releaseConfirmed = loadReleased,
-            backendCloseConfirmed = closeOutcome.closeConfirmed,
+            backendCloseConfirmed = backendClosed,
             mayRemainActive = !loadReleased,
             detail =
                 "Reflection NPU zero=${closeOutcome.zeroConfirmed}; " +
-                    "close=${closeOutcome.closeConfirmed}",
+                    "close=${closeOutcome.closeConfirmed}; " +
+                    "waveformStopped=$waveformStopped; " +
+                    "executorStopped=$executorStopped",
         ).also(shutdownResult::set)
+    }
+
+    private fun awaitReflectionExecutorTermination(): Boolean =
+        try {
+            executor.awaitTermination(
+                REFLECTION_EXECUTOR_JOIN_TIMEOUT_MS,
+                TimeUnit.MILLISECONDS,
+            )
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+
+    private fun closeReflectionBackendBounded(
+        backend: ReflectionBackend,
+    ): ReflectionCloseOutcome {
+        val rollbackFuture = runCatching {
+            executor.submit<ReflectionCloseOutcome> {
+                closeReflectionBackend(backend)
+            }
+        }.getOrNull() ?: return ReflectionCloseOutcome()
+        return try {
+            rollbackFuture.get(REFLECTION_CLOSE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            rollbackFuture.cancel(true)
+            (rollbackFuture as? Runnable)?.let(executor::remove)
+            executor.purge()
+            ReflectionCloseOutcome()
+        } catch (_: Exception) {
+            rollbackFuture.cancel(true)
+            (rollbackFuture as? Runnable)?.let(executor::remove)
+            executor.purge()
+            ReflectionCloseOutcome()
+        }
     }
 
     fun setLoad(
@@ -1459,7 +1734,7 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
         shape: LoadShape,
         restartProfile: Boolean,
     ): NpuControlCommandTicket? {
-        if (instance == null || closed.get()) return null
+        if (!isAvailable()) return null
         val previous = requestedLoad.get()
         val safeIntensity = intensity.takeIf(Float::isFinite)?.coerceIn(0f, 1f) ?: 0f
         val profileRestarted = restartProfile || previous.shape != shape
@@ -1637,6 +1912,7 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
         const val REFLECTION_RELEASE_TIMEOUT_MS = 300L
         const val REFLECTION_CLOSE_TIMEOUT_MS = 300L
         const val REFLECTION_WAVEFORM_JOIN_TIMEOUT_MS = 100L
+        const val REFLECTION_EXECUTOR_JOIN_TIMEOUT_MS = 100L
         const val MAX_REFLECTION_ACK_TIMEOUT_MS = 1_000L
         const val MAX_REFLECTION_PENDING_TIMEOUT_MS = 2_000L
         const val REFLECTION_CONTROL_SESSION = 1L
@@ -1646,6 +1922,7 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
         const val NPU_UPDATE_EPSILON = 0.005f
         const val ADAPTER_CLASS_NAME = "com.vendor.dpulayerlab.NpuStressAdapter"
         val initializationDisabled = AtomicBoolean(false)
+        val initializationThreadDisabled = AtomicBoolean(false)
 
         fun initializeBackend(context: Context): ReflectionInitialization {
             if (LoadSafetyState.hasUnconfirmedNpuCleanup()) {
@@ -1653,6 +1930,12 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
                     backend = null,
                     status = "NPU adapter 비활성 · 이전 cleanup 미확인",
                     cleanupUnknown = true,
+                )
+            }
+            if (initializationThreadDisabled.get()) {
+                return ReflectionInitialization(
+                    backend = null,
+                    status = "NPU adapter 초기화 비활성 · thread 시작 불가",
                 )
             }
             if (initializationDisabled.get()) {
@@ -1720,9 +2003,31 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
                     null
                 }
             }
-            Thread(task, "DpuLab-NpuInit").apply {
-                isDaemon = true
-                start()
+            val initializationThread = try {
+                Thread(task, "DpuLab-NpuInit").apply {
+                    isDaemon = true
+                }
+            } catch (error: Throwable) {
+                if (error is ThreadDeath) throw error
+                initializationThreadDisabled.set(true)
+                return ReflectionInitialization(
+                    backend = null,
+                    status =
+                        "NPU adapter 초기화 thread 생성 실패: " +
+                            error.javaClass.simpleName,
+                )
+            }
+            startLoadThread(initializationThread)?.let { error ->
+                // The task never ran, so it cannot own a vendor candidate. Disable repeated
+                // attempts in this process to avoid a tight Activity-recreation failure loop.
+                initializationThreadDisabled.set(true)
+                task.cancel(false)
+                return ReflectionInitialization(
+                    backend = null,
+                    status =
+                        "NPU adapter 초기화 thread 시작 실패: " +
+                            error.javaClass.simpleName,
+                )
             }
 
             return try {
@@ -1804,14 +2109,38 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
             candidateRef.compareAndSet(candidate, null) &&
                 closeCandidate(candidate, closeMethod)
 
-        private fun closeCandidateAsync(candidate: Any, closeMethod: Method?) {
-            Thread(
-                { closeCandidate(candidate, closeMethod) },
-                "DpuLab-NpuInitCleanup",
-            ).apply {
-                isDaemon = true
-                start()
+        private fun closeCandidateAsync(candidate: Any, closeMethod: Method?): Boolean {
+            val cleanupThread = try {
+                Thread(
+                    { closeCandidate(candidate, closeMethod) },
+                    "DpuLab-NpuInitCleanup",
+                ).apply {
+                    isDaemon = true
+                }
+            } catch (error: Throwable) {
+                if (error is ThreadDeath) throw error
+                return false
             }
+            return if (startLoadThread(cleanupThread) == null) {
+                true
+            } else {
+                // No bounded execution lane exists. The caller already treats this candidate as
+                // cleanup-unknown and prevents another reflection initialization in this process.
+                false
+            }
+        }
+
+        private fun closeReflectionBackend(backend: ReflectionBackend): ReflectionCloseOutcome {
+            val zeroApplied = runCatching {
+                backend.setIntensityMethod.invoke(backend.instance, 0f)
+            }.isSuccess
+            val adapterClosed = runCatching {
+                backend.closeMethod.invoke(backend.instance)
+            }.isSuccess
+            return ReflectionCloseOutcome(
+                zeroConfirmed = zeroApplied,
+                closeConfirmed = adapterClosed,
+            )
         }
 
         private fun closeCandidate(candidate: Any, preferredMethod: Method?): Boolean {
@@ -1857,9 +2186,10 @@ private class ReflectionNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapte
     )
 }
 
-private class CompositeNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapter {
-    private val vendorBridge = VendorBridge.get(context)
-    private val reflection = ReflectionNpuWorkloadAdapter(context)
+private class CompositeNpuWorkloadAdapter private constructor(
+    private val vendorBridge: VendorBridge,
+    private val reflection: ReflectionNpuWorkloadAdapter,
+) : NpuWorkloadAdapter {
     private val closed = AtomicBoolean(false)
     private val shutdownResult = AtomicReference<NpuShutdownResult?>(null)
     private var shape: LoadShape = LoadShape.STEADY
@@ -2002,5 +2332,19 @@ private class CompositeNpuWorkloadAdapter(context: Context) : NpuWorkloadAdapter
                 append(reflectionResult.detail)
             },
         ).also(shutdownResult::set)
+    }
+
+    companion object {
+        fun create(context: Context): CompositeNpuWorkloadAdapter {
+            val appContext = context.applicationContext
+            val vendorBridge = VendorBridge.get(appContext)
+            val reflection = ReflectionNpuWorkloadAdapter(appContext)
+            return constructWithNpuAdapterRollback(reflection) { ownedReflection ->
+                CompositeNpuWorkloadAdapter(
+                    vendorBridge = vendorBridge,
+                    reflection = ownedReflection,
+                )
+            }
+        }
     }
 }

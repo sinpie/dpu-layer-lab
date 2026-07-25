@@ -17,6 +17,28 @@ import org.junit.Test
 
 class DeviceRenderSafetyTest {
     @Test
+    fun originalBatterySaverStateCannotBeHiddenByTemporarySuppression() {
+        assertTrue(
+            effectivePowerSaveConstraint(
+                currentPowerSaveMode = false,
+                originalPowerSaveMode = true,
+            ),
+        )
+        assertTrue(
+            effectivePowerSaveConstraint(
+                currentPowerSaveMode = true,
+                originalPowerSaveMode = false,
+            ),
+        )
+        assertFalse(
+            effectivePowerSaveConstraint(
+                currentPowerSaveMode = false,
+                originalPowerSaveMode = false,
+            ),
+        )
+    }
+
+    @Test
     fun twoGiBEmulatorIsCappedEvenWhenAndroidDoesNotMarkItLowRam() {
         val limits = limits(
             totalRamBytes = 2L * GIB,

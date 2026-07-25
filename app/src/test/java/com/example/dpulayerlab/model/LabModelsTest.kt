@@ -150,4 +150,20 @@ class LabModelsTest {
             ),
         )
     }
+
+    @Test
+    fun performanceRestoreFailureIsAVisibleTerminalReason() {
+        assertEquals(
+            "Battery Saver restore unconfirmed",
+            terminalRunReason(
+                listOf(
+                    RunEvent(
+                        3L,
+                        "PERFORMANCE_RESTORE_FAILED",
+                        "Battery Saver restore unconfirmed",
+                    ),
+                ),
+            ),
+        )
+    }
 }

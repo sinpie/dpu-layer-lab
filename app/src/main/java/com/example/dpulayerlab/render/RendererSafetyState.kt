@@ -105,9 +105,37 @@ internal inline fun startRendererThread(
     thread.start()
     true
 } catch (error: Throwable) {
-    if (error is ThreadDeath) throw error
-    onFailure(error)
+    try {
+        onFailure(error)
+    } catch (rollbackError: Throwable) {
+        if (rollbackError !== error) error.addSuppressed(rollbackError)
+    }
+    if (error is ThreadDeath || error is VirtualMachineError) throw error
     false
+}
+
+/**
+ * Registers every renderer resource before the caller performs the next fallible install step.
+ * If construction, View attachment, or runtime-control initialization throws, the complete owned
+ * prefix is handed to one rollback callback before the original throwable is propagated. This
+ * includes [OutOfMemoryError]; callers may rethrow fatal errors after native/thread ownership has
+ * been made explicit.
+ */
+internal fun <Resource, Result> buildRendererTransaction(
+    build: (register: (Resource) -> Unit) -> Result,
+    rollback: (List<Resource>) -> Unit,
+): Result {
+    val owned = ArrayList<Resource>()
+    return try {
+        build { resource -> owned += resource }
+    } catch (error: Throwable) {
+        try {
+            rollback(owned)
+        } catch (rollbackError: Throwable) {
+            if (rollbackError !== error) error.addSuppressed(rollbackError)
+        }
+        throw error
+    }
 }
 
 internal enum class ProducerRecoveryDecision {

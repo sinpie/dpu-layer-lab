@@ -4,6 +4,7 @@ import java.nio.ByteBuffer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -194,5 +195,98 @@ class VideoDecoderSelectionTest {
             ),
         )
         assertEquals(64, boundedCodecConfigFingerprint(emptyList())?.length)
+    }
+
+    @Test
+    fun failedOwnedResourceConstructionClosesInputAndPreservesCleanupFailure() {
+        val resource = RecordingCloseable(failuresBeforeSuccess = Int.MAX_VALUE)
+        val constructionFailure = IllegalStateException("factory")
+        var observedCloseFailure: Throwable? = null
+
+        lateinit var thrown: IllegalStateException
+        try {
+            constructWithOwnedCloseOnFailure(
+                resource = resource,
+                onCloseFailure = { observedCloseFailure = it },
+            ) {
+                throw constructionFailure
+            }
+        } catch (error: IllegalStateException) {
+            thrown = error
+        }
+
+        assertSame(constructionFailure, thrown)
+        assertEquals(1, resource.closeCalls)
+        assertEquals(1, thrown.suppressed.size)
+        assertEquals("close", thrown.suppressed.single().message)
+        assertSame(thrown.suppressed.single(), observedCloseFailure)
+    }
+
+    @Test
+    fun boundedCloseRetriesOnceAndPublishesStableTerminalResult() {
+        val resource = RecordingCloseable(failuresBeforeSuccess = 1)
+        val closeState = BoundedCloseState(resource::close)
+
+        assertTrue(closeState.closeWithResult())
+        assertTrue(closeState.closeWithResult())
+        assertEquals(2, resource.closeCalls)
+        assertEquals("IllegalStateException", closeState.lastFailureClass())
+    }
+
+    @Test
+    fun boundedCloseFailureDoesNotRetryForeverOrChangeLater() {
+        val resource = RecordingCloseable(failuresBeforeSuccess = Int.MAX_VALUE)
+        val closeState = BoundedCloseState(resource::close)
+
+        assertFalse(closeState.closeWithResult())
+        assertFalse(closeState.closeWithResult())
+        assertEquals(2, resource.closeCalls)
+    }
+
+    @Test
+    fun ownedResourceRetriesCloseAndPublishesNoFailureAfterRecovery() {
+        val resource = RecordingCloseable(failuresBeforeSuccess = 1)
+        val failures = mutableListOf<String>()
+        val owner = BoundedOwnedResource(resource, failures::add)
+
+        assertTrue(owner.closeWithResult())
+        assertTrue(owner.closeWithResult())
+        assertEquals(2, resource.closeCalls)
+        assertTrue(failures.isEmpty())
+    }
+
+    @Test
+    fun ownedResourceUseFailsCurrentOperationAndPublishesTerminalFailureOnce() {
+        val resource = RecordingCloseable(failuresBeforeSuccess = Int.MAX_VALUE)
+        val failures = mutableListOf<String>()
+        val owner = BoundedOwnedResource(resource, failures::add)
+
+        var thrown: IllegalStateException? = null
+        try {
+            owner.use { assertSame(resource, it.resource) }
+        } catch (error: IllegalStateException) {
+            thrown = error
+        }
+
+        assertTrue(thrown?.message.orEmpty().contains("cleanup could not be confirmed"))
+        assertEquals(listOf("IllegalStateException"), failures)
+        assertEquals(2, resource.closeCalls)
+        assertFalse(owner.closeWithResult())
+        assertEquals(listOf("IllegalStateException"), failures)
+        assertEquals(2, resource.closeCalls)
+    }
+
+    private class RecordingCloseable(
+        private val failuresBeforeSuccess: Int,
+    ) : AutoCloseable {
+        var closeCalls = 0
+            private set
+
+        override fun close() {
+            closeCalls += 1
+            if (closeCalls <= failuresBeforeSuccess) {
+                throw IllegalStateException("close")
+            }
+        }
     }
 }

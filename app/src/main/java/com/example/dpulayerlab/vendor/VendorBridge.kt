@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.content.pm.PermissionInfo
+import android.os.Binder
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -14,6 +15,7 @@ import android.os.Looper
 import com.example.dpulayerlab.model.LoadShape
 import com.example.dpulayerlab.model.PixelRoute
 import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.SynchronousQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -28,22 +30,61 @@ data class VendorSnapshot(
     val underrunCount: Long?,
     val dpuUtilization: Float?,
     val busUtilization: Float?,
+    val gpuUtilization: Float?,
+    val gpuFrequencyHz: Long?,
+    val dpuFrequencyHz: Long?,
     val deviceLayers: Int?,
     val clientLayers: Int?,
     val compressionState: String,
     val npuStatus: String,
 )
 
+internal data class VendorTelemetryV2Snapshot(
+    val serviceSession: Long,
+    val gpuUtilization: Float?,
+    val gpuFrequencyHz: Long?,
+    val dpuFrequencyHz: Long?,
+)
+
 data class VendorShutdownResult(
     val brokerWasConnected: Boolean,
     val npuStopConfirmed: Boolean,
     val compressionResetConfirmed: Boolean,
+    val performanceRestoreConfirmed: Boolean,
 )
 
 data class VendorCompressionControlResult(
     val applied: Boolean,
     /** Binder registration that acknowledged the route, or null when it was not acknowledged. */
     val serviceSession: Long?,
+)
+
+enum class VendorPerformanceSessionState {
+    ACTIVE,
+    PENDING,
+    RESTORED,
+    UNAVAILABLE,
+    FAILED,
+}
+
+/**
+ * Client-owned identity for one API-v3 performance-policy lease.
+ *
+ * [commandVersion] is advanced for every begin/renew/health/end operation. Callers must replace
+ * their old ticket with the ticket returned by a successful operation.
+ */
+data class VendorPerformanceSessionTicket(
+    val sessionId: Long,
+    val commandVersion: Long,
+    val serviceSession: Long,
+    val requestedControls: Int,
+    val leaseDurationMs: Long,
+)
+
+data class VendorPerformanceSessionResult(
+    val state: VendorPerformanceSessionState,
+    val ticket: VendorPerformanceSessionTicket?,
+    val detail: String,
 )
 
 internal enum class NpuControlCommandState {
@@ -63,7 +104,10 @@ internal data class NpuControlCommandTicket(
     val submittedAtNanos: Long,
 )
 
-class VendorBridge private constructor(private val context: Context) : AutoCloseable {
+class VendorBridge private constructor(
+    private val context: Context,
+    executorLanes: VendorExecutorLanes,
+) : AutoCloseable {
     private val connectionLock = Any()
     @Volatile
     private var service: IDpuLabVendorService? = null
@@ -83,6 +127,16 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
     private val bindingGeneration = AtomicLong(0L)
     private val serviceGeneration = AtomicLong(0L)
     private val npuCommandVersion = AtomicLong(0L)
+    private val performanceCommandVersion = AtomicLong(0L)
+    private val performanceClientToken: IBinder = Binder()
+    private val desiredPerformanceCommand =
+        AtomicReference<PerformanceCommand?>(null)
+    private val pendingPerformanceCommand =
+        AtomicReference<PerformanceCommand?>(null)
+    private val activePerformanceTicket =
+        AtomicReference<VendorPerformanceSessionTicket?>(null)
+    private val activePerformanceAppliedVersion = AtomicLong(0L)
+    private val performanceLeaseDeadlineNanos = AtomicLong(0L)
     private val npuCommandAcknowledgments = NpuCommandAcknowledgments()
     private val initialNpuCommandTicket =
         npuCommandAcknowledgments.recordPending(version = 0L, serviceSession = null)
@@ -112,9 +166,21 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
      * Bound the waiting queue so one stuck transaction cannot accumulate a task every telemetry
      * interval for the lifetime of the process.
      */
-    private val telemetryExecutor = newRemoteExecutor("DpuLab-VendorTelemetry")
-    private val controlExecutor = newRemoteExecutor("DpuLab-VendorControl")
-    private val npuExecutor = newRemoteExecutor("DpuLab-VendorNpu")
+    private val telemetryExecutor = executorLanes.telemetry
+    /**
+     * Optional API-v2 calls must not poison the v1/exact-counter lane if a faulty provider blocks
+     * in a newly added transaction. No queue means a still-running v2 call drops only the current
+     * optional extension instead of accumulating stale work.
+     */
+    private val telemetryV2Executor = executorLanes.telemetryV2
+    private val controlExecutor = executorLanes.control
+    private val npuExecutor = executorLanes.npu
+    /**
+     * Performance-policy mutations never share telemetry/NPU lanes. One running drain plus one
+     * queued wake signal plus one atomic latest command gives bounded latest-wins behavior without
+     * a stale renewal backlog.
+     */
+    private val performanceExecutor = executorLanes.performance
     private fun newServiceConnection(generation: Long): ServiceConnection =
         object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName, binder: IBinder) {
@@ -421,26 +487,764 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
         }
     }
 
+    /**
+     * Acquires the API-v3 battery-saver suppression lease. This is a bounded blocking API and
+     * must be called away from the main thread.
+     *
+     * A failed or timed-out begin is immediately superseded by a higher-version end. The end stays
+     * in the atomic latest-wins drain even when the original Binder transaction returns late.
+     */
+    @Synchronized
+    fun acquirePerformanceSession(
+        requestedControls: Int = PERFORMANCE_CONTROL_DISABLE_BATTERY_SAVER,
+    ): VendorPerformanceSessionResult {
+        // A closed bridge with a pending process latch is unsafe, not merely unavailable. Report
+        // the exact retained ticket first so callers cannot downgrade it to APP_ONLY monitoring.
+        processPerformanceRestoreLatch.snapshot()?.let { existing ->
+            return performanceResult(
+                state = VendorPerformanceSessionState.FAILED,
+                ticket = existing,
+                detail = "A previous performance session is not confirmed restored",
+            )
+        }
+        if (closed.get()) {
+            return performanceResult(
+                state = VendorPerformanceSessionState.UNAVAILABLE,
+                detail = "Vendor bridge is closed",
+            )
+        }
+        if (!validPerformanceControlRequest(requestedControls)) {
+            return performanceResult(
+                state = VendorPerformanceSessionState.FAILED,
+                detail = "Unsupported performance control request",
+            )
+        }
+        val serviceSession = currentServiceSession()
+            ?: return performanceResult(
+                state = VendorPerformanceSessionState.UNAVAILABLE,
+                detail = "Vendor performance service is unavailable",
+            )
+        val ticket = VendorPerformanceSessionTicket(
+            sessionId = nextVendorPerformanceSessionId(),
+            commandVersion = nextPerformanceCommandVersion(),
+            serviceSession = serviceSession,
+            requestedControls = requestedControls,
+            leaseDurationMs = PERFORMANCE_SESSION_LEASE_MS,
+        )
+        if (!processPerformanceRestoreLatch.arm(ticket)) {
+            return performanceResult(
+                state = VendorPerformanceSessionState.FAILED,
+                ticket = processPerformanceRestoreLatch.snapshot(),
+                detail = "A performance restore acknowledgment is still pending",
+            )
+        }
+        val command = PerformanceCommand(
+            type = PerformanceCommandType.BEGIN,
+            ticket = ticket,
+            minimumAppliedVersion = ticket.commandVersion,
+        )
+        if (!publishPerformanceCommand(command, allowClosed = false)) {
+            // A rejected wake-up is not proof that the command never ran: a previously-running
+            // drain may have taken it concurrently. Clear the process latch only after atomically
+            // withdrawing this exact command from the pending slot.
+            if (withdrawUndispatchedPerformanceCommand(command)) {
+                processPerformanceRestoreLatch.confirmNeverMutated(ticket)
+            }
+            return performanceResult(
+                state = VendorPerformanceSessionState.FAILED,
+                ticket = processPerformanceRestoreLatch.snapshot(),
+                detail = "Vendor performance lane rejected begin",
+            )
+        }
+        val beginResult = awaitPerformanceCommand(command)
+        if (beginResult.state == VendorPerformanceSessionState.ACTIVE) return beginResult
+        if (
+            beginResult.state == VendorPerformanceSessionState.UNAVAILABLE &&
+            processPerformanceRestoreLatch.snapshot() == null
+        ) {
+            return beginResult
+        }
+
+        val restore = endPerformanceSessionInternal(
+            ticket = ticket,
+            allowClosed = false,
+            reason = "begin did not produce a timely active acknowledgment",
+        )
+        return if (restore.state == VendorPerformanceSessionState.RESTORED) {
+            performanceResult(
+                state = VendorPerformanceSessionState.FAILED,
+                detail = "${beginResult.detail}; restore acknowledged",
+            )
+        } else {
+            performanceResult(
+                state = VendorPerformanceSessionState.FAILED,
+                ticket = restore.ticket ?: ticket,
+                detail = "${beginResult.detail}; ${restore.detail}",
+            )
+        }
+    }
+
+    /**
+     * Renews an active 10-second lease. Controllers should invoke this every
+     * [PERFORMANCE_SESSION_RENEW_INTERVAL_MS].
+     */
+    @Synchronized
+    fun renewPerformanceSession(
+        ticket: VendorPerformanceSessionTicket,
+    ): VendorPerformanceSessionResult {
+        val current = activePerformanceTicket.get()
+        if (closed.get() || !ticketsMatchExactly(current, ticket)) {
+            return performanceResult(
+                state = VendorPerformanceSessionState.FAILED,
+                ticket = processPerformanceRestoreLatch.snapshot(),
+                detail = "Performance renewal ticket is stale or inactive",
+            )
+        }
+        if (currentServiceSession() != ticket.serviceSession) {
+            return performanceResult(
+                state = VendorPerformanceSessionState.FAILED,
+                ticket = ticket,
+                detail = "Vendor service changed before performance renewal",
+            )
+        }
+        if (
+            isMonotonicDeadlineReached(
+                nowNanos = System.nanoTime(),
+                deadlineNanos = performanceLeaseDeadlineNanos.get(),
+            )
+        ) {
+            return endPerformanceAfterFailedCommand(
+                ticket = ticket,
+                failureDetail = "Performance lease expired before renewal",
+            )
+        }
+        val renewedTicket = ticket.copy(commandVersion = nextPerformanceCommandVersion())
+        if (!processPerformanceRestoreLatch.advance(renewedTicket)) {
+            return performanceResult(
+                state = VendorPerformanceSessionState.FAILED,
+                ticket = processPerformanceRestoreLatch.snapshot(),
+                detail = "Performance restore latch rejected renewal",
+            )
+        }
+        val command = PerformanceCommand(
+            type = PerformanceCommandType.RENEW,
+            ticket = renewedTicket,
+            minimumAppliedVersion = renewedTicket.commandVersion,
+        )
+        if (!publishPerformanceCommand(command, allowClosed = false)) {
+            return endPerformanceAfterFailedCommand(
+                ticket = renewedTicket,
+                failureDetail = "Vendor performance lane rejected renewal",
+            )
+        }
+        val result = awaitPerformanceCommand(command)
+        return if (result.state == VendorPerformanceSessionState.ACTIVE) {
+            result
+        } else {
+            endPerformanceAfterFailedCommand(
+                ticket = renewedTicket,
+                failureDetail = result.detail,
+            )
+        }
+    }
+
+    /**
+     * Checks provider-confirmed session state on the same serialized lane as begin/renew/end.
+     * A local lease deadline is never promoted to ACTIVE without the v3 provider acknowledgment.
+     */
+    @Synchronized
+    fun performanceSessionHealth(
+        ticket: VendorPerformanceSessionTicket,
+    ): VendorPerformanceSessionResult {
+        val current = activePerformanceTicket.get()
+        if (closed.get() || !ticketsMatchExactly(current, ticket)) {
+            return performanceResult(
+                state = VendorPerformanceSessionState.FAILED,
+                ticket = processPerformanceRestoreLatch.snapshot(),
+                detail = "Performance health ticket is stale or inactive",
+            )
+        }
+        if (currentServiceSession() != ticket.serviceSession) {
+            return performanceResult(
+                state = VendorPerformanceSessionState.FAILED,
+                ticket = ticket,
+                detail = "Vendor service changed during performance session",
+            )
+        }
+        val healthTicket = ticket.copy(commandVersion = nextPerformanceCommandVersion())
+        if (!processPerformanceRestoreLatch.advance(healthTicket)) {
+            return performanceResult(
+                state = VendorPerformanceSessionState.FAILED,
+                ticket = processPerformanceRestoreLatch.snapshot(),
+                detail = "Performance restore latch rejected health query",
+            )
+        }
+        val command = PerformanceCommand(
+            type = PerformanceCommandType.HEALTH,
+            ticket = healthTicket,
+            minimumAppliedVersion = activePerformanceAppliedVersion.get(),
+        )
+        if (!publishPerformanceCommand(command, allowClosed = false)) {
+            return endPerformanceAfterFailedCommand(
+                ticket = healthTicket,
+                failureDetail = "Vendor performance lane rejected health query",
+            )
+        }
+        val result = awaitPerformanceCommand(command)
+        return if (
+            result.state == VendorPerformanceSessionState.ACTIVE ||
+            result.state == VendorPerformanceSessionState.RESTORED
+        ) {
+            result
+        } else {
+            endPerformanceAfterFailedCommand(
+                ticket = healthTicket,
+                failureDetail = result.detail,
+            )
+        }
+    }
+
+    @Synchronized
+    fun endPerformanceSession(
+        ticket: VendorPerformanceSessionTicket,
+    ): VendorPerformanceSessionResult =
+        endPerformanceSessionInternal(
+            ticket = ticket,
+            allowClosed = false,
+            reason = "controller requested release",
+        )
+
+    /**
+     * Activity-free process proof used to reconcile a controller whose cancellation raced the
+     * return of BEGIN/END. Null means there is no unconfirmed vendor policy mutation.
+     */
+    fun pendingPerformanceRestoreTicket(): VendorPerformanceSessionTicket? =
+        processPerformanceRestoreLatch.snapshot()
+
     fun snapshot(): VendorSnapshot? {
-        return callRemote<VendorSnapshot?>(
+        val deadlineNanos =
+            System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(SNAPSHOT_TIMEOUT_MS)
+        val baseSnapshot = callRemote<VendorSnapshot?>(
             executor = telemetryExecutor,
             fallback = null,
             timeoutMs = SNAPSHOT_TIMEOUT_MS,
         ) { remote, serviceSession ->
+            val apiVersion = remote.apiVersion
             val counts: IntArray = remote.compositionLayerCounts ?: intArrayOf()
             VendorSnapshot(
-                apiVersion = remote.apiVersion,
+                apiVersion = apiVersion,
                 serviceSession = serviceSession,
                 underrunCount = remote.dpuUnderrunCount.takeIf { it >= 0 },
-                dpuUtilization = remote.dpuUtilizationPercent.validPercent(),
-                busUtilization = remote.memoryBusUtilizationPercent.validPercent(),
+                dpuUtilization = validVendorUtilizationPercent(remote.dpuUtilizationPercent),
+                busUtilization = validVendorUtilizationPercent(remote.memoryBusUtilizationPercent),
+                gpuUtilization = null,
+                gpuFrequencyHz = null,
+                dpuFrequencyHz = null,
                 deviceLayers = counts.getOrNull(0)?.takeIf { it >= 0 },
                 clientLayers = counts.getOrNull(1)?.takeIf { it >= 0 },
                 compressionState = sanitizeVendorStatus(remote.lastCompressionState),
                 npuStatus = sanitizeVendorStatus(remote.npuStatus),
             )
         }
+        baseSnapshot ?: return null
+
+        val extendedSnapshot = if (supportsVendorTelemetryV2(baseSnapshot.apiVersion)) {
+            val remainingTimeoutMs = remainingVendorTelemetryTimeoutMs(
+                deadlineNanos = deadlineNanos,
+                nowNanos = System.nanoTime(),
+            )
+            if (remainingTimeoutMs > 0L) {
+                callRemote<VendorTelemetryV2Snapshot?>(
+                    executor = telemetryV2Executor,
+                    fallback = null,
+                    timeoutMs = remainingTimeoutMs,
+                    requiredServiceSession = baseSnapshot.serviceSession,
+                ) { remote, serviceSession ->
+                    readVendorTelemetryV2(
+                        serviceSession = serviceSession,
+                        gpuUtilizationReader = { remote.gpuUtilizationPercent },
+                        gpuFrequencyReader = { remote.gpuFrequencyHz },
+                        dpuFrequencyReader = { remote.dpuFrequencyHz },
+                    )
+                }
+            } else {
+                null
+            }
+        } else {
+            null
+        }
+
+        val merged = mergeVendorTelemetryV2(baseSnapshot, extendedSnapshot)
+        // Splitting the transactions creates a second observation window. Do not return the
+        // already-collected v1 values if the service registration changed during that window.
+        return merged.takeIf {
+            currentServiceSession() == baseSnapshot.serviceSession
+        }
     }
+
+    private fun endPerformanceAfterFailedCommand(
+        ticket: VendorPerformanceSessionTicket,
+        failureDetail: String,
+    ): VendorPerformanceSessionResult {
+        val restore = endPerformanceSessionInternal(
+            ticket = ticket,
+            allowClosed = false,
+            reason = failureDetail,
+        )
+        return performanceResult(
+            state = VendorPerformanceSessionState.FAILED,
+            ticket = restore.ticket,
+            detail = if (restore.state == VendorPerformanceSessionState.RESTORED) {
+                "$failureDetail; restore acknowledged"
+            } else {
+                "$failureDetail; ${restore.detail}"
+            },
+        )
+    }
+
+    private fun endPerformanceSessionInternal(
+        ticket: VendorPerformanceSessionTicket,
+        allowClosed: Boolean,
+        reason: String,
+    ): VendorPerformanceSessionResult {
+        if (closed.get() && !allowClosed) {
+            return performanceResult(
+                state = VendorPerformanceSessionState.FAILED,
+                ticket = processPerformanceRestoreLatch.snapshot(),
+                detail = "Vendor bridge closed before performance restore",
+            )
+        }
+        val latched = processPerformanceRestoreLatch.snapshot()
+            ?: return performanceResult(
+                state = VendorPerformanceSessionState.RESTORED,
+                detail = "Performance policy is already confirmed restored",
+            )
+        if (!ticketsReferToSameSession(latched, ticket)) {
+            return performanceResult(
+                state = VendorPerformanceSessionState.FAILED,
+                ticket = latched,
+                detail = "Performance release ticket belongs to another session",
+            )
+        }
+        val endTicket = latched.copy(commandVersion = nextPerformanceCommandVersion())
+        if (!processPerformanceRestoreLatch.advance(endTicket)) {
+            return performanceResult(
+                state = VendorPerformanceSessionState.FAILED,
+                ticket = processPerformanceRestoreLatch.snapshot(),
+                detail = "Performance restore latch rejected release",
+            )
+        }
+        activePerformanceTicket.set(null)
+        activePerformanceAppliedVersion.set(0L)
+        performanceLeaseDeadlineNanos.set(0L)
+        val command = PerformanceCommand(
+            type = PerformanceCommandType.END,
+            ticket = endTicket,
+            minimumAppliedVersion = endTicket.commandVersion,
+            reason = reason,
+        )
+        if (!publishPerformanceCommand(command, allowClosed = allowClosed)) {
+            return performanceResult(
+                state = VendorPerformanceSessionState.FAILED,
+                ticket = endTicket,
+                detail = "Vendor performance lane rejected release",
+            )
+        }
+        return awaitPerformanceCommand(command)
+    }
+
+    private fun publishPerformanceCommand(
+        command: PerformanceCommand,
+        allowClosed: Boolean,
+    ): Boolean {
+        if (closed.get() && !allowClosed && command.type != PerformanceCommandType.END) {
+            return false
+        }
+        while (true) {
+            val current = desiredPerformanceCommand.get()
+            if (
+                current != null &&
+                !isNewerSequence(command.ticket.commandVersion, current.ticket.commandVersion)
+            ) {
+                command.complete(
+                    performanceResult(
+                        state = VendorPerformanceSessionState.FAILED,
+                        ticket = command.ticket,
+                        detail = "Performance command version is stale",
+                    ),
+                )
+                return false
+            }
+            if (desiredPerformanceCommand.compareAndSet(current, command)) {
+                current?.complete(
+                    performanceResult(
+                        state = VendorPerformanceSessionState.FAILED,
+                        ticket = current.ticket,
+                        detail = "Performance command was superseded",
+                    ),
+                )
+                break
+            }
+        }
+        while (true) {
+            val pending = pendingPerformanceCommand.get()
+            if (
+                pending != null &&
+                !isNewerSequence(command.ticket.commandVersion, pending.ticket.commandVersion)
+            ) {
+                return false
+            }
+            if (pendingPerformanceCommand.compareAndSet(pending, command)) {
+                pending?.complete(
+                    performanceResult(
+                        state = VendorPerformanceSessionState.FAILED,
+                        ticket = pending.ticket,
+                        detail = "Performance command was replaced by a newer command",
+                    ),
+                )
+                break
+            }
+        }
+        return schedulePerformanceDrain(allowClosed)
+    }
+
+    private fun schedulePerformanceDrain(allowClosed: Boolean): Boolean {
+        if (closed.get() && !allowClosed && pendingPerformanceCommand.get()?.type != PerformanceCommandType.END) {
+            return false
+        }
+        if (performanceExecutor.isShutdown) return false
+        return runCatching {
+            performanceExecutor.execute(::drainPerformanceCommands)
+            true
+        }.getOrElse {
+            // A rejection while the one-slot queue is occupied means a wake-up is already
+            // guaranteed. The command itself was atomically replaced above, so no extra task is
+            // needed and no stale command queue is created.
+            !performanceExecutor.isShutdown && performanceExecutor.queue.isNotEmpty()
+        }
+    }
+
+    private fun withdrawUndispatchedPerformanceCommand(
+        command: PerformanceCommand,
+    ): Boolean {
+        if (!pendingPerformanceCommand.compareAndSet(command, null)) return false
+        desiredPerformanceCommand.compareAndSet(command, null)
+        command.complete(
+            performanceResult(
+                state = VendorPerformanceSessionState.FAILED,
+                detail = "Performance command was withdrawn before dispatch",
+            ),
+        )
+        return true
+    }
+
+    private fun drainPerformanceCommands() {
+        while (true) {
+            val command = pendingPerformanceCommand.getAndSet(null) ?: return
+            applyPerformanceCommand(command)
+        }
+    }
+
+    private fun applyPerformanceCommand(command: PerformanceCommand) {
+        val target = synchronized(connectionLock) {
+            val remote = service ?: return@synchronized null
+            RemoteCallTarget(
+                remote = remote,
+                binder = serviceBinder,
+                serviceSession = serviceGeneration.get(),
+            )
+        }
+        if (target == null || target.serviceSession != command.ticket.serviceSession) {
+            // No remote mutation was invoked. A BEGIN that lost its registration before dispatch
+            // cannot have disabled Battery Saver, so do not poison the process-wide restore latch.
+            // RENEW/HEALTH/END remain sticky because they refer to a session that may already have
+            // been active in the previous provider registration.
+            if (command.type == PerformanceCommandType.BEGIN) {
+                processPerformanceRestoreLatch.confirmNeverMutated(command.ticket)
+            }
+            command.complete(
+                performanceResult(
+                    state = if (command.type == PerformanceCommandType.BEGIN) {
+                        VendorPerformanceSessionState.UNAVAILABLE
+                    } else {
+                        VendorPerformanceSessionState.FAILED
+                    },
+                    ticket = if (command.type == PerformanceCommandType.BEGIN) {
+                        null
+                    } else {
+                        command.ticket
+                    },
+                    detail =
+                        "Vendor performance service session is unavailable or changed before " +
+                            "the command could be dispatched",
+                ),
+            )
+            return
+        }
+
+        var mutatingTransactionStarted = false
+        val result = try {
+            val apiVersion = target.remote.apiVersion
+            if (!supportsVendorPerformanceSession(apiVersion)) {
+                if (command.type == PerformanceCommandType.BEGIN) {
+                    processPerformanceRestoreLatch.confirmNeverMutated(command.ticket)
+                }
+                performanceResult(
+                    state = VendorPerformanceSessionState.UNAVAILABLE,
+                    ticket = null,
+                    detail = "Vendor service API v3 performance sessions are unavailable",
+                )
+            } else {
+                when (command.type) {
+                    PerformanceCommandType.BEGIN -> {
+                        mutatingTransactionStarted = true
+                        val acknowledgedVersion = target.remote.beginPerformanceSession(
+                            performanceClientToken,
+                            command.ticket.sessionId,
+                            command.ticket.commandVersion,
+                            command.ticket.requestedControls,
+                            command.ticket.leaseDurationMs,
+                        )
+                        performanceMutationResult(
+                            command = command,
+                            acknowledgedVersion = acknowledgedVersion,
+                            target = target,
+                            successState = VendorPerformanceSessionState.ACTIVE,
+                            successDetail = "Performance session acquired",
+                        )
+                    }
+
+                    PerformanceCommandType.RENEW -> {
+                        mutatingTransactionStarted = true
+                        val acknowledgedVersion = target.remote.renewPerformanceSession(
+                            performanceClientToken,
+                            command.ticket.sessionId,
+                            command.ticket.commandVersion,
+                            command.ticket.leaseDurationMs,
+                        )
+                        performanceMutationResult(
+                            command = command,
+                            acknowledgedVersion = acknowledgedVersion,
+                            target = target,
+                            successState = VendorPerformanceSessionState.ACTIVE,
+                            successDetail = "Performance session renewed",
+                        )
+                    }
+
+                    PerformanceCommandType.HEALTH -> {
+                        val state = target.remote.getPerformanceSessionState(
+                            performanceClientToken,
+                            command.ticket.sessionId,
+                            command.minimumAppliedVersion,
+                        )
+                        when {
+                            !isCurrentRemoteCallTarget(target, allowClosed = false) ->
+                                performanceResult(
+                                    state = VendorPerformanceSessionState.FAILED,
+                                    ticket = command.ticket,
+                                    detail = "Vendor service changed during health query",
+                                )
+
+                            state == PERFORMANCE_SESSION_REMOTE_ACTIVE ->
+                                if (
+                                    isMonotonicDeadlineReached(
+                                        nowNanos = System.nanoTime(),
+                                        deadlineNanos = performanceLeaseDeadlineNanos.get(),
+                                    )
+                                ) {
+                                    performanceResult(
+                                        state = VendorPerformanceSessionState.FAILED,
+                                        ticket = command.ticket,
+                                        detail =
+                                            "Provider reports active after the local lease deadline",
+                                    )
+                                } else {
+                                    performanceResult(
+                                        state = VendorPerformanceSessionState.ACTIVE,
+                                        ticket = command.ticket,
+                                        detail = "Performance session is active",
+                                    )
+                                }
+
+                            state == PERFORMANCE_SESSION_REMOTE_RESTORED -> {
+                                if (
+                                    processPerformanceRestoreLatch.confirmRestored(command.ticket)
+                                ) {
+                                    activePerformanceTicket.set(null)
+                                    activePerformanceAppliedVersion.set(0L)
+                                    performanceLeaseDeadlineNanos.set(0L)
+                                    performanceResult(
+                                        state = VendorPerformanceSessionState.RESTORED,
+                                        detail =
+                                            "Provider confirmed performance policy restored",
+                                    )
+                                } else {
+                                    performanceResult(
+                                        state = VendorPerformanceSessionState.FAILED,
+                                        ticket = processPerformanceRestoreLatch.snapshot(),
+                                        detail =
+                                            "Inactive health response did not match latest command",
+                                    )
+                                }
+                            }
+
+                            else -> performanceResult(
+                                state = VendorPerformanceSessionState.FAILED,
+                                ticket = command.ticket,
+                                detail = "Provider could not verify performance session health",
+                            )
+                        }
+                    }
+
+                    PerformanceCommandType.END -> {
+                        mutatingTransactionStarted = true
+                        val acknowledgedVersion = target.remote.endPerformanceSession(
+                            performanceClientToken,
+                            command.ticket.sessionId,
+                            command.ticket.commandVersion,
+                        )
+                        performanceMutationResult(
+                            command = command,
+                            acknowledgedVersion = acknowledgedVersion,
+                            target = target,
+                            successState = VendorPerformanceSessionState.RESTORED,
+                            successDetail = "Performance policy restore acknowledged",
+                        )
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            if (
+                command.type == PerformanceCommandType.BEGIN &&
+                !mutatingTransactionStarted
+            ) {
+                processPerformanceRestoreLatch.confirmNeverMutated(command.ticket)
+            }
+            performanceResult(
+                state = VendorPerformanceSessionState.FAILED,
+                ticket = command.ticket,
+                detail = if (mutatingTransactionStarted) {
+                    "Vendor performance mutation failed with unknown applied state"
+                } else {
+                    "Vendor performance API query failed before mutation"
+                },
+            )
+        }
+
+        if (result.state == VendorPerformanceSessionState.ACTIVE) {
+            activePerformanceTicket.set(command.ticket)
+            if (command.type != PerformanceCommandType.HEALTH) {
+                activePerformanceAppliedVersion.set(command.ticket.commandVersion)
+                performanceLeaseDeadlineNanos.set(
+                    monotonicDeadlineAfter(
+                        System.nanoTime(),
+                        TimeUnit.MILLISECONDS.toNanos(command.ticket.leaseDurationMs),
+                    ),
+                )
+            }
+        } else if (result.state == VendorPerformanceSessionState.RESTORED) {
+            activePerformanceTicket.set(null)
+            activePerformanceAppliedVersion.set(0L)
+            performanceLeaseDeadlineNanos.set(0L)
+        }
+        val latest = desiredPerformanceCommand.get()
+        if (
+            latest != null &&
+            latest.ticket.commandVersion != command.ticket.commandVersion
+        ) {
+            if (
+                result.state == VendorPerformanceSessionState.ACTIVE &&
+                activePerformanceTicket.compareAndSet(command.ticket, null)
+            ) {
+                activePerformanceAppliedVersion.set(0L)
+                performanceLeaseDeadlineNanos.set(0L)
+            }
+            command.complete(
+                performanceResult(
+                    state = VendorPerformanceSessionState.FAILED,
+                    ticket = command.ticket,
+                    detail = "Performance command completed after being superseded",
+                ),
+            )
+            return
+        }
+        command.complete(result)
+    }
+
+    private fun performanceMutationResult(
+        command: PerformanceCommand,
+        acknowledgedVersion: Long,
+        target: RemoteCallTarget,
+        successState: VendorPerformanceSessionState,
+        successDetail: String,
+    ): VendorPerformanceSessionResult {
+        if (
+            acknowledgedVersion != command.ticket.commandVersion ||
+            !isCurrentRemoteCallTarget(
+                target = target,
+                allowClosed = command.type == PerformanceCommandType.END,
+            )
+        ) {
+            return performanceResult(
+                state = VendorPerformanceSessionState.FAILED,
+                ticket = command.ticket,
+                detail = "Vendor performance acknowledgment was stale or unbound",
+            )
+        }
+        if (successState == VendorPerformanceSessionState.RESTORED) {
+            if (!processPerformanceRestoreLatch.confirmRestoredByEnd(command.ticket)) {
+                return performanceResult(
+                    state = VendorPerformanceSessionState.FAILED,
+                    ticket = processPerformanceRestoreLatch.snapshot(),
+                    detail = "Restore acknowledgment did not match the active session",
+                )
+            }
+            return performanceResult(
+                state = VendorPerformanceSessionState.RESTORED,
+                detail = successDetail,
+            )
+        }
+        return performanceResult(
+            state = successState,
+            ticket = command.ticket,
+            detail = successDetail,
+        )
+    }
+
+    private fun awaitPerformanceCommand(
+        command: PerformanceCommand,
+        timeoutMs: Long = PERFORMANCE_COMMAND_ACK_TIMEOUT_MS,
+    ): VendorPerformanceSessionResult {
+        val deadlineNanos = monotonicDeadlineAfter(
+            System.nanoTime(),
+            TimeUnit.MILLISECONDS.toNanos(timeoutMs.coerceIn(1L, PERFORMANCE_MAX_WAIT_MS)),
+        )
+        while (true) {
+            command.result.get()?.let { return it }
+            val remainingNanos = deadlineNanos - System.nanoTime()
+            if (remainingNanos <= 0L) {
+                return performanceResult(
+                    state = VendorPerformanceSessionState.PENDING,
+                    ticket = command.ticket,
+                    detail = "Performance command acknowledgment timed out",
+                )
+            }
+            LockSupport.parkNanos(
+                remainingNanos.coerceAtMost(PERFORMANCE_ACK_POLL_NANOS),
+            )
+            if (Thread.interrupted()) {
+                Thread.currentThread().interrupt()
+                return performanceResult(
+                    state = VendorPerformanceSessionState.FAILED,
+                    ticket = command.ticket,
+                    detail = "Performance command wait was interrupted",
+                )
+            }
+        }
+    }
+
+    private fun nextPerformanceCommandVersion(): Long =
+        nextNonZeroSequence(performanceCommandVersion)
 
     @Synchronized
     fun closeWithResult(
@@ -458,6 +1262,34 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
         reconnectScheduled.set(false)
         cancelCapabilityRetry(resetAttempt = false)
         val brokerWasConnected = service != null
+        processPerformanceRestoreLatch.snapshot()?.let { ticket ->
+            endPerformanceSessionInternal(
+                ticket = ticket,
+                allowClosed = true,
+                reason = "vendor bridge close",
+            )
+        }
+        // Graceful shutdown lets an in-flight late begin return and consume the already-published
+        // higher-version END from the same drain. Do not cancel/remove that safety command.
+        performanceExecutor.shutdown()
+        val performanceLaneQuiesced = try {
+            performanceExecutor.awaitTermination(
+                PERFORMANCE_CLOSE_QUIESCE_TIMEOUT_MS,
+                TimeUnit.MILLISECONDS,
+            )
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        if (!performanceLaneQuiesced) {
+            performanceExecutor.shutdownNow()
+        }
+        if (
+            performanceExecutor.isTerminated &&
+            processPerformanceRestoreLatch.snapshot() == null
+        ) {
+            clearRestoredPerformanceState()
+        }
         val closeTicket = npuCommandAcknowledgments.recordPending(
             version = npuCommandVersion.incrementAndGet(),
             serviceSession = currentServiceSession(),
@@ -473,6 +1305,7 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
         // Discard stale telemetry/NPU work. Safety control uses a dedicated lane so a healthy,
         // merely slow snapshot cannot prevent shutdown reset from even starting.
         telemetryExecutor.queue.clear()
+        telemetryV2Executor.queue.clear()
         npuExecutor.queue.clear()
         controlExecutor.queue.clear()
         npuExecutor.shutdownNow()
@@ -517,12 +1350,26 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
         unbindCurrentBinding()
         clearCurrentService()
         telemetryExecutor.shutdownNow()
+        telemetryV2Executor.shutdownNow()
         controlExecutor.shutdownNow()
         val auxiliaryLanesQuiesced = awaitExecutorTerminationTogether(
-            executors = listOf(telemetryExecutor, controlExecutor),
+            executors = listOf(
+                telemetryExecutor,
+                telemetryV2Executor,
+                controlExecutor,
+                performanceExecutor,
+            ),
             timeoutMs = REMOTE_LANE_QUIESCE_TIMEOUT_MS,
         )
-        val safeToRestart = auxiliaryLanesQuiesced && npuExecutor.isTerminated
+        // The synchronous wait may time out while the serialized late-BEGIN -> END chain still
+        // completes during executor quiescence. The exact-version process latch is the final proof.
+        val performanceRestoreConfirmed =
+            processPerformanceRestoreLatch.snapshot() == null
+        val safeToRestart =
+            auxiliaryLanesQuiesced &&
+                npuExecutor.isTerminated &&
+                performanceExecutor.isTerminated &&
+                performanceRestoreConfirmed
         restartSafe.set(safeToRestart)
         if (safeToRestart) {
             synchronized(Companion) {
@@ -535,11 +1382,26 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
             // complete afterward on the provider Binder pool.
             npuStopConfirmed = npuStopAcknowledged && npuLaneQuiesced,
             compressionResetConfirmed = compressionResetConfirmed,
+            performanceRestoreConfirmed = performanceRestoreConfirmed,
         ).also(shutdownResult::set)
     }
 
     override fun close() {
         closeWithResult()
+    }
+
+    /**
+     * Waits for late Binder lanes to terminate and for the exact performance restore latch to
+     * clear, then detaches this closed singleton. The wait is capped and parks between checks.
+     */
+    fun awaitRestartSafeAfterClose(timeoutMs: Long): Boolean {
+        if (!closed.get()) return false
+        return awaitBoundedCondition(
+            timeoutMs = timeoutMs,
+            maxTimeoutMs = MAX_RESTART_SAFE_WAIT_MS,
+            pollNanos = RESTART_SAFE_POLL_NANOS,
+            condition = ::canRestartAfterClose,
+        )
     }
 
     /**
@@ -1135,6 +1997,7 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
         fallback: T,
         timeoutMs: Long,
         allowClosed: Boolean = false,
+        requiredServiceSession: Long? = null,
         block: (IDpuLabVendorService, Long) -> T,
     ): T {
         if (closed.get() && !allowClosed) return fallback
@@ -1145,6 +2008,12 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
                 binder = serviceBinder,
                 serviceSession = serviceGeneration.get(),
             )
+        }
+        if (
+            requiredServiceSession != null &&
+            target.serviceSession != requiredServiceSession
+        ) {
+            return fallback
         }
         val future = runCatching {
             executor.submit<T> {
@@ -1208,14 +2077,26 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
             closed.get() &&
                 shutdownResult.get() != null &&
                 telemetryExecutor.isTerminated &&
+                telemetryV2Executor.isTerminated &&
                 controlExecutor.isTerminated &&
-                npuExecutor.isTerminated
+                npuExecutor.isTerminated &&
+                performanceExecutor.isTerminated &&
+                processPerformanceRestoreLatch.snapshot() == null
         if (!terminatedLater) return false
+        clearRestoredPerformanceState()
         restartSafe.set(true)
         synchronized(Companion) {
             if (instance === this) instance = null
         }
         return true
+    }
+
+    private fun clearRestoredPerformanceState() {
+        desiredPerformanceCommand.set(null)
+        pendingPerformanceCommand.set(null)
+        activePerformanceTicket.set(null)
+        activePerformanceAppliedVersion.set(0L)
+        performanceLeaseDeadlineNanos.set(0L)
     }
 
     companion object {
@@ -1225,6 +2106,11 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
         const val COMPRESSION_LINEAR = 0
         const val COMPRESSION_AUTO = 1
         const val COMPRESSION_SBWC_REQUIRED = 2
+        /** API-v3 control bit. Thermal/DVFS/frequency controls are intentionally not defined. */
+        const val PERFORMANCE_CONTROL_DISABLE_BATTERY_SAVER = 1
+        const val PERFORMANCE_SESSION_LEASE_MS = 10_000L
+        const val PERFORMANCE_SESSION_RENEW_INTERVAL_MS = 2_000L
+        const val PERFORMANCE_COMMAND_ACK_TIMEOUT_MS = 1_000L
         const val CONTROL_TIMEOUT_MS = 500L
         const val SNAPSHOT_TIMEOUT_MS = 700L
         const val MAX_REMOTE_QUEUE_DEPTH = 8
@@ -1241,6 +2127,13 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
         const val MAX_CAPABILITY_RETRY_DELAY_MS = 800L
         const val STEADY_CAPABILITY_RETRY_DELAY_MS = 4_000L
         private const val NPU_ACK_POLL_NANOS = 2_000_000L
+        private const val PERFORMANCE_ACK_POLL_NANOS = 2_000_000L
+        private const val PERFORMANCE_MAX_WAIT_MS = 2_000L
+        private const val PERFORMANCE_CLOSE_QUIESCE_TIMEOUT_MS = 2_000L
+        private const val PERFORMANCE_SESSION_REMOTE_RESTORED = 0
+        private const val PERFORMANCE_SESSION_REMOTE_ACTIVE = 1
+        const val MAX_RESTART_SAFE_WAIT_MS = 5_000L
+        private const val RESTART_SAFE_POLL_NANOS = 5_000_000L
 
         private fun newRemoteExecutor(threadName: String) = ThreadPoolExecutor(
             1,
@@ -1253,6 +2146,34 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
             },
             ThreadPoolExecutor.AbortPolicy(),
         )
+
+        /**
+         * Executor construction is transactional. A ThreadPoolExecutor allocates ownership state
+         * before VendorBridge itself exists, so a later lane-construction failure must close every
+         * earlier lane instead of losing their references in a failed constructor expression.
+         */
+        private fun create(context: Context): VendorBridge {
+            val lanes = constructVendorExecutorLanes { kind ->
+                when (kind) {
+                    VendorExecutorLane.TELEMETRY ->
+                        newRemoteExecutor("DpuLab-VendorTelemetry")
+                    VendorExecutorLane.TELEMETRY_V2 ->
+                        newNoBacklogRemoteExecutor("DpuLab-VendorTelemetryV2")
+                    VendorExecutorLane.CONTROL ->
+                        newRemoteExecutor("DpuLab-VendorControl")
+                    VendorExecutorLane.NPU ->
+                        newRemoteExecutor("DpuLab-VendorNpu")
+                    VendorExecutorLane.PERFORMANCE ->
+                        newSingleSignalRemoteExecutor("DpuLab-VendorPerformance")
+                }
+            }
+            return try {
+                VendorBridge(context.applicationContext, lanes)
+            } catch (error: Throwable) {
+                lanes.shutdownNow()
+                throw error
+            }
+        }
 
         @SuppressLint("StaticFieldLeak")
         @Volatile
@@ -1273,8 +2194,15 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
                     val existing = instance
                     when {
                         existing == null -> {
-                            val created = VendorBridge(context.applicationContext)
-                            created.connect()
+                            val created = create(context.applicationContext)
+                            try {
+                                created.connect()
+                            } catch (error: Throwable) {
+                                runCatching {
+                                    created.closeWithResult(resetCompression = false)
+                                }.exceptionOrNull()?.let(error::addSuppressed)
+                                throw error
+                            }
                             instance = created
                             return created
                         }
@@ -1286,9 +2214,6 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
                 if (!existingClosed.canRestartAfterClose()) return existingClosed
             }
         }
-
-        private fun Float.validPercent(): Float? =
-            takeIf { it.isFinite() && it in 0f..100f }
 
         // AIDL values are a product ABI; do not couple them to Kotlin enum ordering.
         private fun LoadShape.wireValue(): Int = when (this) {
@@ -1306,6 +2231,25 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
     ) {
         val version: Long
             get() = ticket.version
+    }
+
+    private enum class PerformanceCommandType {
+        BEGIN,
+        RENEW,
+        HEALTH,
+        END,
+    }
+
+    private data class PerformanceCommand(
+        val type: PerformanceCommandType,
+        val ticket: VendorPerformanceSessionTicket,
+        val minimumAppliedVersion: Long,
+        val reason: String = "",
+        val result: AtomicReference<VendorPerformanceSessionResult?> = AtomicReference(null),
+    ) {
+        fun complete(value: VendorPerformanceSessionResult) {
+            result.compareAndSet(null, value)
+        }
     }
 
     private data class RemoteResetResult(
@@ -1334,8 +2278,223 @@ class VendorBridge private constructor(private val context: Context) : AutoClose
 }
 
 internal const val MAX_VENDOR_STATUS_CHARS = 256
+internal const val VENDOR_TELEMETRY_API_V2 = 2
+internal const val VENDOR_PERFORMANCE_API_V3 = 3
+internal const val MAX_VENDOR_FREQUENCY_HZ = 20_000_000_000L
 private const val MAX_VENDOR_STATUS_INSPECTION_FACTOR = 4L
 private const val VENDOR_STATUS_TRUNCATION_MARKER = "\u2026"
+private val vendorPerformanceSessionIds = AtomicLong(0L)
+private val processPerformanceRestoreLatch = VendorPerformanceRestoreLatch()
+
+internal fun supportsVendorTelemetryV2(apiVersion: Int): Boolean =
+    apiVersion >= VENDOR_TELEMETRY_API_V2
+
+internal fun supportsVendorPerformanceSession(apiVersion: Int): Boolean =
+    apiVersion >= VENDOR_PERFORMANCE_API_V3
+
+internal fun validPerformanceControlRequest(requestedControls: Int): Boolean =
+    requestedControls == VendorBridge.PERFORMANCE_CONTROL_DISABLE_BATTERY_SAVER
+
+internal fun ticketsReferToSameSession(
+    first: VendorPerformanceSessionTicket,
+    second: VendorPerformanceSessionTicket,
+): Boolean =
+    first.sessionId == second.sessionId &&
+        first.serviceSession == second.serviceSession
+
+internal fun ticketsMatchExactly(
+    first: VendorPerformanceSessionTicket?,
+    second: VendorPerformanceSessionTicket,
+): Boolean = first == second
+
+internal fun performanceResult(
+    state: VendorPerformanceSessionState,
+    ticket: VendorPerformanceSessionTicket? = null,
+    detail: String,
+): VendorPerformanceSessionResult =
+    VendorPerformanceSessionResult(
+        state = state,
+        ticket = ticket,
+        detail = detail,
+    )
+
+internal fun nextNonZeroSequence(sequence: AtomicLong): Long {
+    while (true) {
+        val current = sequence.get()
+        var candidate = current + 1L
+        if (candidate == 0L) candidate = 1L
+        if (sequence.compareAndSet(current, candidate)) return candidate
+    }
+}
+
+internal fun nextVendorPerformanceSessionId(): Long =
+    nextNonZeroSequence(vendorPerformanceSessionIds)
+
+internal fun monotonicDeadlineAfter(origin: Long, delta: Long): Long =
+    origin + delta.coerceAtLeast(0L)
+
+internal fun isMonotonicDeadlineReached(
+    nowNanos: Long,
+    deadlineNanos: Long,
+): Boolean = nowNanos - deadlineNanos >= 0L
+
+internal fun awaitBoundedCondition(
+    timeoutMs: Long,
+    maxTimeoutMs: Long,
+    pollNanos: Long,
+    monotonicNowNanos: () -> Long = System::nanoTime,
+    parkNanos: (Long) -> Unit = { duration -> LockSupport.parkNanos(duration) },
+    condition: () -> Boolean,
+): Boolean {
+    require(maxTimeoutMs >= 0L) { "maxTimeoutMs must not be negative" }
+    require(pollNanos > 0L) { "pollNanos must be positive" }
+    if (condition()) return true
+    val boundedTimeoutMs = timeoutMs.coerceIn(0L, maxTimeoutMs)
+    val deadlineNanos = monotonicDeadlineAfter(
+        monotonicNowNanos(),
+        TimeUnit.MILLISECONDS.toNanos(boundedTimeoutMs),
+    )
+    while (true) {
+        val remainingNanos = deadlineNanos - monotonicNowNanos()
+        if (remainingNanos <= 0L) return condition()
+        parkNanos(remainingNanos.coerceAtMost(pollNanos))
+        if (Thread.interrupted()) {
+            Thread.currentThread().interrupt()
+            return false
+        }
+        if (condition()) return true
+    }
+}
+
+/**
+ * Small process-wide contamination latch. A provider mutation is considered possibly active from
+ * before BEGIN submission until the exact newest END (or serialized inactive health query) is
+ * acknowledged. It intentionally contains no Context/Binder references.
+ */
+internal class VendorPerformanceRestoreLatch {
+    private val pending = AtomicReference<VendorPerformanceSessionTicket?>(null)
+
+    fun arm(ticket: VendorPerformanceSessionTicket): Boolean =
+        pending.compareAndSet(null, ticket)
+
+    fun advance(ticket: VendorPerformanceSessionTicket): Boolean {
+        while (true) {
+            val current = pending.get() ?: return false
+            if (
+                !ticketsReferToSameSession(current, ticket) ||
+                !isNewerSequence(ticket.commandVersion, current.commandVersion)
+            ) {
+                return false
+            }
+            if (pending.compareAndSet(current, ticket)) return true
+        }
+    }
+
+    fun confirmRestored(ticket: VendorPerformanceSessionTicket): Boolean {
+        while (true) {
+            val current = pending.get() ?: return true
+            if (
+                !ticketsReferToSameSession(current, ticket) ||
+                current.commandVersion != ticket.commandVersion
+            ) {
+                return false
+            }
+            if (pending.compareAndSet(current, null)) return true
+        }
+    }
+
+    /**
+     * Accepts an exact provider acknowledgment for an END which was already in flight when a
+     * higher-version END retry advanced the local latch. Once an END is published, active session
+     * ownership has been cleared and the synchronized API can only append another same-session
+     * END; no newer BEGIN/RENEW mutation can be hidden behind this proof.
+     */
+    fun confirmRestoredByEnd(ticket: VendorPerformanceSessionTicket): Boolean {
+        while (true) {
+            val current = pending.get() ?: return true
+            if (
+                !ticketsReferToSameSession(current, ticket) ||
+                (
+                    current.commandVersion != ticket.commandVersion &&
+                        !isNewerSequence(current.commandVersion, ticket.commandVersion)
+                    )
+            ) {
+                return false
+            }
+            if (pending.compareAndSet(current, null)) return true
+        }
+    }
+
+    /**
+     * Clears the whole same-session chain when BEGIN is proven not to have reached the provider.
+     * A timeout may already have advanced the latch to a queued END; that END exists only to
+     * invalidate the unconfirmed BEGIN and must not leave a false process-wide contamination.
+     */
+    fun confirmNeverMutated(beginTicket: VendorPerformanceSessionTicket): Boolean {
+        while (true) {
+            val current = pending.get() ?: return true
+            if (!ticketsReferToSameSession(current, beginTicket)) return false
+            if (pending.compareAndSet(current, null)) return true
+        }
+    }
+
+    fun snapshot(): VendorPerformanceSessionTicket? = pending.get()
+}
+
+internal fun validVendorUtilizationPercent(value: Float): Float? =
+    value.takeIf { it.isFinite() && it in 0f..100f }
+
+internal fun validVendorFrequencyHz(value: Long): Long? =
+    value.takeIf { it in 0L..MAX_VENDOR_FREQUENCY_HZ }
+
+internal fun readVendorTelemetryV2(
+    serviceSession: Long,
+    gpuUtilizationReader: () -> Float,
+    gpuFrequencyReader: () -> Long,
+    dpuFrequencyReader: () -> Long,
+): VendorTelemetryV2Snapshot = VendorTelemetryV2Snapshot(
+    serviceSession = serviceSession,
+    gpuUtilization = readOptionalVendorTelemetry(gpuUtilizationReader)
+        ?.let(::validVendorUtilizationPercent),
+    gpuFrequencyHz = readOptionalVendorTelemetry(gpuFrequencyReader)
+        ?.let(::validVendorFrequencyHz),
+    dpuFrequencyHz = readOptionalVendorTelemetry(dpuFrequencyReader)
+        ?.let(::validVendorFrequencyHz),
+)
+
+internal fun mergeVendorTelemetryV2(
+    base: VendorSnapshot,
+    extended: VendorTelemetryV2Snapshot?,
+): VendorSnapshot {
+    if (extended == null || extended.serviceSession != base.serviceSession) return base
+    return base.copy(
+        gpuUtilization = extended.gpuUtilization,
+        gpuFrequencyHz = extended.gpuFrequencyHz,
+        dpuFrequencyHz = extended.dpuFrequencyHz,
+    )
+}
+
+internal fun remainingVendorTelemetryTimeoutMs(
+    deadlineNanos: Long,
+    nowNanos: Long,
+): Long {
+    val remainingNanos = deadlineNanos - nowNanos
+    if (remainingNanos <= 0L) return 0L
+    // Use a floor so the optional extension never increases the original snapshot deadline.
+    return TimeUnit.NANOSECONDS.toMillis(remainingNanos)
+}
+
+private inline fun <T> readOptionalVendorTelemetry(reader: () -> T): T? {
+    if (Thread.currentThread().isInterrupted) throw InterruptedException()
+    return try {
+        reader()
+    } catch (interrupted: InterruptedException) {
+        Thread.currentThread().interrupt()
+        throw interrupted
+    } catch (_: Exception) {
+        null
+    }
+}
 
 /**
  * Treat Binder-provided status text as untrusted telemetry. Keeping the normalized copy small
@@ -1597,11 +2756,122 @@ internal fun reconnectDelayMs(attempt: Long): Long {
         .coerceAtMost(VendorBridge.MAX_RECONNECT_DELAY_MS)
 }
 
+internal enum class VendorExecutorLane {
+    TELEMETRY,
+    TELEMETRY_V2,
+    CONTROL,
+    NPU,
+    PERFORMANCE,
+}
+
+/**
+ * Fully constructed executor ownership passed into VendorBridge. This keeps partially-created
+ * lanes outside the bridge constructor until every lane exists and gives the caller one bounded
+ * rollback handle.
+ */
+internal data class VendorExecutorLanes(
+    val telemetry: ThreadPoolExecutor,
+    val telemetryV2: ThreadPoolExecutor,
+    val control: ThreadPoolExecutor,
+    val npu: ThreadPoolExecutor,
+    val performance: ThreadPoolExecutor,
+) {
+    fun shutdownNow() {
+        // Keep rollback allocation-free so constructor OOM cannot prevent an already-created
+        // executor prefix from being shut down.
+        shutdownExecutorBestEffort(performance)
+        shutdownExecutorBestEffort(npu)
+        shutdownExecutorBestEffort(control)
+        shutdownExecutorBestEffort(telemetryV2)
+        shutdownExecutorBestEffort(telemetry)
+    }
+}
+
+/**
+ * Creates all lanes or shuts down every successfully-created prefix in reverse ownership order.
+ */
+internal fun constructVendorExecutorLanes(
+    factory: (VendorExecutorLane) -> ThreadPoolExecutor,
+): VendorExecutorLanes {
+    var telemetry: ThreadPoolExecutor? = null
+    var telemetryV2: ThreadPoolExecutor? = null
+    var control: ThreadPoolExecutor? = null
+    var npu: ThreadPoolExecutor? = null
+    var performance: ThreadPoolExecutor? = null
+    return try {
+        val ownedTelemetry =
+            factory(VendorExecutorLane.TELEMETRY).also { telemetry = it }
+        val ownedTelemetryV2 =
+            factory(VendorExecutorLane.TELEMETRY_V2).also { telemetryV2 = it }
+        val ownedControl =
+            factory(VendorExecutorLane.CONTROL).also { control = it }
+        val ownedNpu =
+            factory(VendorExecutorLane.NPU).also { npu = it }
+        val ownedPerformance =
+            factory(VendorExecutorLane.PERFORMANCE).also { performance = it }
+        VendorExecutorLanes(
+            telemetry = ownedTelemetry,
+            telemetryV2 = ownedTelemetryV2,
+            control = ownedControl,
+            npu = ownedNpu,
+            performance = ownedPerformance,
+        )
+    } catch (error: Throwable) {
+        // Fixed slots avoid the "factory succeeded, tracking-list add OOM" orphan window.
+        shutdownExecutorBestEffort(performance)
+        shutdownExecutorBestEffort(npu)
+        shutdownExecutorBestEffort(control)
+        shutdownExecutorBestEffort(telemetryV2)
+        shutdownExecutorBestEffort(telemetry)
+        throw error
+    }
+}
+
+private fun shutdownExecutorBestEffort(executor: ThreadPoolExecutor?) {
+    if (executor == null) return
+    try {
+        executor.shutdownNow()
+    } catch (_: Throwable) {
+        // Preserve the construction/close failure that initiated rollback. The owner will remain
+        // fail-closed if executor termination cannot subsequently be confirmed.
+    }
+}
+
+internal fun newNoBacklogRemoteExecutor(threadName: String) = ThreadPoolExecutor(
+    1,
+    1,
+    0L,
+    TimeUnit.MILLISECONDS,
+    SynchronousQueue(),
+    { runnable ->
+        Thread(runnable, threadName).apply { isDaemon = true }
+    },
+    ThreadPoolExecutor.AbortPolicy(),
+)
+
+/**
+ * Executor queue holds only a drain wake-up, never a Binder command. Actual commands live in one
+ * atomic latest-wins slot, so a stuck provider can retain at most the running command, one latest
+ * command, and one constant-size wake signal.
+ */
+internal fun newSingleSignalRemoteExecutor(threadName: String) = ThreadPoolExecutor(
+    1,
+    1,
+    0L,
+    TimeUnit.MILLISECONDS,
+    ArrayBlockingQueue(1),
+    { runnable ->
+        Thread(runnable, threadName).apply { isDaemon = true }
+    },
+    ThreadPoolExecutor.AbortPolicy(),
+)
+
 internal fun unattributedVendorShutdownResult(): VendorShutdownResult =
     VendorShutdownResult(
         brokerWasConnected = false,
         npuStopConfirmed = false,
         compressionResetConfirmed = false,
+        performanceRestoreConfirmed = false,
     )
 
 internal fun shouldScheduleReconnectAfterBindFailure(

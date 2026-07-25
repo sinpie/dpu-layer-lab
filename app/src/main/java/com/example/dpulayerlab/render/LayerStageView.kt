@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.PorterDuff
+import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.media.MediaCodec
@@ -15,6 +16,7 @@ import android.media.MediaFormat
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.os.SystemClock
 import android.util.AttributeSet
@@ -35,7 +37,10 @@ import com.example.dpulayerlab.model.PhaseSpec
 import com.example.dpulayerlab.model.PixelRoute
 import com.example.dpulayerlab.model.usesSelectedMediaDecoder
 import java.util.IdentityHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.LockSupport
 import kotlin.math.PI
 import kotlin.math.ceil
@@ -76,9 +81,13 @@ class LayerStageView @JvmOverloads constructor(
     private var failedTopologyGeneration = Long.MIN_VALUE
     private var expectedPublishSuppressed = false
     private var expectedTopologyDirty = true
+    private var forceExpectedProducerRepublish = false
     private var lastPublishedExpectedGeneration = Long.MIN_VALUE
     private var lastPublishedProducerIds: Set<Long> = emptySet()
     private var lastPublishedExpectedCallback: ((Long, Set<Long>) -> Unit)? = null
+    private var capacityGeometryReady = false
+    private val viewIdentity: (View) -> View = { it }
+    private val renderChildView: (RenderChild) -> View = { it.view }
     private val deferredTopologyApplyRunnable = Runnable(::continueDeferredTopologyApply)
 
     init {
@@ -108,13 +117,22 @@ class LayerStageView @JvmOverloads constructor(
         producerRuntimeFailureCallback = onProducerRuntimeFailure
         stageRemovalCallback = onStageRemoved
         val previousPhaseId = phase?.id
+        val previousMotion = phase?.motion
         val newTopology = topologyFor(newPhase, selectedMedia, selectedDecoder)
         val phaseChanged = previousPhaseId != newPhase.id
         val generationChanged = producerGeneration != newProducerGeneration
         if (generationChanged || expectedCallbackChanged) expectedTopologyDirty = true
-        if (generationChanged) failedTopologyGeneration = Long.MIN_VALUE
+        if (generationChanged) {
+            failedTopologyGeneration = Long.MIN_VALUE
+            forceExpectedProducerRepublish = false
+        }
         producerGeneration = newProducerGeneration
         phase = newPhase
+        capacityGeometryReady = when {
+            newPhase.motion != MotionProfile.CAPACITY_TILES -> true
+            generationChanged || previousMotion != MotionProfile.CAPACITY_TILES -> false
+            else -> capacityGeometryReady
+        }
         selectedMediaUri = selectedMedia
         videoDecoderSelection = selectedDecoder
         expectedPublishSuppressed = true
@@ -149,7 +167,6 @@ class LayerStageView @JvmOverloads constructor(
                         beginDeferredTopologyApply()
                         return
                     }
-                    topology = newTopology
                     if (generationChanged || producerCallbackChanged) {
                         updateProducerRelays()
                     }
@@ -176,6 +193,17 @@ class LayerStageView @JvmOverloads constructor(
                 newPhase,
                 restartLoadProfile = phaseChanged || generationChanged,
             )
+            // The topology is externally meaningful only after every child and its initial
+            // runtime controls have been installed successfully.
+            topology = newTopology
+            if (newPhase.motion == MotionProfile.CAPACITY_TILES) {
+                // Publish the non-occluded crop before a very fast producer can satisfy the
+                // controller's all-first-buffer gate under the previous/full-overlap geometry.
+                capacityGeometryReady = applyCapacityTileGeometryAndTrackRecovery()
+                if (!capacityGeometryReady) {
+                    producerTopologyPendingCallback?.invoke(producerGeneration)
+                }
+            }
             scheduleFrame()
         } finally {
             expectedPublishSuppressed = false
@@ -194,6 +222,7 @@ class LayerStageView @JvmOverloads constructor(
             removalCallback?.invoke(releasedGeneration, stopped)
         }
         phase = null
+        capacityGeometryReady = false
         selectedMediaUri = null
         videoDecoderSelection = null
         topology = null
@@ -206,6 +235,7 @@ class LayerStageView @JvmOverloads constructor(
         producerGeneration = Long.MIN_VALUE
         failedTopologyGeneration = Long.MIN_VALUE
         expectedTopologyDirty = true
+        forceExpectedProducerRepublish = false
         lastPublishedExpectedGeneration = Long.MIN_VALUE
         lastPublishedProducerIds = emptySet()
         lastPublishedExpectedCallback = null
@@ -233,6 +263,12 @@ class LayerStageView @JvmOverloads constructor(
             ) {
                 beginDeferredTopologyApply()
             } else {
+                if (current.motion == MotionProfile.CAPACITY_TILES) {
+                    capacityGeometryReady = applyCapacityTileGeometryAndTrackRecovery()
+                    if (!capacityGeometryReady) {
+                        producerTopologyPendingCallback?.invoke(producerGeneration)
+                    }
+                }
                 publishExpectedProducers()
             }
         } else {
@@ -266,7 +302,13 @@ class LayerStageView @JvmOverloads constructor(
                 animateTransforms(current, (frameTimeNanos - startNanos) / 1_000_000_000f)
                 lastTransformNanos = frameTimeNanos
             }
-            if (current.motion != MotionProfile.STATIC || current.alphaOverlap) {
+            if (
+                (
+                    current.motion != MotionProfile.STATIC &&
+                        current.motion != MotionProfile.CAPACITY_TILES
+                ) ||
+                current.alphaOverlap
+            ) {
                 scheduleFrame()
             }
         }
@@ -274,7 +316,18 @@ class LayerStageView @JvmOverloads constructor(
 
     override fun onSizeChanged(width: Int, height: Int, oldWidth: Int, oldHeight: Int) {
         super.onSizeChanged(width, height, oldWidth, oldHeight)
-        if (width != oldWidth || height != oldHeight) scheduleFrame()
+        if (width == oldWidth && height == oldHeight) return
+        val current = phase
+        if (current?.motion == MotionProfile.CAPACITY_TILES && topology != null) {
+            capacityGeometryReady = applyCapacityTileGeometryAndTrackRecovery()
+            if (capacityGeometryReady) {
+                publishExpectedProducers()
+            } else {
+                producerTopologyPendingCallback?.invoke(producerGeneration)
+            }
+        } else {
+            scheduleFrame()
+        }
     }
 
     private fun scheduleFrame() {
@@ -312,43 +365,52 @@ class LayerStageView @JvmOverloads constructor(
             topology = null
             return false
         }
+        if (RendererSafetyState.hasUnconfirmedTeardown()) {
+            topology = null
+            return false
+        }
         val current = phase ?: return false
-        when (current.backend) {
-            LayerBackend.FLATTENED_TEXTURE -> {
-                val relay = newProducerRelay(primary = true)
-                val view =
-                    MultiLayerTextureView(
-                        context = context,
-                        logicalLayerCount = current.activeLayers,
-                        targetFps = current.producerFps,
-                        captureFrameCommit = relay::captureCallback,
-                        onTeardownFailure = teardownFailureCallbackFor(relay),
-                        onRuntimeFailure = runtimeFailureCallbackFor(relay),
+        val installed = installRenderChildren { install ->
+            when (current.backend) {
+                LayerBackend.FLATTENED_TEXTURE -> {
+                    val relay = newProducerRelay(primary = true)
+                    install(
+                        RenderChild(
+                            view = MultiLayerTextureView(
+                                context = context,
+                                logicalLayerCount = current.activeLayers,
+                                targetFps = current.producerFps,
+                                captureFrameCommit = relay::captureCallback,
+                                onTeardownFailure = teardownFailureCallbackFor(relay),
+                                onRuntimeFailure = runtimeFailureCallbackFor(relay),
+                            ),
+                            relay = relay,
+                        ),
                     )
-                producerRelays[view] = relay
-                addRenderChild(
-                    view,
-                )
-            }
+                }
 
-            LayerBackend.INDEPENDENT_SURFACES,
-            LayerBackend.MIXED_SURFACE_TEXTURE,
-            -> {
-                repeat(current.activeLayers.coerceIn(1, MAX_LAYERS)) { index ->
-                    val view = createLayer(current, index)
-                    addRenderChild(view)
+                LayerBackend.INDEPENDENT_SURFACES,
+                LayerBackend.MIXED_SURFACE_TEXTURE,
+                -> {
+                    repeat(current.activeLayers.coerceIn(1, MAX_LAYERS)) { index ->
+                        install(createLayer(current, index))
+                    }
                 }
             }
+            updateRuntimeControls(current, restartLoadProfile = true)
+        }
+        if (!installed) {
+            topology = null
+            return false
         }
         startNanos = System.nanoTime()
         lastTransformNanos = 0L
         topology = desiredTopology
-        updateRuntimeControls(current, restartLoadProfile = true)
         scheduleFrame()
         return true
     }
 
-    private fun createLayer(current: PhaseSpec, index: Int): View {
+    private fun createLayer(current: PhaseSpec, index: Int): RenderChild {
         val primary = index == 0
         val relay = newProducerRelay(primary)
         val view = if (current.includeGlLayer && index == current.activeLayers - 1) {
@@ -384,16 +446,14 @@ class LayerStageView @JvmOverloads constructor(
             } else if (wantsSelectedDecoder) {
                 // A selected source must never silently turn into the procedural YUV proxy if its
                 // immutable hardware-decoder binding is missing or belongs to another URI.
-                SurfaceView(context).also { unavailable ->
-                    unavailable.holder.setFormat(PixelFormat.OPAQUE)
-                    unavailable.post {
-                        if (producerRelays[unavailable] === relay) {
-                            runtimeFailureCallbackFor(relay).invoke(
-                                "Selected decoder binding is unavailable",
-                            )
-                        }
-                    }
-                }
+                UnavailableDecoderSurfaceView(
+                    context = context,
+                    onUnavailable = {
+                        runtimeFailureCallbackFor(relay).invoke(
+                            "Selected decoder binding is unavailable",
+                        )
+                    },
+                )
             } else {
                 val useTexture =
                     current.backend == LayerBackend.MIXED_SURFACE_TEXTURE && index % 3 == 2
@@ -423,8 +483,7 @@ class LayerStageView @JvmOverloads constructor(
                 }
             }
         }
-        producerRelays[view] = relay
-        return view
+        return RenderChild(view = view, relay = relay)
     }
 
     private fun addRenderChild(
@@ -434,6 +493,192 @@ class LayerStageView @JvmOverloads constructor(
         val params = LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
         addView(view, index, params)
         animatedChildren.add(index, view)
+    }
+
+    /**
+     * Owns each constructed child before addView() can synchronously invoke lifecycle code.
+     * Any Throwable rolls the complete prefix back with one shared producer-drain deadline.
+     */
+    private fun installRenderChildren(
+        build: (RenderChildInstaller) -> Unit,
+    ): Boolean = try {
+        buildRendererTransaction<RenderChild, Unit>(
+            build = { register ->
+                build(RenderChildInstaller(register))
+            },
+            rollback = { owned ->
+                rollbackOwnedRendererChildren(
+                    owned = owned,
+                    disableRelay = { child ->
+                        // Registration intentionally precedes the fallible map insertion/addView
+                        // steps. Use the transaction-owned identity here: a child which never reached
+                        // producerRelays must still detach its late native/frame callbacks.
+                        child.relay.disable()
+                    },
+                    retireChildren = { registeredPrefix ->
+                        // Do not allocate a mapped list after an OutOfMemoryError. Only the newly
+                        // owned prefix is retired, so pre-existing topology cannot be released twice.
+                        retireRenderChildren(registeredPrefix, renderChildView)
+                    },
+                )
+            },
+        )
+        true
+    } catch (error: Throwable) {
+        topology = null
+        expectedTopologyDirty = true
+        if (error is ThreadDeath || error is VirtualMachineError) throw error
+        producerRuntimeFailureCallback?.invoke(
+            producerGeneration,
+            buildRuntimeFailureReason("Renderer topology transaction", error),
+        )
+        false
+    }
+
+    private inner class RenderChildInstaller(
+        private val register: (RenderChild) -> Unit,
+    ) {
+        operator fun invoke(
+            child: RenderChild,
+            index: Int = animatedChildren.size,
+        ) {
+            // Register first: producerRelays assignment, addView(), and its callbacks are all
+            // fallible, and rollback must own this candidate before any of them execute.
+            register(child)
+            producerRelays[child.view] = child.relay
+            addRenderChild(child.view, index)
+        }
+    }
+
+    private fun retireRenderChildren(children: List<View>): Boolean =
+        retireRenderChildren(children, viewIdentity)
+
+    private fun <T> retireRenderChildren(
+        children: List<T>,
+        viewOf: (T) -> View,
+    ): Boolean {
+        if (children.isEmpty()) return true
+        var allStopped = true
+        var firstFatal: Throwable? = null
+        var firstCleanupError: Throwable? = null
+        var firstCleanupOperation: String? = null
+
+        // Revoke all frame/failure callbacks first, then request every producer to stop before
+        // joining any one of them. This preserves parallel drain inside the shared deadline.
+        var index = 0
+        while (index < children.size) {
+            val child = viewOf(children[index])
+            try {
+                producerRelays[child]?.disable()
+            } catch (error: Throwable) {
+                allStopped = false
+                if (firstCleanupError == null) {
+                    firstCleanupError = error
+                    firstCleanupOperation = "relay.disable"
+                }
+                if (
+                    firstFatal == null &&
+                    (error is ThreadDeath || error is VirtualMachineError)
+                ) {
+                    firstFatal = error
+                }
+            }
+            index++
+        }
+        index = 0
+        while (index < children.size) {
+            val child = viewOf(children[index])
+            try {
+                requestStopRenderChild(child)
+            } catch (error: Throwable) {
+                allStopped = false
+                if (firstCleanupError == null) {
+                    firstCleanupError = error
+                    firstCleanupOperation = "producer.requestStop"
+                }
+                if (
+                    firstFatal == null &&
+                    (error is ThreadDeath || error is VirtualMachineError)
+                ) {
+                    firstFatal = error
+                }
+            }
+            index++
+        }
+        val stopDeadlineNanos = producerDrainDeadlineNanos()
+        index = 0
+        while (index < children.size) {
+            val child = viewOf(children[index])
+            try {
+                if (!releaseRenderChild(child, stopDeadlineNanos)) allStopped = false
+            } catch (error: Throwable) {
+                allStopped = false
+                if (firstCleanupError == null) {
+                    firstCleanupError = error
+                    firstCleanupOperation = "producer.release"
+                }
+                if (
+                    firstFatal == null &&
+                    (error is ThreadDeath || error is VirtualMachineError)
+                ) {
+                    firstFatal = error
+                }
+            }
+            index++
+        }
+        index = 0
+        while (index < children.size) {
+            val child = viewOf(children[index])
+            try {
+                producerRelays.remove(child)?.disable()
+            } catch (error: Throwable) {
+                allStopped = false
+                if (firstCleanupError == null) {
+                    firstCleanupError = error
+                    firstCleanupOperation = "relay.remove"
+                }
+                if (
+                    firstFatal == null &&
+                    (error is ThreadDeath || error is VirtualMachineError)
+                ) {
+                    firstFatal = error
+                }
+            }
+            animatedChildren.remove(child)
+            try {
+                if (child.parent === this) removeView(child)
+            } catch (error: Throwable) {
+                allStopped = false
+                if (firstCleanupError == null) {
+                    firstCleanupError = error
+                    firstCleanupOperation = "view.remove"
+                }
+                if (
+                    firstFatal == null &&
+                    (error is ThreadDeath || error is VirtualMachineError)
+                ) {
+                    firstFatal = error
+                }
+            }
+            index++
+        }
+        firstCleanupError?.let { cleanupError ->
+            try {
+                RendererSafetyState.markCleanupFailure(
+                    component = "renderer child rollback",
+                    detail = "$firstCleanupOperation=${cleanupError.javaClass.simpleName}",
+                )
+            } catch (reportError: Throwable) {
+                if (
+                    firstFatal == null &&
+                    (reportError is ThreadDeath || reportError is VirtualMachineError)
+                ) {
+                    firstFatal = reportError
+                }
+            }
+        }
+        firstFatal?.let { throw it }
+        return allStopped
     }
 
     private fun canReconcileLayerCount(
@@ -473,47 +718,36 @@ class LayerStageView @JvmOverloads constructor(
             removedChildren += animatedChildren.removeAt(removeIndex)
         }
         if (removedChildren.isNotEmpty()) {
-            removedChildren.forEach { child -> producerRelays[child]?.disable() }
-            removedChildren.forEach(::requestStopRenderChild)
-            val stopDeadlineNanos = producerDrainDeadlineNanos()
-            val allStopped = removedChildren.fold(true) { stopped, child ->
-                releaseRenderChild(child, stopDeadlineNanos) && stopped
-            }
-            removedChildren.forEach(producerRelays::remove)
-            removedChildren.forEach(::removeView)
-            if (!allStopped) {
+            if (!retireRenderChildren(removedChildren)) {
                 return false
             }
         }
-        while (animatedChildren.size < targetCount) {
-            val insertIndex = if (keepsGlTail) {
-                animatedChildren.lastIndex
-            } else {
-                animatedChildren.size
+        if (animatedChildren.size < targetCount) {
+            val installed = installRenderChildren { install ->
+                while (animatedChildren.size < targetCount) {
+                    val insertIndex = if (keepsGlTail) {
+                        animatedChildren.lastIndex
+                    } else {
+                        animatedChildren.size
+                    }
+                    install(createLayer(current, insertIndex), insertIndex)
+                }
+                updateRuntimeControls(current, restartLoadProfile = false)
             }
-            addRenderChild(
-                view = createLayer(current, insertIndex),
-                index = insertIndex,
-            )
+            if (!installed) return false
         }
-        publishExpectedProducers()
         return true
     }
 
     private fun removeAndReleaseChildren(): Boolean {
-        // Stop all producers first so their final unlock/dequeue operations can drain in
-        // parallel before Compose removes the SurfaceView/TextureView objects.
-        producerRelays.values.forEach(ProducerFrameRelay::disable)
         val children = animatedChildren.toList()
-        children.forEach(::requestStopRenderChild)
-        val stopDeadlineNanos = producerDrainDeadlineNanos()
-        val allStopped = children.fold(true) { stopped, child ->
-            releaseRenderChild(child, stopDeadlineNanos) && stopped
-        }
+        val stopped = retireRenderChildren(children)
+        // Also clear any constructor-created relay that never reached animatedChildren.
+        producerRelays.values.forEach(ProducerFrameRelay::disable)
         producerRelays.clear()
         animatedChildren.clear()
         removeAllViews()
-        return allStopped
+        return stopped
     }
 
     private fun replacePrimaryProducer(current: PhaseSpec): Boolean {
@@ -533,9 +767,10 @@ class LayerStageView @JvmOverloads constructor(
         if (!stopped) {
             return false
         }
-        addRenderChild(createLayer(current, index = 0), index = 0)
-        publishExpectedProducers()
-        return true
+        return installRenderChildren { install ->
+            install(createLayer(current, index = 0), 0)
+            updateRuntimeControls(current, restartLoadProfile = false)
+        }
     }
 
     private fun primaryRequiresReplacement(): Boolean =
@@ -561,13 +796,15 @@ class LayerStageView @JvmOverloads constructor(
     }
 
     private fun runtimeFailureCallbackFor(relay: ProducerFrameRelay): (String) -> Unit = { reason ->
-        relay.activeGenerationForFailure()?.let { generation ->
+        relay.captureFailureDispatch()?.let { dispatch ->
             val boundedReason = reason
                 .trim()
                 .ifEmpty { "Producer runtime failure" }
                 .take(MAX_RUNTIME_FAILURE_REASON_CHARS)
             post {
-                producerRuntimeFailureCallback?.invoke(generation, boundedReason)
+                if (relay.isFailureDispatchCurrent(dispatch)) {
+                    producerRuntimeFailureCallback?.invoke(dispatch.generation, boundedReason)
+                }
             }
         }
     }
@@ -650,6 +887,13 @@ class LayerStageView @JvmOverloads constructor(
             return
         }
         updateProducerRelays()
+        val current = phase
+        if (current?.motion == MotionProfile.CAPACITY_TILES) {
+            capacityGeometryReady = applyCapacityTileGeometryAndTrackRecovery()
+            if (!capacityGeometryReady) {
+                producerTopologyPendingCallback?.invoke(producerGeneration)
+            }
+        }
         publishExpectedProducers()
     }
 
@@ -663,7 +907,14 @@ class LayerStageView @JvmOverloads constructor(
             expectedPublishSuppressed ||
             deferredTopologyApply != null ||
             failedTopologyGeneration == producerGeneration ||
-            !expectedTopologyDirty
+            (
+                phase?.motion == MotionProfile.CAPACITY_TILES &&
+                    !capacityGeometryReady
+            ) ||
+            (
+                !expectedTopologyDirty &&
+                    !forceExpectedProducerRepublish
+                )
         ) {
             return
         }
@@ -672,19 +923,30 @@ class LayerStageView @JvmOverloads constructor(
         }
         if (expected.isEmpty()) return
         val callback = expectedProducersCallback ?: run {
-            expectedTopologyDirty = false
+            // A forced recovery publication is the only acknowledgment that clears the
+            // controller/FrameTracker pending latch. Preserve it until a callback really runs.
+            if (!forceExpectedProducerRepublish) expectedTopologyDirty = false
             return
         }
-        if (
+        val sameAsLastPublication =
             producerGeneration == lastPublishedExpectedGeneration &&
-            expected == lastPublishedProducerIds &&
-            callback === lastPublishedExpectedCallback
+                expected == lastPublishedProducerIds &&
+                callback === lastPublishedExpectedCallback
+        if (
+            !shouldPublishExpectedProducerSet(
+                expectedTopologyDirty = expectedTopologyDirty,
+                forceRepublish = forceExpectedProducerRepublish,
+                sameAsLastPublication = sameAsLastPublication,
+            )
         ) {
             expectedTopologyDirty = false
             return
         }
         callback.invoke(producerGeneration, expected)
         expectedTopologyDirty = false
+        // Clear only after callback completion. If callback.invoke throws, the forced retry stays
+        // armed and a later valid configure/size pass can re-issue the exact same expected set.
+        forceExpectedProducerRepublish = false
         lastPublishedExpectedGeneration = producerGeneration
         lastPublishedProducerIds = expected
         lastPublishedExpectedCallback = callback
@@ -697,6 +959,7 @@ class LayerStageView @JvmOverloads constructor(
             is MultiLayerTextureView -> child.requestStop()
             is VideoSurfaceView -> child.requestStop()
             is StressGlSurfaceView -> child.requestStopLab()
+            is UnavailableDecoderSurfaceView -> child.requestStop()
         }
     }
 
@@ -707,6 +970,7 @@ class LayerStageView @JvmOverloads constructor(
             is MultiLayerTextureView -> child.release(stopDeadlineNanos)
             is VideoSurfaceView -> child.release(stopDeadlineNanos)
             is StressGlSurfaceView -> child.releaseLab(stopDeadlineNanos)
+            is UnavailableDecoderSurfaceView -> true
             else -> true
         }
 
@@ -738,8 +1002,16 @@ class LayerStageView @JvmOverloads constructor(
 
     private fun animateTransforms(current: PhaseSpec, time: Float) {
         if (width == 0 || height == 0) return
+        if (current.motion == MotionProfile.CAPACITY_TILES) {
+            capacityGeometryReady = applyCapacityTileGeometryAndTrackRecovery()
+            if (!capacityGeometryReady) {
+                producerTopologyPendingCallback?.invoke(producerGeneration)
+            }
+            return
+        }
         animatedChildren.forEachIndexed { index, child ->
             if (current.motion != MotionProfile.Z_ORDER_SWAP) child.translationZ = 0f
+            if (current.motion != MotionProfile.CAPACITY_TILES) child.clipBounds = null
             val phaseOffset = index * 0.73f
             val wave = sin(time * 1.35f + phaseOffset)
             val wave2 = cos(time * 0.83f + phaseOffset * 1.7f)
@@ -768,6 +1040,8 @@ class LayerStageView @JvmOverloads constructor(
                     }
                     child.rotation = 0f
                 }
+
+                MotionProfile.CAPACITY_TILES -> Unit
 
                 MotionProfile.SCROLL -> {
                     child.scaleX = baseScale
@@ -828,6 +1102,46 @@ class LayerStageView @JvmOverloads constructor(
         }
     }
 
+    /**
+     * Installs the controller-only capacity crops as one bounded topology operation. Geometry that
+     * cannot give every physical producer at least one visible pixel is left unpublished so the
+     * controller records the one-shot calibration as unavailable instead of crashing or sampling
+     * a partially occluded candidate.
+     */
+    private fun applyCapacityTileGeometryAndTrackRecovery(): Boolean {
+        val geometryWasReady = capacityGeometryReady
+        val geometryReady = applyCapacityTileTransforms()
+        if (
+            capacityGeometryRequiresForcedRepublish(
+                geometryWasReady = geometryWasReady,
+                geometryReady = geometryReady,
+            )
+        ) {
+            expectedTopologyDirty = true
+            forceExpectedProducerRepublish = true
+        }
+        return geometryReady
+    }
+
+    private fun applyCapacityTileTransforms(): Boolean {
+        val layerCount = animatedChildren.size
+        if (layerCount <= 0) return false
+        if (capacityTileBounds(width, height, layerCount, layerCount - 1) == null) return false
+        var index = 0
+        while (index < layerCount) {
+            val tile = capacityTileBounds(width, height, layerCount, index) ?: return false
+            val child = animatedChildren[index]
+            child.scaleX = 1f
+            child.scaleY = 1f
+            child.translationX = 0f
+            child.translationY = 0f
+            child.rotation = 0f
+            child.clipBounds = Rect(tile.left, tile.top, tile.right, tile.bottom)
+            index++
+        }
+        return true
+    }
+
     companion object {
         const val MAX_LAYERS = 20
         private const val MAX_RUNTIME_FAILURE_REASON_CHARS = 240
@@ -848,11 +1162,111 @@ class LayerStageView @JvmOverloads constructor(
         var generation: Long,
         var deadlineMs: Long,
     )
+
+    private data class RenderChild(
+        val view: View,
+        val relay: ProducerFrameRelay,
+    )
+}
+
+internal data class CapacityTileBounds(
+    val left: Int,
+    val top: Int,
+    val right: Int,
+    val bottom: Int,
+)
+
+internal fun capacityGeometryRequiresForcedRepublish(
+    geometryWasReady: Boolean,
+    geometryReady: Boolean,
+): Boolean = geometryWasReady && !geometryReady
+
+/**
+ * Normal identical publications are deduplicated. Geometry recovery is different: the controller
+ * has already marked the same generation pending, so the identical expected set is its commit
+ * acknowledgment and must be emitted once more.
+ */
+internal fun shouldPublishExpectedProducerSet(
+    expectedTopologyDirty: Boolean,
+    forceRepublish: Boolean,
+    sameAsLastPublication: Boolean,
+): Boolean =
+    (expectedTopologyDirty || forceRepublish) &&
+        (forceRepublish || !sameAsLastPublication)
+
+/**
+ * Partitions the visible stage into non-overlapping opaque crops. Every candidate Surface keeps
+ * scale=1/rotation=0, while its unique crop prevents opaque higher-Z siblings from completely
+ * occluding lower candidates before SurfaceFlinger composition classification.
+ */
+internal fun capacityTileBounds(
+    width: Int,
+    height: Int,
+    layerCount: Int,
+    layerIndex: Int,
+): CapacityTileBounds? {
+    if (width <= 0 || height <= 0) return null
+    if (layerCount !in 1..LayerStageView.MAX_LAYERS) return null
+    if (layerIndex !in 0 until layerCount) return null
+    val preferredColumns = minOf(5, layerCount)
+    val minimumColumnsForHeight =
+        (layerCount + height.toLong() - 1L) / height.toLong()
+    val columns = maxOf(preferredColumns.toLong(), minimumColumnsForHeight)
+        .coerceAtMost(minOf(layerCount, width).toLong())
+        .toInt()
+    if (columns <= 0) return null
+    val rows = (layerCount + columns - 1) / columns
+    if (rows > height) return null
+    val column = layerIndex % columns
+    val row = layerIndex / columns
+    val left = (width.toLong() * column / columns).toInt()
+    val right = (width.toLong() * (column + 1L) / columns).toInt()
+    val top = (height.toLong() * row / rows).toInt()
+    val bottom = (height.toLong() * (row + 1L) / rows).toInt()
+    return CapacityTileBounds(left, top, right, bottom)
+        .takeIf { it.right > it.left && it.bottom > it.top }
 }
 
 /**
- * Gives every physical BufferQueue producer a stable identity. The immutable state snapshot keeps
- * generation, primary attribution, and callback consistent when a frame races a Compose update.
+ * Revokes transaction-owned callback identities before releasing their renderer children.
+ *
+ * The child is registered before map insertion/addView, so rollback cannot use the map as its
+ * ownership authority. Every direct relay is attempted, renderer retirement runs exactly once even
+ * when one detach fails, and resources outside [owned] are never touched.
+ */
+internal inline fun <Child> rollbackOwnedRendererChildren(
+    owned: List<Child>,
+    disableRelay: (Child) -> Unit,
+    retireChildren: (List<Child>) -> Unit,
+) {
+    var firstFailure: Throwable? = null
+    var index = 0
+    while (index < owned.size) {
+        try {
+            disableRelay(owned[index])
+        } catch (error: Throwable) {
+            if (firstFailure == null) firstFailure = error
+        }
+        index++
+    }
+    try {
+        retireChildren(owned)
+    } catch (error: Throwable) {
+        val prior = firstFailure
+        if (prior == null) {
+            firstFailure = error
+        } else if (error !== prior) {
+            runCatching { prior.addSuppressed(error) }
+        }
+    }
+    firstFailure?.let { throw it }
+}
+
+/**
+ * Gives every physical BufferQueue producer a stable identity. Generation and primary attribution
+ * are immutable for a captured frame, while its callback is detachable: a Canvas/EGL native call
+ * may remain blocked after teardown and its local completion token must not retain the
+ * Activity/controller graph or report a frame for a producer that has already been rebound.
  */
 internal class ProducerFrameRelay(
     val producerId: Long,
@@ -861,7 +1275,8 @@ internal class ProducerFrameRelay(
     callback: ProducerFrameCallback?,
 ) {
     @Volatile
-    private var activeGeneration = generation
+    private var failureDispatch: ProducerFailureDispatch? =
+        ProducerFailureDispatch(generation)
 
     @Volatile
     private var commitToken = callback?.let { capturedCallback ->
@@ -877,7 +1292,8 @@ internal class ProducerFrameRelay(
         generation: Long,
         callback: ProducerFrameCallback?,
     ) {
-        activeGeneration = generation
+        commitToken?.disable()
+        failureDispatch = ProducerFailureDispatch(generation)
         commitToken = callback?.let { capturedCallback ->
             ProducerCommitToken(
                 generation = generation,
@@ -889,7 +1305,8 @@ internal class ProducerFrameRelay(
     }
 
     fun disable() {
-        activeGeneration = DISABLED_GENERATION
+        failureDispatch = null
+        commitToken?.disable()
         commitToken = null
     }
 
@@ -905,21 +1322,125 @@ internal class ProducerFrameRelay(
      * which that producer relay is currently bound rather than LayerStageView's mutable generation.
      */
     fun activeGenerationForFailure(): Long? =
-        activeGeneration.takeUnless { it == DISABLED_GENERATION }
+        failureDispatch?.generation
+
+    /**
+     * Runtime failure delivery crosses a main-queue boundary. Capture an immutable identity, not
+     * just the generation: a relay may be disabled and rebound to the same generation while the
+     * old callback is queued during an in-phase layer-count transition.
+     */
+    fun captureFailureDispatch(): ProducerFailureDispatch? = failureDispatch
+
+    fun isFailureDispatchCurrent(candidate: ProducerFailureDispatch): Boolean =
+        failureDispatch === candidate
 
     private class ProducerCommitToken(
         val generation: Long,
         val producerId: Long,
         val primary: Boolean,
-        val callback: ProducerFrameCallback,
+        callback: ProducerFrameCallback,
     ) : () -> Unit {
+        private val callback = AtomicReference<ProducerFrameCallback?>(callback)
+
         override fun invoke() {
-            callback.onFrame(generation, producerId, primary)
+            callback.get()?.onFrame(generation, producerId, primary)
+        }
+
+        fun disable() {
+            callback.set(null)
         }
     }
 
-    private companion object {
-        const val DISABLED_GENERATION = Long.MIN_VALUE
+}
+
+internal class ProducerFailureDispatch internal constructor(
+    val generation: Long,
+)
+
+/**
+ * A decoder callback can already be queued when MediaCodec teardown starts. Closing this gate
+ * makes those callbacks no-ops even if the platform races one last delivery with listener detach.
+ */
+internal class DecoderFrameCallbackGate {
+    private val open = AtomicBoolean(true)
+
+    /** Allocation-free check for the per-frame MediaCodec callback hot path. */
+    fun isOpen(): Boolean = open.get()
+
+    fun close() {
+        open.set(false)
+    }
+}
+
+/**
+ * Applies one teardown action after both request and resource publication have happened, in either
+ * order. This avoids calling HandlerThread.quit(), whose implicit getLooper() can block main while
+ * the callback thread is still being scheduled.
+ */
+internal class DeferredQuitHandshake<T : Any>(
+    private val quit: (T) -> Unit,
+) {
+    private val requested = AtomicBoolean(false)
+    private val target = AtomicReference<T?>()
+    private val applied = AtomicBoolean(false)
+
+    fun request() {
+        requested.set(true)
+        applyIfReady()
+    }
+
+    fun publish(value: T) {
+        check(target.compareAndSet(null, value) || target.get() === value) {
+            "Deferred quit target is already published"
+        }
+        applyIfReady()
+    }
+
+    fun current(): T? = target.get()
+
+    private fun applyIfReady() {
+        if (!requested.get()) return
+        val published = target.get() ?: return
+        if (applied.compareAndSet(false, true)) quit(published)
+    }
+}
+
+/**
+ * HandlerThread.getLooper() can wait without a deadline. The decoder worker uses this explicit
+ * readiness signal so main-thread start never blocks and a scheduler/Looper startup failure has a
+ * bounded fail-closed path.
+ */
+internal class BoundedCallbackHandlerThread(name: String) : HandlerThread(name) {
+    private val readiness = CountDownLatch(1)
+    private val deferredQuit = DeferredQuitHandshake<Looper> { looper -> looper.quit() }
+
+    override fun onLooperPrepared() {
+        Looper.myLooper()?.let(deferredQuit::publish)
+        readiness.countDown()
+    }
+
+    override fun run() {
+        try {
+            super.run()
+        } finally {
+            readiness.countDown()
+        }
+    }
+
+    fun awaitHandler(timeoutMs: Long): Handler? {
+        if (timeoutMs <= 0L) return null
+        val ready = try {
+            readiness.await(timeoutMs, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        if (!ready) return null
+        return deferredQuit.current()?.let(::Handler)
+    }
+
+    fun requestQuit() {
+        deferredQuit.request()
     }
 }
 
@@ -981,6 +1502,31 @@ private class RendererLeaseStart(
 }
 
 @SuppressLint("ViewConstructor")
+private class UnavailableDecoderSurfaceView(
+    context: Context,
+    onUnavailable: () -> Unit,
+) : SurfaceView(context) {
+    private val callback = AtomicReference<(() -> Unit)?>(onUnavailable)
+    private val notifyUnavailable = Runnable {
+        callback.getAndSet(null)?.invoke()
+    }
+
+    init {
+        holder.setFormat(PixelFormat.OPAQUE)
+    }
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        post(notifyUnavailable)
+    }
+
+    fun requestStop() {
+        callback.set(null)
+        removeCallbacks(notifyUnavailable)
+    }
+}
+
+@SuppressLint("ViewConstructor")
 internal class PatternSurfaceView(
     context: Context,
     private val layerIndex: Int,
@@ -1035,7 +1581,7 @@ internal class PatternSurfaceView(
         val candidate = CanvasDrawingLoop(
             surface = holder.surface,
             layerIndex = layerIndex,
-            fpsProvider = { targetFps },
+            initialTargetFps = targetFps,
             logicalYuv = pixelRoute in setOf(PixelRoute.YUV_420, PixelRoute.P010),
             sbwcRequested = pixelRoute in setOf(PixelRoute.SBWC_AUTO, PixelRoute.SBWC_REQUIRED),
             logicalLayerCount = 1,
@@ -1059,6 +1605,7 @@ internal class PatternSurfaceView(
         val normalized = safeProducerFps(fps)
         if (normalized == targetFps) return
         targetFps = normalized
+        loop?.setTargetFps(normalized)
         if (holder.surface.isValid) applyFrameRate(holder.surface, normalized)
     }
 
@@ -1091,6 +1638,8 @@ internal class PatternTextureView(
     private val removalRequested = AtomicBoolean(false)
     private var loop: CanvasDrawingLoop? = null
     private var drawSurface: Surface? = null
+    private var drawSurfaceTexture: SurfaceTexture? = null
+    private var surfaceTextureOwnedByProducer = false
     private val leaseStart = RendererLeaseStart(
         host = this,
         canStart = {
@@ -1108,32 +1657,43 @@ internal class PatternTextureView(
     override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
         if (removalRequested.get()) return
         release(System.nanoTime())
+        drawSurfaceTexture = texture
         drawSurface = Surface(texture).also { applyFrameRate(it, targetFps) }
         leaseStart.request()
     }
 
     private fun startDrawingLoop() {
         val surface = drawSurface ?: return
+        val texture = drawSurfaceTexture ?: return
         if (removalRequested.get() || !surface.isValid || loop != null) return
         val candidate = CanvasDrawingLoop(
             surface = surface,
             layerIndex = layerIndex,
-            fpsProvider = { targetFps },
+            initialTargetFps = targetFps,
             logicalYuv = logicalYuv,
             sbwcRequested = false,
             logicalLayerCount = 1,
+            releaseSurfaceOnExit = true,
+            ownedSurfaceTexture = texture,
             captureFrameCommit = captureFrameCommit,
             onRuntimeFailure = onRuntimeFailure,
         )
-        if (candidate.start()) loop = candidate
+        if (candidate.start()) {
+            surfaceTextureOwnedByProducer = true
+            loop = candidate
+        }
     }
 
     override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) = Unit
 
     override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
+        val producerOwnsTexture = surfaceTextureOwnedByProducer
         leaseStart.cancel()
         release(System.nanoTime())
-        return true
+        if (producerOwnsTexture) surfaceTextureOwnedByProducer = false
+        return shouldFrameworkReleaseTextureSurface(
+            producerOwnsTexture = producerOwnsTexture,
+        )
     }
 
     override fun onSurfaceTextureUpdated(texture: SurfaceTexture) = Unit
@@ -1142,16 +1702,21 @@ internal class PatternTextureView(
         val normalized = safeProducerFps(fps)
         if (normalized == targetFps) return
         targetFps = normalized
+        loop?.setTargetFps(normalized)
         drawSurface?.let { surface ->
             if (surface.isValid) applyFrameRate(surface, normalized)
         }
     }
 
     fun release(stopDeadlineNanos: Long = producerDrainDeadlineNanos()): Boolean {
-        val stopped = loop?.stop(stopDeadlineNanos) ?: true
+        val startedLoop = loop
+        val stopped = startedLoop?.stop(stopDeadlineNanos) ?: true
         loop = null
-        drawSurface?.release()
+        if (shouldViewReleaseTextureSurface(startedLoopPresent = startedLoop != null)) {
+            drawSurface?.release()
+        }
         drawSurface = null
+        drawSurfaceTexture = null
         return stopped
     }
 
@@ -1183,6 +1748,8 @@ internal class MultiLayerTextureView(
     private var loadStartedMs: Long = SystemClock.elapsedRealtime()
     private var loop: CanvasDrawingLoop? = null
     private var drawSurface: Surface? = null
+    private var drawSurfaceTexture: SurfaceTexture? = null
+    private var surfaceTextureOwnedByProducer = false
     private val leaseStart = RendererLeaseStart(
         host = this,
         canStart = {
@@ -1200,25 +1767,34 @@ internal class MultiLayerTextureView(
     override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
         if (removalRequested.get()) return
         release(System.nanoTime())
+        drawSurfaceTexture = texture
         drawSurface = Surface(texture).also { applyFrameRate(it, targetFps) }
         leaseStart.request()
     }
 
     private fun startDrawingLoop() {
         val surface = drawSurface ?: return
+        val texture = drawSurfaceTexture ?: return
         if (removalRequested.get() || !surface.isValid || loop != null) return
         val candidate = CanvasDrawingLoop(
             surface = surface,
             layerIndex = 0,
-            fpsProvider = { targetFps },
+            initialTargetFps = targetFps,
             logicalYuv = false,
             sbwcRequested = false,
             logicalLayerCount = logicalLayerCount,
-            complexityProvider = ::currentGpuLoad,
+            releaseSurfaceOnExit = true,
+            ownedSurfaceTexture = texture,
+            initialComplexity = gpuLoad,
+            initialLoadShape = loadShape,
+            initialLoadStartedMs = loadStartedMs,
             captureFrameCommit = captureFrameCommit,
             onRuntimeFailure = onRuntimeFailure,
         )
-        if (candidate.start()) loop = candidate
+        if (candidate.start()) {
+            surfaceTextureOwnedByProducer = true
+            loop = candidate
+        }
     }
 
     override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) = Unit
@@ -1228,6 +1804,7 @@ internal class MultiLayerTextureView(
         val normalized = safeProducerFps(fps)
         if (normalized == targetFps) return
         targetFps = normalized
+        loop?.setTargetFps(normalized)
         drawSurface?.let { surface ->
             if (surface.isValid) applyFrameRate(surface, normalized)
         }
@@ -1241,25 +1818,32 @@ internal class MultiLayerTextureView(
         if (restartProfile || shapeChanged) {
             loadStartedMs = SystemClock.elapsedRealtime()
         }
+        loop?.setLoad(
+            load = safeLoad,
+            shape = shape,
+            loadStartedMs = loadStartedMs,
+        )
     }
 
-    private fun currentGpuLoad(): Float = LoadShapeEvaluator.intensityAt(
-        base = gpuLoad,
-        shape = loadShape,
-        elapsedMs = SystemClock.elapsedRealtime() - loadStartedMs,
-    )
-
     override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
+        val producerOwnsTexture = surfaceTextureOwnedByProducer
         leaseStart.cancel()
         release(System.nanoTime())
-        return true
+        if (producerOwnsTexture) surfaceTextureOwnedByProducer = false
+        return shouldFrameworkReleaseTextureSurface(
+            producerOwnsTexture = producerOwnsTexture,
+        )
     }
 
     fun release(stopDeadlineNanos: Long = producerDrainDeadlineNanos()): Boolean {
-        val stopped = loop?.stop(stopDeadlineNanos) ?: true
+        val startedLoop = loop
+        val stopped = startedLoop?.stop(stopDeadlineNanos) ?: true
         loop = null
-        drawSurface?.release()
+        if (shouldViewReleaseTextureSurface(startedLoopPresent = startedLoop != null)) {
+            drawSurface?.release()
+        }
         drawSurface = null
+        drawSurfaceTexture = null
         return stopped
     }
 
@@ -1285,7 +1869,6 @@ internal class VideoSurfaceView(
     private val removalRequested = AtomicBoolean(false)
     @Volatile
     private var decoderSession: DecoderSession? = null
-    private val callbackHandler = Handler(Looper.getMainLooper())
     private val leaseStart = RendererLeaseStart(
         host = this,
         canStart = {
@@ -1326,6 +1909,7 @@ internal class VideoSurfaceView(
             return
         }
         targetFps = normalized
+        decoderSession?.targetFps = normalized
         if (holder.surface.isValid) applyFrameRate(holder.surface, normalized)
     }
 
@@ -1334,18 +1918,48 @@ internal class VideoSurfaceView(
             return
         }
         val sessionRunning = AtomicBoolean(true)
+        val frameCallbackGate = DecoderFrameCallbackGate()
+        val frameCallbackThread = try {
+            BoundedCallbackHandlerThread("DpuLab-MediaCodecCallback").apply {
+                isDaemon = true
+            }
+        } catch (error: Throwable) {
+            frameCallbackGate.close()
+            if (error is ThreadDeath || error is VirtualMachineError) throw error
+            onRuntimeFailure?.invoke(
+                buildRuntimeFailureReason("MediaCodec callback thread create", error),
+            )
+            return
+        }
+        val callbackThreadStarted = startRendererThread(frameCallbackThread) { error ->
+            sessionRunning.set(false)
+            frameCallbackGate.close()
+            onRuntimeFailure?.invoke(
+                buildRuntimeFailureReason("MediaCodec callback thread start", error),
+            )
+        }
+        if (!callbackThreadStarted) return
+        val decoderSelection = selection
         lateinit var session: DecoderSession
-        val thread = Thread({
+        val decoderRunnable = Runnable {
             var extractor: MediaExtractor? = null
             var codec: MediaCodec? = null
+            var fatalFailure: Throwable? = null
             try {
-                ensureSetupActive(surface, session, sessionRunning)
+                val frameCallbackHandler =
+                    session.frameCallbackThread.awaitHandler(
+                        CALLBACK_HANDLER_READY_TIMEOUT_MS,
+                    ) ?: throw IllegalStateException(
+                        "MediaCodec callback Looper readiness timed out",
+                    )
+                session.frameCallbackHandler.set(frameCallbackHandler)
+                session.ensureSetupActive(surface)
                 val activeExtractor = MediaExtractor()
                 extractor = activeExtractor
-                selection.openSourceDuplicate().use { source ->
-                    activeExtractor.setDataSource(source)
+                decoderSelection.openSourceDuplicate().use { source ->
+                    activeExtractor.setDataSource(source.resource)
                 }
-                ensureSetupActive(surface, session, sessionRunning)
+                session.ensureSetupActive(surface)
                 var videoTrack = -1
                 var format: MediaFormat? = null
                 for (index in 0 until activeExtractor.trackCount) {
@@ -1359,17 +1973,17 @@ internal class VideoSurfaceView(
                 }
                 check(videoTrack >= 0 && format != null) { "No video track" }
                 activeExtractor.selectTrack(videoTrack)
-                ensureSetupActive(surface, session, sessionRunning)
+                session.ensureSetupActive(surface)
                 val mime = format.getString(MediaFormat.KEY_MIME)
                     ?: error("Video MIME unavailable")
-                check(mime.equals(selection.mime, ignoreCase = true)) {
+                check(mime.equals(decoderSelection.mime, ignoreCase = true)) {
                     "Video MIME changed after preflight"
                 }
                 val inputEncoded = format.encodedVideoDimensions()
                     ?: error("Video encoded dimensions unavailable")
                 check(
-                    inputEncoded.widthPx == selection.expectedEncodedWidthPx &&
-                        inputEncoded.heightPx == selection.expectedEncodedHeightPx
+                    inputEncoded.widthPx == decoderSelection.expectedEncodedWidthPx &&
+                        inputEncoded.heightPx == decoderSelection.expectedEncodedHeightPx
                 ) {
                     "Video encoded dimensions changed after preflight"
                 }
@@ -1378,8 +1992,8 @@ internal class VideoSurfaceView(
                 val runtimeDeclaredMaxHeight =
                     format.strictOptionalIntegerOrNull(MediaFormat.KEY_MAX_HEIGHT)
                 check(
-                    runtimeDeclaredMaxWidth == selection.expectedDeclaredMaxWidthPx &&
-                        runtimeDeclaredMaxHeight == selection.expectedDeclaredMaxHeightPx &&
+                    runtimeDeclaredMaxWidth == decoderSelection.expectedDeclaredMaxWidthPx &&
+                        runtimeDeclaredMaxHeight == decoderSelection.expectedDeclaredMaxHeightPx &&
                         fixedVideoMaximumDimensionsMatch(
                             encodedWidthPx = inputEncoded.widthPx,
                             encodedHeightPx = inputEncoded.heightPx,
@@ -1392,61 +2006,61 @@ internal class VideoSurfaceView(
                 val inputVisible = format.visibleVideoDimensionsOrNull()
                     ?: error("Video crop/visible dimensions unavailable")
                 check(
-                    inputVisible.widthPx == selection.expectedVisibleWidthPx &&
-                        inputVisible.heightPx == selection.expectedVisibleHeightPx
+                    inputVisible.widthPx == decoderSelection.expectedVisibleWidthPx &&
+                        inputVisible.heightPx == decoderSelection.expectedVisibleHeightPx
                 ) {
                     "Video visible dimensions changed after preflight"
                 }
                 val runtimeFps = format.mediaNumberOrNull(MediaFormat.KEY_FRAME_RATE)
                     ?.toFloat()
-                check(videoFrameRatesMatch(runtimeFps, selection.expectedSourceFps)) {
+                check(videoFrameRatesMatch(runtimeFps, decoderSelection.expectedSourceFps)) {
                     "Video FPS changed after preflight"
                 }
                 val runtimeProfile = format.strictOptionalIntegerOrNull(MediaFormat.KEY_PROFILE)
-                check(runtimeProfile == selection.expectedProfile) {
+                check(runtimeProfile == decoderSelection.expectedProfile) {
                     "Video profile changed after preflight"
                 }
                 val runtimeLevel = format.strictOptionalIntegerOrNull(MediaFormat.KEY_LEVEL)
-                check(runtimeLevel == selection.expectedLevel) {
+                check(runtimeLevel == decoderSelection.expectedLevel) {
                     "Video level changed after preflight"
                 }
                 val runtimeBitRate = format.strictOptionalIntegerOrNull(MediaFormat.KEY_BIT_RATE)
-                check(runtimeBitRate == selection.expectedBitRate) {
+                check(runtimeBitRate == decoderSelection.expectedBitRate) {
                     "Video bitrate changed after preflight"
                 }
                 val runtimeMaxInputSize =
                     format.strictOptionalIntegerOrNull(MediaFormat.KEY_MAX_INPUT_SIZE)
-                check(runtimeMaxInputSize == selection.expectedMaxInputSize) {
+                check(runtimeMaxInputSize == decoderSelection.expectedMaxInputSize) {
                     "Video maximum input size changed after preflight"
                 }
                 check(
                     runtimeMaxInputSize == null ||
-                        runtimeMaxInputSize <= selection.maxCompressedSampleBytes
+                        runtimeMaxInputSize <= decoderSelection.maxCompressedSampleBytes
                 ) {
                     "Video maximum input size exceeds the run safety limit"
                 }
                 val runtimeRotation =
                     format.strictOptionalIntegerOrNull(MediaFormat.KEY_ROTATION) ?: 0
-                check(runtimeRotation == selection.expectedRotationDegrees) {
+                check(runtimeRotation == decoderSelection.expectedRotationDegrees) {
                     "Video rotation changed after preflight"
                 }
                 val runtimeCodecsString = format.boundedCodecsString()
-                check(runtimeCodecsString == selection.expectedCodecsString) {
+                check(runtimeCodecsString == decoderSelection.expectedCodecsString) {
                     "Video codec string changed after preflight"
                 }
                 val runtimeCodecConfigFingerprint = format.codecConfigFingerprintOrNull()
                     ?: error("Video codec configuration is invalid")
-                check(runtimeCodecConfigFingerprint == selection.codecConfigFingerprint) {
+                check(runtimeCodecConfigFingerprint == decoderSelection.codecConfigFingerprint) {
                     "Video codec configuration changed after preflight"
                 }
-                if (selection.requiresVerifiedP010) {
+                if (decoderSelection.requiresVerifiedP010) {
                     check(runtimeProfile != null) {
                         "P010 profile is no longer verifiable"
                     }
                 }
-                val maxEncodedWidth = selection.maxEncodedWidthPx
+                val maxEncodedWidth = decoderSelection.maxEncodedWidthPx
                     ?: error("Video max width unavailable")
-                val maxEncodedHeight = selection.maxEncodedHeightPx
+                val maxEncodedHeight = decoderSelection.maxEncodedHeightPx
                     ?: error("Video max height unavailable")
                 val presentationDimensions = presentationVideoDimensions(
                     inputVisible,
@@ -1458,29 +2072,29 @@ internal class VideoSurfaceView(
                 // and output-format ceiling remain the fail-closed guards.
                 format.removeKey(MediaFormat.KEY_MAX_WIDTH)
                 format.removeKey(MediaFormat.KEY_MAX_HEIGHT)
-                callbackHandler.post {
-                    if (isCurrent(session)) {
-                        holder.setFixedSize(
-                            presentationDimensions.widthPx,
-                            presentationDimensions.heightPx,
-                        )
-                    }
-                }
-                val activeCodec = MediaCodec.createByCodecName(selection.codecName)
+                session.postFixedSize(
+                    presentationDimensions.widthPx,
+                    presentationDimensions.heightPx,
+                )
+                val activeCodec = MediaCodec.createByCodecName(decoderSelection.codecName)
                 codec = activeCodec
-                ensureSetupActive(surface, session, sessionRunning)
+                session.ensureSetupActive(surface)
                 activeCodec.setOnFrameRenderedListener(
-                    { _, _, _ -> if (isCurrent(session)) onFrame?.invoke() },
-                    callbackHandler,
+                    { _, _, _ ->
+                        if (session.frameCallbackGate.isOpen() && session.isActive()) {
+                            session.emitFrame()
+                        }
+                    },
+                    frameCallbackHandler,
                 )
                 activeCodec.configure(format, surface, null, 0)
-                ensureSetupActive(surface, session, sessionRunning)
+                session.ensureSetupActive(surface)
                 activeCodec.start()
 
                 val outputInfo = MediaCodec.BufferInfo()
                 var inputEos = false
                 var nextRenderNanos = System.nanoTime()
-                while (sessionRunning.get() && surface.isValid && isCurrent(session)) {
+                while (session.isActive() && surface.isValid) {
                     var inputProgress = false
                     if (!inputEos) {
                         val inputIndex = activeCodec.dequeueInputBuffer(CODEC_TIMEOUT_US)
@@ -1502,7 +2116,7 @@ internal class VideoSurfaceView(
                                 )
                                 check(
                                     declaredSampleSize <=
-                                        selection.maxCompressedSampleBytes.toLong()
+                                        decoderSelection.maxCompressedSampleBytes.toLong()
                                 ) {
                                     "Compressed video sample exceeds the run safety limit"
                                 }
@@ -1536,13 +2150,13 @@ internal class VideoSurfaceView(
                     )
                     val outputProgress =
                         outputIndex >= 0 ||
-                            outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ||
-                            outputIndex == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED
+                            outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED
                     when {
                         outputIndex >= 0 -> {
                             val isEos = outputInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
                             if (outputInfo.size > 0 || !isEos) {
-                                val interval = (1_000_000_000L / safeProducerFps(targetFps)).toLong()
+                                val interval =
+                                    (1_000_000_000L / safeProducerFps(session.targetFps)).toLong()
                                 val now = System.nanoTime()
                                 if (nextRenderNanos < now - MAX_PACING_LAG_NANOS) {
                                     nextRenderNanos = now
@@ -1552,7 +2166,7 @@ internal class VideoSurfaceView(
                             } else {
                                 activeCodec.releaseOutputBuffer(outputIndex, false)
                             }
-                            if (isEos && sessionRunning.get() && isCurrent(session)) {
+                            if (isEos && session.isActive()) {
                                 activeCodec.flush()
                                 activeExtractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
                                 inputEos = false
@@ -1580,20 +2194,16 @@ internal class VideoSurfaceView(
                                 sameVideoDimensions(
                                     outputVisible.widthPx,
                                     outputVisible.heightPx,
-                                    selection.expectedVisibleWidthPx,
-                                    selection.expectedVisibleHeightPx,
+                                    decoderSelection.expectedVisibleWidthPx,
+                                    decoderSelection.expectedVisibleHeightPx,
                                 )
                             ) {
                                 "Decoder output resolution changed after preflight"
                             }
-                            callbackHandler.post {
-                                if (isCurrent(session)) {
-                                    holder.setFixedSize(
-                                        presentationDimensions.widthPx,
-                                        presentationDimensions.heightPx,
-                                    )
-                                }
-                            }
+                            session.postFixedSize(
+                                presentationDimensions.widthPx,
+                                presentationDimensions.heightPx,
+                            )
                         }
                     }
                     val parkNanos = codecNoProgressParkNanos(
@@ -1607,70 +2217,280 @@ internal class VideoSurfaceView(
             } catch (_: InterruptedException) {
                 // Normal release path.
             } catch (error: Throwable) {
-                if (error is ThreadDeath) throw error
+                if (error is ThreadDeath || error is VirtualMachineError) {
+                    fatalFailure = error
+                    throw error
+                }
                 if (
-                    sessionRunning.get() &&
-                    !removalRequested.get() &&
-                    isCurrent(session)
+                    session.isActive()
                 ) {
-                    onRuntimeFailure?.invoke(
+                    session.dispatchRuntimeFailure(
                         buildRuntimeFailureReason("MediaCodec", error),
                     )
                 }
             } finally {
-                val cleanupFailures = mutableListOf<String>()
-                runCatching { codec?.stop() }
-                codec?.let { activeCodec ->
-                    runCatching { activeCodec.release() }
-                        .onFailure {
-                            cleanupFailures +=
-                                "MediaCodec.release=${it.javaClass.simpleName}"
-                        }
+                // Keep the native cleanup prefix allocation-free. This finally block also runs
+                // while an OutOfMemoryError is propagating; allocating an evidence collection here
+                // could mask the original fatal error and skip codec/extractor release entirely.
+                var extractorReleaseFailure: Throwable? = null
+                var listenerDetachFailure: Throwable? = null
+                var codecReleaseFailure: Throwable? = null
+                var cleanupFatalFailure: Throwable? = null
+                // Invalidate the allocation-free callback fast path before making any potentially
+                // blocking platform cleanup call. MediaCodec may already have queued a rendered
+                // callback, but it can no longer escape this session after the gate is closed.
+                try {
+                    session.frameCallbackGate.close()
+                } catch (error: Throwable) {
+                    if (error is ThreadDeath || error is VirtualMachineError) {
+                        cleanupFatalFailure = error
+                    }
                 }
-                extractor?.let { activeExtractor ->
-                    runCatching { activeExtractor.release() }
-                        .onFailure {
-                            cleanupFailures +=
-                                "MediaExtractor.release=${it.javaClass.simpleName}"
-                        }
+                try {
+                    session.frameCallbackHandler.get()?.removeCallbacksAndMessages(null)
+                } catch (error: Throwable) {
+                    if (
+                        cleanupFatalFailure == null &&
+                        (error is ThreadDeath || error is VirtualMachineError)
+                    ) {
+                        cleanupFatalFailure = error
+                    }
                 }
-                if (cleanupFailures.isNotEmpty()) {
-                    RendererSafetyState.markCleanupFailure(
-                        component = "decoder native cleanup",
-                        detail = cleanupFailures.joinToString(","),
+                // MediaExtractor owns the duplicated selected-media descriptor. It is independent
+                // from codec shutdown, so release it first instead of retaining the FD while a
+                // vendor codec stop/release call is slow.
+                val activeExtractor = extractor
+                if (activeExtractor != null) {
+                    try {
+                        activeExtractor.release()
+                    } catch (error: Throwable) {
+                        extractorReleaseFailure = error
+                        if (
+                            cleanupFatalFailure == null &&
+                            (error is ThreadDeath || error is VirtualMachineError)
+                        ) {
+                            cleanupFatalFailure = error
+                        }
+                    }
+                }
+                val activeCodec = codec
+                if (activeCodec != null) {
+                    val callbackHandler = session.frameCallbackHandler.get()
+                    if (callbackHandler != null) {
+                        try {
+                            activeCodec.setOnFrameRenderedListener(
+                                null,
+                                callbackHandler,
+                            )
+                        } catch (error: Throwable) {
+                            listenerDetachFailure = error
+                            if (
+                                cleanupFatalFailure == null &&
+                                (error is ThreadDeath || error is VirtualMachineError)
+                            ) {
+                                cleanupFatalFailure = error
+                            }
+                        }
+                    }
+                }
+                try {
+                    session.frameCallbackThread.requestQuit()
+                } catch (error: Throwable) {
+                    if (
+                        cleanupFatalFailure == null &&
+                        (error is ThreadDeath || error is VirtualMachineError)
+                    ) {
+                        cleanupFatalFailure = error
+                    }
+                }
+                if (activeCodec != null) {
+                    try {
+                        activeCodec.stop()
+                    } catch (error: Throwable) {
+                        if (
+                            cleanupFatalFailure == null &&
+                            (error is ThreadDeath || error is VirtualMachineError)
+                        ) {
+                            cleanupFatalFailure = error
+                        }
+                    }
+                    try {
+                        activeCodec.release()
+                    } catch (error: Throwable) {
+                        codecReleaseFailure = error
+                        if (
+                            cleanupFatalFailure == null &&
+                            (error is ThreadDeath || error is VirtualMachineError)
+                        ) {
+                            cleanupFatalFailure = error
+                        }
+                    }
+                }
+                val callbackStoppedWithinHandoff = try {
+                    joinThreadUntil(
+                        session.frameCallbackThread,
+                        producerDrainDeadlineNanos(),
                     )
-                    callbackHandler.post { onTeardownFailure?.invoke() }
+                } catch (error: Throwable) {
+                    if (
+                        cleanupFatalFailure == null &&
+                        (error is ThreadDeath || error is VirtualMachineError)
+                    ) {
+                        cleanupFatalFailure = error
+                    }
+                    false
+                }
+                extractorReleaseFailure?.let { failure ->
+                    try {
+                        PinnedMediaCleanupState.markUnconfirmed(
+                            failure.javaClass.simpleName.ifBlank {
+                                failure.javaClass.name
+                            },
+                        )
+                    } catch (error: Throwable) {
+                        // Native ownership has already been released/attempted. Preserve a fatal
+                        // worker error instead of masking it with evidence formatting.
+                        if (
+                            cleanupFatalFailure == null &&
+                            (error is ThreadDeath || error is VirtualMachineError)
+                        ) {
+                            cleanupFatalFailure = error
+                        }
+                    }
+                }
+                val nativeCleanupFailed =
+                    extractorReleaseFailure != null || codecReleaseFailure != null
+                if (nativeCleanupFailed) {
+                    val evidenceFailure =
+                        extractorReleaseFailure ?: codecReleaseFailure ?: listenerDetachFailure
+                    try {
+                        RendererSafetyState.markCleanupFailure(
+                            component = "decoder native cleanup",
+                            detail =
+                                evidenceFailure?.javaClass?.simpleName
+                                    ?: "release failed",
+                        )
+                    } catch (error: Throwable) {
+                        // Teardown callback below remains a second fail-closed signal.
+                        if (
+                            cleanupFatalFailure == null &&
+                            (error is ThreadDeath || error is VirtualMachineError)
+                        ) {
+                            cleanupFatalFailure = error
+                        }
+                    }
+                }
+                // Missing the 16 ms UI hand-off is transient: joinThreadUntil() has already
+                // registered the live callback thread in RendererSafetyState, and the controller's
+                // five-second recovery barrier owns the terminal decision. Only a confirmed native
+                // cleanup failure is terminal at this point.
+                if (
+                    decoderTeardownRequiresTerminalSignal(
+                        callbackStoppedWithinHandoff = callbackStoppedWithinHandoff,
+                        nativeCleanupFailed = nativeCleanupFailed,
+                    )
+                ) {
+                    try {
+                        session.dispatchTeardownFailure()
+                    } catch (error: Throwable) {
+                        // Do not replace an in-flight fatal worker error.
+                        if (
+                            cleanupFatalFailure == null &&
+                            (error is ThreadDeath || error is VirtualMachineError)
+                        ) {
+                            cleanupFatalFailure = error
+                        }
+                    }
                 }
                 sessionRunning.set(false)
-                if (decoderSession === session) decoderSession = null
+                try {
+                    if (!session.postFinished()) {
+                        session.detachUiCallbacks()
+                    }
+                } catch (error: Throwable) {
+                    session.detachUiCallbacks()
+                    if (
+                        cleanupFatalFailure == null &&
+                        (error is ThreadDeath || error is VirtualMachineError)
+                    ) {
+                        cleanupFatalFailure = error
+                    }
+                }
+                val cleanupFatal = cleanupFatalFailure
+                if (
+                    fatalFailure == null &&
+                    (cleanupFatal is ThreadDeath || cleanupFatal is VirtualMachineError)
+                ) {
+                    throw cleanupFatal
+                }
             }
-        }, "DpuLab-MediaCodec")
-        session = DecoderSession(sessionRunning, thread)
+        }
+        val thread = try {
+            Thread(decoderRunnable, "DpuLab-MediaCodec")
+        } catch (error: Throwable) {
+            sessionRunning.set(false)
+            frameCallbackGate.close()
+            runCatching { frameCallbackThread.requestQuit() }
+            joinThreadUntil(
+                frameCallbackThread,
+                producerDrainDeadlineNanos(),
+            )
+            // A live callback thread is process-leased by joinThreadUntil(). The five-second
+            // recovery boundary, not this short hand-off, decides whether teardown is terminal.
+            if (error is ThreadDeath || error is VirtualMachineError) throw error
+            onRuntimeFailure?.invoke(
+                buildRuntimeFailureReason("MediaCodec thread create", error),
+            )
+            return
+        }
+        session = try {
+            DecoderSession(
+                running = sessionRunning,
+                thread = thread,
+                frameCallbackThread = frameCallbackThread,
+                frameCallbackHandler = AtomicReference(null),
+                frameCallbackGate = frameCallbackGate,
+                initialTargetFps = targetFps,
+                uiCallbacks = DecoderUiCallbacks(
+                    onFrame = onFrame,
+                    onFixedSize = { width, height ->
+                        if (decoderSession === session) holder.setFixedSize(width, height)
+                    },
+                    onRuntimeFailure = onRuntimeFailure,
+                    onTeardownFailure = onTeardownFailure,
+                    onFinished = { finished ->
+                        if (decoderSession === finished) decoderSession = null
+                    },
+                ),
+            )
+        } catch (error: Throwable) {
+            // The callback HandlerThread is already running at this point while the decoder
+            // Thread has not started. Roll that owned prefix back before propagating OOM/fatal
+            // errors, otherwise a constructor failure leaves a Looper retaining the process.
+            sessionRunning.set(false)
+            frameCallbackGate.close()
+            runCatching { frameCallbackThread.requestQuit() }
+            joinThreadUntil(
+                frameCallbackThread,
+                producerDrainDeadlineNanos(),
+            )
+            if (error is ThreadDeath || error is VirtualMachineError) throw error
+            onRuntimeFailure?.invoke(
+                buildRuntimeFailureReason("MediaCodec session create", error),
+            )
+            return
+        }
         decoderSession = session
         val threadStarted = startRendererThread(thread) { error ->
-            sessionRunning.set(false)
-            if (decoderSession === session) decoderSession = null
-            onRuntimeFailure?.invoke(
+            session.dispatchRuntimeFailure(
                 buildRuntimeFailureReason("MediaCodec thread start", error),
             )
+            requestStop(session)
+            joinThreadUntil(frameCallbackThread, producerDrainDeadlineNanos())
+            if (decoderSession === session) decoderSession = null
         }
         if (!threadStarted) {
             return
-        }
-    }
-
-    private fun ensureSetupActive(
-        surface: Surface,
-        session: DecoderSession,
-        sessionRunning: AtomicBoolean,
-    ) {
-        if (
-            !sessionRunning.get() ||
-            removalRequested.get() ||
-            !surface.isValid ||
-            !isCurrent(session)
-        ) {
-            throw InterruptedException()
         }
     }
 
@@ -1678,8 +2498,13 @@ internal class VideoSurfaceView(
         val session = decoderSession ?: return true
         decoderSession = null
         requestStop(session)
-        return Thread.currentThread() === session.thread ||
-            joinThreadUntil(session.thread, stopDeadlineNanos)
+        val decoderStopped =
+            Thread.currentThread() === session.thread ||
+                joinThreadUntil(session.thread, stopDeadlineNanos)
+        val callbacksStopped =
+            Thread.currentThread() === session.frameCallbackThread ||
+                joinThreadUntil(session.frameCallbackThread, stopDeadlineNanos)
+        return decoderStopped && callbacksStopped
     }
 
     fun requestStop() {
@@ -1689,21 +2514,85 @@ internal class VideoSurfaceView(
     }
 
     private fun requestStop(session: DecoderSession) {
+        session.detachUiCallbacks()
         session.running.set(false)
+        session.closeFrameCallbacks()
         session.thread.interrupt()
     }
 
-    private fun isCurrent(session: DecoderSession): Boolean =
-        decoderSession === session && session.running.get()
-
-    private data class DecoderSession(
+    private class DecoderSession(
         val running: AtomicBoolean,
         val thread: Thread,
+        val frameCallbackThread: BoundedCallbackHandlerThread,
+        val frameCallbackHandler: AtomicReference<Handler?>,
+        val frameCallbackGate: DecoderFrameCallbackGate,
+        initialTargetFps: Float,
+        uiCallbacks: DecoderUiCallbacks,
+    ) {
+        @Volatile
+        var targetFps: Float = safeProducerFps(initialTargetFps)
+
+        private val attachedToView = AtomicBoolean(true)
+        private val uiCallbacks = AtomicReference<DecoderUiCallbacks?>(uiCallbacks)
+        private val uiHandler = Handler(Looper.getMainLooper())
+
+        fun isActive(): Boolean = running.get() && attachedToView.get()
+
+        fun ensureSetupActive(surface: Surface) {
+            if (!isActive() || !surface.isValid) throw InterruptedException()
+        }
+
+        fun emitFrame() {
+            uiCallbacks.get()?.onFrame?.invoke()
+        }
+
+        fun postFixedSize(width: Int, height: Int) {
+            uiHandler.post {
+                uiCallbacks.get()?.onFixedSize?.invoke(width, height)
+            }
+        }
+
+        fun dispatchRuntimeFailure(reason: String) {
+            uiCallbacks.get()?.onRuntimeFailure?.invoke(reason)
+        }
+
+        fun dispatchTeardownFailure() {
+            uiHandler.post {
+                uiCallbacks.get()?.onTeardownFailure?.invoke()
+            }
+        }
+
+        fun postFinished(): Boolean =
+            uiHandler.post {
+                uiCallbacks.get()?.onFinished?.invoke(this)
+            }
+
+        fun detachUiCallbacks() {
+            // Pending main-queue Runnables retain this Activity-free session only and re-read the
+            // callback reference when they execute; clearing it breaks the View/Activity path.
+            attachedToView.set(false)
+            uiCallbacks.set(null)
+        }
+
+        fun closeFrameCallbacks() {
+            frameCallbackGate.close()
+            frameCallbackHandler.get()?.removeCallbacksAndMessages(null)
+            runCatching { frameCallbackThread.requestQuit() }
+        }
+    }
+
+    private data class DecoderUiCallbacks(
+        val onFrame: (() -> Unit)?,
+        val onFixedSize: ((Int, Int) -> Unit)?,
+        val onRuntimeFailure: ((String) -> Unit)?,
+        val onTeardownFailure: (() -> Unit)?,
+        val onFinished: ((DecoderSession) -> Unit)?,
     )
 
     companion object {
         private const val CODEC_TIMEOUT_US = 10_000L
         private const val MAX_PACING_LAG_NANOS = 250_000_000L
+        private const val CALLBACK_HANDLER_READY_TIMEOUT_MS = 1_000L
     }
 }
 
@@ -1848,18 +2737,33 @@ internal fun flattenedSingleLayerExtraPasses(complexity: Float): Int {
 private class CanvasDrawingLoop(
     private val surface: Surface,
     private val layerIndex: Int,
-    private val fpsProvider: () -> Float,
+    initialTargetFps: Float,
     private val logicalYuv: Boolean,
     private val sbwcRequested: Boolean,
     private val logicalLayerCount: Int,
     private val translucentContent: Boolean = false,
-    private val complexityProvider: () -> Float = { 0f },
-    private val captureFrameCommit: (() -> (() -> Unit)?)?,
-    private val onRuntimeFailure: ((String) -> Unit)?,
+    private val releaseSurfaceOnExit: Boolean = false,
+    private val ownedSurfaceTexture: SurfaceTexture? = null,
+    initialComplexity: Float = 0f,
+    initialLoadShape: LoadShape = LoadShape.STEADY,
+    initialLoadStartedMs: Long = SystemClock.elapsedRealtime(),
+    captureFrameCommit: (() -> (() -> Unit)?)?,
+    onRuntimeFailure: ((String) -> Unit)?,
 ) : Runnable {
 
     private val running = AtomicBoolean(false)
     private var thread: Thread? = null
+    @Volatile
+    private var targetFps = safeProducerFps(initialTargetFps)
+    @Volatile
+    private var complexity =
+        initialComplexity.takeIf(Float::isFinite)?.coerceIn(0f, 1f) ?: 0f
+    @Volatile
+    private var loadShape = initialLoadShape
+    @Volatile
+    private var loadStartedMs = initialLoadStartedMs
+    private val captureFrameCommit = AtomicReference(captureFrameCommit)
+    private val runtimeFailureCallback = AtomicReference(onRuntimeFailure)
     private val painter = PatternPainter(
         index = layerIndex,
         logicalYuv = logicalYuv,
@@ -1877,9 +2781,10 @@ private class CanvasDrawingLoop(
         return startRendererThread(candidate) { error ->
             running.set(false)
             thread = null
-            onRuntimeFailure?.invoke(
+            runtimeFailureCallback.getAndSet(null)?.invoke(
                 buildRuntimeFailureReason("Canvas thread start", error),
             )
+            captureFrameCommit.set(null)
         }
     }
 
@@ -1894,16 +2799,87 @@ private class CanvasDrawingLoop(
     }
 
     fun requestStop() {
+        // Break every path back to LayerStageView/Activity before the bounded join. If the native
+        // lock/unlock call outlives the hand-off, the process lease retains only this scalar
+        // session, its Surface, and immutable painters.
+        captureFrameCommit.set(null)
+        runtimeFailureCallback.set(null)
         running.set(false)
         thread?.interrupt()
     }
 
+    fun setTargetFps(fps: Float) {
+        targetFps = safeProducerFps(fps)
+        thread?.let(LockSupport::unpark)
+    }
+
+    fun setLoad(load: Float, shape: LoadShape, loadStartedMs: Long) {
+        complexity = load.takeIf(Float::isFinite)?.coerceIn(0f, 1f) ?: 0f
+        loadShape = shape
+        this.loadStartedMs = loadStartedMs
+        thread?.let(LockSupport::unpark)
+    }
+
     override fun run() {
+        try {
+            runDrawingLoop()
+        } finally {
+            if (releaseSurfaceOnExit) {
+                var fatalCleanupFailure: Throwable? = null
+                try {
+                    surface.release()
+                } catch (error: Throwable) {
+                    try {
+                        RendererSafetyState.markCleanupFailure(
+                            component = "Texture Canvas Surface",
+                            detail = error.javaClass.simpleName,
+                        )
+                    } catch (reportError: Throwable) {
+                        if (
+                            fatalCleanupFailure == null &&
+                            (reportError is ThreadDeath || reportError is VirtualMachineError)
+                        ) {
+                            fatalCleanupFailure = reportError
+                        }
+                    }
+                    if (error is ThreadDeath || error is VirtualMachineError) {
+                        fatalCleanupFailure = error
+                    }
+                }
+                try {
+                    ownedSurfaceTexture?.release()
+                } catch (error: Throwable) {
+                    try {
+                        RendererSafetyState.markCleanupFailure(
+                            component = "Texture Canvas SurfaceTexture",
+                            detail = error.javaClass.simpleName,
+                        )
+                    } catch (reportError: Throwable) {
+                        if (
+                            fatalCleanupFailure == null &&
+                            (reportError is ThreadDeath || reportError is VirtualMachineError)
+                        ) {
+                            fatalCleanupFailure = reportError
+                        }
+                    }
+                    if (
+                        fatalCleanupFailure == null &&
+                        (error is ThreadDeath || error is VirtualMachineError)
+                    ) {
+                        fatalCleanupFailure = error
+                    }
+                }
+                fatalCleanupFailure?.let { throw it }
+            }
+        }
+    }
+
+    private fun runDrawingLoop() {
         var nextFrame = System.nanoTime()
         val startedNanos = nextFrame
         var consecutiveFailures = 0
         while (running.get() && surface.isValid) {
-            val fps = fpsProvider().takeIf { it.isFinite() }?.coerceIn(1f, 120f) ?: 60f
+            val fps = targetFps
             val interval = (1_000_000_000L / fps).toLong()
             val now = System.nanoTime()
             if (now < nextFrame) {
@@ -1914,17 +2890,18 @@ private class CanvasDrawingLoop(
             var frameDrawn: Boolean
             var posted = false
             var terminalFailure: Throwable? = null
-            val frameCommit = captureFrameCommit?.invoke()
+            val frameCommit = captureFrameCommit.get()?.invoke()
             try {
                 canvas = surface.lockHardwareCanvas()
                 val elapsedSeconds = (System.nanoTime() - startedNanos) / 1_000_000_000f
-                val complexity = complexityProvider()
-                    .takeIf { it.isFinite() }
-                    ?.coerceIn(0f, 1f)
-                    ?: 0f
+                val frameComplexity = LoadShapeEvaluator.intensityAt(
+                    base = complexity,
+                    shape = loadShape,
+                    elapsedMs = SystemClock.elapsedRealtime() - loadStartedMs,
+                )
                 if (logicalLayerCount == 1) {
                     painter.draw(canvas, elapsedSeconds)
-                    repeat(flattenedSingleLayerExtraPasses(complexity)) { passIndex ->
+                    repeat(flattenedSingleLayerExtraPasses(frameComplexity)) { passIndex ->
                         canvas.withSave {
                             val pass = passIndex + 1
                             val w = width.toFloat()
@@ -1946,7 +2923,7 @@ private class CanvasDrawingLoop(
                     }
                 } else {
                     canvas.drawColor(Color.rgb(6, 12, 17))
-                    val passes = logicalPainters.size + (complexity * 8f).roundToInt()
+                    val passes = logicalPainters.size + (frameComplexity * 8f).roundToInt()
                     repeat(passes) { passIndex ->
                         val logicalIndex = passIndex % logicalPainters.size
                         canvas.withSave {
@@ -1988,7 +2965,7 @@ private class CanvasDrawingLoop(
             val fatalFailure = terminalFailure
             if (fatalFailure != null) {
                 if (running.get()) {
-                    onRuntimeFailure?.invoke(
+                    runtimeFailureCallback.get()?.invoke(
                         buildRuntimeFailureReason("Canvas", fatalFailure),
                     )
                 }
@@ -2003,7 +2980,7 @@ private class CanvasDrawingLoop(
             }
             if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
                 if (running.get() && surface.isValid) {
-                    onRuntimeFailure?.invoke(
+                    runtimeFailureCallback.get()?.invoke(
                         "Canvas producer failed $consecutiveFailures consecutive frames",
                     )
                 }
@@ -2188,6 +3165,35 @@ private fun joinThreadUntil(thread: Thread, deadlineNanos: Long): Boolean {
     if (!stopped) RendererSafetyState.trackUnconfirmed(thread)
     return stopped
 }
+
+/**
+ * A short hand-off timeout is represented by RendererSafetyState's live-thread lease. It becomes
+ * terminal only if that lease survives the independent recovery deadline; this immediate signal
+ * is reserved for a confirmed native cleanup failure.
+ */
+internal fun decoderTeardownRequiresTerminalSignal(
+    callbackStoppedWithinHandoff: Boolean,
+    nativeCleanupFailed: Boolean,
+): Boolean = when {
+    nativeCleanupFailed -> true
+    callbackStoppedWithinHandoff -> false
+    else -> false
+}
+
+/**
+ * Once a Canvas loop starts it owns the TextureView Surface wrapper until its real thread finally.
+ * This remains true after a 16 ms hand-off timeout; releasing from the View in that window races a
+ * native lock/unlock still using the same wrapper.
+ */
+internal fun shouldViewReleaseTextureSurface(startedLoopPresent: Boolean): Boolean =
+    !startedLoopPresent
+
+/**
+ * A started Texture Canvas producer owns both the Surface wrapper and its SurfaceTexture. Returning
+ * true here would let TextureView release the native buffer producer before a delayed worker exits.
+ */
+internal fun shouldFrameworkReleaseTextureSurface(producerOwnsTexture: Boolean): Boolean =
+    !producerOwnsTexture
 
 private const val NANOS_PER_MILLI = 1_000_000L
 private const val PRODUCER_DRAIN_TIMEOUT_NANOS = 16_000_000L

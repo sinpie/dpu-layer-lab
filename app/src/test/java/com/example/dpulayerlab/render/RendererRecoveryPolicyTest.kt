@@ -56,6 +56,36 @@ class RendererRecoveryPolicyTest {
     }
 
     @Test
+    fun decoderShortHandoffTimeoutUsesLeaseInsteadOfImmediateTerminalSignal() {
+        assertFalse(
+            decoderTeardownRequiresTerminalSignal(
+                callbackStoppedWithinHandoff = false,
+                nativeCleanupFailed = false,
+            ),
+        )
+        assertFalse(
+            decoderTeardownRequiresTerminalSignal(
+                callbackStoppedWithinHandoff = true,
+                nativeCleanupFailed = false,
+            ),
+        )
+        assertTrue(
+            decoderTeardownRequiresTerminalSignal(
+                callbackStoppedWithinHandoff = false,
+                nativeCleanupFailed = true,
+            ),
+        )
+    }
+
+    @Test
+    fun startedTextureCanvasLoopRetainsNativeResourcesUntilActualThreadFinally() {
+        assertTrue(shouldViewReleaseTextureSurface(startedLoopPresent = false))
+        assertFalse(shouldViewReleaseTextureSurface(startedLoopPresent = true))
+        assertTrue(shouldFrameworkReleaseTextureSurface(producerOwnsTexture = false))
+        assertFalse(shouldFrameworkReleaseTextureSurface(producerOwnsTexture = true))
+    }
+
+    @Test
     fun processLeaseClearsOnlyAfterEveryTrackedProducerExits() {
         val firstRelease = CountDownLatch(1)
         val secondRelease = CountDownLatch(1)

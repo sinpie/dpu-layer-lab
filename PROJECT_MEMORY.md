@@ -3,15 +3,15 @@
 이 문서는 DPULayerTest의 장기 설계 맥락을 보존하는 canonical project memory입니다.
 구현을 바꾸면 코드, test, `README.md`, 이 문서를 함께 갱신합니다.
 
-현재 release version은 `20260724_111816`(`versionCode 3`), debug version은
-`20260724_111816-debug`이며 `yyyyMMdd_HHmmss`는 KST build 시각이다. Launcher와
+현재 release version은 `20260725_090252`(`versionCode 4`), debug version은
+`20260725_090252-debug`이며 `yyyyMMdd_HHmmss`는 KST build 시각이다. Launcher와
 Gradle project 표시 이름은 `DPULayerTest`다.
-release tag는 `v20260724_111816`이다. Canonical GitHub
+release tag는 `v20260725_090252`이다. Canonical GitHub
 저장소는 `sinpie/dpu-layer-lab`이며, 기존 제품 통합과 report consumer를 위해 package
 `com.example.dpulayerlab`, automation action/component, `dpu-layer-lab-` report prefix,
 Soong module/APK 이름 `DpuLayerLab`은 stable compatibility identifier로 유지한다.
-Release asset 이름은 `DPULayerTest-20260724_111816-debug.apk`,
-`DPULayerTest-20260724_111816-release-unsigned.apk`, `SHA256SUMS.txt`다. Unsigned
+Release asset 이름은 `DPULayerTest-20260725_090252-debug.apk`,
+`DPULayerTest-20260725_090252-release-unsigned.apk`, `SHA256SUMS.txt`다. Unsigned
 release는 secure product signing pipeline 입력이며 최종 설치 APK가 아니고 platform
 key/certificate/keystore/token은 저장소나 release에 두지 않는다.
 Android Studio project는 Gradle wrapper를 authority로 사용한다. AGP 8.12.2 때문에
@@ -133,7 +133,31 @@ signing과 분리된 unsigned 산출물만 만든다.
     강도·부하/조건은 같은 facet 안에서 OR, facet 사이에서 AND로 결합한다. Filter
     결과는 catalog 순서로 queue에 append/replace하고, queue는 중복과 명시적 이동을
     보존하되 복원된 unknown ID는 실행 index를 만들기 전에 제거한다. Repeat는 1~10,
-    expanded plan은 40 run 상한이다.
+    expanded plan은 40 run 상한이다. DPU 저→고 burst와 HWC DEVICE/CLIENT 목적도
+    phase의 typed control/expectation으로 분류하며 이름이나 tag에서 실행 의미를
+    추론하지 않는다.
+16. **성능 정책 변경은 typed v3 Battery Saver lease로 제한한다.** Portable app이나
+    platform signing만으로 전역 power policy 접근을 가정하지 않는다. API v3 broker가
+    있으면 BEGIN 전 원래 Battery Saver를 capture하고 10초 lease를 2초 cadence로
+    renew하며 death/expiry/END에서 원래 상태로 exact restore한다. 원래 Saver가 켜져
+    있었다면 임시 해제 중에도 power-save safety envelope를 유지한다. Broker가 없고
+    Saver가 이미 꺼진 경우만 app-only monitor로 실행한다. Thermal/low-memory 보호는
+    비활성화하지 않고, Doze/device-idle은 강제 해제하지 않으며, DVFS/governor/frequency
+    write나 lock은 하지 않는다.
+17. **장기 자원에는 명시적 owner와 cleanup 증거가 필요하다.** Activity보다 오래 살 수
+    있는 monitor/vendor/load cleanup은 application context 또는 Activity-free callback만
+    보유한다. Renderer container, receiver, coroutine, worker, codec/EGL/Surface,
+    descriptor, Binder session은 token/ticket/lease로 소유권을 나타내고 terminal
+    acknowledgment 전에는 다음 owner를 허용하지 않는다. 순간 부하 응답성은 hot path의
+    재할당이 아니라 budget 안의 prewarm·buffer 재사용·fixed-period/latest-wins 제어로
+    얻는다. Decoder callback gate를 native cleanup보다 먼저 닫고 duplicate
+    FD/Extractor를 codec보다 먼저 해제한다. Pinned master descriptor의 bounded close가
+    실패하면 process-sticky로 다음 selected-media plan을 막는다. Memory copy byte
+    accounting은 block마다가 아니라 bounded burst당 한 번 publish한다. Renderer
+    topology는 child 생성/add/control 전체가 성공한 뒤에만 publish하고 partial/OOM
+    실패는 callback detach → 전체 stop request → shared bounded deadline 순서로
+    rollback한다. 네이티브 Canvas/EGL call을 가로질러 capture된 completion token도
+    relay update/disable에서 callback을 분리해 Activity/controller를 보유하지 않는다.
 
 ## 반드시 유지할 불변식
 
@@ -167,19 +191,49 @@ signing과 분리된 unsigned 산출물만 만든다.
 - 비절전 envelope로 실행 중 Battery Saver가 새로 켜지면 이미 승인한 envelope를
   재사용하지 않고 `SAFETY_ENVELOPE_CHANGED`로 plan을 중단한다. 후속 start는 현재
   Battery Saver 상태를 다시 capture해 처음부터 검증한다.
+- Performance-policy BEGIN 전에 원래 Battery Saver 상태를 별도로 보존한다. 원래
+  Saver가 켜져 있었다면 broker가 임시로 꺼도 power-save cap을 유지한다. API v3는
+  `DISABLE_BATTERY_SAVER`만 허용하고 10초 bounded lease/2초 renew, client death,
+  expiry와 idempotent END에서 exact prior-state restore를 요구한다. Restore 미확인,
+  stale command, service session 변경 또는 renewal/health 실패는 fail-closed이며
+  다음 plan을 차단한다. 마지막 scenario report는 plan-wide END 뒤 원자적으로 다시
+  발행해 restore 성공/실패와 late retry를 보존하고, 최초 cleanup 실패 판정을 성공으로
+  덮지 않는다. 같은 session의 더 높은 command가 모두 END retry인 경우 이미 in-flight인
+  이전 END의 exact acknowledgment는 restore latch를 충족할 수 있지만, controller는
+  renewal 실제 종료와 직접 읽은 Saver의 original-state 일치까지 확인한 뒤에만 owner를
+  해제한다. Plan-wide restore 실패는 앞서 발행한 scenario 결과도 `ABORTED`로
+  무효화하고 report path를 철회한다.
+- Battery Saver는 system-wide policy다. Provider는 이를 client별 독립 상태로 다루지
+  않고 user/정책 scope 전체에서 single active lease로 직렬화하거나, 하나의 original
+  baseline과 active refcount를 공유해 마지막 lease 종료/death/expiry에서만 복구한다.
+  두 번째 BEGIN이 이미 임시 해제된 상태를 새 baseline으로 저장해서는 안 된다.
+- 앱 선제 thermal `SEVERE` derating은 사용자 선택형이며 기본 OFF다. 설정은 plan 시작
+  시 immutable snapshot으로 고정하고 외부 Intent가 별도 extra로 바꿀 수 없다. OFF이면
+  SEVERE에서도 앱 setpoint를 유지하되 Android/kernel thermal mitigation은 그대로
+  둔다. thermal `CRITICAL` abort와 low-memory/local-worker/power-display-isolation
+  fail-safe는 선택 설정과 관계없이 performance isolation 중에도 유지한다.
+  Doze/device-idle은 typed 제어 계약이 없으므로 강제 해제하지 않고 active이면
+  start를 거부하거나 run을 중단한다. DPU/GPU/CPU DVFS, devfreq governor와 frequency는
+  write/lock하지 않는다.
 - 실행 중 display ID 또는 정규화한 physical pixel dimensions가 달라지면
   `SAFETY_ENVELOPE_CHANGED`로 중단한다. 같은 ID/physical dimensions의 축 교환은
   graphics envelope를 바꾸지 않는다.
-- thermal `SEVERE` 이후의 layer/FPS/Hz/workload derating은 다음 phase에서 원래
-  setpoint로 되돌아가지 않는다. 기존 generated/NPU workload의 ordered zero 확인,
-  reduced workload의 ticket/acknowledgment, display 감속 acknowledgment 순서 중
-  하나라도 확인되지 않으면 `THERMAL_DERATE_FAILED`로 중단한다.
+- 선택형 선제 감속이 ON인 plan에서 thermal `SEVERE` 이후의
+  layer/FPS/Hz/workload derating은 다음 phase에서 원래 setpoint로 되돌아가지 않는다.
+  기존 generated/NPU workload의 ordered zero 확인, reduced workload의
+  ticket/acknowledgment, display 감속 acknowledgment 순서 중 하나라도 확인되지 않으면
+  `THERMAL_DERATE_FAILED`로 중단한다.
 - thermal `CRITICAL` 이상과 `ActivityManager.MemoryInfo.lowMemory` 감지는 run을
   중단한다.
 - 정상/중단/예외 시 CPU·memory worker, codec, Surface, GL, NPU, compression request,
   wake flag를 해제한다. Activity lifecycle close는 renderer teardown을 동기 증명할 수
   없으므로 compression reset을 호출하지 않고, 비선형 active/unknown 상태만 sticky
   recovery latch로 넘긴다.
+- Activity 수명보다 긴 backend task/receiver가 Activity나 inner callback을 강하게
+  보유하지 않게 한다. Callback은 unregister/close 전에 detach하고 application context를
+  사용하며, unregister·Job join·thread/process termination·descriptor close 중 하나라도
+  미확인이면 cleanup coordinator가 다음 controller/run을 차단한다. Timeout이나 두 번째
+  close 호출을 첫 cleanup 성공의 증거로 만들지 않는다.
 - CPU/memory loop는 fixed period, bounded batch/buffer/worker count와 cancellation을
   유지한다. NPU의 reflection/Binder 제어는 bounded queue와 latest-wins를 유지해 phase
   변경이 오래된 request backlog 뒤에 갇히지 않게 한다.
@@ -248,16 +302,41 @@ signing과 분리된 unsigned 산출물만 만든다.
   sticky teardown failure로 만들고 후속 plan을 차단한다. 명시적으로 제거된 child view는
   늦은 Surface/Texture lifecycle callback으로 producer를 재시작할 수 없다. Teardown
   failure는 active producer relay에 결합된 generation으로만 귀속하며, disabled relay의
-  늦은 callback이 이후 generation의 sticky failure를 만들 수 없다.
+  늦은 callback이 이후 generation의 sticky failure를 만들 수 없다. Texture Canvas
+  loop가 시작된 뒤의 `Surface` wrapper와 backing `SurfaceTexture`는 worker가 실제
+  종료되는 `finally`에서 release하며, 16 ms timeout을 본 UI/framework가 native
+  lock/unlock 중인 producer를 먼저 해제하지 않는다.
 - exact underrun은 warm-up 뒤 baseline을 잡은 monotonic vendor/kernel counter에서만
   만든다. Baseline은 직렬화된 fresh sample barrier로 획득하고 run generation 이전의
   in-flight sample은 다음 항목에 귀속하지 않는다. source/quality가 바뀌거나 값이
   reset/regress하면 연속성을 무효화한다.
 - 정상 verdict를 계산하기 전에 physical producer teardown barrier 뒤의 serialized
   fresh terminal counter sample을 수집한다. Terminal/periodic sample 실패는 telemetry
-  gap으로 exact continuity를 무효화하고, 5초 stale은 run도 중단한다. Source/quality
+  gap으로 exact continuity를 무효화한다. Sample evidence timestamp는 모든 counter와
+  상태 read의 완료 시각이고 CPU delta interval 시작과 분리한다. 마지막 완료 evidence가
+  5초 stale이면 run을 중단하되, 이미 single-flight lane에 수락된 sample은 4초 operation
+  timeout과 다음 500 ms watchdog tick까지의 bounded deadline만 보호한다. Source/quality
   변경 또는 reset/regress도 continuity를 무효화하며, 신뢰할 delta가 없으면
   source/quality도 `N/A`/`UNAVAILABLE`로 기록한다.
+- SystemMonitor 생성은 Kernel sensor → SurfaceFlinger shared-lane lease → shared vendor
+  bridge → local sample lane 순서의 transaction이다. Partial construction 실패는
+  SystemMonitor가 실제로 소유한 SurfaceFlinger lease를 bounded LIFO rollback하고,
+  shared VendorBridge의 소유자인 LoadManager 정리는 controller-level transaction에
+  맡긴다. 종료는 local telemetry lane의 실제 worker 완료를 먼저 확인한 뒤
+  LoadManager/NPU를 닫고, SurfaceFlinger와 vendor lane을 닫는다. Local worker 종료를
+  확인하지 못하면 그 worker가 참조할 수 있는 LoadManager/vendor를 닫지 않고 process
+  cleanup gate를 sticky failure로 유지한다. SurfaceFlinger lane의 shutdown budget은
+  child process의 두 번의 bounded wait 합보다 completion margin만큼 커야 한다.
+- 주기 monitor/watchdog는 두 Activity-free completion registration과 두 LAZY Job을
+  transactional하게 생성·publish·start한 뒤에만 setup을 commit한다. 두 번째 Job
+  construction/start를 포함한 partial failure는 이미 만든 모든 Job을 cancel하고, 각
+  ticket은 setup failure와 해당 Job의 실제 completion이 모두 관측된 뒤에만 끝낸다.
+  Callback attach 자체가 실패해 실제 completion을 증명할 수 없으면 ticket을 열지 않아
+  cleanup coordinator timeout이 sticky failure를 만든다. OOM/ThreadDeath를 포함한
+  fatal `Error`는 같은 rollback을 시도·기록한 뒤 원래 error를 rethrow한다. Pair는 두
+  Job 모두 active일 때만 재사용하고 한쪽의 unexpected completion은 sibling cancel,
+  active run abort와 process-sticky lifecycle failure를 만든다. Pause/resume 재시작은
+  두 exact identity가 completion callback에서 해제된 뒤 한 번만 post한다.
 - exact 양의 delta는 관찰된 증거로 보존하되, delta 0은 baseline 뒤 유효 sample과
   끝까지 유지된 연속성이 있을 때만 `CLEAN` 근거가 된다.
 - 신뢰 가능한 exact delta가 있으면 verdict는 exact를 우선한다. Exact 0과 proxy 증가가
@@ -271,6 +350,61 @@ signing과 분리된 unsigned 산출물만 만든다.
 - CPU/memory/generated traffic/DPU/GPU/bus/produced FPS/HWC DEVICE·CLIENT peak는
   유효 범위와 동일 source/quality가 유지된 sample에서만 집계한다. Provenance가 바뀌면
   서로 다른 source의 값을 합치지 않고 `N/A`로 둔다.
+- SurfaceFlinger composition dump는 전체 telemetry와 독립된 completion
+  monotonic timestamp/age를 보존한다. Dashboard/idle의 `PERIODIC` policy에서만 3개
+  telemetry snapshot마다 bounded probe한다. Active run은 periodic/typed 모두
+  SurfaceFlinger child process를 만들지 않는다. Typed boundary는 같은 현재 service
+  session의 완전하고 fresh한 vendor DEVICE/CLIENT 원자 쌍만 인정하며, pair 부재,
+  timeout/partial pair 또는 session 변경은 cache나 calibration fallback으로 보완하지
+  않고 `N/A`로 유지한다. 2.5초를 넘은 cached
+  DEVICE/CLIENT/HWC·GPU miss 값은 새 telemetry 시각으로 다시 찍지 않고 unavailable
+  gap으로 투영한다. CPU utilization도
+  `HardwarePropertiesManager`↔`/proc/stat` source 전환이나 read gap에서 기존 baseline을
+  버리고 해당 interval을 `N/A`로 둔 뒤 같은 source의 다음 interval부터 계산한다.
+  SurfaceFlinger parser가 앱 layer는 찾았지만 모든 layer를 DEVICE 또는 CLIENT 중
+  하나로 유일하게 분류하지 못하면 부분 count나 0을 만들지 않고 두 count 모두
+  unavailable로 둔다.
+- HWC DEVICE/CLIENT는 같은 vendor snapshot 또는 같은 SurfaceFlinger dump의 완전한
+  원자 쌍으로만 투영한다. Fresh vendor 쌍을 우선하고, 한쪽이라도 없거나 invalid이면
+  SurfaceFlinger fallback은 Dashboard/idle `PERIODIC` 또는 plan-start
+  `CALIBRATION_ONESHOT` policy에서만 허용한다. Active run에서는 서로 다른
+  source/boundary의 한쪽씩을 합치거나 SurfaceFlinger로 fallback하지 않는다. 선택 쌍의
+  completion timestamp/age를 sample/report에 보존하며 2.5초를 넘으면 두 값 모두
+  unavailable이다. Typed HWC expectation phase는 STEP만 허용하고 target topology와
+  첫 buffer acknowledgment 뒤 일반 cadence/cache를 우회한 같은 current-session의
+  fresh vendor probe를 사용한다.
+  `DEVICE_ONLY`는 같은 snapshot의 DEVICE>0·CLIENT=0을 한 번, `CLIENT_REQUIRED`는
+  서로 다른 fresh sample 2회에서 CLIENT>0을 요구하며 evidence 부재·stale·불일치는
+  `INCONCLUSIVE`다.
+- Typed HWC expectation은 관측 대상 target의 layer topology, producer FPS, display
+  pacing, GL producer와 GPU pressure를 safety clamp 뒤에도 그대로 보존해야 한다.
+  하나라도 바뀌면 다른 실험으로 축소하지 않고 preflight에서 거부한다. 3초
+  first-buffer readiness, 최대 4초의 pre-target periodic sample mutex drain, probe당
+  4초 bounded telemetry와 post-target 관측 tick을 포함하기 위해 `DEVICE_ONLY`
+  effective duration은 최소 12초, distinct sample 2회가 필요한 `CLIENT_REQUIRED`는
+  최소 16초다. Catalog의 DEVICE baseline/burst/release는 12초,
+  CLIENT_REQUIRED peak는 16초다.
+- Typed HWC target arm부터 forced evidence batch 종료까지 periodic telemetry는
+  latest-wins try-lock/drop으로 동작해 mutex waiter backlog를 만들지 않는다. 필요한
+  forced sample은 하나의 serialized ownership에서 연속 수집하되 각 sample 사이에
+  cancellation, thermal contract, fresh producer count/topology revision을 재검증한다.
+  Forced sample은 전체 safety/exact telemetry sample이므로 이 구간의 continuity를
+  대체한다. 모든 terminal/cancel/error/phase-finally 경로는 identity-matched priority
+  owner를 해제한다.
+- START plan은 첫 scenario 전에 전체 queue/repeat가 공유하는 HWC capacity 관측을 한
+  번만 수행한다. Safety-approved 최대 20L/30fps opaque RGB tile topology의 모든 first
+  buffer를 확인하고 100ms 안정화한 뒤 fresh DEVICE/CLIENT 원자 쌍을 한 번 읽는다.
+  불완전하면 retry 없이 N/A다. Producer/load zero, teardown, 3초 settle 뒤 기존 1L
+  scenario warm-up과 fresh baseline을 시작해 관측 traffic/frame/counter를 run evidence에서
+  제외한다. 결과는 matching topology의 advisory boundary일 뿐 universal maximum 또는
+  ScenarioSafetyPolicy cap이 아니다. logcat/임의 sysfs·debugfs plane 탐색은 금지한다.
+- Active phase는 SurfaceFlinger child를 생성하지 않는다. Typed boundary도 fresh vendor
+  pair만 사용하고 없으면 INCONCLUSIVE다. Plan calibration의 SF cache를 phase evidence로
+  재사용하지 않으며 untyped active sweep도 vendor pair가 없으면 N/A를 보존한다.
+- 실행 HUD의 typed HWC 상태는 동일 source·quality·timestamp이고 2.5초 freshness를
+  만족한 현재 pair만 `RAW MATCH/WAIT`로 표시하며 그 밖은 `RAW N/A`다. 이는 target
+  readiness, distinct sample 수와 cross-phase delta를 확인하는 controller verdict와
+  별개인 보조 상태다.
 - missed frame, HWC/GPU miss, producer stall은 proxy이며 exact DPU underrun으로
   승격하지 않는다.
 - NPU adapter가 없으면 `UNSUPPORTED`이며 CPU fallback을 NPU로 표시하지 않는다.
@@ -312,17 +446,19 @@ signing과 분리된 unsigned 산출물만 만든다.
 
 ## 현재 구현
 
-- DPULayerTest `20260724_111816` release / `20260724_111816-debug` debug
+- DPULayerTest `20260725_090252` release / `20260725_090252-debug` debug
   launcher/Gradle project, 화면/HUD/report build version과 stable
   `com.example.dpulayerlab`/`DpuLayerLab` 제품 통합 identifier
 - Compose 기반 scenario browser, system dashboard, running HUD, result 화면. 실행
   header의 STOP은 compact/landscape에서도 상단에 유지한다.
-- 22개 catalog preset 및 custom phase. Fixed-topology resource isolation,
+- 25개 catalog preset 및 custom phase. 4L DEVICE candidate/CLIENT plane-overflow의 typed
+  HWC 관측 probe와 cross-load 없는 repeated DPU step shock, fixed-topology resource isolation,
   instant isolated contention, continuous cross-load ramp, paired mid-load reference,
   backend-only composition pivot과 다변수 adaptive hunt의 용도를 구분한다.
-- 카테고리/변화 파형/예상 강도/부하·조건의 OR-within/AND-across facet filter,
-  filtered append/replace, 중복·이동이 가능한 ordered queue, restored unknown-ID
-  sanitize, repeat 1~10과 expanded 40-run cap
+- Typed DPU burst/DEVICE-only/CLIENT-required 목적 quick filter와 접힌 고급
+  카테고리/변화 파형/예상 강도/부하·조건 filter. 같은 행 OR, 목적을 포함한 서로 다른
+  행 AND를 유지하며 filtered append/replace, 중복·이동이 가능한 ordered queue,
+  restored unknown-ID sanitize, repeat 1~10과 expanded 40-run cap을 적용한다.
 - 독립 Surface, mixed Surface/Texture, flattened RGBA, app-owned EGL stress layer
 - scroll/zoom/pan/rotate/parallax/storm과 physical HWC 변경으로 오해하지 않는
   View/client Z-order proxy animation
@@ -351,6 +487,46 @@ signing과 분리된 unsigned 산출물만 만든다.
   layer/DPU/CPU/GPU 숫자·그래프와 linear full-buffer 예상 DPU read/producer write
   traffic을 표시한다. Gauge source/quality를 노출하고 provenance/unavailable 경계에
   graph gap을 둔다.
+- Test plan은 Window token으로 소유한 immersive session에서만 실행한다. status와
+  navigation bar가 모두 invisible이라는 Insets acknowledgment 전에는 producer를
+  게시하지 않고 queue/loop·terminal sample·teardown까지 유지한다. 최초 hide 전이는
+  허용하지만 확인 뒤 bar visibility 또는 session 획득 뒤 focus loss는 측정 오염
+  event로 fail-closed 중단한다. Multi-window/PiP 진입은 시작 전·실행 중 모두
+  거부하고 모든 종료 경로에서 token-safe하게 bar를
+  복구한다. `show()` 반환만 복구 성공으로 보지 않고 원래 status/navigation visibility
+  mask의 Insets acknowledgment까지 token과 process-wide lease를 유지한다. Hide가
+  부분 실패한 경우에도 cleanup token을 controller로 넘기며, 복구 미확인 상태에서는
+  새 plan을 차단한다. 재생성된 Activity의 local IDLE Window도 이전 process lease가
+  active이면 system bar hide를 유지하고 matching release와 visible Insets 확인 뒤에만
+  일반 UI를 복구한다. Foreign Window hide는 100 ms 간격의 4회 verification/attempt로
+  제한하고, 끝내 확인되지 않으면 원래 lease owner에 fail-closed 오염 신호를 보내며
+  START를 계속 차단한다. Owner Activity close는 matching failure callback만 분리해
+  파괴된 Activity를 보존하지 않되 sticky process lease는 해제하지 않는다. HUD를 위한
+  앱 client target은 제거 대상이 아니다.
+- GPU kernel probe는 path별 encoding/unit을 고정한다. KGSL `gpubusy`는 누적 counter가
+  아닌 window busy/total이다. Exynos Xclipse(AMD RDNA)는 DRM
+  `card0/device/gpu_busy_percent`, legacy Mali utilization과 MediaTek `gpu_loading`은
+  direct percent다. GED triplet/indexed-kHz는 explicit typed path에서만 허용하고
+  debugfs를 기본 후보로 탐색하지 않는다. Explicit probe 실패는 default fallback으로
+  숨기지 않으며 read gap은 cumulative baseline을 무효화한다. Xclipse/GED/Mali
+  architecture-specific 후보는 공통 `/sys/kernel/gpu/gpu_busy`보다 먼저 검사하고,
+  legacy scalar/cumulative 실제 해석은 provenance에 포함한다.
+- Vendor telemetry API v2는 기존 AIDL transaction 뒤에 GPU utilization, GPU frequency
+  Hz, DPU frequency Hz getter를 append한다. Client는 `apiVersion >= 2`에서만 호출하고
+  finite 0~100%/0~20 GHz를 재검증한 뒤 vendor HW counter를 kernel 값보다 우선한다.
+  Optional v2 호출은 v1/exact-counter lane과 분리된 no-backlog lane 및 하나의 전체
+  deadline을 사용한다. 개별 실패는 같은 session의 v1 값을 지우지 않되 해당 v2 값만
+  unavailable로 만들고, session 변경이면 snapshot 전체를 폐기한다.
+  세 SoC 계열에 공통인 안정적 DPU busy sysfs가 없으므로 HWC/GPU/traffic proxy를 DPU
+  utilization로 표시하지 않는다.
+- Vendor API v3의 Battery Saver performance isolation. BEGIN 전 original state를
+  safety input과 restore authority로 보존하고, bounded lease/renewal과 service identity를
+  감시한다. Active session을 잃거나 Saver가 다시 켜지면 fail-closed 중단하고,
+  RESTORING 동안 원래 ON 상태가 돌아오는 것은 self-abort로 오인하지 않는다. END의
+  exact restore가 확인되기 전에는 process cleanup gate가 후속 controller/run을 막는다.
+- Function-level pure policy/state/ownership helper test 뒤 controller 전체 흐름의
+  partial start, cancellation, Activity 재생성, backend termination과 restore ordering을
+  조합하는 검증 구조
 - stable-provenance DPU/GPU/bus/produced FPS/HWC DEVICE·CLIENT result peak
 - Android service, kernel allowlist, SurfaceFlinger parser, vendor AIDL 계측
 - post-warmup baseline/continuity가 적용된 exact/proxy verdict
@@ -387,6 +563,10 @@ signing과 분리된 unsigned 산출물만 만든다.
 - codec capability는 sustained 또는 concurrent decode 가능성을 보장하지 않는다.
 - requested display Hz는 실제 mode 전환을 보장하지 않는다.
 - DPU frequency counter는 read-only이고, settle 구간이 실제 clock 하강을 보장하지 않는다.
+- API v3 provider reference implementation은 저장소에 없다. 일반 APK 또는 platform
+  signing만으로 Battery Saver policy를 바꿀 수 없으며, broker가 없을 때 앱은 이미
+  Saver-off인 상태를 감시할 뿐이다. Doze/device-idle을 강제로 해제하는 typed 계약도
+  현재 없다.
 - report에 build fingerprint와 선택 media의 이름/metadata가 포함될 수 있다.
 - `dpu-layer-lab-` prefix와 앱 파일명 형식이 확인된 완료 report만 최근 200개로
   process-serialized best-effort retention한다. 방금 발행한 파일은 보호하고 `.part`와
@@ -398,7 +578,8 @@ signing과 분리된 unsigned 산출물만 만든다.
 우선순위가 높은 후속 작업:
 
 1. 실제 target BSP에서 platform-signed release 및 privapp permission 검증
-2. vendor broker reference implementation과 VINTF-stable AIDL/version/hash 정책
+2. API v3의 system-wide Battery Saver arbitration과 exact prior-state restore를 포함한
+   vendor broker reference implementation 및 VINTF-stable AIDL/version/hash 정책
 3. broker의 NPU/SBWC lease token, heartbeat, client-death/timeout watchdog
 4. HWC composition snapshot과 DPU/DDR counter의 display/sampling scope 명문화
 5. 4K/8K/P010/SBWC 자산 manifest와 decoder output/allocation 검증
@@ -421,8 +602,9 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 .\gradlew.bat assembleRelease
 ```
 
-`20260724_111816`은 host unit test 356개, `lintDebug` error 0개(도구/의존성 업데이트
-warning 6개), `assembleDebug`, `assembleRelease`를 통과했습니다. 이번 release에서는
+`20260725_090252`은 41개 suite의 host unit test 575개를 실패·오류·skip 없이
+통과했고, `lintDebug` error 0개(버전/도구 업데이트 알림 warning 6개),
+`assembleDebug`, `assembleRelease`를 통과했습니다. 이번 release에서는
 emulator/실기기 stress를 자동 실행하지 않았습니다. Exact DPU/SBWC/HWC/NPU 판정은
 host 회귀에 포함되지 않으며 platform-signed target BSP에서 별도로 검증해야 합니다.
 
@@ -445,9 +627,21 @@ host 회귀에 포함되지 않으며 platform-signed target BSP에서 별도로
   GPU-backed producer가 끝까지 유지되는지
 - layer clamp 시 logical/producer count와 report event 일치
 - low-RAM, power-save, `MemoryInfo.lowMemory`, thermal SEVERE/CRITICAL state transition
-- runtime display identity/physical-size 변경 중단과 thermal ordered zero → reduced
-  workload acknowledgment → display acknowledgment 중 하나라도 실패할 때의 중단
+- Battery Saver original ON/OFF 각각의 BEGIN/renew/death/expiry/END와 exact restore,
+  stale command/late BEGIN, service replacement, renewal timeout, overlapping client의
+  global arbitration. 원래 ON 상태가 임시 해제돼도 power-save cap이 유지되는지
+- Broker가 없을 때 Saver OFF만 monitor-only로 허용되고 Saver ON, Doze/device-idle,
+  non-interactive는 producer 전에 거부되는지
+- 앱 선제 thermal SEVERE derating이 plan-start immutable 옵션/기본 OFF인지. OFF에서는
+  앱 setpoint를 유지하고 Android/kernel mitigation을 방해하지 않으며, ON에서만 시작 전
+  SEVERE 거부와 ordered zero → reduced workload acknowledgment → display
+  acknowledgment를 적용하고 하나라도 실패하면 중단하는지
+- thermal CRITICAL, low-memory, local-worker failure와 power/display/SystemUI 격리
+  무결성 fail-safe가 옵션과 무관하게 항상 중단하는지
 - phase 전환, 사용자 stop, exception, Activity destroy 뒤 worker/codec/NPU 해제
+- 함수 단위로 invalid/경계 입력, state transition, idempotent close와 owner token을
+  검증한 뒤 전체 흐름의 partial start·STOP/cancel·Activity 재생성·receiver unregister
+  실패·Job/thread 종료 지연이 Activity를 보존하거나 다음 run과 겹치지 않는지
 - 양의 NPU command ticket/acknowledgment와 active health loss가 fail-closed event를
   만들고 측정 성공으로 남지 않는지
 - local worker Throwable/active interrupt가 first-wins latch와

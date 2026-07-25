@@ -26,7 +26,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
@@ -65,8 +65,8 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.RememberObserver
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -100,6 +100,7 @@ import com.example.dpulayerlab.engine.consistentGaugePeak
 import com.example.dpulayerlab.model.BufferSize
 import com.example.dpulayerlab.model.DecoderLinearReference
 import com.example.dpulayerlab.model.Gauge
+import com.example.dpulayerlab.model.HwcCompositionExpectation
 import com.example.dpulayerlab.model.LayerBackend
 import com.example.dpulayerlab.model.LayerTrafficEstimate
 import com.example.dpulayerlab.model.LayerTrafficEstimator
@@ -135,6 +136,7 @@ import com.example.dpulayerlab.model.TransitionMode
 import com.example.dpulayerlab.model.TransitionSpec
 import com.example.dpulayerlab.monitor.CapabilityScanner
 import com.example.dpulayerlab.monitor.CapabilitySnapshot
+import com.example.dpulayerlab.monitor.HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS
 import com.example.dpulayerlab.render.LayerStageView
 import com.example.dpulayerlab.render.ProducerFrameCallback
 import kotlinx.coroutines.Dispatchers
@@ -180,6 +182,56 @@ private data class ScenarioOverview(
     val intensityLabel: String,
     val phaseSequence: String,
 )
+
+internal enum class CatalogPurpose(
+    val title: String,
+    val eyebrow: String,
+    val validationBadge: String,
+    val expectedChange: String,
+    val verification: String,
+) {
+    DPU_BURST(
+        title = "급격한 DPU 부하",
+        eyebrow = "LOW → STEP",
+        validationBadge = "DPU STEP 검증",
+        expectedChange = "layer·FPS·Hz demand가 기준 구간에서 즉시 상승",
+        verification = "HUD DPU/traffic 응답과 exact underrun delta를 source·quality와 함께 확인",
+    ),
+    DEVICE_STABLE(
+        title = "DEVICE 후보 유지",
+        eyebrow = "HWC PLANE",
+        validationBadge = "DEVICE 유지 검증",
+        expectedChange = "DEVICE_ONLY 후보 phase에서 opaque 독립 Surface demand를 변화",
+        verification = "결과/보고서의 HWC DEVICE·CLIENT 추세와 producer fidelity를 확인",
+    ),
+    CLIENT_TRANSITION(
+        title = "CLIENT 전환 목표",
+        eyebrow = "COMPOSITION PIVOT",
+        validationBadge = "CLIENT 전환 검증",
+        expectedChange = "CLIENT_REQUIRED 검증 phase에 mixed/alpha/GL 압력 입력을 적용",
+        verification = "결과/보고서의 HWC D/C 변화와 GPU/DPU provenance를 함께 확인",
+    ),
+}
+
+internal data class ScenarioSelectionPreview(
+    val queueEntries: Int,
+    val uniqueScenarios: Int,
+    val duplicateEntries: Int,
+    val inputChange: String,
+    val compositionTarget: String,
+    val verification: String,
+)
+
+internal data class DashboardPurposeScenario(
+    val purpose: CatalogPurpose,
+    val scenario: ScenarioSpec,
+)
+
+internal enum class RawHwcExpectationState(val label: String) {
+    MATCH("RAW MATCH"),
+    WAIT("RAW WAIT"),
+    N_A("RAW N/A"),
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -455,6 +507,9 @@ private fun DashboardScreen(
     openCatalog: () -> Unit,
 ) {
     val telemetry = controller.telemetry
+    val purposeScenarios = remember {
+        dashboardPurposeScenarios(ScenarioCatalog.presets)
+    }
     LazyColumn(
         modifier = modifier
             .fillMaxSize()
@@ -481,15 +536,26 @@ private fun DashboardScreen(
             }
         }
         item {
-            Text("빠른 실행", style = MaterialTheme.typography.headlineMedium)
+            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text("목적별 빠른 실행", style = MaterialTheme.typography.headlineMedium)
+                Text(
+                    "typed catalog 목표를 대표하는 preset입니다. 실제 HWC 배정은 측정 결과로 판정합니다.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelLarge,
+                )
+            }
         }
         items(
-            ScenarioCatalog.presets.filter {
-                it.id in setOf("baseline-display-modes", "plane-staircase", "transform-storm")
-            },
-            key = { it.id },
-        ) { scenario ->
-            CompactScenarioCard(scenario) { controller.startScenario(scenario) }
+            purposeScenarios,
+            key = { it.purpose.name },
+        ) { entry ->
+            CompactScenarioCard(
+                scenario = entry.scenario,
+                purpose = entry.purpose,
+                running = controller.isRunning,
+            ) {
+                controller.startScenario(entry.scenario)
+            }
         }
         item {
             OutlinedButton(onClick = openCatalog, modifier = Modifier.fillMaxWidth()) {
@@ -757,6 +823,8 @@ private fun CatalogScreen(
     var patternKeys by rememberSaveable { mutableStateOf<List<String>>(arrayListOf()) }
     var loadBandKeys by rememberSaveable { mutableStateOf<List<String>>(arrayListOf()) }
     var conditionKeys by rememberSaveable { mutableStateOf<List<String>>(arrayListOf()) }
+    var purposeKey by rememberSaveable { mutableStateOf<String?>(null) }
+    var advancedFiltersExpanded by rememberSaveable { mutableStateOf(false) }
     val validCategoryKeys = remember(categoryKeys) {
         categoryKeys.retainKnownEnumKeys<ScenarioCategory>()
     }
@@ -769,11 +837,15 @@ private fun CatalogScreen(
     val validConditionKeys = remember(conditionKeys) {
         conditionKeys.retainKnownEnumKeys<ScenarioCondition>()
     }
-    LaunchedEffect(categoryKeys, patternKeys, loadBandKeys, conditionKeys) {
+    val validPurpose = remember(purposeKey) {
+        CatalogPurpose.entries.firstOrNull { it.name == purposeKey }
+    }
+    LaunchedEffect(categoryKeys, patternKeys, loadBandKeys, conditionKeys, purposeKey) {
         if (categoryKeys != validCategoryKeys) categoryKeys = validCategoryKeys
         if (patternKeys != validPatternKeys) patternKeys = validPatternKeys
         if (loadBandKeys != validLoadBandKeys) loadBandKeys = validLoadBandKeys
         if (conditionKeys != validConditionKeys) conditionKeys = validConditionKeys
+        if (purposeKey != null && validPurpose == null) purposeKey = null
     }
     val selectedCategories = remember(validCategoryKeys) {
         validCategoryKeys.toKnownEnumSet<ScenarioCategory>()
@@ -800,8 +872,16 @@ private fun CatalogScreen(
             conditions = selectedConditions,
         )
     }
-    val scenarios = remember(selectionFilter) {
+    val facetScenarios = remember(selectionFilter) {
         ScenarioClassifier.filter(ScenarioCatalog.presets, selectionFilter)
+    }
+    val scenarios = remember(facetScenarios, validPurpose) {
+        scenariosForCatalogPurpose(facetScenarios, validPurpose)
+    }
+    val purposeCounts = remember {
+        CatalogPurpose.entries.associateWith { purpose ->
+            scenariosForCatalogPurpose(ScenarioCatalog.presets, purpose).size
+        }
     }
     val selectedScenarios = remember(selectedScenarioIds) {
         selectedScenarioIds.mapNotNull(ScenarioCatalog::byId)
@@ -830,9 +910,29 @@ private fun CatalogScreen(
             }
         }
         item {
-            MediaSourceCard(controller.selectedMediaUri, selectMedia) {
-                controller.setMediaUri(null)
-            }
+            PurposeQuickStartCard(
+                activePurpose = validPurpose,
+                purposeCounts = purposeCounts,
+                resultCount = scenarios.size,
+                queueSize = selectedScenarioIds.size,
+                running = controller.isRunning,
+                selectPurpose = { purpose ->
+                    if (validPurpose == purpose) {
+                        purposeKey = null
+                    } else {
+                        purposeKey = purpose.name
+                        categoryKeys = arrayListOf()
+                        patternKeys = arrayListOf()
+                        loadBandKeys = arrayListOf()
+                        conditionKeys = arrayListOf()
+                    }
+                },
+                appendResults = { appendFiltered(scenarios.map { it.id }) },
+                replaceWithResults = { replaceWithFiltered(scenarios.map { it.id }) },
+            )
+        }
+        item {
+            RuntimeProtectionCard(controller)
         }
         item {
             QueuePlanCard(
@@ -850,7 +950,17 @@ private fun CatalogScreen(
             )
         }
         item {
+            MediaSourceCard(controller.selectedMediaUri, selectMedia) {
+                controller.setMediaUri(null)
+            }
+        }
+        item {
             CatalogFilterCard(
+                expanded = advancedFiltersExpanded,
+                toggleExpanded = {
+                    advancedFiltersExpanded = !advancedFiltersExpanded
+                },
+                selectedPurpose = validPurpose,
                 selectedCategoryKeys = validCategoryKeys.toSet(),
                 selectedPatternKeys = validPatternKeys.toSet(),
                 selectedLoadBandKeys = validLoadBandKeys.toSet(),
@@ -874,7 +984,9 @@ private fun CatalogScreen(
                 clearPatterns = { patternKeys = arrayListOf() },
                 clearLoadBands = { loadBandKeys = arrayListOf() },
                 clearConditions = { conditionKeys = arrayListOf() },
+                clearPurpose = { purposeKey = null },
                 clearAll = {
+                    purposeKey = null
                     categoryKeys = arrayListOf()
                     patternKeys = arrayListOf()
                     loadBandKeys = arrayListOf()
@@ -903,6 +1015,7 @@ private fun CatalogScreen(
                         )
                         TextButton(
                             onClick = {
+                                purposeKey = null
                                 categoryKeys = arrayListOf()
                                 patternKeys = arrayListOf()
                                 loadBandKeys = arrayListOf()
@@ -929,7 +1042,169 @@ private fun CatalogScreen(
 }
 
 @Composable
+private fun PurposeQuickStartCard(
+    activePurpose: CatalogPurpose?,
+    purposeCounts: Map<CatalogPurpose, Int>,
+    resultCount: Int,
+    queueSize: Int,
+    running: Boolean,
+    selectPurpose: (CatalogPurpose) -> Unit,
+    appendResults: () -> Unit,
+    replaceWithResults: () -> Unit,
+) {
+    val availableQueueSlots =
+        (ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS - queueSize).coerceAtLeast(0)
+    val appendCount = minOf(resultCount.coerceAtLeast(0), availableQueueSlots)
+    val replaceCount = minOf(
+        resultCount.coerceAtLeast(0),
+        ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS,
+    )
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        shape = RoundedCornerShape(22.dp),
+    ) {
+        Column(
+            Modifier.padding(vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(11.dp),
+        ) {
+            Column(
+                Modifier.padding(horizontal = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(3.dp),
+            ) {
+                Text("목적별 빠른 시작", style = MaterialTheme.typography.titleLarge)
+                Text(
+                    "먼저 관찰 목표를 고르세요. 선택 시 세부 facet은 초기화되고, 이후 " +
+                        "추가한 facet 행은 이 목적과 AND로 결합됩니다.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelLarge,
+                )
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp),
+                horizontalArrangement = Arrangement.spacedBy(9.dp),
+            ) {
+                CatalogPurpose.entries.forEach { purpose ->
+                    val selected = activePurpose == purpose
+                    Card(
+                        modifier = Modifier.width(272.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (selected) {
+                                MaterialTheme.colorScheme.primaryContainer
+                            } else {
+                                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.70f)
+                            },
+                        ),
+                        shape = RoundedCornerShape(18.dp),
+                    ) {
+                        Column(
+                            Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(7.dp),
+                        ) {
+                            Row(
+                                Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    purpose.eyebrow,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    fontWeight = FontWeight.Bold,
+                                )
+                                Text(
+                                    "${purposeCounts[purpose] ?: 0} presets",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            Text(purpose.title, style = MaterialTheme.typography.titleMedium)
+                            Surface(
+                                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.14f),
+                                shape = RoundedCornerShape(100.dp),
+                            ) {
+                                Text(
+                                    purpose.validationBadge,
+                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
+                                    color = MaterialTheme.colorScheme.primary,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.Bold,
+                                )
+                            }
+                            Text(
+                                "기대 · ${purpose.expectedChange}",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                style = MaterialTheme.typography.labelLarge,
+                                minLines = 2,
+                            )
+                            Text(
+                                "검증 · ${purpose.verification}",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                style = MaterialTheme.typography.labelMedium,
+                                minLines = 2,
+                            )
+                            OutlinedButton(
+                                onClick = { selectPurpose(purpose) },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text(if (selected) "목적 필터 해제" else "이 목적의 테스트 보기")
+                            }
+                        }
+                    }
+                }
+            }
+            if (activePurpose != null) {
+                HorizontalDivider(Modifier.padding(horizontal = 16.dp))
+                Column(
+                    Modifier.padding(horizontal = 16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        "${activePurpose.title} · 현재 facet까지 적용한 결과 ${resultCount}개",
+                        color = MaterialTheme.colorScheme.primary,
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        OutlinedButton(
+                            onClick = replaceWithResults,
+                            enabled = replaceCount > 0 && !running,
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp),
+                        ) {
+                            Text("큐로 교체 · $replaceCount")
+                        }
+                        Button(
+                            onClick = appendResults,
+                            enabled = appendCount > 0 && !running,
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp),
+                        ) {
+                            Text("뒤에 추가 · $appendCount")
+                        }
+                    }
+                    Text(
+                        "DEVICE/CLIENT는 구성 목표이며 판정값이 아닙니다. HWC D/C가 없으면 " +
+                            "성공으로 추정하지 않고 결과에 N/A로 남습니다.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun CatalogFilterCard(
+    expanded: Boolean,
+    toggleExpanded: () -> Unit,
+    selectedPurpose: CatalogPurpose?,
     selectedCategoryKeys: Set<String>,
     selectedPatternKeys: Set<String>,
     selectedLoadBandKeys: Set<String>,
@@ -945,6 +1220,7 @@ private fun CatalogFilterCard(
     clearPatterns: () -> Unit,
     clearLoadBands: () -> Unit,
     clearConditions: () -> Unit,
+    clearPurpose: () -> Unit,
     clearAll: () -> Unit,
     appendResults: () -> Unit,
     replaceWithResults: () -> Unit,
@@ -956,6 +1232,21 @@ private fun CatalogFilterCard(
         resultCount.coerceAtLeast(0),
         ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS,
     )
+    val hasActiveFilters =
+        selectedPurpose != null ||
+            selectedCategoryKeys.isNotEmpty() ||
+            selectedPatternKeys.isNotEmpty() ||
+            selectedLoadBandKeys.isNotEmpty() ||
+            selectedConditionKeys.isNotEmpty()
+    val activeFilterSummary =
+        (if (expanded) "현재 · " else "접힘 · ") +
+            advancedFilterSummary(
+                purpose = selectedPurpose,
+                categoryKeys = selectedCategoryKeys,
+                patternKeys = selectedPatternKeys,
+                loadBandKeys = selectedLoadBandKeys,
+                conditionKeys = selectedConditionKeys,
+            )
     Card(
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
@@ -966,46 +1257,101 @@ private fun CatalogFilterCard(
             Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(11.dp),
         ) {
-            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                Text("카테고리 · 부하 · 조건 조합", style = MaterialTheme.typography.titleLarge)
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Column(
+                    Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(3.dp),
+                ) {
+                    Text("고급 필터", style = MaterialTheme.typography.titleLarge)
+                    Text(
+                        activeFilterSummary,
+                        color = if (hasActiveFilters) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                        style = MaterialTheme.typography.labelLarge,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                OutlinedButton(onClick = toggleExpanded) {
+                    Text(if (expanded) "접기 ↑" else "펼치기 ↓")
+                }
+            }
+            if (expanded) {
                 Text(
-                    "같은 행은 OR, 서로 다른 행은 AND로 결합합니다. 결과 순서는 catalog와 같습니다.",
+                    "같은 행은 OR, 서로 다른 행은 AND로 결합합니다. 빠른 목적도 별도 AND " +
+                        "행이며 결과 순서는 catalog와 같습니다.",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     style = MaterialTheme.typography.labelLarge,
                 )
             }
-            FacetFilterRow(
-                title = "카테고리",
-                allLabel = "모든 카테고리",
-                items = ScenarioCategory.entries.map { it.name to it.label },
-                selectedKeys = selectedCategoryKeys,
-                clear = clearCategories,
-                toggle = toggleCategory,
-            )
-            FacetFilterRow(
-                title = "부하 변화",
-                allLabel = "모든 변화",
-                items = ScenarioChangePattern.entries.map { it.name to it.label },
-                selectedKeys = selectedPatternKeys,
-                clear = clearPatterns,
-                toggle = togglePattern,
-            )
-            FacetFilterRow(
-                title = "예상 강도",
-                allLabel = "모든 강도",
-                items = ScenarioLoadBand.entries.map { it.name to it.label },
-                selectedKeys = selectedLoadBandKeys,
-                clear = clearLoadBands,
-                toggle = toggleLoadBand,
-            )
-            FacetFilterRow(
-                title = "부하/조건",
-                allLabel = "모든 자원",
-                items = ScenarioCondition.entries.map { it.name to it.label },
-                selectedKeys = selectedConditionKeys,
-                clear = clearConditions,
-                toggle = toggleCondition,
-            )
+            if (selectedPurpose != null) {
+                Surface(
+                    color = MaterialTheme.colorScheme.primaryContainer,
+                    shape = RoundedCornerShape(14.dp),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 12.dp, end = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                "빠른 목적 · AND",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Text(
+                                selectedPurpose.title,
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        }
+                        TextButton(onClick = clearPurpose) { Text("해제") }
+                    }
+                }
+            }
+            if (expanded) {
+                FacetFilterRow(
+                    title = "카테고리",
+                    allLabel = "모든 카테고리",
+                    items = ScenarioCategory.entries.map { it.name to it.label },
+                    selectedKeys = selectedCategoryKeys,
+                    clear = clearCategories,
+                    toggle = toggleCategory,
+                )
+                FacetFilterRow(
+                    title = "부하 변화",
+                    allLabel = "모든 변화",
+                    items = ScenarioChangePattern.entries.map { it.name to it.label },
+                    selectedKeys = selectedPatternKeys,
+                    clear = clearPatterns,
+                    toggle = togglePattern,
+                )
+                FacetFilterRow(
+                    title = "예상 강도",
+                    allLabel = "모든 강도",
+                    items = ScenarioLoadBand.entries.map { it.name to it.label },
+                    selectedKeys = selectedLoadBandKeys,
+                    clear = clearLoadBands,
+                    toggle = toggleLoadBand,
+                )
+                FacetFilterRow(
+                    title = "부하/조건",
+                    allLabel = "모든 자원",
+                    items = ScenarioCondition.entries.map { it.name to it.label },
+                    selectedKeys = selectedConditionKeys,
+                    clear = clearConditions,
+                    toggle = toggleCondition,
+                )
+            }
             HorizontalDivider()
             Text(
                 "${resultCount}개 테스트 일치 · 예상 강도는 preset 비교용이며 HW 수용 한계가 아닙니다.",
@@ -1014,15 +1360,10 @@ private fun CatalogFilterCard(
             )
             TextButton(
                 onClick = clearAll,
-                enabled = (
-                    selectedCategoryKeys.isNotEmpty() ||
-                        selectedPatternKeys.isNotEmpty() ||
-                        selectedLoadBandKeys.isNotEmpty() ||
-                        selectedConditionKeys.isNotEmpty()
-                    ) && !running,
+                enabled = hasActiveFilters && !running,
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text("조합 필터 초기화")
+                Text("활성 필터 모두 초기화")
             }
             Row(
                 Modifier.fillMaxWidth(),
@@ -1114,6 +1455,9 @@ private fun QueuePlanCard(
     }
     val totalDurationMs = previewPlan.estimatedDurationMs
     val totalRuns = previewPlan.totalRuns
+    val selectionPreview = remember(selectedScenarios) {
+        scenarioSelectionPreview(selectedScenarios)
+    }
     val catalogIds = remember { ScenarioCatalog.presets.map { it.id } }
     val selectionMatchesCatalog = remember(selectedScenarios, catalogIds) {
         selectedScenarios.map { it.id } == catalogIds
@@ -1181,6 +1525,9 @@ private fun QueuePlanCard(
                     value = formatDuration(totalDurationMs),
                     modifier = Modifier.weight(1f),
                 )
+            }
+            if (selectedScenarios.isNotEmpty()) {
+                QueueSelectionPreviewCard(selectionPreview)
             }
             Text(
                 "실행 순서",
@@ -1326,6 +1673,51 @@ private fun QueuePlanCard(
 }
 
 @Composable
+private fun QueueSelectionPreviewCard(preview: ScenarioSelectionPreview) {
+    Surface(
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.78f),
+        shape = RoundedCornerShape(16.dp),
+    ) {
+        Column(
+            Modifier.padding(13.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                buildString {
+                    append("선택 요약 · ${preview.queueEntries}회 / ${preview.uniqueScenarios}종")
+                    if (preview.duplicateEntries > 0) {
+                        append(" · 중복 ${preview.duplicateEntries}회")
+                    }
+                },
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                "기대 입력 변화 · ${preview.inputChange}",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                "합성 목표 · ${preview.compositionTarget}",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                "검증 방법 · ${preview.verification}",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
+            )
+            Text(
+                "목표 구성은 실제 HWC 배정의 증거가 아닙니다. source/quality가 끊기거나 " +
+                    "unavailable이면 결과도 N/A로 해석합니다.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
 private fun MediaSourceCard(uri: android.net.Uri?, selectMedia: () -> Unit, clear: () -> Unit) {
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
@@ -1357,6 +1749,15 @@ private fun ScenarioCard(
     removeSelection: () -> Unit,
 ) {
     val overview = remember(scenario) { scenario.overview() }
+    val validationPreview = remember(scenario) {
+        scenarioSelectionPreview(listOf(scenario))
+    }
+    val hwcExpectations = remember(scenario) {
+        scenario.phases
+            .map(PhaseSpec::hwcCompositionExpectation)
+            .filter { it != HwcCompositionExpectation.NONE }
+            .distinct()
+    }
     val selected = selectedPositions.isNotEmpty()
     val cardShape = RoundedCornerShape(22.dp)
     Card(
@@ -1445,6 +1846,10 @@ private fun ScenarioCard(
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
             )
+            ScenarioValidationPreview(
+                preview = validationPreview,
+                hwcExpectations = hwcExpectations,
+            )
             Row(
                 modifier = Modifier.horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(7.dp),
@@ -1499,6 +1904,66 @@ private fun ScenarioCard(
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun ScenarioValidationPreview(
+    preview: ScenarioSelectionPreview,
+    hwcExpectations: List<HwcCompositionExpectation>,
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.44f),
+        shape = RoundedCornerShape(13.dp),
+    ) {
+        Column(
+            Modifier.padding(horizontal = 11.dp, vertical = 9.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                "실행 전 Preview",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
+                fontWeight = FontWeight.SemiBold,
+            )
+            if (hwcExpectations.isNotEmpty()) {
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    hwcExpectations.forEach { expectation ->
+                        Surface(
+                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.14f),
+                            shape = RoundedCornerShape(100.dp),
+                        ) {
+                            Text(
+                                expectation.validationBadge(),
+                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
+                                color = MaterialTheme.colorScheme.primary,
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                            )
+                        }
+                    }
+                }
+                Text(
+                    "실제 배치는 fresh HWC DEVICE/CLIENT 측정으로 판정합니다. 측정 N/A 또는 " +
+                        "source continuity 단절은 검증 성공이 아닙니다.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.tertiary,
+                )
+            }
+            Text(
+                "기대 · ${preview.inputChange} · ${preview.compositionTarget}",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                "확인 · ${preview.verification}",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }
@@ -1585,7 +2050,12 @@ private fun ScenarioIntensity(
 }
 
 @Composable
-private fun CompactScenarioCard(scenario: ScenarioSpec, run: () -> Unit) {
+private fun CompactScenarioCard(
+    scenario: ScenarioSpec,
+    purpose: CatalogPurpose,
+    running: Boolean,
+    run: () -> Unit,
+) {
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         shape = RoundedCornerShape(18.dp),
@@ -1605,6 +2075,12 @@ private fun CompactScenarioCard(scenario: ScenarioSpec, run: () -> Unit) {
                 Text("${scenario.maxLayers}L", fontWeight = FontWeight.Bold)
             }
             Column(Modifier.weight(1f)) {
+                Text(
+                    purpose.validationBadge,
+                    color = MaterialTheme.colorScheme.primary,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                )
                 Text(scenario.name, style = MaterialTheme.typography.titleMedium)
                 Text(
                     "${formatDuration(scenario.durationMs)} · ${scenario.maxHz.toInt()}Hz",
@@ -1612,7 +2088,11 @@ private fun CompactScenarioCard(scenario: ScenarioSpec, run: () -> Unit) {
                     style = MaterialTheme.typography.labelLarge,
                 )
             }
-            Button(onClick = run, contentPadding = PaddingValues(horizontal = 15.dp, vertical = 9.dp)) {
+            Button(
+                onClick = run,
+                enabled = !running,
+                contentPadding = PaddingValues(horizontal = 15.dp, vertical = 9.dp),
+            ) {
                 Text("RUN")
             }
         }
@@ -1667,7 +2147,13 @@ private fun BuilderScreen(controller: LabController, modifier: Modifier) {
                 EnumSelector("합성 경로", backend, LayerBackend.entries) { backend = it }
                 EnumSelector("Pixel route", route, PixelRoute.entries) { route = it }
                 EnumSelector("Buffer size", size, BufferSize.entries) { size = it }
-                EnumSelector("Motion", motion, MotionProfile.entries) { motion = it }
+                EnumSelector(
+                    "Motion",
+                    motion,
+                    MotionProfile.entries.filterNot {
+                        it == MotionProfile.CAPACITY_TILES
+                    },
+                ) { motion = it }
                 if (motion == MotionProfile.Z_ORDER_SWAP) {
                     Text(
                         "View translationZ 기반 client proxy입니다. physical Surface/HWC " +
@@ -1898,6 +2384,44 @@ private fun enumLabel(value: Any?): String = when (value) {
     else -> value.toString()
 }
 
+/**
+ * Owns the renderer-container token at the Compose commit boundary.
+ *
+ * The object itself may be constructed by `remember` during a composition that is later
+ * abandoned, so acquisition happens only from [onRemembered]. Both committed removal and the
+ * defensive abandoned path are idempotent.
+ */
+internal class RendererContainerRememberOwner(
+    private val attach: () -> Long,
+    private val dispose: (Long) -> Unit,
+) : RememberObserver {
+    private var attachedToken: Long? = null
+
+    override fun onRemembered() {
+        check(attachedToken == null) {
+            "renderer container owner remembered while already attached"
+        }
+        attachedToken = attach()
+    }
+
+    override fun onForgotten() {
+        disposeIfAttached()
+    }
+
+    override fun onAbandoned() {
+        disposeIfAttached()
+    }
+
+    private fun disposeIfAttached() {
+        val token = attachedToken ?: return
+        try {
+            dispose(token)
+        } finally {
+            attachedToken = null
+        }
+    }
+}
+
 @Composable
 private fun RunningScreen(controller: LabController) {
     val progress = controller.progress
@@ -1910,7 +2434,25 @@ private fun RunningScreen(controller: LabController) {
         -> true
         else -> false
     }
-    var stageView by remember { mutableStateOf<LayerStageView?>(null) }
+    var stageView by remember(controller) { mutableStateOf<LayerStageView?>(null) }
+    // RememberObserver defers the external attach side effect until this composition is committed.
+    // Its dispose callback owns both native stage release and the matching lifecycle token so their
+    // ordering does not depend on DisposableEffect/RememberObserver callback ordering.
+    remember(controller) {
+        RendererContainerRememberOwner(
+            attach = controller::onRendererContainerAttached,
+            dispose = { rendererContainerToken ->
+                try {
+                    stageView?.release()
+                } finally {
+                    stageView = null
+                    // This also clears the close-time lifecycle token when disposal happened before
+                    // AndroidView.factory created a stage. Live native workers keep their own leases.
+                    controller.onRendererContainerDisposed(rendererContainerToken)
+                }
+            },
+        )
+    }
     var stageWidthPx by remember { mutableIntStateOf(0) }
     var stageHeightPx by remember { mutableIntStateOf(0) }
     val producerFrameCallback = remember(controller) {
@@ -2025,20 +2567,12 @@ private fun RunningScreen(controller: LabController) {
             mediaHeightPx = controller.selectedMediaHeightPx,
             decoderLinearReference = controller.selectedMediaLinearReference,
             safetyAdjustments = controller.lastSafetyAdjustments,
+            performanceIsolationStatus = controller.performanceIsolationStatus,
+            capacityCalibrationStatus = controller.hwcCapacityCalibration.uiSummary(),
+            severeThermalDeratingEnabled =
+                controller.activeSevereThermalDeratingEnabled,
             stop = controller::stopScenario,
         )
-    }
-    DisposableEffect(Unit) {
-        onDispose {
-            try {
-                stageView?.release()
-            } finally {
-                stageView = null
-                // This also clears the close-time lifecycle token when disposal happened before
-                // AndroidView.factory created a stage. Live native workers keep their own leases.
-                controller.onRendererContainerDisposed()
-            }
-        }
     }
 }
 
@@ -2055,6 +2589,9 @@ private fun RunningHud(
     mediaHeightPx: Int?,
     decoderLinearReference: DecoderLinearReference?,
     safetyAdjustments: List<String>,
+    performanceIsolationStatus: String,
+    capacityCalibrationStatus: String,
+    severeThermalDeratingEnabled: Boolean,
     stop: () -> Unit,
 ) {
     val phase = progress.phase
@@ -2152,7 +2689,7 @@ private fun RunningHud(
     Column(
         Modifier
             .fillMaxSize()
-            .windowInsetsPadding(WindowInsets.safeDrawing)
+            .windowInsetsPadding(WindowInsets.displayCutout)
             .padding(12.dp),
         verticalArrangement = Arrangement.SpaceBetween,
     ) {
@@ -2214,6 +2751,30 @@ private fun RunningHud(
                         Text("STOP", fontWeight = FontWeight.Bold)
                     }
                 }
+                phase
+                    ?.hwcCompositionExpectation
+                    ?.takeIf { it != HwcCompositionExpectation.NONE }
+                    ?.let { expectation ->
+                        val rawState = rawHwcExpectationState(
+                            expectation = expectation,
+                            telemetry = telemetry,
+                        )
+                        Text(
+                            hwcExpectationLiveSummary(
+                                expectation = expectation,
+                                telemetry = telemetry,
+                            ),
+                            color = when (rawState) {
+                                RawHwcExpectationState.MATCH -> Color(0xFFB8CBC5)
+                                RawHwcExpectationState.WAIT,
+                                RawHwcExpectationState.N_A -> Color(0xFFFFC857)
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            fontSize = if (compactHud) 8.sp else 10.sp,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
                 HudProgressLine(
                     label = if (compactHud) {
                         "PLAN ${(planProgress.overallFraction * 100f).roundToInt()}% · " +
@@ -2302,6 +2863,9 @@ private fun RunningHud(
                             planProgress = planProgress,
                             telemetry = telemetry,
                             safetyAdjustments = safetyAdjustments,
+                            performanceIsolationStatus = performanceIsolationStatus,
+                            capacityCalibrationStatus = capacityCalibrationStatus,
+                            severeThermalDeratingEnabled = severeThermalDeratingEnabled,
                             compact = true,
                             modifier = Modifier
                                 .heightIn(max = detailPanelMaxHeight)
@@ -2359,6 +2923,9 @@ private fun RunningHud(
                         planProgress = planProgress,
                         telemetry = telemetry,
                         safetyAdjustments = safetyAdjustments,
+                        performanceIsolationStatus = performanceIsolationStatus,
+                        capacityCalibrationStatus = capacityCalibrationStatus,
+                        severeThermalDeratingEnabled = severeThermalDeratingEnabled,
                         compact = false,
                         modifier = Modifier
                             .heightIn(max = detailPanelMaxHeight)
@@ -2427,6 +2994,9 @@ private fun RunTransitionStatus(
     planProgress: PlanProgress,
     telemetry: TelemetrySnapshot,
     safetyAdjustments: List<String>,
+    performanceIsolationStatus: String,
+    capacityCalibrationStatus: String,
+    severeThermalDeratingEnabled: Boolean,
     compact: Boolean,
     modifier: Modifier = Modifier,
 ) {
@@ -2572,7 +3142,15 @@ private fun RunTransitionStatus(
             }
             Text(
                 "Vendor S${telemetry.vendorServiceSession ?: "N/A"} · " +
+                    "Power $performanceIsolationStatus · " +
                     "compression ${telemetry.compressionState} · NPU ${telemetry.npuState}",
+                color = Color(0xFF86A39A),
+                fontSize = 9.sp,
+                maxLines = if (compact) 2 else 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                capacityCalibrationStatus,
                 color = Color(0xFF86A39A),
                 fontSize = 9.sp,
                 maxLines = if (compact) 2 else 1,
@@ -2591,15 +3169,16 @@ private fun RunTransitionStatus(
                     maxLines = if (compact) 2 else 3,
                     overflow = TextOverflow.Ellipsis,
                 )
-            } else if (!compact) {
-                Text(
-                    "Thermal ${telemetry.thermalLabel} · runtime memory/thermal watchdog 활성",
-                    color = Color(0xFF86A39A),
-                    fontSize = 9.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
             }
+            Text(
+                "Thermal ${telemetry.thermalLabel} · SEVERE 앱 감속 " +
+                    "${if (severeThermalDeratingEnabled) "ON" else "OFF"} · " +
+                    "CRITICAL/low-memory 필수 중단 ON",
+                color = Color(0xFF86A39A),
+                fontSize = 9.sp,
+                maxLines = if (compact) 2 else 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }
@@ -3279,6 +3858,9 @@ private fun SystemScreen(controller: LabController, modifier: Modifier) {
             )
         }
         item {
+            RuntimeProtectionCard(controller)
+        }
+        item {
             PermissionCard(controller)
         }
         capabilities?.let { snapshot ->
@@ -3301,6 +3883,68 @@ private fun SystemScreen(controller: LabController, modifier: Modifier) {
         }
         item {
             IntegrationNote()
+        }
+    }
+}
+
+@Composable
+private fun RuntimeProtectionCard(controller: LabController) {
+    val severeDerateEnabled = controller.severeThermalDeratingEnabled
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface,
+        ),
+        shape = RoundedCornerShape(20.dp),
+    ) {
+        Column(
+            Modifier.padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("실행 보호 정책", style = MaterialTheme.typography.titleLarge)
+                    Text(
+                        "Plan 시작 시 고정되며 외부 Intent도 이 설정을 그대로 사용합니다.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.labelMedium,
+                    )
+                }
+                FilterChip(
+                    selected = severeDerateEnabled,
+                    onClick = {
+                        controller.setSevereThermalDeratingEnabled(!severeDerateEnabled)
+                    },
+                    enabled = controller.canConfigureRuntimeProtection,
+                    label = {
+                        Text(if (severeDerateEnabled) "SEVERE 감속 ON" else "SEVERE 감속 OFF")
+                    },
+                )
+            }
+            Text(
+                if (severeDerateEnabled) {
+                    "선택 보호 ON · 시작 전 SEVERE를 거부하고, 실행 중 SEVERE에서 앱 부하를 " +
+                        "ordered-zero 뒤 지속 감속합니다."
+                } else {
+                    "기본값 OFF · SEVERE에서도 앱은 요청 부하를 유지합니다. Android/kernel의 " +
+                        "thermal throttling은 그대로 동작합니다."
+                },
+                color = if (severeDerateEnabled) {
+                    MaterialTheme.colorScheme.tertiary
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+                style = MaterialTheme.typography.labelLarge,
+            )
+            Text(
+                "항상 강제 · thermal CRITICAL 중단 · low-memory 중단 · local worker 실패 · " +
+                    "Battery Saver/display/device-idle/SystemUI 격리 무결성 중단",
+                color = MaterialTheme.colorScheme.primary,
+                style = MaterialTheme.typography.labelMedium,
+            )
         }
     }
 }
@@ -3542,7 +4186,6 @@ internal fun gaugeProvenanceLabel(gauge: Gauge): String {
         MetricQuality.PROXY -> "PROXY"
         MetricQuality.UNAVAILABLE -> "N/A"
     }
-    if (gauge.quality == MetricQuality.UNAVAILABLE) return quality
     val source = gauge.source
         .trim()
         .replace(Regex("\\s+"), " ")
@@ -3591,6 +4234,304 @@ private fun compositionProvenance(telemetry: TelemetrySnapshot): String {
         "$label ${Gauge(quality = quality, source = source).provenanceLabel()}"
     }
 }
+
+internal fun dashboardPurposeScenarios(
+    scenarios: List<ScenarioSpec>,
+): List<DashboardPurposeScenario> {
+    val preferredIds = mapOf(
+        CatalogPurpose.DPU_BURST to "dpu-only-repeat-shock",
+        CatalogPurpose.DEVICE_STABLE to "dpu-device-envelope-burst",
+        CatalogPurpose.CLIENT_TRANSITION to "dpu-client-fallback-burst",
+    )
+    val byId = scenarios.associateBy(ScenarioSpec::id)
+    val usedIds = HashSet<String>()
+    return CatalogPurpose.entries.mapNotNull { purpose ->
+        val preferred = preferredIds[purpose]
+            ?.let(byId::get)
+            ?.takeIf {
+                it.id !in usedIds && scenarioMatchesCatalogPurpose(it, purpose)
+            }
+        val scenario = preferred ?: scenarios.firstOrNull {
+            it.id !in usedIds && scenarioMatchesCatalogPurpose(it, purpose)
+        }
+        scenario?.let {
+            usedIds += it.id
+            DashboardPurposeScenario(purpose = purpose, scenario = it)
+        }
+    }
+}
+
+internal fun scenariosForCatalogPurpose(
+    scenarios: List<ScenarioSpec>,
+    purpose: CatalogPurpose?,
+): List<ScenarioSpec> =
+    if (purpose == null) {
+        scenarios
+    } else {
+        scenarios.filter { scenarioMatchesCatalogPurpose(it, purpose) }
+    }
+
+internal fun scenarioMatchesCatalogPurpose(
+    scenario: ScenarioSpec,
+    purpose: CatalogPurpose,
+): Boolean {
+    val phases = scenario.phases
+    if (phases.isEmpty()) return false
+    val conditions = ScenarioClassifier.conditions(scenario)
+    return when (purpose) {
+        CatalogPurpose.DPU_BURST -> ScenarioCondition.DPU_BURST in conditions
+        CatalogPurpose.DEVICE_STABLE ->
+            ScenarioCondition.HWC_DEVICE_ONLY in conditions &&
+                ScenarioCondition.HWC_CLIENT_REQUIRED !in conditions
+        CatalogPurpose.CLIENT_TRANSITION ->
+            ScenarioCondition.HWC_CLIENT_REQUIRED in conditions
+    }
+}
+
+internal fun advancedFilterSummary(
+    purpose: CatalogPurpose?,
+    categoryKeys: Set<String>,
+    patternKeys: Set<String>,
+    loadBandKeys: Set<String>,
+    conditionKeys: Set<String>,
+): String {
+    val rows = buildList {
+        purpose?.let { add("목적 ${it.title}") }
+        enumSelectionSummary<ScenarioCategory>(categoryKeys)?.let { add("카테고리 $it") }
+        enumSelectionSummary<ScenarioChangePattern>(patternKeys)?.let { add("변화 $it") }
+        enumSelectionSummary<ScenarioLoadBand>(loadBandKeys)?.let { add("강도 $it") }
+        enumSelectionSummary<ScenarioCondition>(conditionKeys)?.let { add("조건 $it") }
+    }
+    return if (rows.isEmpty()) {
+        "활성 조건 없음 · 모든 preset 표시"
+    } else {
+        rows.joinToString(" AND ")
+    }
+}
+
+private inline fun <reified T : Enum<T>> enumSelectionSummary(
+    keys: Set<String>,
+): String? {
+    if (keys.isEmpty()) return null
+    val names = enumValues<T>()
+        .filter { it.name in keys }
+        .map {
+            when (it) {
+                is ScenarioCategory -> it.label
+                is ScenarioChangePattern -> it.label
+                is ScenarioLoadBand -> it.label
+                is ScenarioCondition -> it.label
+                else -> it.name
+            }
+        }
+    if (names.isEmpty()) return null
+    val visible = names.take(2).joinToString(" OR ")
+    return if (names.size > 2) "$visible +${names.size - 2}" else visible
+}
+
+internal fun scenarioSelectionPreview(
+    scenarios: List<ScenarioSpec>,
+): ScenarioSelectionPreview {
+    val phases = scenarios.flatMap(ScenarioSpec::phases)
+    if (phases.isEmpty()) {
+        return ScenarioSelectionPreview(
+            queueEntries = scenarios.size,
+            uniqueScenarios = scenarios.distinctBy(ScenarioSpec::id).size,
+            duplicateEntries =
+                (scenarios.size - scenarios.distinctBy(ScenarioSpec::id).size).coerceAtLeast(0),
+            inputChange = "실행 가능한 phase 없음",
+            compositionTarget = "합성 목표 N/A",
+            verification = "실행 전 plan 검증 결과를 확인",
+        )
+    }
+
+    val layerValues = phases.map { it.activeLayers.coerceAtLeast(0) }
+    val fpsValues = phases.mapNotNull { phase ->
+        phase.producerFps.finitePositiveOrNull()?.roundToInt()
+    }
+    val hzValues = phases.mapNotNull { phase ->
+        phase.requestedDisplayHz.finitePositiveOrNull()?.roundToInt()
+    }
+    val patterns = ScenarioChangePattern.entries.filter { pattern ->
+        scenarios.any { pattern in ScenarioClassifier.changePatterns(it) }
+    }
+    val patternSummary = patterns.take(2).joinToString("/") { it.previewLabel() } +
+        if (patterns.size > 2) " +${patterns.size - 2}" else ""
+    val workloads = phases.map { it.workloads.normalized() }
+    val resources = buildList {
+        if (workloads.any { it.cpu > 0.001f }) add("CPU")
+        if (workloads.any { it.memory > 0.001f }) add("MEM")
+        if (workloads.any { it.gpu > 0.001f }) add("GPU")
+        if (workloads.any { it.npu > 0.001f }) add("NPU")
+    }
+    val resourceSummary = resources.joinToString("/").ifBlank { "display-only" }
+    val topologyPressureSummary = if (
+        phases.any {
+            it.backend != LayerBackend.INDEPENDENT_SURFACES ||
+                it.alphaOverlap ||
+                it.includeGlLayer
+        }
+    ) {
+        "mixed/alpha/GL 압력 입력"
+    } else {
+        null
+    }
+    val hasDeviceTarget = phases.any {
+        it.hwcCompositionExpectation == HwcCompositionExpectation.DEVICE_ONLY
+    }
+    val hasClientTarget = phases.any {
+        it.hwcCompositionExpectation == HwcCompositionExpectation.CLIENT_REQUIRED
+    }
+    val compositionTarget = when {
+        hasDeviceTarget && hasClientTarget ->
+            "DEVICE 유지 검증 ↔ CLIENT 전환 검증"
+        hasDeviceTarget ->
+            "DEVICE 유지 검증"
+        hasClientTarget ->
+            "CLIENT 전환 검증"
+        else ->
+            "HWC 자동 배정/검증 목표 없음"
+    }
+    val uniqueCount = scenarios.distinctBy(ScenarioSpec::id).size
+    return ScenarioSelectionPreview(
+        queueEntries = scenarios.size,
+        uniqueScenarios = uniqueCount,
+        duplicateEntries = (scenarios.size - uniqueCount).coerceAtLeast(0),
+        inputChange = listOfNotNull(
+            integerRangeSummary(layerValues, "L"),
+            integerRangeSummary(fpsValues, "fps"),
+            integerRangeSummary(hzValues, "Hz"),
+            patternSummary.ifBlank { "고정" },
+            resourceSummary,
+            topologyPressureSummary,
+        ).joinToString(" · "),
+        compositionTarget = compositionTarget,
+        verification =
+            "HUD layer/DPU/CPU/GPU·예상 traffic → 결과 HWC D/C·underrun delta·producer fidelity",
+    )
+}
+
+private fun Float.finitePositiveOrNull(): Float? =
+    takeIf { it.isFinite() && it > 0f }
+
+private fun integerRangeSummary(values: List<Int>, unit: String): String {
+    val minimum = values.minOrNull() ?: return "N/A $unit"
+    val maximum = values.maxOrNull() ?: return "N/A $unit"
+    return if (minimum == maximum) "$minimum$unit" else "$minimum–$maximum$unit"
+}
+
+private fun ScenarioChangePattern.previewLabel(): String = when (this) {
+    ScenarioChangePattern.INSTANT -> "STEP"
+    ScenarioChangePattern.GRADUAL -> "RAMP"
+    ScenarioChangePattern.CYCLIC -> "CYCLE"
+    ScenarioChangePattern.STEADY -> "STEADY"
+}
+
+internal fun HwcCompositionExpectation.validationBadge(): String = when (this) {
+    HwcCompositionExpectation.NONE -> "HWC 자동 배정"
+    HwcCompositionExpectation.DEVICE_ONLY -> "DEVICE 유지 검증"
+    HwcCompositionExpectation.CLIENT_REQUIRED -> "CLIENT 전환 검증"
+}
+
+internal fun hwcExpectationLiveSummary(
+    expectation: HwcCompositionExpectation,
+    telemetry: TelemetrySnapshot,
+): String {
+    val rawState = rawHwcExpectationState(
+        expectation = expectation,
+        telemetry = telemetry,
+    )
+    val deviceValue = telemetry.hwcDeviceLayers?.takeIf { it >= 0 }
+    val clientValue = telemetry.hwcClientLayers?.takeIf { it >= 0 }
+    val device = deviceValue?.toString() ?: "N/A"
+    val client = clientValue?.toString() ?: "N/A"
+    val age = telemetry.hwcCompositionEvidenceAgeMs
+        ?.takeIf { it >= 0L }
+        ?.let { "${it}ms" }
+        ?: "N/A"
+    val deviceSource = compactHwcSource(
+        valueAvailable = deviceValue != null,
+        quality = telemetry.hwcDeviceLayersQuality,
+        source = telemetry.hwcDeviceLayersSource,
+    )
+    val clientSource = compactHwcSource(
+        valueAvailable = clientValue != null,
+        quality = telemetry.hwcClientLayersQuality,
+        source = telemetry.hwcClientLayersSource,
+    )
+    val provenance = if (deviceSource == clientSource) {
+        deviceSource
+    } else {
+        "D $deviceSource / C $clientSource"
+    }
+    return "HWC ${rawState.label} · D $device/C $client · AGE $age · SRC $provenance\n" +
+        "목표 ${expectation.validationBadge()} · controller target-fresh 최종 판정 별도"
+}
+
+internal fun rawHwcExpectationState(
+    expectation: HwcCompositionExpectation,
+    telemetry: TelemetrySnapshot,
+): RawHwcExpectationState {
+    if (expectation == HwcCompositionExpectation.NONE) return RawHwcExpectationState.N_A
+
+    val device = telemetry.hwcDeviceLayers?.takeIf { it >= 0 }
+        ?: return RawHwcExpectationState.N_A
+    val client = telemetry.hwcClientLayers?.takeIf { it >= 0 }
+        ?: return RawHwcExpectationState.N_A
+    val evidenceMonotonicMs = telemetry.hwcCompositionEvidenceMonotonicMs
+        ?.takeIf { it >= 0L }
+        ?: return RawHwcExpectationState.N_A
+    val evidenceAgeMs = telemetry.hwcCompositionEvidenceAgeMs
+        ?: return RawHwcExpectationState.N_A
+    if (telemetry.monotonicMs < evidenceMonotonicMs) return RawHwcExpectationState.N_A
+    val computedAgeMs = telemetry.monotonicMs - evidenceMonotonicMs
+    val deviceSource = telemetry.hwcDeviceLayersSource.trim()
+    val clientSource = telemetry.hwcClientLayersSource.trim()
+    val validQuality =
+        telemetry.hwcDeviceLayersQuality == telemetry.hwcClientLayersQuality &&
+            telemetry.hwcDeviceLayersQuality in RAW_HWC_COMPOSITION_QUALITIES
+    val atomicFreshPair =
+        evidenceAgeMs == computedAgeMs &&
+            evidenceAgeMs in 0L..HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS &&
+            validQuality &&
+            deviceSource.isNotEmpty() &&
+            deviceSource == clientSource
+    if (!atomicFreshPair) return RawHwcExpectationState.N_A
+
+    val matches = when (expectation) {
+        HwcCompositionExpectation.NONE -> false
+        HwcCompositionExpectation.DEVICE_ONLY -> device > 0 && client == 0
+        HwcCompositionExpectation.CLIENT_REQUIRED -> client > 0
+    }
+    return if (matches) RawHwcExpectationState.MATCH else RawHwcExpectationState.WAIT
+}
+
+private fun compactHwcSource(
+    valueAvailable: Boolean,
+    quality: MetricQuality,
+    source: String,
+): String {
+    val qualityCode = when (quality) {
+        MetricQuality.HARDWARE_COUNTER -> "HW"
+        MetricQuality.KERNEL -> "KRN"
+        MetricQuality.SYSTEM_SERVICE -> "SYS"
+        MetricQuality.MEASURED -> "MEAS"
+        MetricQuality.ESTIMATED -> "EST"
+        MetricQuality.PROXY -> "PROXY"
+        MetricQuality.UNAVAILABLE -> "N/A"
+    }
+    val boundedSource = source
+        .trim()
+        .replace(Regex("\\s+"), " ")
+        .take(10)
+    val sourceToken = boundedSource.ifBlank { "source N/A" }
+    return if (valueAvailable) "$qualityCode:$sourceToken" else "N/A:$sourceToken"
+}
+
+private val RAW_HWC_COMPOSITION_QUALITIES = setOf(
+    MetricQuality.HARDWARE_COUNTER,
+    MetricQuality.SYSTEM_SERVICE,
+)
 
 private fun ScenarioSpec.overview(): ScenarioOverview {
     val patternParts = buildList {

@@ -8,11 +8,11 @@ Launcher와 Gradle project의 표시 이름은 `DPULayerTest`이고 canonical re
 `https://github.com/sinpie/dpu-layer-lab`이다. 제품 호환성 계약인 package
 `com.example.dpulayerlab`, automation component/action, `dpu-layer-lab-` report
 prefix, Soong module/APK 이름 `DpuLayerLab`은 별도 migration 요구 없이 바꾸지 않는다.
-현재 release version은 `20260724_111816`(`versionCode 3`), debug version은
-`20260724_111816-debug`이며 `yyyyMMdd_HHmmss`는 KST build 시각이다. release tag는
-`v20260724_111816`이다. Release asset은
-`DPULayerTest-20260724_111816-debug.apk`,
-`DPULayerTest-20260724_111816-release-unsigned.apk`, `SHA256SUMS.txt` 이름을 사용한다.
+현재 release version은 `20260725_090252`(`versionCode 4`), debug version은
+`20260725_090252-debug`이며 `yyyyMMdd_HHmmss`는 KST build 시각이다. release tag는
+`v20260725_090252`이다. Release asset은
+`DPULayerTest-20260725_090252-debug.apk`,
+`DPULayerTest-20260725_090252-release-unsigned.apk`, `SHA256SUMS.txt` 이름을 사용한다.
 
 ## 기본 작업 규칙
 
@@ -51,6 +51,30 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 - renderer 입력은 반드시 runtime safety policy를 통과해야 한다.
 - 비절전 envelope로 실행 중 Battery Saver가 켜지면 현재 run을
   `SAFETY_ENVELOPE_CHANGED`로 중단하고, 새 plan에서 현재 상태를 다시 검증한다.
+- Test-time power policy는 API v3 typed broker의
+  `DISABLE_BATTERY_SAVER` 하나만 허용한다. BEGIN 전에 original Saver 상태를 capture해
+  restore authority와 safety input으로 보존하며, original ON이면 임시 해제 중에도
+  power-save cap을 유지한다. 10초 lease를 2초 cadence로 renew하고 client death,
+  expiry, idempotent END에서 exact prior-state restore를 확인한다. Restore 미확인,
+  stale/late command, renewal/health/session failure가 있으면 후속 plan을 차단한다.
+  같은 session의 더 높은 command가 전부 END retry일 때만 이미 in-flight인 이전 END의
+  exact acknowledgment로 restore latch를 충족할 수 있다. Controller owner는 process
+  latch clear, renewal 실제 종료와 직접 읽은 Saver의 original-state 일치를 모두
+  확인한 뒤에만 해제한다.
+- Broker가 없을 때는 Battery Saver가 이미 OFF인 경우만 app-only monitoring을 허용한다.
+  Saver ON 또는 remote mutation 가능성이 남은 모호한 응답을 성공으로 낮추지 않는다.
+  Platform signing만으로 전역 power policy 접근이 생긴다고 가정하지 않는다.
+- 앱 선제 thermal SEVERE derating은 선택형이고 기본 OFF다. 설정은 plan 시작 시
+  immutable snapshot으로 고정하며 외부 Intent extra로 우회하지 않는다. OFF이면
+  SEVERE에서도 앱 setpoint를 유지하고 Android/kernel thermal mitigation에 맡긴다.
+  Battery Saver suppression 중에도 thermal CRITICAL, low-memory, local-worker failure,
+  power/display/SystemUI 격리 무결성 fail-safe는 항상 유지한다. Doze/device-idle은
+  typed BSP 계약이 없으므로 강제로 해제하지 않고 active이면 거부/중단한다.
+  DPU/GPU/CPU DVFS, devfreq governor와 frequency write/lock을 추가하지 않는다.
+- Battery Saver는 system-wide policy이므로 API v3 provider는 policy scope 전체에서
+  single lease로 직렬화하거나 하나의 original baseline과 active refcount를 공유한다.
+  겹치는 client/session이 임시 OFF 상태를 새 baseline으로 저장하면 안 되며, 마지막
+  lease의 END/death/expiry에서만 원래 상태를 복구한다.
 - 실행 중 display ID/physical dimensions가 바뀌면 같은 event로 중단한다. 정규화한
   dimensions가 같은 단순 축 교환만 허용한다.
 - hard cap(layer 20, producer 120 fps, requested display 240 Hz)을 늘리려면 명시적인
@@ -76,11 +100,29 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 - low-RAM/power-save cap을 우회하지 않는다.
 - `ActivityManager.MemoryInfo.lowMemory`와 thermal CRITICAL 이상은 active run을
   중단한다.
-- thermal SEVERE derating은 이후 phase에도 유지한다. 기존 generated/NPU load의
-  ordered zero 확인 → reduced workload ticket/acknowledgment → display 감속
-  acknowledgment 순서를 지키며, 하나라도 실패하면 `THERMAL_DERATE_FAILED`로 중단한다.
+- 선택형 선제 thermal SEVERE derating이 ON이면 이후 phase에도 유지한다. 기존
+  generated/NPU load의 ordered zero 확인 → reduced workload ticket/acknowledgment →
+  display 감속 acknowledgment 순서를 지키며, 하나라도 실패하면
+  `THERMAL_DERATE_FAILED`로 중단한다.
 - loop, thread, buffer allocation, codec dequeue, Binder call에는 상한이나
   cancellation 경로가 있어야 한다.
+- Activity 수명보다 오래 살 수 있는 backend job/thread/receiver/Binder callback은
+  Activity/inner callback을 강하게 보유하지 않고 application context 또는
+  Activity-free holder를 사용한다. Receiver callback은 unregister 전에 detach하며,
+  unregister·join·process termination·descriptor close의 terminal 증거가 없으면
+  cleanup coordinator가 다음 controller/run을 차단한다. Timeout이나 중복 close를
+  성공 증거로 바꾸지 않는다.
+- 서로 의존하는 completion ticket/LAZY Job 묶음은 모두 생성·publish·start된 뒤에만
+  transactional commit한다. Partial start 실패에서는 생성된 Job을 모두 cancel하고
+  ticket은 실제 Job completion 뒤에 실패 완료한다. OOM/ThreadDeath를 포함한 fatal
+  `Error`도 rollback을 먼저 시도·기록한 뒤 rethrow한다.
+  Telemetry monitor/watchdog는 둘 다 active인 pair만 재사용한다. 한쪽 unexpected
+  completion은 sibling cancel과 active run fail-closed를 수행하고 process-sticky
+  lifecycle failure로 후속 controller/plan을 차단한다. Pause/resume은 두 identity의
+  실제 completion 뒤 single pending restart만 허용한다.
+- 순간 부하 성능은 graphics budget 안의 prewarm, page touch, pinned/reused buffer와
+  fixed-period/latest-wins 제어로 확보한다. Measured/frame hot path에 반복 buffer,
+  lambda, boxed timestamp 또는 불필요한 객체 할당을 추가하지 않는다.
 - CPU/memory 부하는 fixed-period bounded worker와 재사용 buffer를 유지한다. NPU/vendor
   control은 bounded latest-wins로 처리하며 오래된 setpoint backlog를 만들지 않는다.
 - 양의 NPU setpoint도 latest command ticket과 acknowledgment가 일치한 뒤에만 적용
@@ -112,7 +154,13 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 - producer callback은 generation token과 physical producer ID로 분리한다. 게시 전
   immutable token capture, expected topology 선언 전 readiness 금지, 모든 producer
   first buffer/heartbeat와 peak topology 확인을 유지한다. Frame hot path에 per-frame
-  lambda/boxed timestamp allocation을 다시 추가하지 않는다.
+  lambda/boxed timestamp allocation을 다시 추가하지 않는다. Canvas/EGL native call을
+  가로질러 local completion token이 남을 수 있으므로 relay update/disable은 token의
+  callback을 분리해 제거된 generation 보고와 Activity/controller 강한 참조를 막는다.
+- Renderer topology 생성/add/control은 하나의 transaction이다. 전부 성공하기 전에는
+  expected topology를 publish하지 않고, partial failure/OOM은 relay callback detach →
+  모든 생성 producer stop request → 하나의 shared bounded deadline join → child 제거
+  순서로 rollback한 뒤 fatal error는 다시 throw한다.
 - topology pending 중 fake expected producer를 게시하지 않는다. 실제 relay set을
   commit한 뒤 같은 generation에 한 번 게시하고, 그 전에는 phase clock/transition/
   workload/frame budget을 시작하지 않는다. Activation은 fresh counter sample 뒤에
@@ -134,13 +182,40 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 - Transition `floor`는 pulse/triangle의 반복 valley에만 허용한다. STEP/linear/
   staircase/soak에 nonzero floor가 있는 runnable plan은 reject한다. 순수 evaluator는
   hostile direct call에서만 defensive하게 0으로 지워 origin sample을 건너뛰지 않는다.
+- Typed `DEVICE_ONLY`/`CLIENT_REQUIRED` phase는 관측 계약이며 HWC 경로 강제가 아니다.
+  Safety clamp가 계약 phase의 layer topology, producer FPS, display pacing, GL producer
+  또는 GPU pressure를 바꾸면 다른 실험으로 축소하지 말고 reject한다. 3초 first-buffer
+  readiness, 최대 4초 pre-target periodic sample mutex drain, probe당 4초 bounded fresh
+  composition과 post-target 관측 tick을 위해 `DEVICE_ONLY`는 최소 12초, distinct fresh
+  sample 2회를 요구하는 `CLIENT_REQUIRED`는 최소 16초다.
+- Typed HWC target arm 중 periodic telemetry는 latest-wins try-lock/drop으로 처리해
+  forced probe 앞에 waiter를 쌓지 않는다. 필요한 forced sample은 같은 serialized
+  ownership에서 수집하되 각 sample 사이 cancellation/thermal contract/fresh producer
+  count와 topology revision을 재검증한다. Forced full telemetry가 safety/exact
+  continuity를 갱신하며 모든 terminal/cancel/error/phase-finally는 identity-matched
+  priority owner를 해제한다.
+- START plan은 첫 scenario 전에 전체 queue/repeat가 공유하는 HWC capacity 관측을 정확히
+  한 번 수행한다. Safety-approved 최대 20L/30fps opaque RGB non-overlap tile의 모든
+  first buffer를 확인하고 100ms 안정화한 뒤 fresh DEVICE/CLIENT snapshot을 한 번만
+  수집한다. 실패는 retry/0 추정 없이 N/A다. Producer/load zero, teardown, 3초 settle 뒤
+  기존 1L scenario warm-up과 fresh baseline을 시작한다. 이 결과는 matching topology의
+  advisory boundary일 뿐 universal maximum이나 renderer safety cap이 아니다.
+- Active run은 periodic/typed 모두 SurfaceFlinger child process를 만들지 않는다. Typed
+  boundary는 같은 현재 vendor session의 fresh 원자 쌍만 사용하고 없으면 INCONCLUSIVE다.
+  Plan calibration SF cache를 phase evidence로 재사용하지 않는다. HWC count를 logcat이나
+  임의 sysfs/debugfs plane 탐색으로 추론하지 않는다.
+- HUD의 typed HWC `RAW MATCH/WAIT/N/A`는 2.5초 이내 동일 source·quality·timestamp
+  DEVICE/CLIENT pair의 보조 해석일 뿐이다. Target readiness, distinct sample 수와
+  cross-phase 방향성을 확인하는 controller 최종 판정처럼 표시하지 않는다.
 - 16 ms producer hand-off를 넘기면 새 codec/EGL/Canvas replacement를 만들지 않고
   process-wide lease를 bounded poll한다. 5초 안의 transient drain은 phase active time과
   frame budget에서 제외하고 교차 부하를 0으로 유지한다. 연속 recovery deadline을
   넘긴 뒤에만 sticky failure로 만들며, 실제 thread 종료까지 후속 plan을 차단한다.
   해당 event를 report/result/UI의 terminal reason으로 유지한다. Child lifecycle
   teardown failure는 active relay의 generation으로만 귀속하고 disabled relay의 늦은
-  callback은 무시한다.
+  callback은 무시한다. 시작된 Texture Canvas loop의 `Surface` wrapper와 backing
+  `SurfaceTexture`는 worker의 실제 `finally`가 release하며 UI/framework hand-off
+  timeout 경로에서 먼저 release하지 않는다.
 - STOP/pause는 cancellation reason 존재 여부와 관계없이 phase/target을 먼저 null로
   게시하고 local/NPU setpoint와 display request를 즉시 안전값으로 내린다. 취소된
   runJob의 NonCancellable finalizer가 소유권을 해제하기 전 새 START를 허용하지 않는다.
@@ -151,6 +226,24 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   DPU-read/producer-write traffic은 unavailable/provenance 및 pending `—P` 의미를
   숨기지 않는다. Gauge source/quality를 표시하고 provenance 변경/unavailable 경계를
   graph gap으로 유지한다.
+- Test Window의 immersive hide는 status/navigation bar가 모두 invisible이라는 Insets
+  acknowledgment 전에는 producer를 시작하지 않는다. 종료 시 `show()` 요청 성공만으로
+  token을 해제하지 않고 원래 bar visibility mask의 Insets acknowledgment까지
+  process-wide lease를 유지한다. 부분 hide 실패도 cleanup token을 controller에
+  넘기며, 복원 미확인/focus loss/post-confirmation reveal에서는 새 plan을 fail-closed로
+  차단한다. 재생성된 Activity의 local IDLE Window도 이전 process lease가 active이면
+  system bar hide를 유지하고 matching release와 visible Insets 확인 뒤에만 일반 UI를
+  복구한다. Foreign Window hide는 100 ms 간격의 4회 verification/attempt로 제한하고,
+  끝내 확인되지 않으면 원래 lease owner에 fail-closed 오염 신호를 보내며 busy
+  retry하지 않는다. Owner Activity close에서는 matching failure callback만 분리하고
+  sticky process lease 자체는 해제하지 않는다.
+  RESTORING/RESTORE_FAILED focus gain에서 bar를 다시 숨기지 않는다.
+- Test plan은 status/navigation bar가 모두 hidden으로 확인된 tokenized Window
+  isolation 안에서만 producer를 시작한다. 최초 hide pending 중 visible Insets는
+  허용하지만 확인 뒤 system bar 재등장 또는 window focus loss는 측정 오염으로
+  fail-closed 중단한다. Multi-window/PiP에서는 시작을 거부하고 queue/loop, terminal
+  sample과 renderer teardown까지 isolation을 유지한 뒤 모든 종료 경로에서 같은 token의
+  system bar만 복구한다.
 - SBWC route 적용/해제 결과는 모두 event로 남긴다. 활성 SBWC의 linear/default reset을
   확인하지 못하거나 adapter가 거부/timeout되면 fail-closed로 plan을 중단한다.
 - 정상 cooldown에서도 phase/target과 generated load를 먼저 제거하고 physical
@@ -193,9 +286,15 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   baseline 뒤 sample과 끝까지 이어진 연속성이 있을 때만 허용한다.
 - 정상 verdict는 최종 physical producer teardown을 확인한 뒤 serialized fresh terminal
   counter sample까지 성공한 후에만 계산한다. 이 sample 또는 periodic telemetry 실패는
-  telemetry gap으로 exact continuity를 무효화하고, 5초 stale은 run도 중단한다.
-  Source/quality 변경 또는 reset/regress도 continuity를 무효화한다. 신뢰할 exact
-  delta가 없으면 report/UI의 delta source와 quality도 `N/A`/`UNAVAILABLE`이어야 한다.
+  telemetry gap으로 exact continuity를 무효화한다. Sample evidence timestamp는 모든
+  counter/state read가 끝난 시각이며 CPU interval 시작과 분리한다. 마지막 완료
+  evidence의 5초 stale은 run을 중단하되, 이미 수락된 single-flight sample은 4초
+  operation timeout과 다음 500 ms watchdog tick까지의 bounded deadline만 보호한다.
+  SystemMonitor 종료는 local sample worker 완료 확인이 LoadManager/vendor teardown보다
+  먼저여야 하며, 이 확인이 실패하면 worker가 참조할 수 있는 dependency를 닫지 않고
+  process cleanup gate를 sticky failure로 유지한다. Source/quality 변경 또는
+  reset/regress도 continuity를 무효화한다. 신뢰할 exact delta가 없으면 report/UI의
+  delta source와 quality도 `N/A`/`UNAVAILABLE`이어야 한다.
 - 신뢰 가능한 exact delta가 있으면 exact verdict가 proxy보다 우선한다. Exact 0과
   proxy 증가를 `SUSPECTED_PROXY`로 내리지 말고 proxy를 보조 event/수치로만 보존한다.
 - adaptive boundary는 topology preparation 직전과 active phase 종료 직후의 serialized
@@ -209,6 +308,18 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   미만이면 `PRODUCER_RATE_SHORTFALL`을 남기며, verified exact delta가 양수가 아닌 run은
   `INCONCLUSIVE`로 판정한다.
 - source가 없거나 parse가 불확실하면 0이 아니라 `N/A`/`UNAVAILABLE`을 반환한다.
+- GPU probe는 encoding과 frequency unit이 결속된 typed path만 사용한다. KGSL
+  `gpubusy` window pair를 cumulative delta로 해석하지 않고, explicit probe 실패를
+  generic fallback으로 숨기지 않으며 read gap 뒤 cumulative baseline을 재사용하지
+  않는다. Exynos Xclipse는 AMD-RDNA DRM direct-percent ABI와 결속하고 Mali path를
+  Xclipse로 오인하지 않는다. Xclipse/GED/Mali 고정 ABI를 Samsung 공통 SKI 후보보다
+  먼저 검사하고 legacy direct/cumulative 실제 encoding을 provenance에 남긴다.
+  GED debugfs는 기본 탐색하지 않는다. Vendor GPU/DPU
+  frequency 확장은 AIDL 끝에 append한 API v2 getter만 사용하고 `apiVersion >= 2`
+  gate와 값 범위 검증을 유지한다. Optional v2 Binder 호출은 v1/exact-counter 호출과
+  분리된 bounded no-backlog lane과 하나의 전체 snapshot deadline을 사용한다. 개별 v2
+  실패는 같은 service session의 v1 snapshot을 지우지 않지만 session 변경은 snapshot
+  전체를 폐기한다.
 - Binder가 반환하는 NPU/compression status는 HUD/sample/report에 넣기 전에 최대
   256자로 제한하고 whitespace/control/format 문자를 정규화한다.
 - run peak는 유효 범위 안의 sample 중 같은 `MetricQuality`와 source가 유지된 경우에만
@@ -265,6 +376,8 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 - report 발행은 process 안에서 직렬화하고 temp write/fsync/rename 뒤 수행한다. 완료
   `dpu-layer-lab-` prefix와 앱 파일명 형식이 확인된 `.json`만 최신 200개로 best-effort
   보존하되 방금 발행한 파일과 `.part`/unrelated `.json`은 삭제하지 않는다.
+  Plan-wide Battery Saver restore가 실패하면 앞서 완료된 plan item도 `ABORTED`로
+  무효화하고 report path를 철회하며 managed completed JSON만 best-effort 삭제한다.
 
 ## 금지사항
 
@@ -299,9 +412,13 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
    provider/parser refcount lease, exact-size capability와 64 px allocation ceiling,
    generation·all-producer·teardown race, aggregate producer-rate boundary test를
    갱신했다.
-10. tracked 파일에 secret, APK, report, local path가 없다.
-11. 보고서는 internal `files/reports`만 사용하고 FileProvider로만 공유한다. 공유할
+10. power/isolation 변경은 original Battery Saver ON/OFF, power-save cap 보존,
+    BEGIN/renew/health/END, stale/late command, death/expiry, exact restore와
+    system-wide overlapping-client arbitration을 함수 단위와 전체 run/cancel/Activity
+    재생성 흐름에서 검증했다.
+11. tracked 파일에 secret, APK, report, local path가 없다.
+12. 보고서는 internal `files/reports`만 사용하고 FileProvider로만 공유한다. 공유할
     파일은 canonical internal directory 안에 실제 존재하며 managed completed
     `dpu-layer-lab-…json` 이름을 통과해야 한다. Traversal, foreign/missing file은
     거부한다.
-12. cloud backup/device-to-device/legacy rule에서 모든 app data domain이 제외된다.
+13. cloud backup/device-to-device/legacy rule에서 모든 app data domain이 제외된다.

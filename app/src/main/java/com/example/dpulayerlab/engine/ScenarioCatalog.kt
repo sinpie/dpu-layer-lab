@@ -1,6 +1,7 @@
 package com.example.dpulayerlab.engine
 
 import com.example.dpulayerlab.model.BufferSize
+import com.example.dpulayerlab.model.HwcCompositionExpectation
 import com.example.dpulayerlab.model.LayerBackend
 import com.example.dpulayerlab.model.LoadSetpoints
 import com.example.dpulayerlab.model.LoadShape
@@ -22,6 +23,9 @@ object ScenarioCatalog {
         baseline(),
         dvfsSingleLayerWake(),
         dvfsCompositionShock(),
+        dpuDeviceEnvelopeBurst(),
+        dpuClientFallbackBurst(),
+        dpuOnlyRepeatShock(),
         midLoadPerturbation(),
         dvfsVideoShock(),
         planeStaircase(),
@@ -266,6 +270,174 @@ object ScenarioCatalog {
         ),
     )
 
+    private fun dpuDeviceEnvelopeBurst() = ScenarioSpec(
+        id = "dpu-device-envelope-burst",
+        name = "DPU 4L DEVICE Candidate Burst",
+        description =
+            "1L/30fps governor settle에서 불투명 RGB 독립 Surface 4L/120fps/120Hz로 " +
+                "즉시 전환합니다. 4L은 DEVICE 합성 가능성을 확인하는 보수적 candidate일 뿐 " +
+                "제품별 plane capacity를 보장하지 않습니다. 각 burst의 fresh HWC " +
+                "DEVICE/CLIENT 계측이 DEVICE-only 조건을 충족하는지 결과에서 확인하며, " +
+                "계측이 없거나 조건이 다르면 INCONCLUSIVE입니다.",
+        category = ScenarioCategory.LAYER_HWC,
+        risk = RiskLevel.MEDIUM,
+        tags = setOf(
+            "DPU low→high",
+            "idle→burst",
+            "DEVICE intent",
+            "opaque RGB",
+            "physical Surface",
+            "120fps",
+        ),
+        requirements = setOf(
+            "expectation 검증용 fresh HWC DEVICE/CLIENT telemetry 필수(미가용 시 INCONCLUSIVE)",
+        ),
+        phases = listOf(
+            phase(
+                "de-settle-a",
+                "Governor settle · 1L 30fps DEVICE baseline",
+                12,
+                1,
+                30f,
+                60f,
+                hwcExpectation = HwcCompositionExpectation.DEVICE_ONLY,
+            ),
+            phase(
+                "de-static-burst",
+                "4L/120fps opaque DEVICE-intent step",
+                12,
+                4,
+                120f,
+                120f,
+                hwcExpectation = HwcCompositionExpectation.DEVICE_ONLY,
+            ),
+            phase(
+                "de-release",
+                "Return to 1L DEVICE baseline",
+                12,
+                1,
+                30f,
+                60f,
+                hwcExpectation = HwcCompositionExpectation.DEVICE_ONLY,
+            ),
+            phase(
+                "de-transform-burst",
+                "4L/120fps transform DEVICE-intent step",
+                12,
+                4,
+                120f,
+                120f,
+                motion = MotionProfile.ZOOM_PAN,
+                hwcExpectation = HwcCompositionExpectation.DEVICE_ONLY,
+            ),
+            phase("de-recover", "DEVICE probe recovery", 7, 1, 30f, 60f),
+        ),
+    )
+
+    private fun dpuClientFallbackBurst() = ScenarioSpec(
+        id = "dpu-client-fallback-burst",
+        name = "DPU 20L CLIENT Fallback Candidate",
+        description =
+            "1L/30fps governor settle에서 app hard cap인 mixed Surface/Texture + alpha/GL " +
+                "20L/120fps/120Hz로 즉시 전환해 plane-count pressure로 CLIENT fallback을 " +
+                "유도합니다. 실제 plane capacity와 safety clamp는 제품마다 달라 CLIENT를 " +
+                "보장하지 않습니다. 각 burst target window의 distinct fresh HWC 계측 " +
+                "2회에서 CLIENT>0을 확인해야 하며 계측 부재 또는 fallback 미관측은 " +
+                "INCONCLUSIVE입니다.",
+        category = ScenarioCategory.LAYER_HWC,
+        risk = RiskLevel.HIGH,
+        tags = setOf(
+            "DPU low→high",
+            "idle→burst",
+            "CLIENT fallback intent",
+            "plane-pressure candidate",
+            "20L",
+            "120fps",
+        ),
+        requirements = setOf(
+            "expectation 검증용 fresh HWC DEVICE/CLIENT telemetry 필수(미가용 시 INCONCLUSIVE)",
+            "runtime safety policy 필수(20L/120fps/GL target이 clamp되면 expectation 보존을 위해 실행 거부)",
+        ),
+        phases = listOf(
+            phase(
+                "cf-settle-a",
+                "Governor settle · 1L 30fps DEVICE baseline",
+                12,
+                1,
+                30f,
+                60f,
+                hwcExpectation = HwcCompositionExpectation.DEVICE_ONLY,
+            ),
+            phase(
+                "cf-static-burst",
+                "20L/120fps mixed/alpha/GL CLIENT-intent step",
+                16,
+                20,
+                120f,
+                120f,
+                backend = LayerBackend.MIXED_SURFACE_TEXTURE,
+                alpha = true,
+                gl = true,
+                hwcExpectation = HwcCompositionExpectation.CLIENT_REQUIRED,
+            ),
+            phase(
+                "cf-release",
+                "Return to 1L DEVICE baseline",
+                12,
+                1,
+                30f,
+                60f,
+                hwcExpectation = HwcCompositionExpectation.DEVICE_ONLY,
+            ),
+            phase(
+                "cf-transform-burst",
+                "20L/120fps transformed overflow step",
+                16,
+                20,
+                120f,
+                120f,
+                backend = LayerBackend.MIXED_SURFACE_TEXTURE,
+                motion = MotionProfile.ZOOM_PAN,
+                alpha = true,
+                gl = true,
+                hwcExpectation = HwcCompositionExpectation.CLIENT_REQUIRED,
+            ),
+            phase("cf-recover", "CLIENT probe recovery", 7, 1, 30f, 60f),
+        ),
+    )
+
+    private fun dpuOnlyRepeatShock() = ScenarioSpec(
+        id = "dpu-only-repeat-shock",
+        name = "DPU-only Repeated Step Shock",
+        description =
+            "CPU·memory·GPU·NPU cross-load와 alpha/GL을 모두 0으로 유지한 채 " +
+                "1L/30fps/60Hz와 12L/120fps/120Hz를 세 번 STEP 왕복합니다. " +
+                "요청한 layer/FPS/Hz edge의 반복성과 DPU recovery를 비교하며, 실제 " +
+                "DEVICE/CLIENT 경로·주사율·DPU clock 변화는 계측 결과로만 판단합니다.",
+        category = ScenarioCategory.TRANSITION,
+        risk = RiskLevel.HIGH,
+        tags = setOf(
+            "DPU-only",
+            "DPU low→high",
+            "idle→burst",
+            "repeat shock",
+            "no cross-load",
+            "120fps",
+        ),
+        requirements = setOf(
+            "DPU 응답 비교용 frequency/busy 또는 HWC telemetry(미가용 시 요청 부하만 기록)",
+        ),
+        phases = listOf(
+            phase("dr-settle", "DPU low-load settle · 1L/30fps", 10, 1, 30f, 60f),
+            phase("dr-burst-1", "DPU-only burst 1 · 12L/120fps", 5, 12, 120f, 120f),
+            phase("dr-release-1", "DPU-only release 1", 6, 1, 30f, 60f),
+            phase("dr-burst-2", "DPU-only burst 2 · 12L/120fps", 5, 12, 120f, 120f),
+            phase("dr-release-2", "DPU-only release 2", 6, 1, 30f, 60f),
+            phase("dr-burst-3", "DPU-only burst 3 · 12L/120fps", 5, 12, 120f, 120f),
+            phase("dr-recover", "DPU-only final recovery", 8, 1, 30f, 60f),
+        ),
+    )
+
     private fun midLoadPerturbation() = ScenarioSpec(
         id = "mid-load-perturbation",
         name = "Paired Mid-load Perturbation Matrix",
@@ -390,10 +562,19 @@ object ScenarioCatalog {
     private fun planeStaircase() = ScenarioSpec(
         id = "plane-staircase",
         name = "HWC Plane Staircase",
-        description = "불투명 독립 Surface를 단계적으로 추가하고 다시 줄여 HWC plane 한계와 recovery를 찾습니다.",
+        description =
+            "불투명 독립 Surface demand를 1→2→4→6→8→12L로 올렸다가 줄입니다. " +
+                "Plan-start 1회 capacity 관측과 별개인 bounded sweep이며 이 sweep의 " +
+                "최대값도 제품 HWC 최대 plane 수로 간주하지 않습니다. Active load를 " +
+                "교란하지 않도록 SurfaceFlinger dump는 중지하고, fresh vendor composition " +
+                "snapshot이 없으면 단계별 DEVICE/CLIENT 결과는 N/A일 수 있습니다.",
         category = ScenarioCategory.LAYER_HWC,
         risk = RiskLevel.MEDIUM,
-        tags = setOf("HWC", "plane", "sweep"),
+        tags = setOf("HWC", "plane", "bounded sweep", "plan calibration separate"),
+        requirements = setOf(
+            "저교란 단계별 HWC 관측에는 vendor composition snapshot 권장",
+            "Active 단계는 SurfaceFlinger fallback 없이 vendor snapshot만 사용",
+        ),
         phases = listOf(1, 2, 4, 6, 8, 12, 8, 4, 1).mapIndexed { index, layers ->
             phase(
                 "p$index",
@@ -1184,6 +1365,7 @@ object ScenarioCatalog {
         alpha: Boolean = false,
         gl: Boolean = false,
         transition: TransitionSpec = TransitionSpec(),
+        hwcExpectation: HwcCompositionExpectation = HwcCompositionExpectation.NONE,
     ) = PhaseSpec(
         id = id,
         label = label,
@@ -1199,5 +1381,6 @@ object ScenarioCatalog {
         alphaOverlap = alpha,
         includeGlLayer = gl,
         transition = transition,
+        hwcCompositionExpectation = hwcExpectation,
     )
 }

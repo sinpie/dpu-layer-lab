@@ -16,10 +16,14 @@ import com.example.dpulayerlab.model.TelemetrySnapshot
 import com.example.dpulayerlab.model.PixelRoute
 import com.example.dpulayerlab.vendor.VendorBridge
 import com.example.dpulayerlab.vendor.VendorShutdownResult
+import com.example.dpulayerlab.vendor.validVendorFrequencyHz
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.runInterruptible
 import java.io.File
+import java.util.ArrayDeque
+import java.util.concurrent.atomic.AtomicBoolean
 
 enum class CompressionControlResult {
     APPLIED,
@@ -33,43 +37,229 @@ data class CompressionControlOutcome(
     val serviceSession: Long? = null,
 )
 
-class SystemMonitor(
-    private val context: Context,
+data class SystemMonitorShutdownResult(
+    val localSampleLaneStopped: Boolean,
+    val surfaceFlingerStopped: Boolean,
+    val vendor: VendorShutdownResult,
+)
+
+internal data class SystemMonitorSampleRequest(
+    val displayRefreshRateHz: Float?,
+    val surfaceFlingerProbePolicy: SurfaceFlingerProbePolicy,
+)
+
+internal enum class SurfaceFlingerProbePolicy {
+    /** Dashboard/idle diagnostics may refresh the bounded dump on its normal cadence. */
+    PERIODIC,
+
+    /** An active typed target accepts a fresh vendor pair but never starts another dump process. */
+    TYPED_BOUNDARY,
+
+    /** The single plan-start candidate topology may use one SurfaceFlinger fallback snapshot. */
+    CALIBRATION_ONESHOT,
+
+    /** Never spawn a diagnostic process in an untyped active load interval. */
+    SUPPRESS_DURING_LOAD,
+}
+
+internal class SystemMonitorSampleException(
+    message: String,
+    cause: Throwable? = null,
+) : IllegalStateException(message, cause)
+
+private data class SystemMonitorDependencies(
+    val activityManager: ActivityManager,
+    val powerManager: PowerManager,
+    val hardwareProperties: HardwarePropertiesManager,
+    val kernelSensors: KernelSensorProvider,
+    val surfaceFlinger: SurfaceFlingerProbe,
+    val vendorBridge: VendorBridge,
+)
+
+class SystemMonitor private constructor(
+    dependencies: SystemMonitorDependencies,
     private val frameTracker: FrameTracker,
     private val loadManager: LoadManager,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) {
-    private val activityManager = context.getSystemService(ActivityManager::class.java)
-    private val powerManager = context.getSystemService(PowerManager::class.java)
-    private val hardwareProperties = context.getSystemService(HardwarePropertiesManager::class.java)
-    private val kernelSensors = KernelSensorProvider(context)
-    private val surfaceFlinger = SurfaceFlingerProbe(context)
-    private val vendorBridge = VendorBridge.get(context)
-    private var lastCpu: CpuTimes? = null
-    private var lastHardwareCpu: CpuTimes? = null
+    private val activityManager = dependencies.activityManager
+    private val powerManager = dependencies.powerManager
+    private val hardwareProperties = dependencies.hardwareProperties
+    private val kernelSensors = dependencies.kernelSensors
+    private val surfaceFlinger = dependencies.surfaceFlinger
+    private val vendorBridge = dependencies.vendorBridge
+    private var lastCpuBaseline: CpuCounterBaseline? = null
     private var lastAppCpuMs = Process.getElapsedCpuTime()
     private var lastWallMs = SystemClock.elapsedRealtime()
     private var lastRateSampleMs: Long? = null
-    private var lastComposition = CompositionSnapshot()
-    private var compositionSampleCounter = 0
+    private var lastCompositionEvidence: CompositionEvidence? = null
+    private var verifiedVendorCompositionSession: Long? = null
+    private var compositionSamplesUntilProbe = 0
     @Volatile
     private var latestReadings: List<SensorReading> = emptyList()
+    private val sampleContinuityLost = AtomicBoolean(false)
+    private val sampleLane = SingleFlightInputProbeLane<SystemMonitorSampleRequest, TelemetrySnapshot>(
+        threadName = "DpuLab-SystemMonitor",
+        timeoutMs = SYSTEM_MONITOR_SAMPLE_TIMEOUT_MS,
+        shutdownTimeoutMs = SAMPLE_SHUTDOWN_TIMEOUT_MS,
+    ) { request, cancellation ->
+        try {
+            sampleOnWorker(request, cancellation)
+        } catch (error: Throwable) {
+            sampleContinuityLost.set(true)
+            throw error
+        } finally {
+            if (cancellation.isCancellationRequested()) {
+                sampleContinuityLost.set(true)
+            }
+        }
+    }
 
-    suspend fun sample(display: Display?): TelemetrySnapshot = withContext(ioDispatcher) {
-        val now = SystemClock.elapsedRealtime()
+    companion object {
+        /**
+         * Builds owned probe state transactionally. In particular, a failure while acquiring the
+         * shared vendor bridge or constructing the sample lane cannot leak the already-acquired
+         * SurfaceFlinger lane lease.
+         *
+         * [VendorBridge] is deliberately not registered in this rollback: it is a process
+         * singleton already owned by [LoadManager]. The controller-level construction transaction
+         * closes that owner if a later dependency fails.
+         */
+        fun create(
+            context: Context,
+            frameTracker: FrameTracker,
+            loadManager: LoadManager,
+            ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+        ): SystemMonitor {
+            // Only the application Context crosses into process-owned diagnostic/Binder state.
+            val appContext = context.applicationContext
+            val activityManager = checkNotNull(
+                appContext.getSystemService(ActivityManager::class.java),
+            ) {
+                "ActivityManager unavailable"
+            }
+            val powerManager = checkNotNull(
+                appContext.getSystemService(PowerManager::class.java),
+            ) {
+                "PowerManager unavailable"
+            }
+            val hardwareProperties = checkNotNull(
+                appContext.getSystemService(HardwarePropertiesManager::class.java),
+            ) {
+                "HardwarePropertiesManager unavailable"
+            }
+            val kernelSensors = KernelSensorProvider(appContext)
+            // The local val becomes the owner immediately when construction returns. This avoids
+            // allocating a rollback closure/list after acquiring the shared probe lane.
+            val surfaceFlinger = SurfaceFlingerProbe(appContext)
+            return try {
+                val vendorBridge = VendorBridge.get(appContext)
+                SystemMonitor(
+                    dependencies = SystemMonitorDependencies(
+                        activityManager = activityManager,
+                        powerManager = powerManager,
+                        hardwareProperties = hardwareProperties,
+                        kernelSensors = kernelSensors,
+                        surfaceFlinger = surfaceFlinger,
+                        vendorBridge = vendorBridge,
+                    ),
+                    frameTracker = frameTracker,
+                    loadManager = loadManager,
+                    ioDispatcher = ioDispatcher,
+                )
+            } catch (error: Throwable) {
+                try {
+                    if (!surfaceFlinger.closeWithResult()) {
+                        runCatching {
+                            error.addSuppressed(
+                                IllegalStateException(
+                                    "SurfaceFlinger probe rollback was not confirmed",
+                                ),
+                            )
+                        }
+                    }
+                } catch (cleanupError: Throwable) {
+                    if (cleanupError !== error) {
+                        runCatching { error.addSuppressed(cleanupError) }
+                    }
+                }
+                throw error
+            }
+        }
+    }
+
+    internal suspend fun sample(
+        display: Display?,
+        surfaceFlingerProbePolicy: SurfaceFlingerProbePolicy =
+            SurfaceFlingerProbePolicy.PERIODIC,
+    ): TelemetrySnapshot {
+        // Capture only immutable scalar input before handing work to the process-owned lane. A
+        // timed-out worker therefore cannot retain an Activity, Window, or Display object.
+        val request = SystemMonitorSampleRequest(
+            displayRefreshRateHz = display
+                ?.refreshRate
+                ?.takeIf { it.isFinite() && it > 0f },
+            surfaceFlingerProbePolicy = surfaceFlingerProbePolicy,
+        )
+        val result = try {
+            runInterruptible(ioDispatcher) {
+                sampleLane.execute(request)
+            }
+        } catch (cancelled: CancellationException) {
+            sampleContinuityLost.set(true)
+            throw cancelled
+        }
+        return when (result) {
+            is ProbeLaneResult.Completed -> result.value
+            is ProbeLaneResult.Failed -> {
+                sampleContinuityLost.set(true)
+                throw SystemMonitorSampleException(
+                    "telemetry sample failed: ${result.error.javaClass.simpleName}",
+                    result.error,
+                )
+            }
+            ProbeLaneResult.Busy -> sampleFailure("previous telemetry sample is still active")
+            ProbeLaneResult.Closed -> sampleFailure("telemetry sample lane is closed")
+            ProbeLaneResult.Cancelled -> sampleFailure("telemetry sample was cancelled")
+            ProbeLaneResult.Interrupted -> sampleFailure("telemetry sample was interrupted")
+            ProbeLaneResult.TimedOut -> sampleFailure(
+                "telemetry sample exceeded ${SYSTEM_MONITOR_SAMPLE_TIMEOUT_MS}ms",
+            )
+        }
+    }
+
+    private fun sampleFailure(message: String): Nothing {
+        sampleContinuityLost.set(true)
+        throw SystemMonitorSampleException(message)
+    }
+
+    private fun sampleOnWorker(
+        request: SystemMonitorSampleRequest,
+        cancellation: ProbeCancellation,
+    ): TelemetrySnapshot {
+        if (sampleContinuityLost.getAndSet(false)) {
+            resetSampleBaselines()
+        }
+        ensureSampleActive(cancellation)
+        val cpuIntervalStartedMs = SystemClock.elapsedRealtime()
         val hardwareCpuNow = readHardwareCpuTimes()
         val procCpuNow = if (hardwareCpuNow == null) readCpuTimes() else null
-        val cpuPercent = if (hardwareCpuNow != null) {
-            hardwareCpuNow.percentSince(lastHardwareCpu)
+        val cpuCounterSource = if (hardwareCpuNow != null) {
+            CpuCounterSource.HARDWARE_PROPERTIES
         } else {
-            procCpuNow?.percentSince(lastCpu)
+            CpuCounterSource.PROC_STAT
         }
-        if (hardwareCpuNow != null) lastHardwareCpu = hardwareCpuNow
-        if (procCpuNow != null) lastCpu = procCpuNow
-        val cpuSource = if (hardwareCpuNow != null) "HardwarePropertiesManager" else "/proc/stat"
-        val cpuQuality = if (hardwareCpuNow != null) MetricQuality.SYSTEM_SERVICE else MetricQuality.MEASURED
+        val cpuInterval = evaluateCpuCounterInterval(
+            source = cpuCounterSource,
+            current = hardwareCpuNow ?: procCpuNow,
+            previous = lastCpuBaseline,
+        )
+        lastCpuBaseline = cpuInterval.nextBaseline
+        val cpuPercent = cpuInterval.percent
+        val cpuSource = cpuCounterSource.provenance
+        val cpuQuality = cpuCounterSource.quality
 
-        val wallDelta = now - lastWallMs
+        val wallDelta = cpuIntervalStartedMs - lastWallMs
         val appCpuNow = Process.getElapsedCpuTime()
         val appCpuDelta = appCpuNow - lastAppCpuMs
         val appCpu = if (wallDelta > 0L && appCpuDelta >= 0L) {
@@ -81,7 +271,7 @@ class SystemMonitor(
             null
         }
         lastAppCpuMs = appCpuNow
-        lastWallMs = now
+        lastWallMs = cpuIntervalStartedMs
 
         val memoryInfo = ActivityManager.MemoryInfo().also(activityManager::getMemoryInfo)
         val memory = normalizedMemoryMetrics(
@@ -90,27 +280,121 @@ class SystemMonitor(
             appPssKilobytes = Debug.getPss().toLong(),
         )
 
-        val hz = display?.refreshRate?.takeIf { it.isFinite() && it > 0f }
+        ensureSampleActive(cancellation)
+        val hz = request.displayRefreshRateHz
         hz?.let(frameTracker::updateExpectedRefresh)
 
-        compositionSampleCounter++
-        if (compositionSampleCounter == 1 || compositionSampleCounter % 5 == 0) {
-            lastComposition = surfaceFlinger.sample()
+        val compositionDecisionMonotonicMs = SystemClock.elapsedRealtime()
+        val vendorSessionBeforeCompositionProbe = vendorBridge.currentServiceSession()
+        val vendorCompositionPathReady = vendorCompositionPathCanReplaceSurfaceFlinger(
+            verifiedVendorCompositionSession = verifiedVendorCompositionSession,
+            currentVendorServiceSession = vendorSessionBeforeCompositionProbe,
+        )
+        if (
+            shouldRunSurfaceFlingerCompositionProbe(
+                policy = request.surfaceFlingerProbePolicy,
+                samplesUntilProbe = compositionSamplesUntilProbe,
+                evidence = lastCompositionEvidence,
+                observedMonotonicMs = compositionDecisionMonotonicMs,
+                maxAgeMs = SURFACE_FLINGER_EVIDENCE_MAX_AGE_MS,
+                vendorCompositionPathReady = vendorCompositionPathReady,
+            )
+        ) {
+            val composition = surfaceFlinger.sample()
+            lastCompositionEvidence = CompositionEvidence(
+                snapshot = composition,
+                completedMonotonicMs = SystemClock.elapsedRealtime(),
+            )
+            compositionSamplesUntilProbe = SURFACE_FLINGER_SAMPLE_EVERY_N_SNAPSHOTS - 1
+        } else if (
+            shouldDiscardCachedSurfaceFlingerEvidence(
+                request.surfaceFlingerProbePolicy,
+            )
+        ) {
+            // A pre-run dump must not masquerade as evidence for an untyped load step. Preserve
+            // the old sample in history, but project an explicit N/A until a fresh vendor pair or
+            // an explicit typed-boundary dump exists.
+            lastCompositionEvidence = null
+            compositionSamplesUntilProbe = 0
+        } else if (vendorCompositionPathReady) {
+            // Keep the fallback due. If the vendor pair disappears, or the active run ends, the
+            // next eligible sample probes immediately instead of inheriting a hidden cadence.
+            compositionSamplesUntilProbe = 0
+        } else {
+            compositionSamplesUntilProbe -= 1
         }
-        // Exact counters are intentionally sampled after the potentially slow SurfaceFlinger
-        // probe. A caller waiting for a post-warm-up baseline can then start its first phase
-        // immediately after this sample without charging probe latency to that phase.
+        ensureSampleActive(cancellation)
+        // Exact counters are intentionally sampled after a SurfaceFlinger probe. A caller waiting
+        // for a pre-phase baseline can then start immediately after this sample. At a typed active
+        // boundary the same ordering deliberately charges the bounded probe to that target phase.
         val vendor = vendorBridge.snapshot()
+        val vendorEvidenceCompletedMonotonicMs = vendor?.let {
+            completedEvidenceMonotonicMs(
+                sampleStartedMs = cpuIntervalStartedMs,
+                evidenceCompletedMs = SystemClock.elapsedRealtime(),
+            )
+        }
+        ensureSampleActive(cancellation)
         // Registration continuity is local state and must remain observable when the remote
         // metrics call times out under load. Only a real disconnect/reconnect changes this ID.
         val currentVendorServiceSession = vendorBridge.currentServiceSession()
+        verifiedVendorCompositionSession = nextVerifiedVendorCompositionSession(
+            snapshotServiceSession = vendor?.serviceSession,
+            currentServiceSession = currentVendorServiceSession,
+            deviceLayers = vendor?.deviceLayers,
+            clientLayers = vendor?.clientLayers,
+        )
         val kernel = kernelSensors.sample()
+        ensureSampleActive(cancellation)
         val vendorSource = vendor?.let {
             vendorServiceSource(it.apiVersion, it.serviceSession)
         }
 
         val vendorDpu = vendor?.dpuUtilization?.validUtilizationPercent()
         val vendorBus = vendor?.busUtilization?.validUtilizationPercent()
+        val vendorGpu = vendor?.gpuUtilization?.validUtilizationPercent()
+        val vendorGpuFrequencyMhz = normalizedVendorFrequencyMhz(vendor?.gpuFrequencyHz)
+        val vendorDpuFrequencyMhz = normalizedVendorFrequencyMhz(vendor?.dpuFrequencyHz)
+
+        // Read and reset both counters at the same point in every sample. The monitor loop can
+        // slip while dumpsys/sysfs is slow, so rates must use this real interval instead of
+        // assuming that every invocation represents exactly one second.
+        ensureSampleActive(cancellation)
+        val rateSampleNow = SystemClock.elapsedRealtime()
+        val rateDeltaMs = lastRateSampleMs?.let { rateSampleNow - it }?.takeIf { it > 0L }
+        val producedFrames = frameTracker.sampleProducedFrames()
+        val generatedBytes = loadManager.sampleAndResetBandwidthBytes()
+        lastRateSampleMs = rateSampleNow
+        val producedFps = normalizedPerSecond(producedFrames, rateDeltaMs)
+        val generatedGbps = normalizedGigabitsPerSecond(generatedBytes, rateDeltaMs)
+        val missedFrames = frameTracker.totalMissedFrames()
+        val thermalStatus = powerManager.currentThermalStatus
+        ensureSampleActive(cancellation)
+        val memoryLow = memoryInfo.lowMemory || loadManager.hasMemoryAllocationFailure()
+        val npuState = loadManager.npuStatus(vendor?.npuStatus)
+        val powerSaveMode = powerManager.isPowerSaveMode
+        ensureSampleActive(cancellation)
+        // CPU deltas use the interval-start clock above. Report/HUD ordering instead uses a
+        // terminal evidence timestamp after every counter and state read completed.
+        val evidenceMonotonicMs = completedEvidenceMonotonicMs(
+            sampleStartedMs = cpuIntervalStartedMs,
+            evidenceCompletedMs = SystemClock.elapsedRealtime(),
+        )
+        val compositionEvidence = projectCompositionEvidence(
+            evidence = lastCompositionEvidence,
+            observedMonotonicMs = evidenceMonotonicMs,
+            maxAgeMs = SURFACE_FLINGER_EVIDENCE_MAX_AGE_MS,
+        )
+        val composition = compositionEvidence.snapshot
+        val hwcCompositionEvidence = selectHwcCompositionEvidence(
+            vendorDeviceLayers = vendor?.deviceLayers,
+            vendorClientLayers = vendor?.clientLayers,
+            vendorSource = vendorSource,
+            vendorCompletedMonotonicMs = vendorEvidenceCompletedMonotonicMs,
+            surfaceFlinger = compositionEvidence,
+            observedMonotonicMs = evidenceMonotonicMs,
+            maxAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
+        )
         latestReadings = buildList {
             vendor?.underrunCount?.takeIf { it >= 0L }?.let { underrunCount ->
                 add(
@@ -134,70 +418,66 @@ class SystemMonitor(
                     ),
                 )
             }
-            lastComposition.hwcMissedFrames?.let { missed ->
+            vendorGpu?.let { gpu ->
+                add(
+                    SensorReading(
+                        "vendor_gpu",
+                        "GPU busy",
+                        "$gpu%",
+                        MetricQuality.HARDWARE_COUNTER,
+                        checkNotNull(vendorSource),
+                    ),
+                )
+            }
+            vendorGpuFrequencyMhz?.let { mhz ->
+                add(
+                    SensorReading(
+                        "vendor_gpu_frequency",
+                        "GPU clock",
+                        "%.0f MHz".format(mhz),
+                        MetricQuality.HARDWARE_COUNTER,
+                        checkNotNull(vendorSource),
+                    ),
+                )
+            }
+            vendorDpuFrequencyMhz?.let { mhz ->
+                add(
+                    SensorReading(
+                        "vendor_dpu_frequency",
+                        "DPU clock",
+                        "%.0f MHz".format(mhz),
+                        MetricQuality.HARDWARE_COUNTER,
+                        checkNotNull(vendorSource),
+                    ),
+                )
+            }
+            composition.hwcMissedFrames?.let { missed ->
                 add(
                     SensorReading(
                         "sf_hwc_missed",
                         "HWC missed frames",
                         missed.toString(),
                         MetricQuality.PROXY,
-                        lastComposition.source,
+                        composition.source,
                     ),
                 )
             }
-            lastComposition.gpuMissedFrames?.let { missed ->
+            composition.gpuMissedFrames?.let { missed ->
                 add(
                     SensorReading(
                         "sf_gpu_missed",
                         "GPU missed frames",
                         missed.toString(),
                         MetricQuality.PROXY,
-                        lastComposition.source,
+                        composition.source,
                     ),
                 )
             }
             addAll(kernel.readings)
         }
 
-        // Read and reset both counters at the same point in every sample. The monitor loop can
-        // slip while dumpsys/sysfs is slow, so rates must use this real interval instead of
-        // assuming that every invocation represents exactly one second.
-        val rateSampleNow = SystemClock.elapsedRealtime()
-        val rateDeltaMs = lastRateSampleMs?.let { rateSampleNow - it }?.takeIf { it > 0L }
-        val producedFrames = frameTracker.sampleProducedFrames()
-        val generatedBytes = loadManager.sampleAndResetBandwidthBytes()
-        lastRateSampleMs = rateSampleNow
-        val producedFps = normalizedPerSecond(producedFrames, rateDeltaMs)
-        val generatedGbps = normalizedGigabitsPerSecond(generatedBytes, rateDeltaMs)
-        val missedFrames = frameTracker.totalMissedFrames()
-        val thermalStatus = powerManager.currentThermalStatus
-        val vendorDeviceLayers = vendor?.deviceLayers
-        val vendorClientLayers = vendor?.clientLayers
-        val hwcDeviceLayers = vendorDeviceLayers ?: lastComposition.deviceLayers
-        val hwcClientLayers = vendorClientLayers ?: lastComposition.clientLayers
-        val hwcDeviceLayersQuality = when {
-            vendorDeviceLayers != null -> MetricQuality.HARDWARE_COUNTER
-            lastComposition.deviceLayers != null -> MetricQuality.SYSTEM_SERVICE
-            else -> MetricQuality.UNAVAILABLE
-        }
-        val hwcClientLayersQuality = when {
-            vendorClientLayers != null -> MetricQuality.HARDWARE_COUNTER
-            lastComposition.clientLayers != null -> MetricQuality.SYSTEM_SERVICE
-            else -> MetricQuality.UNAVAILABLE
-        }
-        val hwcDeviceLayersSource = when {
-            vendorDeviceLayers != null -> checkNotNull(vendorSource)
-            lastComposition.deviceLayers != null -> lastComposition.source
-            else -> ""
-        }
-        val hwcClientLayersSource = when {
-            vendorClientLayers != null -> checkNotNull(vendorSource)
-            lastComposition.clientLayers != null -> lastComposition.source
-            else -> ""
-        }
-
-        TelemetrySnapshot(
-            monotonicMs = now,
+        return TelemetrySnapshot(
+            monotonicMs = evidenceMonotonicMs,
             cpu = if (cpuPercent != null) {
                 Gauge(cpuPercent, "%", cpuQuality, cpuSource)
             } else {
@@ -238,38 +518,65 @@ class SystemMonitor(
                     MetricQuality.KERNEL
                 else -> MetricQuality.UNAVAILABLE
             },
-            gpuBusy = kernel.gpuBusy,
-            gpuFrequency = kernel.gpuFrequency,
-            busBusy = vendorBus?.let {
-                Gauge(it, "%", MetricQuality.HARDWARE_COUNTER, checkNotNull(vendorSource))
-            } ?: kernel.busBusy,
+            gpuBusy = preferHardwareCounterGauge(
+                value = vendorGpu,
+                unit = "%",
+                source = vendorSource,
+                fallback = kernel.gpuBusy,
+            ),
+            gpuFrequency = preferHardwareCounterGauge(
+                value = vendorGpuFrequencyMhz,
+                unit = " MHz",
+                source = vendorSource,
+                fallback = kernel.gpuFrequency,
+            ),
+            busBusy = preferHardwareCounterGauge(
+                value = vendorBus,
+                unit = "%",
+                source = vendorSource,
+                fallback = kernel.busBusy,
+            ),
             generatedBandwidth = generatedGbps?.let {
                 Gauge(it, " Gbps", MetricQuality.MEASURED, "memory load generator")
             } ?: Gauge(source = "memory load generator · sample baseline pending"),
-            dpuBusy = vendorDpu?.let {
-                Gauge(it, "%", MetricQuality.HARDWARE_COUNTER, checkNotNull(vendorSource))
-            } ?: kernel.dpuBusy,
-            dpuFrequency = kernel.dpuFrequency,
-            hwcDeviceLayers = hwcDeviceLayers,
-            hwcDeviceLayersQuality = hwcDeviceLayersQuality,
-            hwcDeviceLayersSource = hwcDeviceLayersSource,
-            hwcClientLayers = hwcClientLayers,
-            hwcClientLayersQuality = hwcClientLayersQuality,
-            hwcClientLayersSource = hwcClientLayersSource,
-            surfaceFlingerHwcMissed = lastComposition.hwcMissedFrames,
-            surfaceFlingerGpuMissed = lastComposition.gpuMissedFrames,
+            dpuBusy = preferHardwareCounterGauge(
+                value = vendorDpu,
+                unit = "%",
+                source = vendorSource,
+                fallback = kernel.dpuBusy,
+            ),
+            dpuFrequency = preferHardwareCounterGauge(
+                value = vendorDpuFrequencyMhz,
+                unit = " MHz",
+                source = vendorSource,
+                fallback = kernel.dpuFrequency,
+            ),
+            hwcDeviceLayers = hwcCompositionEvidence.deviceLayers,
+            hwcDeviceLayersQuality = hwcCompositionEvidence.quality,
+            hwcDeviceLayersSource = hwcCompositionEvidence.source,
+            hwcClientLayers = hwcCompositionEvidence.clientLayers,
+            hwcClientLayersQuality = hwcCompositionEvidence.quality,
+            hwcClientLayersSource = hwcCompositionEvidence.source,
+            hwcCompositionEvidenceMonotonicMs =
+                hwcCompositionEvidence.completedMonotonicMs,
+            hwcCompositionEvidenceAgeMs = hwcCompositionEvidence.ageMs,
+            surfaceFlingerHwcMissed = composition.hwcMissedFrames,
+            surfaceFlingerGpuMissed = composition.gpuMissedFrames,
             surfaceFlingerMissSource = if (
-                lastComposition.hwcMissedFrames != null ||
-                lastComposition.gpuMissedFrames != null
+                composition.hwcMissedFrames != null ||
+                composition.gpuMissedFrames != null
             ) {
-                lastComposition.source
+                composition.source
             } else {
                 ""
             },
+            surfaceFlingerEvidenceMonotonicMs =
+                compositionEvidence.completedMonotonicMs,
+            surfaceFlingerEvidenceAgeMs = compositionEvidence.ageMs,
             thermalStatus = thermalStatus,
             thermalLabel = thermalLabel(thermalStatus),
-            memoryLow = memoryInfo.lowMemory || loadManager.hasMemoryAllocationFailure(),
-            powerSaveMode = powerManager.isPowerSaveMode,
+            memoryLow = memoryLow,
+            powerSaveMode = powerSaveMode,
             vendorServiceSession = currentVendorServiceSession,
             compressionState = when {
                 vendor != null -> vendor.compressionState.ifBlank { "Unknown" }
@@ -278,8 +585,28 @@ class SystemMonitor(
             },
             // Reuse the vendor transaction already completed at the start of this sample.
             // NPU status must not trigger a second snapshot or contend with control-to-zero.
-            npuState = loadManager.npuStatus(vendor?.npuStatus),
+            npuState = npuState,
         )
+    }
+
+    private fun resetSampleBaselines() {
+        lastCpuBaseline = null
+        lastAppCpuMs = Process.getElapsedCpuTime()
+        lastWallMs = SystemClock.elapsedRealtime()
+        lastRateSampleMs = null
+        lastCompositionEvidence = null
+        verifiedVendorCompositionSession = null
+        compositionSamplesUntilProbe = 0
+        // A detached/timed-out sample may have consumed part of these interval counters. Discard
+        // the remainder so the next accepted value starts from one explicit fresh baseline.
+        frameTracker.sampleProducedFrames()
+        loadManager.sampleAndResetBandwidthBytes()
+    }
+
+    private fun ensureSampleActive(cancellation: ProbeCancellation) {
+        if (cancellation.isCancellationRequested() || Thread.currentThread().isInterrupted) {
+            throw InterruptedException("telemetry sample cancelled")
+        }
     }
 
     fun directSensorReadings(): List<SensorReading> = latestReadings
@@ -310,7 +637,25 @@ class SystemMonitor(
 
     fun close(
         resetCompression: Boolean = true,
-    ): VendorShutdownResult = vendorBridge.closeWithResult(resetCompression)
+    ): SystemMonitorShutdownResult {
+        val localSampleLaneStopped = stopLocalSamplingForShutdown()
+        // Cancel the process-owned diagnostic lane before tearing down vendor telemetry. Its
+        // bounded close prevents a stuck dumpsys pipe from retaining this monitor indefinitely.
+        val surfaceFlingerStopped = surfaceFlinger.closeWithResult()
+        return SystemMonitorShutdownResult(
+            localSampleLaneStopped = localSampleLaneStopped,
+            surfaceFlingerStopped = surfaceFlingerStopped,
+            vendor = vendorBridge.closeWithResult(resetCompression),
+        )
+    }
+
+    /**
+     * First shutdown stage. It prevents new samples, cancels the active request and waits for the
+     * actual worker `finally`. The backend owner must call this before closing [loadManager], whose
+     * counters and NPU status are read by the sample worker.
+     */
+    internal fun stopLocalSamplingForShutdown(): Boolean =
+        sampleLane.closeWithResult()
 
     private fun readCpuTimes(): CpuTimes? = runCatching {
         File("/proc/stat").bufferedReader().use { reader ->
@@ -390,6 +735,344 @@ internal fun normalizedMemoryMetrics(
 internal fun vendorServiceSource(apiVersion: Int, serviceSession: Long): String =
     "IDpuLabVendorService v$apiVersion · session=$serviceSession"
 
+internal fun normalizedVendorFrequencyMhz(frequencyHz: Long?): Float? {
+    val validHz = frequencyHz?.let(::validVendorFrequencyHz) ?: return null
+    return (validHz.toDouble() / HZ_PER_MHZ)
+        .takeIf { it.isFinite() && it <= Float.MAX_VALUE }
+        ?.toFloat()
+}
+
+internal fun preferHardwareCounterGauge(
+    value: Float?,
+    unit: String,
+    source: String?,
+    fallback: Gauge,
+): Gauge {
+    val validValue = value?.takeIf(Float::isFinite) ?: return fallback
+    val validSource = source?.takeIf(String::isNotBlank) ?: return fallback
+    return Gauge(
+        value = validValue,
+        unit = unit,
+        quality = MetricQuality.HARDWARE_COUNTER,
+        source = validSource,
+    )
+}
+
+/**
+ * Small construction-only ownership stack. It is intentionally bounded and single-threaded:
+ * callers register cleanup immediately after acquiring each resource, then commit exactly once.
+ */
+internal class BoundedConstructionRollback(
+    private val maxActions: Int = MAX_CONSTRUCTION_ROLLBACK_ACTIONS,
+) {
+    private val actions = ArrayDeque<() -> Unit>()
+    private var finished = false
+
+    init {
+        require(maxActions > 0) { "maxActions must be positive" }
+    }
+
+    fun own(action: () -> Unit) {
+        check(!finished) { "construction rollback is already finished" }
+        check(actions.size < maxActions) { "construction rollback action limit exceeded" }
+        actions.addLast(action)
+    }
+
+    fun commit() {
+        check(!finished) { "construction rollback is already finished" }
+        finished = true
+        actions.clear()
+    }
+
+    fun rollbackInto(primary: Throwable) {
+        if (finished) return
+        finished = true
+        while (actions.isNotEmpty()) {
+            try {
+                actions.removeLast().invoke()
+            } catch (cleanupError: Throwable) {
+                if (cleanupError !== primary) {
+                    runCatching { primary.addSuppressed(cleanupError) }
+                }
+            }
+        }
+    }
+}
+
+internal fun <T> constructWithBoundedRollback(
+    maxActions: Int = MAX_CONSTRUCTION_ROLLBACK_ACTIONS,
+    construction: (BoundedConstructionRollback) -> T,
+): T {
+    val rollback = BoundedConstructionRollback(maxActions)
+    return try {
+        construction(rollback).also {
+            rollback.commit()
+        }
+    } catch (error: Throwable) {
+        rollback.rollbackInto(error)
+        throw error
+    }
+}
+
+internal enum class CpuCounterSource(
+    val provenance: String,
+    val quality: MetricQuality,
+) {
+    HARDWARE_PROPERTIES(
+        provenance = "HardwarePropertiesManager",
+        quality = MetricQuality.SYSTEM_SERVICE,
+    ),
+    PROC_STAT(
+        provenance = "/proc/stat",
+        quality = MetricQuality.MEASURED,
+    ),
+}
+
+internal data class CpuCounterBaseline(
+    val source: CpuCounterSource,
+    val times: CpuTimes,
+)
+
+internal data class CpuCounterInterval(
+    val percent: Float?,
+    val nextBaseline: CpuCounterBaseline?,
+)
+
+/**
+ * CPU counter encodings have independent epochs. A source transition (including recovery from an
+ * unavailable read) establishes a new baseline and deliberately emits N/A for that interval.
+ */
+internal fun evaluateCpuCounterInterval(
+    source: CpuCounterSource,
+    current: CpuTimes?,
+    previous: CpuCounterBaseline?,
+): CpuCounterInterval {
+    val validCurrent = current?.takeIf(CpuTimes::isValid)
+        ?: return CpuCounterInterval(percent = null, nextBaseline = null)
+    val percent = if (previous?.source == source) {
+        validCurrent.percentSince(previous.times)
+    } else {
+        null
+    }
+    return CpuCounterInterval(
+        percent = percent,
+        nextBaseline = CpuCounterBaseline(source, validCurrent),
+    )
+}
+
+internal data class CompositionEvidence(
+    val snapshot: CompositionSnapshot,
+    val completedMonotonicMs: Long,
+)
+
+internal data class CompositionEvidenceProjection(
+    val snapshot: CompositionSnapshot,
+    val completedMonotonicMs: Long?,
+    val ageMs: Long?,
+)
+
+internal data class HwcCompositionEvidenceProjection(
+    val deviceLayers: Int? = null,
+    val clientLayers: Int? = null,
+    val quality: MetricQuality = MetricQuality.UNAVAILABLE,
+    val source: String = "",
+    val completedMonotonicMs: Long? = null,
+    val ageMs: Long? = null,
+)
+
+/**
+ * A complete pair from the still-current vendor service is a lower-overhead fresh composition
+ * path. Avoid spawning `dumpsys SurfaceFlinger` in that case, including for a forced typed sample:
+ * the vendor snapshot collected later in the same telemetry transaction is the fresh evidence.
+ */
+internal fun vendorCompositionPathCanReplaceSurfaceFlinger(
+    verifiedVendorCompositionSession: Long?,
+    currentVendorServiceSession: Long?,
+): Boolean =
+    verifiedVendorCompositionSession != null &&
+        verifiedVendorCompositionSession >= 0L &&
+        verifiedVendorCompositionSession == currentVendorServiceSession
+
+/**
+ * Capability is session-scoped and fail-closed. A timeout, partial pair, negative value, or Binder
+ * replacement clears the shortcut so the next eligible request can use SurfaceFlinger fallback.
+ */
+internal fun nextVerifiedVendorCompositionSession(
+    snapshotServiceSession: Long?,
+    currentServiceSession: Long?,
+    deviceLayers: Int?,
+    clientLayers: Int?,
+): Long? {
+    val snapshotSession = snapshotServiceSession ?: return null
+    if (snapshotSession < 0L) return null
+    if (snapshotSession != currentServiceSession) return null
+    if (deviceLayers == null || clientLayers == null) return null
+    if (deviceLayers < 0 || clientLayers < 0) return null
+    return snapshotSession
+}
+
+internal fun shouldRunSurfaceFlingerCompositionProbe(
+    policy: SurfaceFlingerProbePolicy,
+    samplesUntilProbe: Int,
+    evidence: CompositionEvidence?,
+    observedMonotonicMs: Long,
+    maxAgeMs: Long,
+    vendorCompositionPathReady: Boolean,
+): Boolean {
+    require(observedMonotonicMs >= 0L)
+    require(maxAgeMs >= 0L)
+    // Capacity evidence must be correlated with the just-published candidate topology. Never let
+    // an earlier vendor-capability cache suppress this one fresh fallback snapshot.
+    if (
+        policy != SurfaceFlingerProbePolicy.CALIBRATION_ONESHOT &&
+        vendorCompositionPathReady
+    ) {
+        return false
+    }
+    return when (policy) {
+        SurfaceFlingerProbePolicy.CALIBRATION_ONESHOT -> true
+        // Active typed phases may still obtain a fresh vendor snapshot later in this telemetry
+        // transaction, but never spawn a second SurfaceFlinger process after plan calibration.
+        SurfaceFlingerProbePolicy.TYPED_BOUNDARY -> false
+        SurfaceFlingerProbePolicy.SUPPRESS_DURING_LOAD -> false
+        SurfaceFlingerProbePolicy.PERIODIC ->
+            shouldProbeComposition(
+                forceCompositionProbe = false,
+                samplesUntilProbe = samplesUntilProbe,
+                evidence = evidence,
+                observedMonotonicMs = observedMonotonicMs,
+                maxAgeMs = maxAgeMs,
+            )
+    }
+}
+
+internal fun shouldDiscardCachedSurfaceFlingerEvidence(
+    policy: SurfaceFlingerProbePolicy,
+): Boolean =
+    policy == SurfaceFlingerProbePolicy.TYPED_BOUNDARY ||
+        policy == SurfaceFlingerProbePolicy.SUPPRESS_DURING_LOAD
+
+internal fun shouldProbeComposition(
+    forceCompositionProbe: Boolean,
+    samplesUntilProbe: Int,
+    evidence: CompositionEvidence?,
+    observedMonotonicMs: Long,
+    maxAgeMs: Long,
+): Boolean {
+    require(observedMonotonicMs >= 0L)
+    require(maxAgeMs >= 0L)
+    return forceCompositionProbe ||
+        samplesUntilProbe <= 0 ||
+        compositionEvidenceNeedsRefresh(
+            evidence = evidence,
+            observedMonotonicMs = observedMonotonicMs,
+            maxAgeMs = maxAgeMs,
+        )
+}
+
+internal fun compositionEvidenceNeedsRefresh(
+    evidence: CompositionEvidence?,
+    observedMonotonicMs: Long,
+    maxAgeMs: Long,
+): Boolean {
+    require(observedMonotonicMs >= 0L)
+    require(maxAgeMs >= 0L)
+    val completedMonotonicMs = evidence?.completedMonotonicMs ?: return true
+    if (completedMonotonicMs < 0L || observedMonotonicMs < completedMonotonicMs) return true
+    return observedMonotonicMs - completedMonotonicMs > maxAgeMs
+}
+
+/**
+ * Projects independently timestamped SurfaceFlinger evidence into a full telemetry snapshot.
+ * Values older than [maxAgeMs] become an explicit N/A gap instead of being re-stamped with the
+ * newer telemetry timestamp.
+ */
+internal fun projectCompositionEvidence(
+    evidence: CompositionEvidence?,
+    observedMonotonicMs: Long,
+    maxAgeMs: Long,
+): CompositionEvidenceProjection {
+    require(observedMonotonicMs >= 0L)
+    require(maxAgeMs >= 0L)
+    val completedMonotonicMs = evidence
+        ?.completedMonotonicMs
+        ?.takeIf { it >= 0L }
+    val ageMs = completedMonotonicMs
+        ?.takeIf { observedMonotonicMs >= it }
+        ?.let { observedMonotonicMs - it }
+    val fresh = ageMs != null && ageMs <= maxAgeMs
+    return CompositionEvidenceProjection(
+        snapshot = if (fresh) {
+            checkNotNull(evidence).snapshot
+        } else {
+            CompositionSnapshot(
+                source = evidence?.snapshot?.source.orEmpty(),
+                detail = "SurfaceFlinger evidence unavailable or stale",
+            )
+        },
+        completedMonotonicMs = completedMonotonicMs,
+        ageMs = ageMs,
+    )
+}
+
+/**
+ * Selects DEVICE/CLIENT as one atomic evidence pair. Mixing one vendor count with one
+ * SurfaceFlinger count would combine different sampling boundaries and can fabricate a topology
+ * that never existed in either source.
+ */
+internal fun selectHwcCompositionEvidence(
+    vendorDeviceLayers: Int?,
+    vendorClientLayers: Int?,
+    vendorSource: String?,
+    vendorCompletedMonotonicMs: Long?,
+    surfaceFlinger: CompositionEvidenceProjection,
+    observedMonotonicMs: Long,
+    maxAgeMs: Long,
+): HwcCompositionEvidenceProjection {
+    require(observedMonotonicMs >= 0L)
+    require(maxAgeMs >= 0L)
+
+    fun completePair(
+        deviceLayers: Int?,
+        clientLayers: Int?,
+        source: String?,
+        quality: MetricQuality,
+        completedMonotonicMs: Long?,
+    ): HwcCompositionEvidenceProjection? {
+        val device = deviceLayers?.takeIf { it >= 0 } ?: return null
+        val client = clientLayers?.takeIf { it >= 0 } ?: return null
+        val provenance = source?.takeIf(String::isNotBlank) ?: return null
+        if (quality == MetricQuality.UNAVAILABLE) return null
+        val completed = completedMonotonicMs
+            ?.takeIf { it >= 0L && it <= observedMonotonicMs }
+            ?: return null
+        val ageMs = observedMonotonicMs - completed
+        if (ageMs > maxAgeMs) return null
+        return HwcCompositionEvidenceProjection(
+            deviceLayers = device,
+            clientLayers = client,
+            quality = quality,
+            source = provenance,
+            completedMonotonicMs = completed,
+            ageMs = ageMs,
+        )
+    }
+
+    return completePair(
+        deviceLayers = vendorDeviceLayers,
+        clientLayers = vendorClientLayers,
+        source = vendorSource,
+        quality = MetricQuality.HARDWARE_COUNTER,
+        completedMonotonicMs = vendorCompletedMonotonicMs,
+    ) ?: completePair(
+        deviceLayers = surfaceFlinger.snapshot.deviceLayers,
+        clientLayers = surfaceFlinger.snapshot.clientLayers,
+        source = surfaceFlinger.snapshot.source,
+        quality = MetricQuality.SYSTEM_SERVICE,
+        completedMonotonicMs = surfaceFlinger.completedMonotonicMs,
+    ) ?: HwcCompositionEvidenceProjection()
+}
+
 internal data class CpuTimes(
     val idle: Long,
     val total: Long,
@@ -408,7 +1091,7 @@ internal data class CpuTimes(
             ?.toFloat()
     }
 
-    private fun isValid(): Boolean =
+    internal fun isValid(): Boolean =
         idle >= 0L && total > 0L && idle <= total && participantCount >= 0
 }
 
@@ -457,3 +1140,20 @@ private const val BITS_PER_BYTE = 8.0
 private const val BITS_PER_GIGABIT = 1_000_000_000.0
 private const val BYTES_PER_MEBIBYTE = 1_048_576.0
 private const val KIBIBYTES_PER_MEBIBYTE = 1_024.0
+private const val HZ_PER_MHZ = 1_000_000.0
+internal const val SYSTEM_MONITOR_SAMPLE_TIMEOUT_MS = 4_000L
+internal const val HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS = 2_500L
+internal const val SURFACE_FLINGER_EVIDENCE_MAX_AGE_MS =
+    HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS
+private const val SURFACE_FLINGER_SAMPLE_EVERY_N_SNAPSHOTS = 3
+private const val SAMPLE_SHUTDOWN_TIMEOUT_MS = 1_500L
+private const val MAX_CONSTRUCTION_ROLLBACK_ACTIONS = 8
+
+internal fun completedEvidenceMonotonicMs(
+    sampleStartedMs: Long,
+    evidenceCompletedMs: Long,
+): Long {
+    require(sampleStartedMs >= 0L)
+    require(evidenceCompletedMs >= 0L)
+    return maxOf(sampleStartedMs, evidenceCompletedMs)
+}

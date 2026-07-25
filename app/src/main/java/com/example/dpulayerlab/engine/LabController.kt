@@ -2,6 +2,7 @@ package com.example.dpulayerlab.engine
 
 import android.app.Activity
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.res.AssetFileDescriptor
 import android.media.MediaCodecInfo
 import android.media.MediaExtractor
@@ -18,9 +19,11 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.FileProvider
+import androidx.core.content.ContextCompat
 import com.example.dpulayerlab.model.BufferSize
 import com.example.dpulayerlab.model.DecoderLinearReference
 import com.example.dpulayerlab.model.Gauge
+import com.example.dpulayerlab.model.HwcCompositionExpectation
 import com.example.dpulayerlab.model.LayerBackend
 import com.example.dpulayerlab.model.LOAD_CONTROL_CADENCE_MS
 import com.example.dpulayerlab.model.MIN_EFFECTIVE_LOAD
@@ -57,7 +60,10 @@ import com.example.dpulayerlab.model.terminalReason
 import com.example.dpulayerlab.monitor.FrameTracker
 import com.example.dpulayerlab.monitor.CapabilityScanner
 import com.example.dpulayerlab.monitor.CompressionControlResult
+import com.example.dpulayerlab.monitor.HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS
 import com.example.dpulayerlab.monitor.SystemMonitor
+import com.example.dpulayerlab.monitor.SurfaceFlingerProbePolicy
+import com.example.dpulayerlab.monitor.SYSTEM_MONITOR_SAMPLE_TIMEOUT_MS
 import com.example.dpulayerlab.render.RendererSafetyState
 import com.example.dpulayerlab.render.MAX_BOUND_COMPRESSED_SAMPLE_BYTES
 import com.example.dpulayerlab.render.MEDIA_KEY_CODECS_STRING_COMPAT
@@ -66,6 +72,9 @@ import com.example.dpulayerlab.render.MEDIA_KEY_CROP_LEFT_COMPAT
 import com.example.dpulayerlab.render.MEDIA_KEY_CROP_RIGHT_COMPAT
 import com.example.dpulayerlab.render.MEDIA_KEY_CROP_TOP_COMPAT
 import com.example.dpulayerlab.render.PinnedMediaSource
+import com.example.dpulayerlab.render.PinnedMediaCleanupState
+import com.example.dpulayerlab.render.closePinnedMediaDescriptor
+import com.example.dpulayerlab.render.constructWithOwnedCloseOnFailure
 import com.example.dpulayerlab.render.VideoDecoderSelection
 import com.example.dpulayerlab.render.boundedCodecConfigFingerprint
 import com.example.dpulayerlab.render.exactMediaIntegerOrNull
@@ -73,13 +82,18 @@ import com.example.dpulayerlab.render.fixedVideoMaximumDimensionsMatch
 import com.example.dpulayerlab.render.videoDimensionCeiling
 import com.example.dpulayerlab.render.visibleVideoDimensions
 import com.example.dpulayerlab.util.currentDisplayCompat
+import com.example.dpulayerlab.vendor.VendorBridge
+import com.example.dpulayerlab.vendor.VendorPerformanceSessionState
+import com.example.dpulayerlab.vendor.VendorPerformanceSessionTicket
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -87,6 +101,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.File
@@ -99,19 +114,242 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-class LabController(
+internal data class LabControllerFrontendInputs(
+    val appContext: android.content.Context,
+    val mainHandler: Handler,
+    val keepScreenOnInitially: Boolean,
+    val powerManager: PowerManager,
+    val initialSafetyLimits: RenderSafetyLimits,
+)
+
+internal data class LabControllerBackendResources(
+    val loadManager: LoadManager,
+    val frameTracker: FrameTracker,
+    val systemMonitor: SystemMonitor,
+    val vendorBridge: VendorBridge,
+)
+
+enum class HwcCapacityCalibrationStatus {
+    PENDING,
+    OBSERVED_AT_CANDIDATE,
+    UNAVAILABLE,
+}
+
+data class HwcCapacityCalibrationResult(
+    val status: HwcCapacityCalibrationStatus,
+    val candidateLayers: Int? = null,
+    val observedDeviceLayers: Int? = null,
+    val observedClientLayers: Int? = null,
+    val source: String = "",
+    val quality: MetricQuality = MetricQuality.UNAVAILABLE,
+    val evidenceMonotonicMs: Long? = null,
+    val detail: String = "",
+) {
+    fun eventDetail(): String =
+        "status=${status.name}; candidate=${candidateLayers ?: "N/A"}; " +
+            "device=${observedDeviceLayers ?: "N/A"}; " +
+            "client=${observedClientLayers ?: "N/A"}; " +
+            "quality=${quality.name}; source=${source.ifBlank { "N/A" }}; " +
+            "evidenceMs=${evidenceMonotonicMs ?: "N/A"}; " +
+            "scope=observed-at-candidate-not-universal-max; detail=${detail.ifBlank { "N/A" }}"
+
+    fun uiSummary(): String =
+        when (status) {
+            HwcCapacityCalibrationStatus.PENDING ->
+                "HWC capacity · plan 1회 측정 대기"
+            HwcCapacityCalibrationStatus.OBSERVED_AT_CANDIDATE ->
+                "HWC capacity · ${candidateLayers ?: "N/A"}L 후보에서 " +
+                    "D${observedDeviceLayers ?: "N/A"}/C${observedClientLayers ?: "N/A"} · " +
+                    "${quality.name}@${source.ifBlank { "N/A" }} · " +
+                    capacityReuseGuidance(this).uiSummary()
+            HwcCapacityCalibrationStatus.UNAVAILABLE ->
+                "HWC capacity · N/A · 후보 ${candidateLayers ?: "N/A"}L · " +
+                    "${quality.name}@${source.ifBlank { "N/A" }} · " +
+                    detail.ifBlank { "fresh pair unavailable" }
+        }
+}
+
+data class HwcCapacityReuseGuidance(
+    val deviceCandidateCeiling: Int? = null,
+    val clientPressureCandidate: Int? = null,
+    val detail: String,
+) {
+    fun uiSummary(): String =
+        "ref DEVICE≤${deviceCandidateCeiling ?: "N/A"}L / " +
+            "CLIENT≥${clientPressureCandidate ?: "N/A"}L · topology별 재검증"
+}
+
+/**
+ * Builds fallible Activity state first, then transfers a fully-owned backend bundle into the
+ * controller. Any failure after VendorBridge creation performs bounded reverse cleanup while all
+ * references are still available; MainActivity will keep the process owner failed if that cleanup
+ * cannot be proved.
+ */
+internal fun createLabController(
+    activity: Activity,
+    requestDisplayMode: (Float) -> Boolean,
+    testWindowIsolation: TestWindowIsolationPort,
+    backendOwnerToken: ControllerBackendOwnerToken,
+): LabController {
+    val appContext = activity.applicationContext
+    val frontendInputs = LabControllerFrontendInputs(
+        appContext = appContext,
+        mainHandler = Handler(Looper.getMainLooper()),
+        keepScreenOnInitially =
+            activity.window.attributes.flags and
+                WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON != 0,
+        powerManager = checkNotNull(activity.getSystemService(PowerManager::class.java)) {
+            "PowerManager unavailable"
+        },
+        initialSafetyLimits = DeviceRenderSafety.detect(activity),
+    )
+
+    // Acquire the singleton before constructing LoadManager, which also uses it internally. If
+    // LoadManager construction fails after creating its reflection adapter, this outer owner can
+    // still close the Binder lanes instead of losing the only bridge reference.
+    val vendorBridge = VendorBridge.get(appContext)
+    var loadManager: LoadManager? = null
+    var systemMonitor: SystemMonitor? = null
+    try {
+        val ownedLoadManager = LoadManager(appContext)
+        loadManager = ownedLoadManager
+        val frameTracker = FrameTracker()
+        val ownedSystemMonitor = SystemMonitor.create(
+            context = appContext,
+            frameTracker = frameTracker,
+            loadManager = ownedLoadManager,
+        )
+        systemMonitor = ownedSystemMonitor
+        return LabController(
+            activity = activity,
+            requestDisplayMode = requestDisplayMode,
+            testWindowIsolation = testWindowIsolation,
+            backendOwnerToken = backendOwnerToken,
+            frontendInputs = frontendInputs,
+            backendResources = LabControllerBackendResources(
+                loadManager = ownedLoadManager,
+                frameTracker = frameTracker,
+                systemMonitor = ownedSystemMonitor,
+                vendorBridge = vendorBridge,
+            ),
+        )
+    } catch (error: Throwable) {
+        val monitor = systemMonitor
+        val sampleLaneStopped = monitor?.let { ownedMonitor ->
+            runCatching {
+                ownedMonitor.stopLocalSamplingForShutdown()
+            }.getOrElse { cleanupError ->
+                error.addSuppressed(cleanupError)
+                false
+            }
+        } ?: true
+        if (sampleLaneStopped) {
+            loadManager?.let { ownedLoadManager ->
+                runCatching {
+                    val shutdown = ownedLoadManager.closeWithResult()
+                    check(
+                        shutdown.workersStopped &&
+                            shutdown.npu.backendCloseConfirmed,
+                    ) {
+                        "LoadManager construction rollback did not stop every worker/backend"
+                    }
+                }.exceptionOrNull()?.let(error::addSuppressed)
+            }
+            if (monitor != null) {
+                runCatching {
+                    val shutdown = monitor.close(resetCompression = false)
+                    check(
+                        shutdown.localSampleLaneStopped &&
+                            shutdown.surfaceFlingerStopped,
+                    ) {
+                        "SystemMonitor construction rollback was not confirmed"
+                    }
+                }.exceptionOrNull()?.let(error::addSuppressed)
+            }
+            // SystemMonitor normally owns this close. Repeat it defensively because an exception
+            // in an earlier monitor rollback step must not skip Binder-lane shutdown.
+            runCatching {
+                vendorBridge.closeWithResult(resetCompression = false)
+            }.exceptionOrNull()?.let(error::addSuppressed)
+        } else {
+            error.addSuppressed(
+                IllegalStateException(
+                    "SystemMonitor sample worker survived construction rollback; " +
+                        "dependent backends were quarantined",
+                ),
+            )
+        }
+        throw error
+    }
+}
+
+class LabController internal constructor(
     private val activity: Activity,
     private val requestDisplayMode: (Float) -> Boolean,
+    private val testWindowIsolation: TestWindowIsolationPort,
+    private val backendOwnerToken: ControllerBackendOwnerToken,
+    frontendInputs: LabControllerFrontendInputs,
+    backendResources: LabControllerBackendResources,
 ) : AutoCloseable {
+    private val appContext = frontendInputs.appContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val mainHandler = Handler(Looper.getMainLooper())
+    /** Survives [scope] cancellation long enough to acknowledge SystemUI restoration. */
+    private val isolationCleanupScope =
+        CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val mainHandler = frontendInputs.mainHandler
+    /** Preserve a host Activity/embedding environment that already owned the screen-on flag. */
+    private val keepScreenOnInitially = frontendInputs.keepScreenOnInitially
     private val rendererLifecycleStageOwner =
         RendererSafetyState.createLifecycleStageOwner()
-    private val loadManager = LoadManager(activity)
-    val frameTracker = FrameTracker()
-    private val systemMonitor = SystemMonitor(activity, frameTracker, loadManager)
+    private val powerManager = frontendInputs.powerManager
+    private val loadManager = backendResources.loadManager
+    val frameTracker = backendResources.frameTracker
+    private val systemMonitor = backendResources.systemMonitor
+    private val vendorBridge = backendResources.vendorBridge
+    @Volatile
     private var monitorJob: Job? = null
+    @Volatile
     private var watchdogJob: Job? = null
+    @Volatile
+    private var expectedMonitorStop: Job? = null
+    @Volatile
+    private var expectedWatchdogStop: Job? = null
+    private val telemetryMonitoringRequested = AtomicBoolean(false)
+    private val telemetryLifecycleIntegrityConfirmed = AtomicBoolean(true)
+    private val telemetryRestartPosted = AtomicBoolean(false)
+    private val telemetryRestartRunnable = Runnable {
+        telemetryRestartPosted.set(false)
+        if (
+            telemetryMonitoringRequested.get() &&
+            telemetryLifecycleIntegrityConfirmed.get() &&
+            !closed &&
+            monitorJob == null &&
+            watchdogJob == null
+        ) {
+            start()
+        }
+    }
+    @Volatile
+    private var performanceRenewalJob: Job? = null
+    @Volatile
+    private var performanceSessionTicket: VendorPerformanceSessionTicket? = null
+    @Volatile
+    private var performanceIsolationOwned = false
+    @Volatile
+    private var performanceIsolationLifecycle = PerformanceIsolationLifecycle.IDLE
+    private var performanceBaselinePowerSaveMode: Boolean? = null
+    private val performancePolicyRestoreConfirmed = AtomicBoolean(true)
+    /**
+     * Exact END restoration cannot rehabilitate a stale/late command, failed renewal/health
+     * acknowledgment, or changed vendor service session. Keep that evidence across plan resets and
+     * hand it to the Activity-free process cleanup gate on close.
+     */
+    private val performanceSessionIntegrityConfirmed = AtomicBoolean(true)
+    private var powerStateReceiverRegistered = false
+    private val powerStateReceiverCleanupConfirmed = AtomicBoolean(true)
+    private val powerStateCallbackHolder = PowerStateCallbackHolder()
+    private val powerStateReceiver = PowerStateBroadcastReceiver(powerStateCallbackHolder)
+    @Volatile
     private var runJob: Job? = null
     private val runSamples = mutableListOf<TelemetrySnapshot>()
     private val runEvents = mutableListOf<RunEvent>()
@@ -126,19 +364,39 @@ class LabController(
     private var exactCounterSamplesAfterBaseline = 0
     private var baselineSuspected = 0L
     private var producerRateShortfallReason: String? = null
+    private var hwcCompositionCoverageFailureReason: String? = null
+    private var hwcCompositionChainAnchor: HwcCompositionChainAnchor? = null
+    private val activeHwcCompositionCoverage =
+        AtomicReference<HwcCompositionCoverageTracker?>()
+    /**
+     * While a typed target needs forced evidence, periodic telemetry uses latest-wins tryLock/drop
+     * semantics and cannot enqueue ahead of the next forced sample.
+     */
+    private val hwcCompositionProbePriorityGate =
+        HwcCompositionProbePriorityGate()
     private var thermalReduced = false
+    private var severeThermalPolicyObservationRecorded = false
+    private var activeRuntimeProtectionPolicy = RuntimeProtectionPolicy()
     /** True after an accepted SBWC route until a linear/default reset is acknowledged. */
     private var compressionControlActive = false
     /** Binder registration that acknowledged the currently active non-linear route. */
     private var compressionControlSession: Long? = null
     private var cancellationReason: String? = null
     private var runFinalized = false
+    private var lastPerformanceRestoreReportPersisted = false
     private var pendingRendererGeneration: Long? = null
     private val telemetrySampleMutex = Mutex()
     /** Serializes phase setpoints with ordered-zero/thermal control transactions. */
     private val loadControlMutex = Mutex()
     private val telemetrySampleGate = TelemetrySampleGenerationGate()
-    private var controllerCloseCleanupConfirmed: Boolean? = null
+    private val backendUseCompletionGroup =
+        ActivityFreeCompletionGroup(maxPendingRegistrations = 16)
+    private val frontendCleanupConfirmed = AtomicBoolean(true)
+    private val controllerCloseCleanupConfirmed =
+        AtomicReference<Boolean?>(null)
+    private var closeRendererCompletion: ActivityFreeCompletionRegistration? = null
+    private var closeRendererTimeout: Runnable? = null
+    private val rendererContainerLifecycle = RendererContainerLifecycleTracker()
     @Volatile
     private var activeProducerFrameBudget: AppliedProducerFrameBudget? = null
     @Volatile
@@ -149,8 +407,18 @@ class LabController(
     private var producerRecoveryPaused = false
     private val topologyPendingBoundary =
         AtomicReference<ProducerTopologyPendingBoundary?>()
+    private val producerTopologyStateLock = Any()
+    @Volatile
     private var closed = false
     private var lastSuccessfulSampleMs = SystemClock.elapsedRealtime()
+    @Volatile
+    private var telemetrySampleInFlightDeadlineMs: Long? = null
+    @Volatile
+    private var activeTestWindowIsolationToken: Long? = null
+    private var isolationReleaseToken: Long? = null
+    private var isolationReleaseDeferred: Deferred<Boolean>? = null
+    private var isolationBarrierReleaseToken: Long? = null
+    private var isolationBarrierReleaseDeferred: Deferred<Boolean>? = null
 
     var telemetry by mutableStateOf(TelemetrySnapshot())
         private set
@@ -174,12 +442,24 @@ class LabController(
         private set
     var screenAwake by mutableStateOf(false)
         private set
+    var performanceIsolationStatus by mutableStateOf("대기")
+        private set
+    var hwcCapacityCalibration by mutableStateOf(
+        HwcCapacityCalibrationResult(HwcCapacityCalibrationStatus.PENDING),
+    )
+        private set
     var errorMessage by mutableStateOf<String?>(null)
         private set
-    var safetyLimits by mutableStateOf(DeviceRenderSafety.detect(activity))
+    var safetyLimits by mutableStateOf(frontendInputs.initialSafetyLimits)
         private set
     var lastSafetyAdjustments by mutableStateOf<List<String>>(emptyList())
         private set
+    var severeThermalDeratingEnabled by mutableStateOf(false)
+        private set
+    val canConfigureRuntimeProtection: Boolean
+        get() = !planStartBlocked(runJobPresent = runJob != null, isRunning = isRunning)
+    val activeSevereThermalDeratingEnabled: Boolean
+        get() = activeRuntimeProtectionPolicy.severeThermalDeratingEnabled
     val directSensors = mutableStateListOf<SensorReading>()
     val telemetryHistory = mutableStateListOf<TelemetrySnapshot>()
     private val mutablePlanResultHistory = mutableStateListOf<PlanRunResult>()
@@ -195,10 +475,38 @@ class LabController(
 
     fun start() {
         if (closed) return
-        if (monitorJob?.isActive == true) {
-            // FrameTracker.stop() is called from pause(); reset its baseline on every resume.
-            frameTracker.start()
-            return
+        telemetryMonitoringRequested.set(true)
+        registerPowerStateReceiver()
+        val existingMonitor = monitorJob
+        val existingWatchdog = watchdogJob
+        when (
+            telemetryPairStartDecision(
+                monitorPresent = existingMonitor != null,
+                monitorActive = existingMonitor?.isActive == true,
+                watchdogPresent = existingWatchdog != null,
+                watchdogActive = existingWatchdog?.isActive == true,
+                lifecycleIntegrityConfirmed = telemetryLifecycleIntegrityConfirmed.get(),
+            )
+        ) {
+            TelemetryPairStartDecision.REUSE_ACTIVE_PAIR -> {
+                // FrameTracker.stop() is called from pause(); reset its baseline on every resume.
+                frameTracker.start()
+                return
+            }
+            TelemetryPairStartDecision.WAIT_FOR_TERMINATION -> {
+                cancelTelemetryPairExpected(existingMonitor, existingWatchdog)
+                frameTracker.stop()
+                return
+            }
+            TelemetryPairStartDecision.REJECT_UNTRUSTED_LIFECYCLE -> {
+                cancelTelemetryPairExpected(existingMonitor, existingWatchdog)
+                frameTracker.stop()
+                errorMessage =
+                    "Telemetry worker lifecycle 실패가 확인되어 process 재시작 전 계측을 " +
+                        "재사용할 수 없습니다."
+                return
+            }
+            TelemetryPairStartDecision.START_NEW_PAIR -> Unit
         }
         if (!loadManager.start()) {
             errorMessage =
@@ -207,41 +515,140 @@ class LabController(
         }
         frameTracker.start()
         lastSuccessfulSampleMs = SystemClock.elapsedRealtime()
-        monitorJob = scope.launch {
-            while (isActive) {
-                try {
-                    collectTelemetrySample()
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (error: Exception) {
-                    errorMessage = "상태 계측 실패: ${error.javaClass.simpleName}"
-                    if (isRunning) {
-                        invalidateExactCounter(
-                            "periodic telemetry sample failed: ${error.javaClass.simpleName}",
+        val monitorCompletion = backendUseCompletionGroup.registerStart()
+        val watchdogCompletion = backendUseCompletionGroup.registerStart()
+        if (monitorCompletion == null || watchdogCompletion == null) {
+            telemetryLifecycleIntegrityConfirmed.set(false)
+            monitorCompletion?.fail("monitor/watchdog registration was incomplete")
+            watchdogCompletion?.fail("monitor/watchdog registration was incomplete")
+            errorMessage =
+                "Backend lifecycle tracker를 등록할 수 없어 계측을 시작하지 않았습니다."
+            frameTracker.stop()
+            return
+        }
+        val monitorLifecycle = TransactionalCompletionRegistration(monitorCompletion)
+        val watchdogLifecycle = TransactionalCompletionRegistration(watchdogCompletion)
+        var newMonitorJob: Job? = null
+        var newWatchdogJob: Job? = null
+        var monitorCompletionAttached = false
+        var watchdogCompletionAttached = false
+        try {
+            val createdMonitorJob = scope.launch(start = CoroutineStart.LAZY) {
+                while (isActive) {
+                    try {
+                        collectPeriodicTelemetrySample()
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        errorMessage = "상태 계측 실패: ${error.javaClass.simpleName}"
+                        if (isRunning) {
+                            invalidateExactCounter(
+                                "periodic telemetry sample failed: ${error.javaClass.simpleName}",
+                            )
+                        }
+                    }
+                    delay(MONITOR_INTERVAL_MS)
+                }
+            }
+            newMonitorJob = createdMonitorJob
+            createdMonitorJob.invokeOnCompletion { cause ->
+                onTelemetryWorkerCompletion(
+                    operation = "monitor",
+                    completedJob = createdMonitorJob,
+                    monitorWorker = true,
+                    cause = cause,
+                    lifecycle = monitorLifecycle,
+                )
+            }
+            monitorCompletionAttached = true
+
+            val createdWatchdogJob = scope.launch(start = CoroutineStart.LAZY) {
+                while (isActive) {
+                    delay(WATCHDOG_INTERVAL_MS)
+                    val watchdogNowMs = SystemClock.elapsedRealtime()
+                    if (
+                        isRunning &&
+                        shouldAbortTelemetryWatchdog(
+                            nowMs = watchdogNowMs,
+                            lastSuccessfulSampleMs = lastSuccessfulSampleMs,
+                            staleTimeoutMs = MONITOR_STALE_TIMEOUT_MS,
+                            inFlightDeadlineMs = telemetrySampleInFlightDeadlineMs,
+                        ) &&
+                        cancellationReason == null
+                    ) {
+                        abortForSafety(
+                            reason =
+                                "telemetry가 ${MONITOR_STALE_TIMEOUT_MS / 1_000}초 이상 응답하지 않음",
+                            eventType = "MONITOR_WATCHDOG",
                         )
                     }
                 }
-                delay(MONITOR_INTERVAL_MS)
             }
-        }
-        watchdogJob = scope.launch {
-            while (isActive) {
-                delay(WATCHDOG_INTERVAL_MS)
-                if (
-                    isRunning &&
-                    SystemClock.elapsedRealtime() - lastSuccessfulSampleMs > MONITOR_STALE_TIMEOUT_MS &&
-                    cancellationReason == null
-                ) {
-                    abortForSafety(
-                        reason = "telemetry가 ${MONITOR_STALE_TIMEOUT_MS / 1_000}초 이상 응답하지 않음",
-                        eventType = "MONITOR_WATCHDOG",
-                    )
-                }
+            newWatchdogJob = createdWatchdogJob
+            createdWatchdogJob.invokeOnCompletion { cause ->
+                onTelemetryWorkerCompletion(
+                    operation = "watchdog",
+                    completedJob = createdWatchdogJob,
+                    monitorWorker = false,
+                    cause = cause,
+                    lifecycle = watchdogLifecycle,
+                )
             }
+            watchdogCompletionAttached = true
+
+            monitorJob = createdMonitorJob
+            watchdogJob = createdWatchdogJob
+            check(createdMonitorJob.start()) { "monitor Job did not enter LAZY start" }
+            check(createdWatchdogJob.start()) { "watchdog Job did not enter LAZY start" }
+            check(monitorLifecycle.commit()) { "monitor lifecycle setup was already resolved" }
+            check(watchdogLifecycle.commit()) { "watchdog lifecycle setup was already resolved" }
+        } catch (error: Throwable) {
+            telemetryLifecycleIntegrityConfirmed.set(false)
+            val failureReason = if (isFatalTelemetryStartupFailure(error)) {
+                "fatal monitor/watchdog startup failure"
+            } else {
+                "monitor/watchdog startup failed"
+            }
+            bestEffortCleanup(error) { monitorLifecycle.fail(failureReason) }
+            bestEffortCleanup(error) { watchdogLifecycle.fail(failureReason) }
+            newMonitorJob?.let { failedMonitor ->
+                if (monitorCompletionAttached) expectedMonitorStop = failedMonitor
+                bestEffortCleanup(error) { failedMonitor.cancel() }
+            }
+            newWatchdogJob?.let { failedWatchdog ->
+                if (watchdogCompletionAttached) expectedWatchdogStop = failedWatchdog
+                bestEffortCleanup(error) { failedWatchdog.cancel() }
+            }
+            if (!monitorCompletionAttached) {
+                completeUnattachedStartupOperation(
+                    job = newMonitorJob,
+                    completion = monitorLifecycle,
+                    primaryFailure = error,
+                )
+            }
+            if (!watchdogCompletionAttached) {
+                completeUnattachedStartupOperation(
+                    job = newWatchdogJob,
+                    completion = watchdogLifecycle,
+                    primaryFailure = error,
+                )
+            }
+            if (newMonitorJob?.isCompleted == true && monitorJob === newMonitorJob) {
+                monitorJob = null
+            }
+            if (newWatchdogJob?.isCompleted == true && watchdogJob === newWatchdogJob) {
+                watchdogJob = null
+            }
+            bestEffortCleanup(error) { frameTracker.stop() }
+            if (isFatalTelemetryStartupFailure(error)) throw error
+            errorMessage = "상태 계측 lifecycle 시작 실패: ${error.javaClass.simpleName}"
         }
     }
 
     fun pause() {
+        telemetryMonitoringRequested.set(false)
+        mainHandler.removeCallbacks(telemetryRestartRunnable)
+        telemetryRestartPosted.set(false)
         val activeRun = shouldStopActivePlan(
             jobPresent = runJob?.isActive == true,
             isRunning = isRunning,
@@ -252,14 +659,131 @@ class LabController(
             progress = progressForControllerPause(progress, activeRun)
             stopScenario("Controller가 pause되어 안전 중단")
         }
-        monitorJob?.cancel()
-        watchdogJob?.cancel()
-        monitorJob = null
-        watchdogJob = null
+        cancelTelemetryPairExpected(monitorJob, watchdogJob)
         frameTracker.stop()
+        unregisterPowerStateReceiver()
         releaseGeneratedLoads(dropMemoryBuffers = true)
         resetDisplayModeSafely()
         setWakeStateSafely(false)
+    }
+
+    private fun cancelTelemetryPairExpected(
+        monitor: Job?,
+        watchdog: Job?,
+    ) {
+        monitor?.let { owner ->
+            expectedMonitorStop = owner
+            owner.cancel()
+        }
+        watchdog?.let { owner ->
+            expectedWatchdogStop = owner
+            owner.cancel()
+        }
+    }
+
+    private fun onTelemetryWorkerCompletion(
+        operation: String,
+        completedJob: Job,
+        monitorWorker: Boolean,
+        cause: Throwable?,
+        lifecycle: TransactionalCompletionRegistration,
+    ) {
+        val expectedStop = if (monitorWorker) {
+            val expected = expectedMonitorStop === completedJob
+            if (expected) expectedMonitorStop = null
+            expected
+        } else {
+            val expected = expectedWatchdogStop === completedJob
+            if (expected) expectedWatchdogStop = null
+            expected
+        }
+        val operationFailure = unexpectedLongLivedWorkerCompletionReason(
+            operation = operation,
+            cause = cause,
+            expectedStop = expectedStop,
+        )
+        if (operationFailure != null) {
+            telemetryLifecycleIntegrityConfirmed.set(false)
+        }
+        val ownedCompletion = if (monitorWorker) {
+            if (monitorJob === completedJob) {
+                monitorJob = null
+                true
+            } else {
+                false
+            }
+        } else {
+            if (watchdogJob === completedJob) {
+                watchdogJob = null
+                true
+            } else {
+                false
+            }
+        }
+        try {
+            if (operationFailure != null && ownedCompletion) {
+                // Keep the pair indivisible. A surviving watchdog without samples (or a sampler
+                // without its watchdog) must never be reused or overwritten by a new generation.
+                if (monitorWorker) {
+                    watchdogJob?.let { sibling ->
+                        expectedWatchdogStop = sibling
+                        sibling.cancel()
+                    }
+                } else {
+                    monitorJob?.let { sibling ->
+                        expectedMonitorStop = sibling
+                        sibling.cancel()
+                    }
+                }
+                publishTelemetryWorkerFailure(operationFailure)
+            }
+        } finally {
+            // Integrity and identity must be visible before resolving the Activity-free ticket:
+            // this may wake process cleanup immediately when it was the final backend user.
+            try {
+                lifecycle.completeOperation(operationFailure)
+            } finally {
+                if (ownedCompletion) requestTelemetryRestartAfterTermination()
+            }
+        }
+    }
+
+    private fun publishTelemetryWorkerFailure(reason: String) {
+        val bounded =
+            "Telemetry worker 비정상 종료: $reason".take(MAX_EVENT_MESSAGE_CHARS)
+        val abort = Runnable {
+            errorMessage = bounded
+            if (runJob?.isActive == true && isRunning) {
+                abortForSafety(
+                    reason = bounded,
+                    eventType = "TELEMETRY_WORKER_FAILURE",
+                )
+            }
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            abort.run()
+        } else if (!mainHandler.post(abort)) {
+            // The UI lane is unavailable, but cancellation itself is thread-safe and ensures the
+            // NonCancellable run finalizer starts draining every producer/load owner.
+            runJob?.cancel(CancellationException(bounded))
+        }
+    }
+
+    private fun requestTelemetryRestartAfterTermination() {
+        if (
+            !telemetryMonitoringRequested.get() ||
+            !telemetryLifecycleIntegrityConfirmed.get() ||
+            closed ||
+            monitorJob != null ||
+            watchdogJob != null ||
+            !telemetryRestartPosted.compareAndSet(false, true)
+        ) {
+            return
+        }
+        if (!mainHandler.post(telemetryRestartRunnable)) {
+            telemetryRestartPosted.set(false)
+            telemetryLifecycleIntegrityConfirmed.set(false)
+        }
     }
 
     fun setMediaUri(uri: Uri?) {
@@ -276,6 +800,19 @@ class LabController(
 
     fun clearError() {
         errorMessage = null
+    }
+
+    /**
+     * Configures the next plan only. An active/finalizing plan keeps its immutable start snapshot,
+     * including when it was launched through the protected automation alias.
+     */
+    fun setSevereThermalDeratingEnabled(enabled: Boolean): Boolean {
+        if (!canConfigureRuntimeProtection) {
+            showError("실행 중인 plan의 thermal 보호 설정은 변경할 수 없습니다.")
+            return false
+        }
+        severeThermalDeratingEnabled = enabled
+        return true
     }
 
     fun showError(message: String) {
@@ -302,12 +839,68 @@ class LabController(
             showError("종료된 controller에서는 테스트를 시작할 수 없습니다.")
             return false
         }
+        registerPowerStateReceiver()
+        if (!powerStateReceiverRegistered) {
+            val reason =
+                "Battery Saver/device-idle 감시를 등록할 수 없어 테스트를 시작하지 않았습니다."
+            planProgress = PlanProgress(
+                state = PlanState.REJECTED,
+                source = requestedPlan.source,
+                repeatCount = requestedPlan.repeatCount.coerceAtLeast(0),
+                queueSize = requestedPlan.scenarios.size,
+                totalRuns = requestedPlan.totalRuns,
+                statusText = reason,
+                terminalReason = reason,
+            )
+            showError(reason)
+            return false
+        }
         // A cancelled Job remains the owner until its NonCancellable renderer/load/report
         // finalizer clears runJob. Starting in that gap would let the old finalizer reset the new
         // run's loads, display mode, and wake state.
         if (planStartBlocked(runJobPresent = runJob != null, isRunning = isRunning)) {
             showError("이미 실행 중인 테스트 plan이 있습니다.")
             return false
+        }
+        if (
+            telemetryPairStartDecision(
+                monitorPresent = monitorJob != null,
+                monitorActive = monitorJob?.isActive == true,
+                watchdogPresent = watchdogJob != null,
+                watchdogActive = watchdogJob?.isActive == true,
+                lifecycleIntegrityConfirmed = telemetryLifecycleIntegrityConfirmed.get(),
+            ) != TelemetryPairStartDecision.REUSE_ACTIVE_PAIR
+        ) {
+            val reason = if (!telemetryLifecycleIntegrityConfirmed.get()) {
+                "Telemetry worker lifecycle 실패가 있어 process 재시작 전 test plan을 " +
+                    "시작할 수 없습니다."
+            } else {
+                "Telemetry monitor/watchdog pair가 모두 active 상태가 아니어서 test plan을 " +
+                    "시작하지 않았습니다."
+            }
+            planProgress = PlanProgress(
+                state = PlanState.REJECTED,
+                source = requestedPlan.source,
+                repeatCount = requestedPlan.repeatCount.coerceAtLeast(0),
+                queueSize = requestedPlan.scenarios.size,
+                totalRuns = requestedPlan.totalRuns,
+                statusText = reason,
+                terminalReason = reason.take(MAX_TERMINAL_REASON_CHARS),
+            )
+            showError(reason)
+            return false
+        }
+        activeTestWindowIsolationToken?.let { staleToken ->
+            if (!clearReleasedTestWindowIsolationToken(staleToken)) {
+                // A retained token may mean the prior producer teardown timed out. Never issue
+                // show() from a new START until that barrier is re-acknowledged.
+                beginTestWindowIsolationReleaseAfterRendererTeardown(staleToken)
+                showError(
+                    "이전 SystemUI 복원이 확인되지 않아 새 test plan을 시작할 수 없습니다. " +
+                        "복원 완료 후 다시 시도하고, 계속 실패하면 앱 process를 다시 시작하세요.",
+                )
+                return false
+            }
         }
         if (hasUnconfirmedRendererCleanup()) {
             val reason =
@@ -336,6 +929,47 @@ class LabController(
                 totalRuns = requestedPlan.totalRuns,
                 statusText = reason,
                 terminalReason = reason,
+            )
+            showError(reason)
+            return false
+        }
+        if (PinnedMediaCleanupState.hasUnconfirmedCleanup()) {
+            val reason =
+                "이전 selected-media descriptor 종료가 확인되지 않아 새 plan을 시작할 수 " +
+                    "없습니다. 앱 process를 완전히 종료하세요."
+            planProgress = PlanProgress(
+                state = PlanState.REJECTED,
+                source = requestedPlan.source,
+                repeatCount = requestedPlan.repeatCount.coerceAtLeast(0),
+                queueSize = requestedPlan.scenarios.size,
+                totalRuns = requestedPlan.totalRuns,
+                statusText = reason,
+                terminalReason = reason.take(MAX_TERMINAL_REASON_CHARS),
+            )
+            showError(reason)
+            return false
+        }
+        reconcilePerformanceIsolationOwnership()
+        if (
+            performanceIsolationStartBlocked(
+                isolationOwned = performanceIsolationOwned,
+                ticketPresent = performanceSessionTicket != null,
+                renewalPresent = performanceRenewalJob != null,
+                restoreConfirmed = performancePolicyRestoreConfirmed.get(),
+                sessionIntegrityConfirmed = performanceSessionIntegrityConfirmed.get(),
+            )
+        ) {
+            val reason =
+                "이전 성능 격리 session의 종료/원상복구가 확인되지 않아 새 plan을 " +
+                    "시작할 수 없습니다. 앱 process를 다시 시작하세요."
+            planProgress = PlanProgress(
+                state = PlanState.REJECTED,
+                source = requestedPlan.source,
+                repeatCount = requestedPlan.repeatCount.coerceAtLeast(0),
+                queueSize = requestedPlan.scenarios.size,
+                totalRuns = requestedPlan.totalRuns,
+                statusText = reason,
+                terminalReason = reason.take(MAX_TERMINAL_REASON_CHARS),
             )
             showError(reason)
             return false
@@ -369,6 +1003,9 @@ class LabController(
             showError(reason)
             return false
         }
+        val runtimeProtectionPolicySnapshot = RuntimeProtectionPolicy(
+            severeThermalDeratingEnabled = severeThermalDeratingEnabled,
+        )
         val plan = requestedPlan.copy(
             scenarios = requestedPlan.scenarios.map { scenario ->
                 scenario.copy(
@@ -380,9 +1017,56 @@ class LabController(
         )
 
         resetPlanState()
+        activeRuntimeProtectionPolicy = runtimeProtectionPolicySnapshot
         val firstScenario = plan.scenarios.first()
         if (!setWakeStateSafely(true)) {
             val reason = "화면 wake 상태를 설정할 수 없어 테스트를 시작하지 않았습니다."
+            planProgress = PlanProgress(
+                state = PlanState.REJECTED,
+                source = plan.source,
+                repeatCount = plan.repeatCount,
+                queueSize = plan.scenarios.size,
+                totalRuns = plan.totalRuns,
+                statusText = reason,
+                terminalReason = reason.take(MAX_TERMINAL_REASON_CHARS),
+            )
+            progress = RunProgress(statusText = reason)
+            showError(reason)
+            return false
+        }
+        val isolationRequest = runCatching {
+            testWindowIsolation.request()
+        }.getOrDefault(RequestResult.Rejected)
+        if (isolationRequest == RequestResult.Rejected) {
+            val reason =
+                "status/navigation bar를 격리할 수 없습니다. 전체 화면 단일-window 모드에서 " +
+                    "다시 실행하세요."
+            setWakeStateSafely(false)
+            planProgress = PlanProgress(
+                state = PlanState.REJECTED,
+                source = plan.source,
+                repeatCount = plan.repeatCount,
+                queueSize = plan.scenarios.size,
+                totalRuns = plan.totalRuns,
+                statusText = reason,
+                terminalReason = reason.take(MAX_TERMINAL_REASON_CHARS),
+            )
+            progress = RunProgress(statusText = reason)
+            showError(reason)
+            return false
+        }
+        val isolationToken = when (isolationRequest) {
+            is RequestResult.Acquired -> isolationRequest.token
+            is RequestResult.CleanupRequired -> isolationRequest.token
+            RequestResult.Rejected -> error("handled above")
+        }
+        activeTestWindowIsolationToken = isolationToken
+        if (isolationRequest is RequestResult.CleanupRequired) {
+            ensureTestWindowIsolationReleased(isolationToken)
+            val reason =
+                "SystemUI hide 요청이 실패해 test plan을 시작하지 않았습니다. " +
+                    "원래 system bar 상태 복원을 확인한 뒤 다시 시도하세요."
+            setWakeStateSafely(false)
             planProgress = PlanProgress(
                 state = PlanState.REJECTED,
                 source = plan.source,
@@ -416,12 +1100,43 @@ class LabController(
             thermalDerated = thermalReduced,
         )
 
+        val runRegistration = backendUseCompletionGroup.registerStart()
+        if (runRegistration == null) {
+            val reason =
+                "Backend lifecycle tracker가 닫혀 test plan을 시작할 수 없습니다."
+            ensureTestWindowIsolationReleased(isolationToken)
+            setWakeStateSafely(false)
+            planProgress = planProgress.copy(
+                state = PlanState.REJECTED,
+                currentScenario = null,
+                nextScenario = null,
+                statusText = reason,
+                terminalReason = reason,
+            )
+            progress = RunProgress(statusText = reason)
+            showError(reason)
+            return false
+        }
+        val runLifecycle = TransactionalCompletionRegistration(runRegistration)
         lateinit var launchedJob: Job
-        launchedJob = scope.launch(start = CoroutineStart.LAZY) {
+        var constructedJob: Job? = null
+        var runCompletionAttached = false
+        try {
+            launchedJob = scope.launch(start = CoroutineStart.LAZY) {
             var activeRunIndex = -1
             var activeRepeatIndex = -1
             var activeQueueIndex = -1
             try {
+                if (!awaitTestWindowIsolation(isolationToken)) {
+                    val reason =
+                        "status/navigation bar 숨김 확인이 ${SYSTEM_UI_ISOLATION_TIMEOUT_MS}ms " +
+                            "안에 완료되지 않아 test plan을 시작하지 않았습니다."
+                    cancellationReason = reason
+                    throw PlanAbortException(reason)
+                }
+                acquirePerformanceIsolationForPlan()
+                startPerformanceSessionRenewal(launchedJob)
+                calibrateHwcCapacityOnceForPlan(firstScenario)
                 repeat(plan.repeatCount) { repeatIndex ->
                     plan.scenarios.forEachIndexed { queueIndex, scenario ->
                         currentCoroutineContext().ensureActive()
@@ -481,6 +1196,26 @@ class LabController(
                 }
 
                 currentCoroutineContext().ensureActive()
+                val performanceRestored =
+                    releasePerformanceIsolationForPlan("plan completed")
+                val restoreOutcomePersisted =
+                    persistPerformanceRestoreOutcome(
+                        restored = performanceRestored,
+                        releaseReason = "plan completed",
+                    )
+                if (!performanceRestored) {
+                    val reason =
+                        "Battery Saver 원상복구 확인에 실패해 plan을 완료로 판정하지 않습니다."
+                    cancellationReason = reason
+                    throw PlanAbortException(reason)
+                }
+                if (!restoreOutcomePersisted) {
+                    val reason =
+                        "Battery Saver 복원 결과를 보고서에 안전하게 기록하지 못해 plan을 " +
+                            "완료로 판정하지 않습니다."
+                    cancellationReason = reason
+                    throw PlanAbortException(reason)
+                }
                 val lastResult = mutablePlanResultHistory.last()
                 planProgress = planProgress.copy(
                     state = PlanState.COMPLETE,
@@ -568,9 +1303,34 @@ class LabController(
             } finally {
                 try {
                     withContext(NonCancellable) {
-                        releaseActiveLoadsForRun()
-                        resetDisplayModeSafely()
-                        setWakeStateSafely(false)
+                        var performanceRestored = false
+                        try {
+                            releaseActiveLoadsForRun()
+                        } finally {
+                            try {
+                                resetDisplayModeSafely()
+                            } finally {
+                                try {
+                                    performanceRestored =
+                                        releasePerformanceIsolationForPlan("plan finalizer")
+                                } finally {
+                                    try {
+                                        persistPerformanceRestoreOutcome(
+                                            restored = performanceRestored,
+                                            releaseReason = "plan finalizer",
+                                        )
+                                    } finally {
+                                        try {
+                                            setWakeStateSafely(false)
+                                        } finally {
+                                            releaseTestWindowIsolationAfterRendererTeardown(
+                                                isolationToken,
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 } finally {
                     // Never leave startPlan permanently locked out if a vendor/window cleanup
@@ -581,23 +1341,95 @@ class LabController(
                     }
                 }
             }
-        }
-        // Dispatchers.Main.immediate may run a normal launch to completion before the assignment
-        // above publishes its Job. Publish a lazy owner first, then permit its body to execute.
-        runJob = launchedJob
-        launchedJob.invokeOnCompletion {
-            val clearOwner = Runnable {
-                if (publishedJobOwnerMatches(runJob, launchedJob)) {
-                    runJob = null
+            }
+            constructedJob = launchedJob
+            // Dispatchers.Main.immediate may run a normal launch to completion before the
+            // assignment below publishes its Job. Publish a lazy owner and its real completion
+            // callback before permitting the body to execute.
+            runJob = launchedJob
+            launchedJob.invokeOnCompletion { cause ->
+                try {
+                    runLifecycle.completeOperation(
+                        failureReason = unexpectedJobCompletionReason(
+                            operation = "plan runner",
+                            cause = cause,
+                        ),
+                    )
+                } finally {
+                    val clearOwner = Runnable {
+                        if (publishedJobOwnerMatches(runJob, launchedJob)) {
+                            runJob = null
+                        }
+                    }
+                    if (Looper.myLooper() == Looper.getMainLooper()) {
+                        clearOwner.run()
+                    } else if (!mainHandler.post(clearOwner)) {
+                        // The controller is already losing its main lane. The volatile owner may
+                        // be cleared here only after actual Job completion; backend cleanup still
+                        // uses the Activity-free completion ticket above as its authority.
+                        if (publishedJobOwnerMatches(runJob, launchedJob)) {
+                            runJob = null
+                        }
+                    }
                 }
             }
-            if (Looper.myLooper() == Looper.getMainLooper()) {
-                clearOwner.run()
+            runCompletionAttached = true
+            check(launchedJob.start()) { "plan runner Job did not enter LAZY start" }
+            check(runLifecycle.commit()) { "plan runner lifecycle setup was already resolved" }
+        } catch (error: Throwable) {
+            val failureReason = if (isFatalControllerStartupFailure(error)) {
+                "fatal plan runner startup failure"
             } else {
-                mainHandler.post(clearOwner)
+                "plan runner startup failed"
             }
+            bestEffortCleanup(error) { runLifecycle.fail(failureReason) }
+            bestEffortCleanup(error) { constructedJob?.cancel() }
+            val failedJob = constructedJob
+            if (!runCompletionAttached) {
+                completeUnattachedStartupOperation(
+                    job = failedJob,
+                    completion = runLifecycle,
+                    primaryFailure = error,
+                    onTerminal = if (failedJob == null) {
+                        null
+                    } else {
+                        {
+                            if (publishedJobOwnerMatches(runJob, failedJob)) {
+                                runJob = null
+                            }
+                        }
+                    },
+                )
+            }
+            if (
+                failedJob != null &&
+                failedJob.isCompleted &&
+                publishedJobOwnerMatches(runJob, failedJob)
+            ) {
+                runJob = null
+            }
+            // No measured phase can be committed before this setup transaction completes. The
+            // token and wake flag can therefore be rolled back immediately; both operations are
+            // idempotent if a just-started Job also reaches its NonCancellable finalizer.
+            bestEffortCleanup(error) { ensureTestWindowIsolationReleased(isolationToken) }
+            bestEffortCleanup(error) { setWakeStateSafely(false) }
+            if (isFatalControllerStartupFailure(error)) throw error
+            val reason =
+                "Plan runner lifecycle 시작 실패: ${error.javaClass.simpleName}"
+                    .take(MAX_EVENT_MESSAGE_CHARS)
+            cancellationReason = reason
+            planProgress = planProgress.copy(
+                state = PlanState.REJECTED,
+                currentScenario = null,
+                nextScenario = null,
+                currentRunFraction = 0f,
+                statusText = reason,
+                terminalReason = reason.take(MAX_TERMINAL_REASON_CHARS),
+            )
+            progress = RunProgress(statusText = reason)
+            showError(reason)
+            return false
         }
-        launchedJob.start()
         return true
     }
 
@@ -640,28 +1472,60 @@ class LabController(
         )
     }
 
-    fun onProducerTopologyPending(generation: Long) {
-        if (!frameTracker.markProducerTopologyPending(generation)) return
-        if (progress.producerGeneration != generation) return
-        val boundaryMs = SystemClock.elapsedRealtime()
-        val boundary = checkNotNull(
-            topologyPendingBoundary.updateAndGet { current ->
-                if (
-                    current != null &&
-                    current.generation == generation &&
-                    current.monotonicMs <= boundaryMs
-                ) {
-                    current
-                } else {
-                    ProducerTopologyPendingBoundary(generation, boundaryMs)
-                }
-            }
+    fun onTestWindowIsolationLost(token: Long, reason: String, eventType: String) {
+        if (
+            activeTestWindowIsolationToken != token ||
+            runJob == null ||
+            !isRunning
+        ) {
+            return
+        }
+        val boundedReason = reason
+            .trim()
+            .ifEmpty { "측정 중 SystemUI 격리가 해제됨" }
+            .take(MAX_EVENT_MESSAGE_CHARS)
+        val boundedEventType = eventType
+            .takeIf { it == "SYSTEM_UI_REVEALED" || it == "WINDOW_FOCUS_LOST" }
+            ?: "SYSTEM_UI_REVEALED"
+        abortForSafety(
+            reason = boundedReason,
+            eventType = boundedEventType,
         )
+    }
+
+    fun onProducerTopologyPending(generation: Long) {
+        val boundary = synchronized(producerTopologyStateLock) {
+            if (!frameTracker.markProducerTopologyPending(generation)) return
+            if (progress.producerGeneration != generation) return
+            val boundaryMs = SystemClock.elapsedRealtime()
+            val committedBoundary = checkNotNull(
+                topologyPendingBoundary.updateAndGet { current ->
+                    if (
+                        current != null &&
+                        current.generation == generation &&
+                        current.monotonicMs <= boundaryMs
+                    ) {
+                        current
+                    } else {
+                        ProducerTopologyPendingBoundary(generation, boundaryMs)
+                    }
+                },
+            )
+            activeHwcCompositionCoverage.get()?.recordProbeFailure(
+                "target producer topology entered recovery during HWC observation",
+            )
+            activePhaseClock?.pause(
+                atMonotonicMs = committedBoundary.monotonicMs,
+                owner = PhasePauseOwner.PRODUCER_RECOVERY,
+            )
+            committedBoundary
+        }
         val frameBudget = activeProducerFrameBudget ?: return
         if (producerRecoveryPaused) return
         frameBudget.pauseAtPhysicalBoundary(
             atMonotonicMs = boundary.monotonicMs,
             totalFrames = frameTracker.totalPhysicalProducedFrames(),
+            owner = PhasePauseOwner.PRODUCER_RECOVERY,
         )
         // Do not leave CPU/memory/NPU work active until the next 100 ms controller poll. The
         // callback is delivered on the View/main boundary, so zeroing here is both serialized and
@@ -705,16 +1569,17 @@ class LabController(
         )
     }
 
+    @Suppress("UNUSED_PARAMETER")
     fun onRendererStageRemoved(generation: Long, stopped: Boolean) {
-        if (!stopped) {
-            frameTracker.markProducerTeardownFailure(generation)
-        }
+        // `stopped=false` means only that the producer missed the short UI hand-off deadline.
+        // releaseRenderChild() has already registered every live thread in RendererSafetyState;
+        // awaitRendererTeardownBarrier() polls that lease and marks failure only at the continuous
+        // recovery deadline. Treating this callback as terminal would collapse 16 ms and 5 s.
         frameTracker.markProducerTeardownComplete(generation)
         // Lifecycle stop can race a just-published generation before AndroidView receives its
         // update. A detached single stage is proof that neither generation remains attached.
         val publishedGeneration = progress.producerGeneration
         if (publishedGeneration > 0L && publishedGeneration != generation) {
-            if (!stopped) frameTracker.markProducerTeardownFailure(publishedGeneration)
             frameTracker.markProducerTeardownComplete(publishedGeneration)
         }
         RendererSafetyState.markLifecycleStageRemoved(rendererLifecycleStageOwner)
@@ -725,8 +1590,16 @@ class LabController(
      * factory cannot appear later. Native producer threads, if any, remain guarded by their
      * independent process-wide leases and teardown callbacks.
      */
-    fun onRendererContainerDisposed() {
+    fun onRendererContainerAttached(): Long =
+        rendererContainerLifecycle.attach()
+
+    fun onRendererContainerDisposed(token: Long) {
+        if (!rendererContainerLifecycle.dispose(token)) return
         RendererSafetyState.markLifecycleStageRemoved(rendererLifecycleStageOwner)
+        closeRendererTimeout?.let(mainHandler::removeCallbacks)
+        closeRendererTimeout = null
+        closeRendererCompletion?.complete()
+        closeRendererCompletion = null
     }
 
     fun dismissResult() {
@@ -745,7 +1618,14 @@ class LabController(
             reportsDirectory = File(activity.filesDir, "reports"),
             reportPath = reportPath,
         )
-        if (file == null) {
+        if (
+            file == null ||
+            !isPublishedReportForSharing(
+                reportFile = file,
+                lastReportFile = lastReportFile,
+                planResultPaths = mutablePlanResultHistory.asSequence().map(PlanRunResult::reportPath),
+            )
+        ) {
             errorMessage = "공유할 수 있는 관리 대상 보고서 파일이 없습니다."
             return
         }
@@ -769,11 +1649,11 @@ class LabController(
     override fun close() {
         if (closed) return
         closed = true
-        val hadPublishedStage =
-            progress.phase != null || progress.targetPhase != null
-        val hadPublishedProducer =
-            hadPublishedStage || RendererSafetyState.hasUnconfirmedTeardown()
-        if (hadPublishedStage) {
+        try {
+        val activeRunOwner = runJob
+        val hasAttachedRendererContainer =
+            rendererContainerLifecycle.hasAttachedContainers()
+        if (hasAttachedRendererContainer) {
             // Compose disposal is asynchronous. This process-wide token prevents a newly created
             // Activity/controller from starting RGB producers before this stage acknowledges
             // removal; live worker threads remain protected by their separate leases.
@@ -794,72 +1674,925 @@ class LabController(
         )
         runJob?.cancel()
         pause()
-        closeSelectedVideoDecoder()
-        val loadShutdown = loadManager.closeWithResult()
+        // An active run owns its pinned descriptor until the NonCancellable renderer finalizer
+        // has stopped the codec. Closing it here would race MediaCodec on Activity destruction.
+        if (activeRunOwner == null) closeSelectedVideoDecoder()
+
         // Activity destruction cannot prove that Compose/AndroidView/Surface teardown completed
         // synchronously. Never change the allocation route from this non-suspending lifecycle
-        // path; the normal run finalizer is the only path that may reset compression after its
-        // explicit renderer barrier. A later controller recovers a sticky non-linear route.
-        val rendererReleasedForClose =
-            !hadPublishedProducer && !RendererSafetyState.hasUnconfirmedTeardown()
-        val shutdown = systemMonitor.close(
-            resetCompression = false,
-        )
-        val compressionCleanupRequired =
+        // path; the run finalizer remains live because backend shutdown waits for its completion.
+        if (
             compressionControlActive ||
-                CompressionSafetyState.hasUnconfirmedCompressionCleanup()
-        if (compressionCleanupRequired) {
+            CompressionSafetyState.hasUnconfirmedCompressionCleanup()
+        ) {
             CompressionSafetyState.markNonLinearRouteMayBeActive()
-            recordCleanupFailure(
-                "Activity 종료 compression 보류",
-                IllegalStateException(
-                    "lifecycle close cannot prove producer teardown; " +
-                        "linear reset was intentionally deferred",
-                ),
-            )
         }
-        if (!loadShutdown.workersStopped) {
-            recordCleanupFailure(
-                "Activity 종료 local load worker stop",
-                IllegalStateException("one or more load workers exceeded the shutdown deadline"),
-            )
+
+        val frontendCompletion = ActivityFreeCompletionGroup(
+            maxPendingRegistrations = 2,
+        )
+        if (hasAttachedRendererContainer) {
+            val rendererCompletion = frontendCompletion.registerStart()
+            if (rendererCompletion == null) {
+                frontendCleanupConfirmed.set(false)
+            } else {
+                closeRendererCompletion = rendererCompletion
+                val timeout = Runnable {
+                    if (
+                        rendererCompletion.fail(
+                            "renderer container disposal was not observed before timeout",
+                        )
+                    ) {
+                        frontendCleanupConfirmed.set(false)
+                    }
+                    if (closeRendererCompletion === rendererCompletion) {
+                        closeRendererCompletion = null
+                    }
+                    closeRendererTimeout = null
+                }
+                closeRendererTimeout = timeout
+                if (!mainHandler.postDelayed(timeout, RENDERER_CONTAINER_DISPOSE_TIMEOUT_MS)) {
+                    timeout.run()
+                }
+            }
         }
-        val vendorStopRescued =
-            loadShutdown.npu.backendCloseConfirmed &&
-                shutdown.brokerWasConnected &&
-                shutdown.npuStopConfirmed
-        val npuLoadReleaseConfirmed =
-            loadShutdown.npu.releaseConfirmed ||
-                vendorStopRescued
-        if (!npuLoadReleaseConfirmed) {
-            recordCleanupFailure(
-                "Activity 종료 NPU stop",
-                IllegalStateException(loadShutdown.npu.detail),
-            )
+
+        val isolationToken = activeTestWindowIsolationToken
+        if (isolationToken == null) {
+            isolationCleanupScope.cancel()
+        } else {
+            val isolationCompletion = frontendCompletion.registerStart()
+            if (isolationCompletion == null) {
+                frontendCleanupConfirmed.set(false)
+            } else {
+                completeCloseIsolationAfterRun(
+                    activeRunOwner = activeRunOwner,
+                    registration = isolationCompletion,
+                )
+            }
         }
-        if (!loadShutdown.npu.backendCloseConfirmed) {
-            recordCleanupFailure(
-                "Activity 종료 reflection NPU backend close",
-                IllegalStateException(loadShutdown.npu.detail),
-            )
+
+        val frontendBarrier = frontendCompletion.seal()
+        val backendUsersBarrier = backendUseCompletionGroup.seal()
+        val cleanupStart = ProcessControllerBackendCleanupCoordinator.beginCleanup(
+            ownerToken = backendOwnerToken,
+            runCompletion = frontendBarrier,
+            monitorCompletion = backendUsersBarrier,
+            operation = ControllerBackendCleanup(
+                loadManager = loadManager,
+                systemMonitor = systemMonitor,
+                vendorBridge = vendorBridge,
+                frontendCleanupConfirmed = frontendCleanupConfirmed,
+                powerStateReceiverCleanupConfirmed = powerStateReceiverCleanupConfirmed,
+                telemetryLifecycleIntegrityConfirmed =
+                    telemetryLifecycleIntegrityConfirmed,
+                performancePolicyRestoreConfirmed = performancePolicyRestoreConfirmed,
+                performanceSessionIntegrityConfirmed =
+                    performanceSessionIntegrityConfirmed,
+                publishedResult = controllerCloseCleanupConfirmed,
+            ),
+        )
+        if (cleanupStart != ControllerBackendCleanupStart.STARTED) {
+            frontendCleanupConfirmed.set(false)
+            controllerCloseCleanupConfirmed.set(false)
         }
-        LoadSafetyState.recordNpuLoadIdle(npuLoadReleaseConfirmed)
-        LoadSafetyState.recordNpuBackendCleanup(loadShutdown.npu.backendCloseConfirmed)
-        controllerCloseCleanupConfirmed =
-            loadShutdown.workersStopped &&
-                npuLoadReleaseConfirmed &&
-                loadShutdown.npu.backendCloseConfirmed &&
-                rendererReleasedForClose &&
-                !CompressionSafetyState.hasUnconfirmedCompressionCleanup()
+        // Cancelling the Activity-owned scope is non-blocking. Registered completion tickets keep
+        // backend cleanup behind the real run/monitor finalizers even though their fields are
+        // cleared by pause().
         scope.cancel()
+        } catch (error: Throwable) {
+            // close() is the last Activity-owned opportunity to hand every backend to the
+            // process coordinator. If any setup step escapes, make the owner sticky-failed before
+            // the Activity drops this controller instead of allowing a second backend generation.
+            frontendCleanupConfirmed.set(false)
+            controllerCloseCleanupConfirmed.set(false)
+            ProcessControllerBackendCleanupCoordinator.failOwner(
+                backendOwnerToken,
+                "controller close transaction failed: ${error.javaClass.simpleName}",
+            )
+            bestEffortCleanup(error) { scope.cancel() }
+            if (isFatalControllerStartupFailure(error)) throw error
+            errorMessage =
+                "Controller 종료 transaction 실패: ${error.javaClass.simpleName}"
+                    .take(MAX_EVENT_MESSAGE_CHARS)
+        }
+    }
+
+    private fun completeCloseIsolationAfterRun(
+        activeRunOwner: Job?,
+        registration: ActivityFreeCompletionRegistration,
+    ) {
+        val beginRelease = Runnable {
+            val retainedToken = activeTestWindowIsolationToken
+            if (retainedToken == null) {
+                registration.complete()
+                isolationCleanupScope.cancel()
+                return@Runnable
+            }
+            val release =
+                beginTestWindowIsolationReleaseAfterRendererTeardown(retainedToken)
+            isolationCleanupScope.launch {
+                val restored = try {
+                    release.await()
+                } catch (_: CancellationException) {
+                    false
+                } catch (_: Exception) {
+                    false
+                }
+                if (restored) {
+                    registration.complete()
+                } else {
+                    frontendCleanupConfirmed.set(false)
+                    registration.fail("SystemUI restoration was not acknowledged")
+                }
+                isolationCleanupScope.cancel()
+            }
+        }
+        if (activeRunOwner == null) {
+            beginRelease.run()
+            return
+        }
+        activeRunOwner.invokeOnCompletion {
+            if (!mainHandler.post(beginRelease)) {
+                frontendCleanupConfirmed.set(false)
+                registration.fail("main thread rejected post-finalizer SystemUI restoration")
+                isolationCleanupScope.cancel()
+            }
+        }
+    }
+
+    private fun registerPowerStateReceiver() {
+        powerStateCallbackHolder.attach(::handlePowerStateBroadcast)
+        if (powerStateReceiverRegistered) {
+            powerStateReceiverCleanupConfirmed.set(false)
+            return
+        }
+        val registered = runCatching {
+            ContextCompat.registerReceiver(
+                appContext,
+                powerStateReceiver,
+                IntentFilter().apply {
+                    addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED)
+                    addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
+                },
+                ContextCompat.RECEIVER_NOT_EXPORTED,
+            )
+            true
+        }.getOrElse { error ->
+            errorMessage =
+                "Power 상태 broadcast 감시 등록 실패: ${error.javaClass.simpleName}"
+                    .take(MAX_EVENT_MESSAGE_CHARS)
+            false
+        }
+        powerStateReceiverRegistered = registered
+        powerStateReceiverCleanupConfirmed.set(!registered)
+        if (!registered) powerStateCallbackHolder.detach()
+    }
+
+    private fun unregisterPowerStateReceiver() {
+        // Remove the Controller/Activity reference before touching the framework registration.
+        // Even a broken unregister implementation can then retain only this Activity-free holder.
+        powerStateCallbackHolder.detach()
+        if (!powerStateReceiverRegistered) {
+            powerStateReceiverCleanupConfirmed.set(true)
+            return
+        }
+        var lastError: Throwable? = null
+        var unregistered = false
+        repeat(POWER_RECEIVER_UNREGISTER_ATTEMPTS) {
+            if (unregistered) return@repeat
+            unregistered = runCatching {
+                appContext.unregisterReceiver(powerStateReceiver)
+                true
+            }.recoverCatching { error ->
+                // A framework-side unregister which already won the race is equivalent to the
+                // receiver no longer retaining this holder.
+                if (error is IllegalArgumentException) true else throw error
+            }.getOrElse { error ->
+                lastError = error
+                false
+            }
+        }
+        if (unregistered) {
+            powerStateReceiverRegistered = false
+            powerStateReceiverCleanupConfirmed.set(true)
+        } else {
+            powerStateReceiverCleanupConfirmed.set(false)
+            recordCleanupFailure(
+                "power-state receiver unregister",
+                lastError ?: IllegalStateException("unregister was not acknowledged"),
+            )
+        }
+    }
+
+    private fun handlePowerStateBroadcast() {
+        if (
+            !isRunning ||
+            !shouldMonitorPerformanceIsolation(performanceIsolationLifecycle)
+        ) {
+            return
+        }
+        val state = runCatching {
+            powerManager.isPowerSaveMode to powerManager.isDeviceIdleMode
+        }.getOrElse { error ->
+            abortForSafety(
+                reason =
+                    "실행 중 power 상태를 읽을 수 없음: " +
+                        error.javaClass.simpleName,
+                eventType = "PERFORMANCE_ENVIRONMENT_CHANGED",
+            )
+            return
+        }
+        when {
+            state.first ->
+                abortForSafety(
+                    reason = "실행 중 Battery Saver가 활성화되어 성능 격리를 잃었습니다.",
+                    eventType = "SAFETY_ENVELOPE_CHANGED",
+                )
+            state.second ->
+                abortForSafety(
+                    reason = "실행 중 device-idle 상태가 활성화됨",
+                    eventType = "PERFORMANCE_ENVIRONMENT_CHANGED",
+                )
+        }
+    }
+
+    /**
+     * Requests the only policy mutation allowed by the portable client: temporary Battery Saver
+     * suppression through the API-v3 product broker. If no broker is present, a run is allowed
+     * only when Battery Saver is already off; broadcasts and telemetry then enforce that state.
+     */
+    private suspend fun acquirePerformanceIsolationForPlan() {
+        performanceIsolationLifecycle = PerformanceIsolationLifecycle.ACQUIRING
+        performanceIsolationStatus = "설정 중 · Battery Saver"
+        planProgress = planProgress.copy(statusText = "성능 저하 정책 격리 확인 중")
+        progress = progress.copy(statusText = "Battery Saver 격리 확인 중")
+        performanceBaselinePowerSaveMode = try {
+            powerManager.isPowerSaveMode
+        } catch (error: Throwable) {
+            if (isFatalControllerStartupFailure(error)) throw error
+            failPerformanceIsolation(
+                "Battery Saver 원래 상태 확인 실패: ${error.javaClass.simpleName}",
+            )
+        }
+        val result = try {
+            // BEGIN may have mutated a global policy by the time the caller is cancelled. Complete
+            // the bounded call and publish any returned ticket before observing cancellation so
+            // the NonCancellable plan finalizer always has authoritative cleanup ownership.
+            withContext(NonCancellable + Dispatchers.IO) {
+                vendorBridge.acquirePerformanceSession()
+            }
+        } catch (error: Throwable) {
+            performanceSessionIntegrityConfirmed.set(false)
+            // A fatal failure can arrive after the broker accepted BEGIN but before its normal
+            // result reached this coroutine. Publish the process latch into controller ownership
+            // before propagating anything so the outer NonCancellable finalizer can still issue
+            // the ordered END.
+            vendorBridge.pendingPerformanceRestoreTicket()?.let { pendingTicket ->
+                performanceSessionTicket = pendingTicket
+                performanceIsolationOwned = true
+                performancePolicyRestoreConfirmed.set(false)
+            }
+            if (isFatalControllerStartupFailure(error)) {
+                val reason =
+                    "성능 격리 broker fatal 실패: ${error.javaClass.simpleName}"
+                        .take(MAX_EVENT_MESSAGE_CHARS)
+                performanceIsolationLifecycle = PerformanceIsolationLifecycle.FAILED
+                performanceIsolationStatus = "실패 · broker fatal"
+                cancellationReason = reason
+                errorMessage = reason
+                throw error
+            }
+            failPerformanceIsolation(
+                "성능 격리 broker 호출 실패: ${error.javaClass.simpleName}",
+            )
+        }
+        if (
+            performanceIsolationAcquisitionCompromised(
+                brokerState = result.state,
+                ticketPresent = result.ticket != null,
+            )
+        ) {
+            performanceSessionIntegrityConfirmed.set(false)
+        }
+        result.ticket?.let { returnedTicket ->
+            performanceSessionTicket = returnedTicket
+            performanceIsolationOwned = true
+            performancePolicyRestoreConfirmed.set(false)
+        }
+
+        val batterySaverActive = try {
+            powerManager.isPowerSaveMode
+        } catch (error: Throwable) {
+            if (isFatalControllerStartupFailure(error)) {
+                val reason =
+                    "Battery Saver acknowledgment fatal 실패: ${error.javaClass.simpleName}"
+                        .take(MAX_EVENT_MESSAGE_CHARS)
+                performanceIsolationLifecycle = PerformanceIsolationLifecycle.FAILED
+                performanceIsolationStatus = "실패 · Battery Saver 확인 fatal"
+                cancellationReason = reason
+                errorMessage = reason
+                throw error
+            }
+            failPerformanceIsolation(
+                "Battery Saver 상태 확인 실패: ${error.javaClass.simpleName}",
+            )
+        }
+        when (
+            performanceIsolationStartMode(
+                brokerState = result.state,
+                ticketPresent = result.ticket != null,
+                originalBatterySaverActive =
+                    performanceBaselinePowerSaveMode == true,
+                batterySaverActive = batterySaverActive,
+            )
+        ) {
+            PerformanceIsolationStartMode.VENDOR_LEASE -> {
+                val ticket = checkNotNull(result.ticket)
+                performanceSessionTicket = ticket
+                performanceIsolationOwned = true
+                performancePolicyRestoreConfirmed.set(false)
+                if (!awaitBatterySaverOff()) {
+                    performanceSessionIntegrityConfirmed.set(false)
+                    releasePerformanceIsolationForPlan(
+                        "Battery Saver disable acknowledgment mismatch",
+                    )
+                    failPerformanceIsolation(
+                        "broker 승인 뒤에도 Battery Saver=off를 확인할 수 없습니다.",
+                    )
+                }
+                performanceIsolationLifecycle = PerformanceIsolationLifecycle.ACTIVE
+                performanceIsolationStatus =
+                    "보호됨 · vendor lease S${ticket.serviceSession}"
+            }
+            PerformanceIsolationStartMode.APP_ONLY_MONITOR -> {
+                performanceSessionTicket = null
+                performanceIsolationOwned = true
+                // No system policy was mutated. A later external Battery Saver change aborts the
+                // run but is not an app-owned restore leak and must be revalidated by the next
+                // plan instead of process-sticky cleanup.
+                performancePolicyRestoreConfirmed.set(true)
+                performanceIsolationLifecycle = PerformanceIsolationLifecycle.ACTIVE
+                performanceIsolationStatus =
+                    "APP_ONLY · Battery Saver=off 감시"
+            }
+            PerformanceIsolationStartMode.REJECT -> {
+                // Even a no-ticket failure may represent a BEGIN which the bridge restored before
+                // returning. Keep a local release owner so the finalizer verifies the direct
+                // producer-before-BEGIN Battery Saver state instead of trusting wording alone.
+                performanceIsolationOwned = true
+                performancePolicyRestoreConfirmed.set(false)
+                val policyDetail = when {
+                    result.state == VendorPerformanceSessionState.UNAVAILABLE &&
+                        batterySaverActive ->
+                        "Battery Saver가 켜져 있고 API-v3 broker를 사용할 수 없음"
+                    result.ticket != null &&
+                        result.state != VendorPerformanceSessionState.ACTIVE ->
+                        "remote 정책 변경/복원이 불명확한 ticket을 반환함"
+                    else -> result.detail
+                }
+                failPerformanceIsolation("성능 격리 broker 승인 실패: $policyDetail")
+            }
+        }
+    }
+
+    private fun startPerformanceSessionRenewal(owner: Job) {
+        if (performanceSessionTicket == null) return
+        check(performanceRenewalJob == null) {
+            "A performance renewal owner is already published"
+        }
+        val renewalRegistration = backendUseCompletionGroup.registerStart()
+        if (renewalRegistration == null) {
+            performanceSessionIntegrityConfirmed.set(false)
+            performanceIsolationLifecycle = PerformanceIsolationLifecycle.FAILED
+            performanceIsolationStatus = "실패 · renew lifecycle 등록"
+            abortForSafety(
+                reason = "성능 격리 renewal lifecycle을 추적할 수 없습니다.",
+                eventType = "PERFORMANCE_ISOLATION_LOST",
+            )
+            return
+        }
+        val renewalLifecycle = TransactionalCompletionRegistration(renewalRegistration)
+        val renewalFailure = AtomicReference<String?>()
+        lateinit var renewalOwner: Job
+        var constructedRenewal: Job? = null
+        var renewalCompletionAttached = false
+        try {
+            renewalOwner = scope.launch(
+                context = Dispatchers.Default,
+                start = CoroutineStart.LAZY,
+            ) {
+                var nextDeadlineMs = saturatingAdd(
+                    SystemClock.elapsedRealtime(),
+                    VendorBridge.PERFORMANCE_SESSION_RENEW_INTERVAL_MS,
+                )
+                while (
+                    isActive &&
+                    runJob === owner &&
+                    shouldMonitorPerformanceIsolation(performanceIsolationLifecycle)
+                ) {
+                    val waitMs =
+                        (nextDeadlineMs - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+                    if (waitMs > 0L) delay(waitMs)
+                    if (
+                        !isActive ||
+                        runJob !== owner ||
+                        !shouldMonitorPerformanceIsolation(performanceIsolationLifecycle)
+                    ) {
+                        break
+                    }
+                    nextDeadlineMs = nextAbsoluteControlDeadlineMs(
+                        previousDeadlineMs = nextDeadlineMs,
+                        nowMs = SystemClock.elapsedRealtime(),
+                        periodMs = VendorBridge.PERFORMANCE_SESSION_RENEW_INTERVAL_MS,
+                    )
+                    val current = performanceSessionTicket
+                    if (current == null) {
+                        val reason =
+                            "성능 격리 lease ticket이 active renewal 중 사라졌습니다."
+                        renewalFailure.compareAndSet(
+                            null,
+                            "performance renewal lost its active ticket",
+                        )
+                        postPerformanceIsolationFailure(
+                            owner = owner,
+                            status = "실패 · renew ticket 없음",
+                            reason = reason,
+                            eventType = "PERFORMANCE_ISOLATION_LOST",
+                        )
+                        break
+                    }
+                    val result = try {
+                        withContext(Dispatchers.IO) {
+                            vendorBridge.renewPerformanceSession(current)
+                        }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        renewalFailure.compareAndSet(
+                            null,
+                            "performance renewal call failed: ${error.javaClass.simpleName}",
+                        )
+                        postPerformanceIsolationFailure(
+                            owner = owner,
+                            status = "실패 · renew ${error.javaClass.simpleName}",
+                            reason =
+                                "성능 격리 lease 갱신 호출 실패: " +
+                                    error.javaClass.simpleName,
+                            eventType = "PERFORMANCE_ISOLATION_LOST",
+                        )
+                        break
+                    }
+                    if (
+                        !isActive ||
+                        runJob !== owner ||
+                        !shouldMonitorPerformanceIsolation(performanceIsolationLifecycle)
+                    ) {
+                        break
+                    }
+                    val renewed = result.ticket
+                    if (
+                        result.state == VendorPerformanceSessionState.ACTIVE &&
+                        renewed != null &&
+                        samePerformanceSession(current, renewed)
+                    ) {
+                        performanceSessionTicket = renewed
+                        val saverOff = runCatching {
+                            !powerManager.isPowerSaveMode
+                        }.getOrDefault(false)
+                        if (!saverOff) {
+                            renewalFailure.compareAndSet(
+                                null,
+                                "performance renewal observed Battery Saver active",
+                            )
+                            postPerformanceIsolationFailure(
+                                owner = owner,
+                                status = "실패 · Battery Saver 재활성",
+                                reason = "성능 격리 lease 중 Battery Saver가 활성화됨",
+                                eventType = "SAFETY_ENVELOPE_CHANGED",
+                            )
+                            break
+                        } else {
+                            mainHandler.post {
+                                if (
+                                    runJob === owner &&
+                                    owner.isActive &&
+                                    shouldMonitorPerformanceIsolation(
+                                        performanceIsolationLifecycle,
+                                    )
+                                ) {
+                                    performanceIsolationStatus =
+                                        "보호됨 · vendor lease S${renewed.serviceSession}"
+                                }
+                            }
+                        }
+                    } else {
+                        if (
+                            renewed != null &&
+                            samePerformanceSession(current, renewed) &&
+                            shouldMonitorPerformanceIsolation(performanceIsolationLifecycle)
+                        ) {
+                            // Keep the newest command version so the finalizer can issue an
+                            // authoritative higher-version END after a failed renewal.
+                            performanceSessionTicket = renewed
+                        }
+                        renewalFailure.compareAndSet(
+                            null,
+                            "performance renewal lease was rejected: ${result.state.name}",
+                        )
+                        postPerformanceIsolationFailure(
+                            owner = owner,
+                            status = "실패 · lease ${result.state.name}",
+                            reason =
+                                "성능 격리 lease를 유지할 수 없음: " +
+                                    result.detail.take(MAX_EVENT_MESSAGE_CHARS),
+                            eventType = "PERFORMANCE_ISOLATION_LOST",
+                        )
+                        break
+                    }
+                }
+            }
+            constructedRenewal = renewalOwner
+            performanceRenewalJob = renewalOwner
+            renewalOwner.invokeOnCompletion { cause ->
+                val operationFailure =
+                    renewalFailure.get()
+                        ?: unexpectedJobCompletionReason(
+                            operation = "performance renewal",
+                            cause = cause,
+                        )
+                if (operationFailure != null) {
+                    // Publish sticky evidence before resolving the completion ticket. The process
+                    // cleanup coordinator may wake immediately when this is the final backend user.
+                    performanceSessionIntegrityConfirmed.set(false)
+                }
+                try {
+                    renewalLifecycle.completeOperation(operationFailure)
+                } finally {
+                    val ownedCompletion = performanceRenewalJob === renewalOwner
+                    if (ownedCompletion) {
+                        // This callback is the only authority that clears a published renewal
+                        // owner: cancellation request or timeout alone is not terminal evidence.
+                        performanceRenewalJob = null
+                    }
+                    if (
+                        ownedCompletion &&
+                        shouldFailPerformanceIsolationAfterRenewalCompletion(
+                            operationFailure = operationFailure,
+                            runOwnerMatches = runJob === owner,
+                            runOwnerActive = owner.isActive,
+                            isolationMonitoringExpected =
+                                shouldMonitorPerformanceIsolation(
+                                    performanceIsolationLifecycle,
+                                ),
+                        )
+                    ) {
+                        postPerformanceIsolationFailure(
+                            owner = owner,
+                            status = "실패 · renew worker 종료",
+                            reason =
+                                "성능 격리 renewal worker 비정상 종료: " +
+                                    operationFailure.orEmpty(),
+                            eventType = "PERFORMANCE_ISOLATION_LOST",
+                        )
+                    }
+                }
+            }
+            renewalCompletionAttached = true
+            check(renewalOwner.start()) { "performance renewal Job did not enter LAZY start" }
+            check(renewalLifecycle.commit()) {
+                "performance renewal lifecycle setup was already resolved"
+            }
+        } catch (error: Throwable) {
+            performanceSessionIntegrityConfirmed.set(false)
+            val failureReason = if (isFatalControllerStartupFailure(error)) {
+                "fatal performance renewal startup failure"
+            } else {
+                "performance renewal startup failed: ${error.javaClass.simpleName}"
+            }
+            bestEffortCleanup(error) { renewalLifecycle.fail(failureReason) }
+            bestEffortCleanup(error) { constructedRenewal?.cancel() }
+            val failedRenewal = constructedRenewal
+            if (!renewalCompletionAttached) {
+                completeUnattachedStartupOperation(
+                    job = failedRenewal,
+                    completion = renewalLifecycle,
+                    primaryFailure = error,
+                    onTerminal = if (failedRenewal == null) {
+                        null
+                    } else {
+                        {
+                            if (performanceRenewalJob === failedRenewal) {
+                                performanceRenewalJob = null
+                            }
+                        }
+                    },
+                )
+            }
+            if (
+                failedRenewal?.isCompleted == true &&
+                performanceRenewalJob === failedRenewal
+            ) {
+                performanceRenewalJob = null
+            }
+            performanceIsolationLifecycle = PerformanceIsolationLifecycle.FAILED
+            performanceIsolationStatus = "실패 · renew Job 생성"
+            if (isFatalControllerStartupFailure(error)) throw error
+            abortForSafety(
+                reason =
+                    "성능 격리 renewal worker를 생성할 수 없습니다: " +
+                        error.javaClass.simpleName,
+                eventType = "PERFORMANCE_ISOLATION_LOST",
+            )
+            return
+        }
+    }
+
+    /**
+     * Renewal itself never waits for the main thread. A long render/UI stall therefore cannot
+     * delay the next 2-second lease command. Failure state is published immediately through the
+     * volatile lifecycle, while UI/event mutation is posted to main.
+     */
+    private fun postPerformanceIsolationFailure(
+        owner: Job,
+        status: String,
+        reason: String,
+        eventType: String,
+    ) {
+        performanceSessionIntegrityConfirmed.set(false)
+        if (!shouldMonitorPerformanceIsolation(performanceIsolationLifecycle)) return
+        performanceIsolationLifecycle = PerformanceIsolationLifecycle.FAILED
+        val delivered = mainHandler.post {
+            if (runJob === owner && owner.isActive) {
+                performanceIsolationStatus = status.take(MAX_EVENT_MESSAGE_CHARS)
+                abortForSafety(
+                    reason = reason.take(MAX_EVENT_MESSAGE_CHARS),
+                    eventType = eventType,
+                )
+            }
+        }
+        if (!delivered) {
+            owner.cancel(CancellationException(reason.take(MAX_EVENT_MESSAGE_CHARS)))
+        }
+    }
+
+    /**
+     * Stops renewal before END. END is a higher command version on the same serialized vendor
+     * lane, so a timed-out older renewal can never re-enable the temporary policy afterward.
+     */
+    private suspend fun releasePerformanceIsolationForPlan(reason: String): Boolean {
+        if (
+            shouldRetryDirectPerformanceRestore(
+                isolationOwned = performanceIsolationOwned,
+                ticketPresent = performanceSessionTicket != null,
+                renewalPresent = performanceRenewalJob != null,
+                restoreConfirmed = performancePolicyRestoreConfirmed.get(),
+                originalStateKnown = performanceBaselinePowerSaveMode != null,
+            )
+        ) {
+            performanceIsolationLifecycle = PerformanceIsolationLifecycle.RESTORING
+            val restored =
+                awaitOriginalBatterySaverState(performanceBaselinePowerSaveMode)
+            if (restored) {
+                performancePolicyRestoreConfirmed.set(true)
+                performanceBaselinePowerSaveMode = null
+                performanceIsolationLifecycle = PerformanceIsolationLifecycle.IDLE
+                performanceIsolationStatus =
+                    "복원 확인 · 지연된 Battery Saver 상태 반영"
+                return true
+            }
+            performanceIsolationLifecycle = PerformanceIsolationLifecycle.FAILED
+            performanceIsolationStatus = "복원 실패 · Battery Saver 원상태 불일치"
+            return false
+        }
+        if (
+            !performanceIsolationOwned &&
+            performanceSessionTicket == null &&
+            performanceRenewalJob == null &&
+            performancePolicyRestoreConfirmed.get()
+        ) {
+            performanceIsolationLifecycle = PerformanceIsolationLifecycle.IDLE
+            performanceBaselinePowerSaveMode = null
+            return true
+        }
+        if (
+            !performanceIsolationOwned &&
+            performanceSessionTicket == null &&
+            performanceRenewalJob == null
+        ) {
+            performanceIsolationLifecycle = PerformanceIsolationLifecycle.FAILED
+            return false
+        }
+        val originalPowerSaveMode = performanceBaselinePowerSaveMode
+        performanceIsolationLifecycle = PerformanceIsolationLifecycle.RESTORING
+        val renewal = performanceRenewalJob
+        var renewalStopped = true
+        if (renewal != null) {
+            renewal.cancel()
+            renewalStopped = withTimeoutOrNull(PERFORMANCE_RENEWAL_JOIN_TIMEOUT_MS) {
+                renewal.join()
+                true
+            } == true
+            if (renewalStopped && performanceRenewalJob === renewal) {
+                performanceRenewalJob = null
+            }
+            if (!renewalStopped) {
+                performanceIsolationStatus = "복원 실패 · renew 종료 미확인"
+            }
+        }
+
+        val ticket = performanceSessionTicket
+        if (ticket == null) {
+            val restoreWasAlreadyConfirmed =
+                performancePolicyRestoreConfirmed.get()
+            val directOriginalStateMatched = if (restoreWasAlreadyConfirmed) {
+                false
+            } else {
+                awaitOriginalBatterySaverState(originalPowerSaveMode)
+            }
+            val originalStateRestored = ticketlessPerformanceRestoreConfirmed(
+                restoreAlreadyConfirmed = restoreWasAlreadyConfirmed,
+                directOriginalStateMatched = directOriginalStateMatched,
+            )
+            performanceIsolationOwned = false
+            if (originalStateRestored) {
+                performancePolicyRestoreConfirmed.set(true)
+            }
+            performanceIsolationLifecycle = if (renewalStopped && originalStateRestored) {
+                PerformanceIsolationLifecycle.IDLE
+            } else {
+                PerformanceIsolationLifecycle.FAILED
+            }
+            if (renewalStopped && originalStateRestored) {
+                performanceBaselinePowerSaveMode = null
+                performanceIsolationStatus = if (restoreWasAlreadyConfirmed) {
+                    "해제됨 · APP_ONLY 감시 종료"
+                } else {
+                    "복원 확인 · Battery Saver 정책"
+                }
+            } else if (!originalStateRestored) {
+                performanceIsolationStatus = "복원 실패 · Battery Saver 원상태 불일치"
+                errorMessage =
+                    "성능 정책 원상복구 실패($reason): Battery Saver 원래 상태를 확인할 수 없음"
+                        .take(MAX_EVENT_MESSAGE_CHARS)
+            }
+            return renewalStopped && originalStateRestored
+        }
+        val result = try {
+            withContext(NonCancellable + Dispatchers.IO) {
+                vendorBridge.endPerformanceSession(ticket)
+            }
+        } catch (error: Exception) {
+            performanceIsolationStatus =
+                "복원 실패 · ${error.javaClass.simpleName}"
+            performanceIsolationLifecycle = PerformanceIsolationLifecycle.FAILED
+            return false
+        }
+        return if (result.state == VendorPerformanceSessionState.RESTORED) {
+            val originalStateRestored =
+                awaitOriginalBatterySaverState(originalPowerSaveMode)
+            performanceSessionTicket = null
+            performanceIsolationOwned = false
+            if (originalStateRestored) {
+                performancePolicyRestoreConfirmed.set(true)
+            }
+            performanceIsolationLifecycle = if (renewalStopped && originalStateRestored) {
+                PerformanceIsolationLifecycle.IDLE
+            } else {
+                PerformanceIsolationLifecycle.FAILED
+            }
+            performanceIsolationStatus = if (renewalStopped && originalStateRestored) {
+                performanceBaselinePowerSaveMode = null
+                "복원 확인 · Battery Saver 정책"
+            } else if (!originalStateRestored) {
+                errorMessage =
+                    "성능 정책 원상복구 실패($reason): Battery Saver 원래 상태 불일치"
+                        .take(MAX_EVENT_MESSAGE_CHARS)
+                "복원 실패 · Battery Saver 원상태 불일치"
+            } else {
+                "복원 실패 · renew 종료 미확인"
+            }
+            renewalStopped && originalStateRestored
+        } else {
+            result.ticket?.takeIf { samePerformanceSession(ticket, it) }?.let {
+                performanceSessionTicket = it
+            }
+            performanceIsolationStatus =
+                "복원 실패 · ${result.state.name}"
+            performanceIsolationLifecycle = PerformanceIsolationLifecycle.FAILED
+            errorMessage =
+                "성능 정책 원상복구 실패($reason): ${result.detail}"
+                    .take(MAX_EVENT_MESSAGE_CHARS)
+            false
+        }
+    }
+
+    private suspend fun awaitOriginalBatterySaverState(expected: Boolean?): Boolean {
+        if (expected == null) return false
+        return withContext(NonCancellable) {
+            val deadline = saturatingAdd(
+                SystemClock.elapsedRealtime(),
+                PERFORMANCE_POLICY_PROPAGATION_TIMEOUT_MS,
+            )
+            while (true) {
+                val restored = runCatching {
+                    powerManager.isPowerSaveMode == expected
+                }.getOrDefault(false)
+                if (restored) return@withContext true
+                if (SystemClock.elapsedRealtime() >= deadline) return@withContext false
+                delay(PERFORMANCE_POLICY_POLL_MS)
+            }
+            @Suppress("UNREACHABLE_CODE")
+            false
+        }
+    }
+
+    private suspend fun awaitBatterySaverOff(): Boolean {
+        val deadline = saturatingAdd(
+            SystemClock.elapsedRealtime(),
+            PERFORMANCE_POLICY_PROPAGATION_TIMEOUT_MS,
+        )
+        while (currentCoroutineContext().isActive) {
+            val saverOff = runCatching {
+                !powerManager.isPowerSaveMode
+            }.getOrElse {
+                return false
+            }
+            if (saverOff) return true
+            if (SystemClock.elapsedRealtime() >= deadline) return false
+            delay(PERFORMANCE_POLICY_POLL_MS)
+        }
+        return false
+    }
+
+    private fun failPerformanceIsolation(reason: String): Nothing {
+        val bounded = reason.take(MAX_EVENT_MESSAGE_CHARS)
+        performanceIsolationLifecycle = PerformanceIsolationLifecycle.FAILED
+        performanceIsolationStatus = "실패 · 시작 거부"
+        cancellationReason = bounded
+        errorMessage = bounded
+        throw PlanAbortException(bounded)
+    }
+
+    private fun samePerformanceSession(
+        first: VendorPerformanceSessionTicket,
+        second: VendorPerformanceSessionTicket,
+    ): Boolean =
+        first.sessionId == second.sessionId &&
+            first.serviceSession == second.serviceSession
+
+    /**
+     * A late exact END may clear the process latch after the controller timed out. Reconcile only
+     * from that authoritative proof and a terminated renewal Job; never clear a live owner merely
+     * because a local status string changed.
+     */
+    private fun reconcilePerformanceIsolationOwnership() {
+        val pendingRestore = vendorBridge.pendingPerformanceRestoreTicket()
+        if (pendingRestore != null) {
+            performanceSessionTicket = pendingRestore
+            performanceIsolationOwned = true
+            performanceIsolationLifecycle = PerformanceIsolationLifecycle.FAILED
+            return
+        }
+        val renewal = performanceRenewalJob
+        val renewalRunning = renewal != null && !renewal.isCompleted
+        val restoreAlreadyConfirmed = performancePolicyRestoreConfirmed.get()
+        val currentPowerSaveMode = if (restoreAlreadyConfirmed) {
+            null
+        } else {
+            runCatching { powerManager.isPowerSaveMode }.getOrNull()
+        }
+        if (
+            !latePerformanceRestoreConfirmed(
+                processRestorePending = false,
+                renewalRunning = renewalRunning,
+                restoreAlreadyConfirmed = restoreAlreadyConfirmed,
+                originalPowerSaveMode = performanceBaselinePowerSaveMode,
+                currentPowerSaveMode = currentPowerSaveMode,
+            )
+        ) {
+            return
+        }
+        performancePolicyRestoreConfirmed.set(true)
+        performanceRenewalJob = null
+        performanceSessionTicket = null
+        performanceIsolationOwned = false
+        performanceBaselinePowerSaveMode = null
+        performanceIsolationLifecycle = PerformanceIsolationLifecycle.IDLE
+        if (performanceIsolationStatus.startsWith("복원 실패")) {
+            performanceIsolationStatus = "복원 확인 · 지연된 END acknowledgment"
+        }
     }
 
     private fun resetPlanState() {
         loadManager.clearMemoryAllocationFailure()
         mutablePlanResultHistory.clear()
+        hwcCapacityCalibration =
+            HwcCapacityCalibrationResult(HwcCapacityCalibrationStatus.PENDING)
         thermalReduced = false
         cancellationReason = null
         errorMessage = null
+        performanceBaselinePowerSaveMode = null
         resetScenarioRunState()
     }
 
@@ -872,6 +2605,7 @@ class LabController(
         runSamples.clear()
         runEvents.clear()
         runFinalized = false
+        lastPerformanceRestoreReportPersisted = false
         runStartMonotonicMs = SystemClock.elapsedRealtime()
         runStartEpochMs = System.currentTimeMillis()
         baselineExactUnderruns = null
@@ -883,8 +2617,249 @@ class LabController(
         exactCounterSamplesAfterBaseline = 0
         baselineSuspected = telemetry.suspectedUnderruns
         producerRateShortfallReason = null
+        hwcCompositionCoverageFailureReason = null
+        hwcCompositionChainAnchor = null
+        severeThermalPolicyObservationRecorded = false
+        activeHwcCompositionCoverage.set(null)
+        hwcCompositionProbePriorityGate.reset()
         activeProducerFrameBudget = null
         producerRecoveryPaused = false
+    }
+
+    private suspend fun calibrateHwcCapacityOnceForPlan(firstScenario: ScenarioSpec) {
+        check(hwcCapacityCalibration.status == HwcCapacityCalibrationStatus.PENDING) {
+            "Plan HWC capacity calibration must execute at most once"
+        }
+        ensurePlanMemoryAvailable()
+        verifyPerformanceEnvironmentBeforeProducer()
+        safetyLimits = DeviceRenderSafety.detect(
+            activity = activity,
+            originalPowerSaveMode = performanceBaselinePowerSaveMode == true,
+        )
+        val requestedPhase = PhaseSpec(
+            id = "plan-hwc-capacity-calibration",
+            label = "Plan HWC capacity one-shot",
+            durationMs = HWC_CAPACITY_CALIBRATION_PHASE_BUDGET_MS,
+            activeLayers = ScenarioSafetyPolicy.HARD_MAX_LAYERS,
+            producerFps = HWC_CAPACITY_CALIBRATION_PRODUCER_FPS,
+            requestedDisplayHz = 60f,
+            backend = LayerBackend.INDEPENDENT_SURFACES,
+            pixelRoute = PixelRoute.RGB_8888,
+            bufferSize = BufferSize.DISPLAY,
+            motion = MotionProfile.CAPACITY_TILES,
+        )
+        val calibrationScenario = firstScenario.copy(
+            id = "plan-hwc-capacity-calibration",
+            name = "Plan HWC capacity one-shot",
+            description =
+                "Safety-approved RGB candidate topology for one fresh composition snapshot",
+            tags = emptySet(),
+            requirements = emptySet(),
+            phases = listOf(requestedPhase),
+            isCustom = false,
+        )
+        val decision = ScenarioSafetyPolicy.evaluate(
+            scenario = calibrationScenario,
+            limits = safetyLimits,
+            selectedDecoderBuffer = null,
+        )
+        val candidatePhase = decision.effectiveScenario?.phases?.singleOrNull()
+        if (candidatePhase == null) {
+            hwcCapacityCalibration = HwcCapacityCalibrationResult(
+                status = HwcCapacityCalibrationStatus.UNAVAILABLE,
+                detail = "safety policy rejected calibration candidate: " +
+                    decision.rejectionReason.orEmpty(),
+            )
+            return
+        }
+
+        if (!confirmGeneratedLoadQuiesce()) {
+            throw PlanAbortException(
+                "HWC capacity calibration 전 generated/NPU load zero를 확인하지 못했습니다.",
+            )
+        }
+        requestDisplayModeOrAbort(60f, "plan HWC capacity calibration")
+        val generation = beginTrackedProducerGeneration()
+        progress = RunProgress(
+            stage = RunnerStage.WARMUP,
+            scenario = firstScenario,
+            phase = candidatePhase,
+            targetPhase = candidatePhase,
+            statusText =
+                "Plan 1회 HWC capacity 관측 · ${candidatePhase.activeLayers}L 후보 준비",
+            producerGeneration = generation,
+        )
+        val deadlineMs = saturatingAdd(
+            SystemClock.elapsedRealtime(),
+            HWC_CAPACITY_CALIBRATION_TOPOLOGY_TIMEOUT_MS,
+        )
+        var readinessAtSnapshot: com.example.dpulayerlab.monitor.ProducerReadiness? = null
+        var unavailableReason: String? = null
+        var generationActivated = false
+        var teardownConfirmed: Boolean
+        try {
+            while (readinessAtSnapshot == null && unavailableReason == null) {
+                currentCoroutineContext().ensureActive()
+                val nowMs = SystemClock.elapsedRealtime()
+                val readiness = frameTracker.producerReadiness(generation)
+                val rendererCleanupPending = RendererSafetyState.hasUnconfirmedTeardown()
+                readiness.runtimeFailureReason?.let { failure ->
+                    throw PlanAbortException(
+                        "HWC capacity calibration producer 실행 실패: $failure",
+                    )
+                }
+                if (readiness.teardownFailed) {
+                    throw PlanAbortException(
+                        "HWC capacity calibration producer teardown/recovery가 실패했습니다.",
+                    )
+                }
+                if (
+                    hwcCapacityGenerationAction(
+                        generationActivated = generationActivated,
+                        topologyPublished = readiness.topologyPublished,
+                        topologyPending = readiness.topologyPending,
+                        expectedProducerCount = readiness.expectedCount,
+                        candidateLayers = candidatePhase.activeLayers,
+                        rendererCleanupPending = rendererCleanupPending,
+                    ) == HwcCapacityGenerationAction.ACTIVATE &&
+                    frameTracker.activateProducerGeneration(generation)
+                ) {
+                    // activate() atomically clears every pre-activation observation. From this
+                    // point onward the ready gate can only be satisfied by fresh first buffers.
+                    generationActivated = true
+                }
+                if (
+                    generationActivated &&
+                    readiness.ready &&
+                    readiness.topologyPublished &&
+                    !readiness.topologyPending &&
+                    !rendererCleanupPending &&
+                    readiness.expectedCount == candidatePhase.activeLayers &&
+                    readiness.observedCount == candidatePhase.activeLayers
+                ) {
+                    readinessAtSnapshot = readiness
+                    break
+                }
+                if (nowMs >= deadlineMs || readiness.topologyMissed) {
+                    unavailableReason =
+                        "candidate topology readiness unavailable; " +
+                            "expected=${candidatePhase.activeLayers}, " +
+                            "published=${readiness.expectedCount}, " +
+                            "observed=${readiness.observedCount}, " +
+                            "topologyMissed=${readiness.topologyMissed}"
+                    break
+                }
+                progress = progress.copy(
+                    expectedProducerCount = visibleExpectedProducerCount(
+                        committedExpectedCount = readiness.expectedCount,
+                        topologyPublished = readiness.topologyPublished,
+                        topologyPending = readiness.topologyPending,
+                        processLeaseActive = rendererCleanupPending,
+                    ),
+                    observedProducerCount = readiness.observedCount,
+                )
+                delay(RENDERER_TEARDOWN_POLL_MS)
+            }
+
+            if (readinessAtSnapshot != null) {
+                val remainingMs = deadlineMs - SystemClock.elapsedRealtime()
+                if (remainingMs < HWC_CAPACITY_CALIBRATION_STABILIZE_MS) {
+                    readinessAtSnapshot = null
+                    unavailableReason =
+                        "candidate became ready without stabilization budget"
+                } else {
+                    // First-buffer means that every producer submitted at least once; it does not
+                    // prove that SurfaceFlinger has latched and validated the last transaction.
+                    // Keep the snapshot count at one while allowing several vsyncs to settle.
+                    delay(HWC_CAPACITY_CALIBRATION_STABILIZE_MS)
+                    currentCoroutineContext().ensureActive()
+                    ensurePlanMemoryAvailable()
+                    verifyPerformanceEnvironmentBeforeProducer()
+                    val isolationToken = activeTestWindowIsolationToken
+                    if (
+                        isolationToken == null ||
+                        !testWindowIsolation.isConfirmed(isolationToken)
+                    ) {
+                        throw PlanAbortException(
+                            "HWC capacity calibration 안정화 중 SystemUI 격리가 해제되었습니다.",
+                        )
+                    }
+                    val stabilized = frameTracker.producerReadiness(generation)
+                    val topologyStillReady =
+                        stabilized.ready &&
+                            stabilized.topologyPublished &&
+                            !stabilized.topologyPending &&
+                            !stabilized.teardownFailed &&
+                            stabilized.runtimeFailureReason == null &&
+                            !RendererSafetyState.hasUnconfirmedTeardown() &&
+                            stabilized.expectedCount == candidatePhase.activeLayers &&
+                            stabilized.observedCount == candidatePhase.activeLayers
+                    readinessAtSnapshot = stabilized.takeIf { topologyStillReady }
+                    if (!topologyStillReady) {
+                        unavailableReason =
+                            "candidate topology changed during stabilization; " +
+                                "expected=${candidatePhase.activeLayers}, " +
+                                "published=${stabilized.expectedCount}, " +
+                                "observed=${stabilized.observedCount}"
+                    }
+                }
+            }
+
+            val ready = readinessAtSnapshot
+            if (ready == null) {
+                hwcCapacityCalibration = HwcCapacityCalibrationResult(
+                    status = HwcCapacityCalibrationStatus.UNAVAILABLE,
+                    candidateLayers = candidatePhase.activeLayers,
+                    detail = unavailableReason.orEmpty(),
+                )
+            } else {
+                val calibrationSampleStartedMs = SystemClock.elapsedRealtime()
+                val snapshot = try {
+                    collectPlanHwcCapacityCalibrationSample()
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    null.also {
+                        unavailableReason =
+                            "single fresh composition snapshot failed: " +
+                                error.javaClass.simpleName
+                    }
+                }
+                hwcCapacityCalibration = if (snapshot == null) {
+                    HwcCapacityCalibrationResult(
+                        status = HwcCapacityCalibrationStatus.UNAVAILABLE,
+                        candidateLayers = candidatePhase.activeLayers,
+                        detail = unavailableReason.orEmpty(),
+                    )
+                } else {
+                    hwcCapacityCalibrationResult(
+                        candidateLayers = candidatePhase.activeLayers,
+                        expectedProducerCount = ready.expectedCount,
+                        observedProducerCount = ready.observedCount,
+                        sampleStartedMonotonicMs = calibrationSampleStartedMs,
+                        snapshot = snapshot,
+                    )
+                }
+            }
+        } finally {
+            progress = progress.copy(
+                phase = null,
+                targetPhase = null,
+                transitionFraction = 0f,
+                statusText = "HWC capacity calibration teardown/zero-load settle",
+            )
+            val loadsZero = confirmGeneratedLoadQuiesce()
+            val rendererReleased = awaitRendererTeardownBarrier()
+            teardownConfirmed = loadsZero && rendererReleased
+            if (teardownConfirmed) {
+                delay(HWC_CAPACITY_CALIBRATION_SETTLE_MS)
+            }
+        }
+        if (!teardownConfirmed) {
+            throw PlanAbortException(
+                "HWC capacity calibration producer/load teardown을 확인하지 못했습니다.",
+            )
+        }
     }
 
     private suspend fun executeScenario(requestedScenario: ScenarioSpec): ScenarioRunArtifact {
@@ -893,6 +2868,41 @@ class LabController(
         var cleanupConfirmed = false
         val pendingMediaSource = AtomicReference<PinnedMediaSource?>()
         try {
+            runEvents += event(
+                "PLAN_HWC_CAPACITY_CALIBRATION",
+                hwcCapacityCalibration.eventDetail(),
+            )
+            runEvents += event(
+                "PLAN_HWC_CAPACITY_REUSE_GUIDANCE",
+                capacityReuseGuidance(hwcCapacityCalibration).let { guidance ->
+                    "deviceCandidateCeiling=" +
+                        "${guidance.deviceCandidateCeiling ?: "N/A"}; " +
+                        "clientPressureCandidate=" +
+                        "${guidance.clientPressureCandidate ?: "N/A"}; " +
+                        guidance.detail
+                },
+            )
+            val isolationToken = activeTestWindowIsolationToken
+            if (
+                isolationToken == null ||
+                !testWindowIsolation.isConfirmed(isolationToken)
+            ) {
+                val reason = "측정 시작 전 SystemUI 격리 상태를 확인할 수 없습니다."
+                cancellationReason = reason
+                throw PlanAbortException(reason)
+            }
+            runEvents += event(
+                "SYSTEM_UI_ISOLATED",
+                "status/navigation bars hidden; token=$isolationToken",
+            )
+            runEvents += event(
+                "PERFORMANCE_ISOLATION",
+                performanceIsolationStatus.take(MAX_EVENT_MESSAGE_CHARS),
+            )
+            runEvents += event(
+                "RUNTIME_PROTECTION_POLICY",
+                runtimeProtectionPolicyDescription(activeRuntimeProtectionPolicy),
+            )
             if (hasUnconfirmedRendererCleanup()) {
                 val reason =
                     "이전 physical producer teardown이 미확인 상태여서 plan을 안전 중단합니다."
@@ -924,7 +2934,10 @@ class LabController(
                 )
             }
             ensurePlanMemoryAvailable()
-            safetyLimits = DeviceRenderSafety.detect(activity)
+            safetyLimits = DeviceRenderSafety.detect(
+                activity = activity,
+                originalPowerSaveMode = performanceBaselinePowerSaveMode == true,
+            )
             val scenarioUsesSelectedDecoder =
                 requestedScenario.phases.any(::canUseVideoPrimary)
             if (scenarioUsesSelectedDecoder && selectedMediaUri == null) {
@@ -1011,6 +3024,7 @@ class LabController(
                 runEvents += event("MEDIA_SOURCE", mediaInfo.description + codecDetail)
             }
             delay(PRECHECK_DELAY_MS)
+            verifyPerformanceEnvironmentBeforeProducer()
 
             val warmupProducerGeneration = beginTrackedProducerGeneration()
             progress = progress.copy(
@@ -1088,7 +3102,11 @@ class LabController(
             )
             // A normal verdict is derived only after the final physical producer has drained and
             // one serialized fresh counter sample has covered that teardown tail.
-            return finalizeProtected(scenario, preselectedVerdict = null)
+            return finalizeProtected(
+                scenario = scenario,
+                preselectedVerdict = null,
+                pendingMediaSource = pendingMediaSource,
+            )
         } catch (cancelled: CancellationException) {
             val initialReason = cancellationReason
                 ?: cancelled.message
@@ -1125,7 +3143,11 @@ class LabController(
             )
             if (!runFinalized) {
                 runEvents += event("ABORTED", reason)
-                finalizeProtected(scenarioForReport, RunVerdict.ABORTED)
+                finalizeProtected(
+                    scenarioForReport,
+                    RunVerdict.ABORTED,
+                    pendingMediaSource,
+                )
             }
             throw cancelled
         } catch (unsupported: UnsupportedRunException) {
@@ -1151,7 +3173,11 @@ class LabController(
                     statusText = unsupportedReason,
                     thermalDerated = thermalReduced,
                 )
-                finalizeProtected(scenarioForReport, RunVerdict.UNSUPPORTED)
+                finalizeProtected(
+                    scenarioForReport,
+                    RunVerdict.UNSUPPORTED,
+                    pendingMediaSource,
+                )
             } else {
                 val reason = "$unsupportedReason · 부하/compression 해제 미확인"
                     .take(MAX_EVENT_MESSAGE_CHARS)
@@ -1163,7 +3189,11 @@ class LabController(
                     thermalDerated = thermalReduced,
                 )
                 runEvents += event("ABORTED", reason)
-                finalizeProtected(scenarioForReport, RunVerdict.ABORTED)
+                finalizeProtected(
+                    scenarioForReport,
+                    RunVerdict.ABORTED,
+                    pendingMediaSource,
+                )
             }
         } catch (inconclusive: InconclusiveRunException) {
             val reason = inconclusive.message.orEmpty()
@@ -1182,7 +3212,11 @@ class LabController(
             }
             cleanupConfirmed = cleanupSucceeded
             return if (cleanupSucceeded) {
-                finalizeProtected(scenarioForReport, RunVerdict.INCONCLUSIVE)
+                finalizeProtected(
+                    scenarioForReport,
+                    RunVerdict.INCONCLUSIVE,
+                    pendingMediaSource,
+                )
             } else {
                 val abortReason = "$reason · 부하/compression 해제 미확인"
                     .take(MAX_EVENT_MESSAGE_CHARS)
@@ -1194,7 +3228,11 @@ class LabController(
                     thermalDerated = thermalReduced,
                 )
                 runEvents += event("ABORTED", abortReason)
-                finalizeProtected(scenarioForReport, RunVerdict.ABORTED)
+                finalizeProtected(
+                    scenarioForReport,
+                    RunVerdict.ABORTED,
+                    pendingMediaSource,
+                )
             }
         } catch (error: Exception) {
             errorMessage = "실행 실패: ${error.message ?: error.javaClass.simpleName}"
@@ -1234,22 +3272,30 @@ class LabController(
                 thermalDerated = thermalReduced,
             )
             runEvents += event("ABORTED", reason)
-            return finalizeProtected(scenarioForReport, unexpectedExceptionVerdict())
+            return finalizeProtected(
+                scenarioForReport,
+                unexpectedExceptionVerdict(),
+                pendingMediaSource,
+            )
         } finally {
             activeProducerFrameBudget = null
+            activeHwcCompositionCoverage.set(null)
+            // Scenario teardown is terminal: no typed phase may retain priority after any
+            // cancellation, fatal error, or finalization failure that bypassed phase cleanup.
+            hwcCompositionProbePriorityGate.reset()
             withContext(NonCancellable) {
                 if (!cleanupConfirmed) releaseActiveLoadsForRun()
                 resetDisplayModeSafely()
             }
             closeSelectedVideoDecoder()
-            pendingMediaSource.getAndSet(null)?.close()
+            pendingMediaSource.getAndSet(null)?.closeWithResult()
         }
     }
 
-    private fun closeSelectedVideoDecoder() {
+    private fun closeSelectedVideoDecoder(): Boolean {
         val previous = selectedVideoDecoder
         selectedVideoDecoder = null
-        previous?.close()
+        return previous?.closeWithResult() ?: true
     }
 
     private fun establishCounterBaseline(snapshot: TelemetrySnapshot) {
@@ -1270,16 +3316,89 @@ class LabController(
         )
     }
 
-    private suspend fun collectTelemetrySample(): TelemetrySnapshot =
+    private suspend fun collectTelemetrySample(
+        forceCompositionProbe: Boolean = false,
+    ): TelemetrySnapshot =
         telemetrySampleMutex.withLock {
-            val generation = telemetrySampleGate.issue()
-            val snapshot = systemMonitor.sample(activity.currentDisplayCompat())
-            lastSuccessfulSampleMs = SystemClock.elapsedRealtime()
-            acceptSnapshot(generation, snapshot)
-            snapshot
+            collectTelemetrySampleLocked(forceCompositionProbe)
         }
 
-    private suspend fun acceptSnapshot(generation: Long, snapshot: TelemetrySnapshot) {
+    private suspend fun collectPlanHwcCapacityCalibrationSample(): TelemetrySnapshot =
+        telemetrySampleMutex.withLock {
+            collectTelemetrySampleLocked(
+                forceCompositionProbe = false,
+                surfaceFlingerProbePolicyOverride =
+                    SurfaceFlingerProbePolicy.CALIBRATION_ONESHOT,
+            )
+        }
+
+    /**
+     * Periodic HUD sampling is latest-wins. It never creates a mutex waiter, especially while a
+     * typed HWC batch owns priority; forced/boundary samples themselves refresh safety telemetry
+     * and exact-counter continuity.
+     */
+    private suspend fun collectPeriodicTelemetrySample(): TelemetrySnapshot? {
+        if (!telemetrySampleMutex.tryLock()) return null
+        return try {
+            when (
+                periodicTelemetryArbitration(
+                    mutexAcquired = true,
+                    typedHwcProbePriority =
+                        hwcCompositionProbePriorityGate.isActive(),
+                )
+            ) {
+                PeriodicTelemetryArbitration.SAMPLE ->
+                    collectTelemetrySampleLocked(forceCompositionProbe = false)
+                PeriodicTelemetryArbitration.DROP_BUSY,
+                PeriodicTelemetryArbitration.DROP_TYPED_HWC_PRIORITY,
+                -> null
+            }
+        } finally {
+            telemetrySampleMutex.unlock()
+        }
+    }
+
+    /** Caller must own [telemetrySampleMutex]. */
+    private suspend fun collectTelemetrySampleLocked(
+        forceCompositionProbe: Boolean,
+        surfaceFlingerProbePolicyOverride: SurfaceFlingerProbePolicy? = null,
+    ): TelemetrySnapshot {
+        val generation = telemetrySampleGate.issue()
+        val sampleStartedMs = SystemClock.elapsedRealtime()
+        telemetrySampleInFlightDeadlineMs = telemetrySampleDeadlineMs(
+            sampleStartedMs = sampleStartedMs,
+            sampleTimeoutMs = SYSTEM_MONITOR_SAMPLE_TIMEOUT_MS,
+            completionGraceMs = WATCHDOG_INTERVAL_MS,
+        )
+        val snapshot = try {
+            systemMonitor.sample(
+                display = activity.currentDisplayCompat(),
+                // An app-spawned dumpsys process can perturb CPU/SF scheduling during the load
+                // under test. Active runs use fresh vendor composition snapshots when available
+                // and invoke SurfaceFlinger only at an explicit typed HWC observation boundary.
+                surfaceFlingerProbePolicy =
+                    surfaceFlingerProbePolicyOverride ?: surfaceFlingerProbePolicy(
+                        forceCompositionProbe = forceCompositionProbe,
+                        activeRun = isRunning,
+                    ),
+            )
+        } finally {
+            telemetrySampleInFlightDeadlineMs = null
+        }
+        lastSuccessfulSampleMs = SystemClock.elapsedRealtime()
+        acceptSnapshot(
+            generation = generation,
+            snapshot = snapshot,
+            sampleStartedMonotonicMs = sampleStartedMs,
+        )
+        return snapshot
+    }
+
+    private suspend fun acceptSnapshot(
+        generation: Long,
+        snapshot: TelemetrySnapshot,
+        sampleStartedMonotonicMs: Long,
+    ) {
         telemetry = snapshot
         telemetryHistory += snapshot
         while (telemetryHistory.size > MAX_TELEMETRY_HISTORY) telemetryHistory.removeAt(0)
@@ -1287,14 +3406,17 @@ class LabController(
         directSensors.addAll(systemMonitor.directSensorReadings())
         if (!isRunning) return
         // Safety observations stay conservative even if the sample was requested by an older run.
-        enforceCompressionSessionContinuity(snapshot)
         enforceRuntimeSafety(snapshot)
+        enforcePerformanceIsolationContinuity(snapshot)
+        enforceCompressionSessionContinuity(snapshot)
         if (!telemetrySampleGate.belongsToCurrentRun(generation)) return
 
+        activeHwcCompositionCoverage.get()?.observe(
+            sampleStartedMonotonicMs = sampleStartedMonotonicMs,
+            snapshot = snapshot,
+        )
         if (runSamples.size < MAX_RUN_SAMPLES) {
-            runSamples += snapshot.copy(
-                monotonicMs = (snapshot.monotonicMs - runStartMonotonicMs).coerceAtLeast(0L),
-            )
+            runSamples += snapshot.toRunRelativeTelemetry(runStartMonotonicMs)
         }
         observeExactCounter(snapshot)
     }
@@ -1400,7 +3522,10 @@ class LabController(
                     throw PlanAbortException(reason)
                 }
             }
-            requestDisplayMode(min(60f, targetPhase.requestedDisplayHz))
+            requestDisplayModeOrAbort(
+                min(60f, targetPhase.requestedDisplayHz),
+                "phase '${targetPhase.id}' preparation",
+            )
             val adaptiveBoundaryBefore = if (adaptiveCandidate) {
                 collectAdaptiveBoundarySample(targetPhase.id, "before")
             } else {
@@ -1538,6 +3663,24 @@ class LabController(
             val phaseStarted = SystemClock.elapsedRealtime()
             val phaseClock = ActivePhaseClock(phaseStarted)
             activePhaseClock = phaseClock
+            val hwcCompositionCoverage =
+                targetPhase.hwcCompositionExpectation
+                    .takeUnless { it == HwcCompositionExpectation.NONE }
+                    ?.let { expectation ->
+                        HwcCompositionCoverageTracker(expectation).also { tracker ->
+                            if (
+                                !hwcCompositionContractPreserved(
+                                    requested = requestedPhase,
+                                    effective = targetPhase,
+                                )
+                            ) {
+                                tracker.recordContractFailure(
+                                    "typed HWC target was changed by a persistent runtime " +
+                                        "safety derate before phase activation",
+                                )
+                            }
+                        }
+                    }
             // Attribute exact/proxy deltas only after the requested topology has committed and a
             // fresh serialized sample has completed.
             val exactBefore = activationBaseline.exactUnderruns
@@ -1549,7 +3692,8 @@ class LabController(
                 "PHASE_START",
                 "${targetPhase.id}: ${targetPhase.label}; " +
                     "${targetPhase.activeLayers}L @ ${targetPhase.producerFps}fps; " +
-                    "transition=${targetPhase.transition.summary()}",
+                    "transition=${targetPhase.transition.summary()}; " +
+                    "hwcExpectation=${targetPhase.hwcCompositionExpectation.name}",
             )
             var lastRawRuntime = initialRawRuntime
             var firstControlTick = false
@@ -1564,6 +3708,8 @@ class LabController(
             var pendingCoverageElapsedMs = 0L
             var pendingCoverageProducerCount = 0
             var pendingCoverageTopologyRevision = 0L
+            var hwcCompositionProbeResolved = false
+            var forcedHwcCompositionProbeAttempts = 0
             val producerFrameBudget = AppliedProducerFrameBudget(
                 phaseStartedMs = phaseStarted,
                 phaseDurationMs = targetPhase.durationMs,
@@ -1597,8 +3743,14 @@ class LabController(
                     .coerceAtMost(nowMs)
                 recoveryPaused = true
                 producerRecoveryPaused = true
-                phaseClock.pause(boundedBoundaryMs)
-                producerFrameBudget.pause(boundedBoundaryMs)
+                phaseClock.pause(
+                    boundedBoundaryMs,
+                    PhasePauseOwner.PRODUCER_RECOVERY,
+                )
+                producerFrameBudget.pause(
+                    boundedBoundaryMs,
+                    PhasePauseOwner.PRODUCER_RECOVERY,
+                )
                 progress.phase?.let { activePhase ->
                     progress = progress.copy(
                         phase = rendererPreparationPhase(activePhase),
@@ -1606,12 +3758,219 @@ class LabController(
                     )
                 }
                 loadManager.releaseLoads()
-                requestDisplayMode(min(60f, targetPhase.requestedDisplayHz))
+                requestDisplayModeOrAbort(
+                    min(60f, targetPhase.requestedDisplayHz),
+                    "phase '${targetPhase.id}' producer recovery",
+                )
                 runEvents += event(
                     "PRODUCER_RECOVERY_WAIT",
                     "phase=${targetPhase.id}; pending=$topologyPending; " +
                         "processLease=$processLeaseActive",
                 )
+            }
+            suspend fun collectTargetHwcCompositionEvidence(
+                boundaryMs: Long,
+                expectedProducerCount: Int,
+                expectedTopologyRevision: Long,
+            ): Long? {
+                val coverage = hwcCompositionCoverage ?: return boundaryMs
+                currentCoroutineContext().ensureActive()
+                fun preserveTypedContract(): Boolean {
+                    val effectiveTarget = applyPersistentSafety(requestedPhase)
+                    val preserved = hwcCompositionContractPreserved(
+                        requested = requestedPhase,
+                        effective = effectiveTarget,
+                    )
+                    if (!preserved) {
+                        coverage.recordContractFailure(
+                            "typed HWC target changed before/during forced observation: " +
+                                hwcCompositionContractDeltaSummary(
+                                    requested = requestedPhase,
+                                    effective = effectiveTarget,
+                                ),
+                        )
+                    }
+                    return preserved
+                }
+                fun targetTopologyStableLocked(): Boolean {
+                    val freshReadiness =
+                        frameTracker.producerReadiness(producerGeneration)
+                    val pendingBoundaryExists =
+                        topologyPendingBoundary.get()?.generation == producerGeneration
+                    return hwcCompositionTargetReadyForArm(
+                        ready = freshReadiness.ready,
+                        topologyPublished = freshReadiness.topologyPublished,
+                        topologyPending = freshReadiness.topologyPending,
+                        processLeaseActive =
+                            RendererSafetyState.hasUnconfirmedTeardown(),
+                        pendingBoundaryExists = pendingBoundaryExists,
+                        teardownFailed = freshReadiness.teardownFailed,
+                        runtimeFailurePresent =
+                            freshReadiness.runtimeFailureReason != null,
+                        expectedProducerCount = expectedProducerCount,
+                        observedProducerCount = freshReadiness.observedCount,
+                        expectedTopologyRevision = expectedTopologyRevision,
+                        observedTopologyRevision =
+                            freshReadiness.topologyRevision,
+                    )
+                }
+                preserveTypedContract()
+                val newlyArmed = synchronized(producerTopologyStateLock) {
+                    if (!targetTopologyStableLocked()) {
+                        return@synchronized null
+                    }
+                    val activated = if (coverage.targetActivated()) {
+                        false
+                    } else {
+                        coverage.activateTarget(boundaryMs)
+                    }
+                    check(
+                        hwcCompositionProbePriorityGate.acquire(coverage),
+                    ) {
+                        "Another typed HWC probe priority owner is still active"
+                    }
+                    activated
+                } ?: return boundaryMs
+                if (newlyArmed) {
+                    runEvents += event(
+                        "HWC_EXPECTATION_ARMED",
+                        "phase=${targetPhase.id}; " +
+                            "expectation=${targetPhase.hwcCompositionExpectation.name}; " +
+                            "targetReadyRunMs=" +
+                            "${monotonicTimestampRelativeToRun(
+                                boundaryMs,
+                                runStartMonotonicMs,
+                            ) ?: "N/A"}",
+                    )
+                }
+                fun resolveProbePriority(atMonotonicMs: Long): Long {
+                    hwcCompositionProbeResolved = true
+                    check(
+                        hwcCompositionProbePriorityGate.release(coverage) ||
+                            !hwcCompositionProbePriorityGate.isActive(),
+                    ) {
+                        "Typed HWC probe priority ownership changed before resolution"
+                    }
+                    return atMonotonicMs
+                }
+                if (hwcCompositionProbeResolved) {
+                    return resolveProbePriority(boundaryMs)
+                }
+                when (coverage.probeAction(forcedHwcCompositionProbeAttempts)) {
+                    HwcCompositionProbeAction.COMPLETE,
+                    HwcCompositionProbeAction.EXHAUSTED,
+                    -> {
+                        return resolveProbePriority(boundaryMs)
+                    }
+                    HwcCompositionProbeAction.FORCE_SAMPLE -> Unit
+                }
+                if (!telemetrySampleMutex.tryLock()) return null
+                try {
+                    // Keep one serialized ownership across the bounded forced batch. A periodic
+                    // waiter therefore cannot run between CLIENT sample 1 and sample 2. The target
+                    // renderer/load/display stay active, so probe time remains in duration and
+                    // producer-fidelity accounting.
+                    while (true) {
+                        currentCoroutineContext().ensureActive()
+                        preserveTypedContract()
+                        val topologyStableBeforeProbe =
+                            synchronized(producerTopologyStateLock) {
+                                targetTopologyStableLocked()
+                            }
+                        if (!topologyStableBeforeProbe) {
+                            coverage.recordProbeFailure(
+                                "target producer topology/fresh heartbeat changed before forced " +
+                                    "HWC composition observation",
+                            )
+                        }
+                        when (coverage.probeAction(forcedHwcCompositionProbeAttempts)) {
+                            HwcCompositionProbeAction.COMPLETE,
+                            HwcCompositionProbeAction.EXHAUSTED,
+                            -> return resolveProbePriority(SystemClock.elapsedRealtime())
+                            HwcCompositionProbeAction.FORCE_SAMPLE -> Unit
+                        }
+
+                        // Starting only with a complete bounded sample window left prevents a slow
+                        // SurfaceFlinger/Binder probe from silently extending the stress phase.
+                        val probeStartedAtMs = SystemClock.elapsedRealtime()
+                        val remainingActiveMs =
+                            (targetPhase.durationMs - phaseClock.elapsedMs(probeStartedAtMs))
+                                .coerceAtLeast(0L)
+                        if (
+                            !hwcCompositionProbeCanStart(
+                                remainingActiveMs = remainingActiveMs,
+                                sampleTimeoutMs = SYSTEM_MONITOR_SAMPLE_TIMEOUT_MS,
+                                completionReserveMs = PROGRESS_INTERVAL_MS,
+                            )
+                        ) {
+                            coverage.recordProbeFailure(
+                                "insufficient active phase window for bounded HWC composition " +
+                                    "probe; remainingMs=$remainingActiveMs",
+                            )
+                            return resolveProbePriority(probeStartedAtMs)
+                        }
+                        progress = progress.copy(
+                            statusText =
+                                "${targetPhase.label} · fresh HWC composition 확인 " +
+                                    "${forcedHwcCompositionProbeAttempts + 1}/" +
+                                    "${requiredHwcMatchingEvidenceCount(
+                                        targetPhase.hwcCompositionExpectation,
+                                    )}",
+                        )
+                        forcedHwcCompositionProbeAttempts++
+                        runEvents += event(
+                            "HWC_EXPECTATION_PROBE",
+                            "phase=${targetPhase.id}; attempt=" +
+                                "$forcedHwcCompositionProbeAttempts/" +
+                                "${requiredHwcMatchingEvidenceCount(
+                                    targetPhase.hwcCompositionExpectation,
+                                )}",
+                        )
+                        try {
+                            val probeBudgetMs = remainingActiveMs - PROGRESS_INTERVAL_MS
+                            val completedWithinPhase = withTimeoutOrNull(probeBudgetMs) {
+                                collectTelemetrySampleLocked(forceCompositionProbe = true)
+                                true
+                            } == true
+                            if (!completedWithinPhase) {
+                                coverage.recordProbeFailure(
+                                    "forced HWC composition sample exceeded the active phase " +
+                                        "deadline",
+                                )
+                            }
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (error: Exception) {
+                            coverage.recordProbeFailure(
+                                "forced HWC composition sample failed: " +
+                                    error.javaClass.simpleName,
+                            )
+                        }
+                        currentCoroutineContext().ensureActive()
+                        preserveTypedContract()
+                        val topologyStableAfterProbe =
+                            synchronized(producerTopologyStateLock) {
+                                targetTopologyStableLocked()
+                            }
+                        if (!topologyStableAfterProbe) {
+                            coverage.recordProbeFailure(
+                                "target producer topology/fresh heartbeat changed during forced " +
+                                    "HWC composition observation",
+                            )
+                        }
+                        when (coverage.probeAction(forcedHwcCompositionProbeAttempts)) {
+                            HwcCompositionProbeAction.FORCE_SAMPLE -> continue
+                            HwcCompositionProbeAction.COMPLETE,
+                            HwcCompositionProbeAction.EXHAUSTED,
+                            -> return resolveProbePriority(SystemClock.elapsedRealtime())
+                        }
+                    }
+                } finally {
+                    telemetrySampleMutex.unlock()
+                }
+            }
+            check(activeHwcCompositionCoverage.compareAndSet(null, hwcCompositionCoverage)) {
+                "Previous HWC composition coverage owner was not released"
             }
             try {
                 val pendingBoundaryAtActivation =
@@ -1622,11 +3981,19 @@ class LabController(
                     producerFrameBudget.pauseAtPhysicalBoundary(
                         atMonotonicMs = pendingBoundaryAtActivation.monotonicMs,
                         totalFrames = frameTracker.totalPhysicalProducedFrames(),
+                        owner = PhasePauseOwner.PRODUCER_RECOVERY,
+                    )
+                    phaseClock.pause(
+                        atMonotonicMs = pendingBoundaryAtActivation.monotonicMs,
+                        owner = PhasePauseOwner.PRODUCER_RECOVERY,
                     )
                     producerRecoveryPaused = true
                     loadManager.releaseLoads()
                     lastAppliedWorkloads = null
-                    requestDisplayMode(min(60f, initialRuntime.requestedDisplayHz))
+                    requestDisplayModeOrAbort(
+                        min(60f, initialRuntime.requestedDisplayHz),
+                        "phase '${targetPhase.id}' pending topology",
+                    )
                     lastAppliedDisplayHz = null
                 } else {
                     val initialNpuHealth = applyRuntimeWorkloads(
@@ -1644,7 +4011,10 @@ class LabController(
                     )
                     positiveNpuAcknowledged =
                         initialRuntime.workloads.npu > MIN_EFFECTIVE_LOAD
-                    requestDisplayMode(initialRuntime.requestedDisplayHz)
+                    requestDisplayModeOrAbort(
+                        initialRuntime.requestedDisplayHz,
+                        "phase '${targetPhase.id}' initial target",
+                    )
                 }
                 while (true) {
                 currentCoroutineContext().ensureActive()
@@ -1708,7 +4078,10 @@ class LabController(
                             processLeaseActive = processLeaseActive,
                         )
                     }
-                    val currentPauseMs = phaseClock.currentPauseMs(nowMs)
+                    val currentPauseMs = phaseClock.currentPauseMs(
+                        nowMs,
+                        PhasePauseOwner.PRODUCER_RECOVERY,
+                    )
                     if (
                         producerRecoveryDeadlineExceeded(
                             recoveryStillActive = true,
@@ -1751,7 +4124,10 @@ class LabController(
                     if (
                         producerRecoveryDeadlineExceeded(
                             recoveryStillActive = false,
-                            currentPauseMs = phaseClock.currentPauseMs(nowMs),
+                            currentPauseMs = phaseClock.currentPauseMs(
+                                nowMs,
+                                PhasePauseOwner.PRODUCER_RECOVERY,
+                            ),
                             timeoutMs = PRODUCER_RECOVERY_TIMEOUT_MS,
                         )
                     ) {
@@ -1790,7 +4166,10 @@ class LabController(
                         if (
                             producerRecoveryDeadlineExceeded(
                                 recoveryStillActive = false,
-                                currentPauseMs = phaseClock.currentPauseMs(restartNowMs),
+                                currentPauseMs = phaseClock.currentPauseMs(
+                                    restartNowMs,
+                                    PhasePauseOwner.PRODUCER_RECOVERY,
+                                ),
                                 timeoutMs = PRODUCER_RECOVERY_TIMEOUT_MS,
                             )
                         ) {
@@ -1847,7 +4226,10 @@ class LabController(
                         if (
                             producerRecoveryDeadlineExceeded(
                                 recoveryStillActive = true,
-                                currentPauseMs = phaseClock.currentPauseMs(resumeNowMs),
+                                currentPauseMs = phaseClock.currentPauseMs(
+                                    resumeNowMs,
+                                    PhasePauseOwner.PRODUCER_RECOVERY,
+                                ),
                                 timeoutMs = PRODUCER_RECOVERY_TIMEOUT_MS,
                             )
                         ) {
@@ -1865,7 +4247,10 @@ class LabController(
                     if (
                         producerRecoveryDeadlineExceeded(
                             recoveryStillActive = !resumeReadiness.ready,
-                            currentPauseMs = phaseClock.currentPauseMs(resumeNowMs),
+                            currentPauseMs = phaseClock.currentPauseMs(
+                                resumeNowMs,
+                                PhasePauseOwner.PRODUCER_RECOVERY,
+                            ),
                             timeoutMs = PRODUCER_RECOVERY_TIMEOUT_MS,
                         )
                     ) {
@@ -1898,8 +4283,14 @@ class LabController(
                         totalFrames = frameTracker.totalPhysicalProducedFrames(),
                         countAsActive = false,
                     )
-                    phaseClock.resume(resumeNowMs)
-                    producerFrameBudget.resume(resumeNowMs)
+                    phaseClock.resume(
+                        resumeNowMs,
+                        PhasePauseOwner.PRODUCER_RECOVERY,
+                    )
+                    producerFrameBudget.resume(
+                        resumeNowMs,
+                        PhasePauseOwner.PRODUCER_RECOVERY,
+                    )
                     nextControlTickAtMs = resumeNowMs
                     producerRecoveryPaused = false
                     recoveryPaused = false
@@ -1920,6 +4311,7 @@ class LabController(
                     countAsActive = true,
                 )
                 val phaseElapsed = phaseClock.elapsedMs(nowMs)
+                var compositionVerificationBoundaryHandled = false
                 pendingCoverageSample?.let { pendingSample ->
                     if (
                         producerReadiness.ready &&
@@ -1933,7 +4325,28 @@ class LabController(
                         )
                         pendingCoverageSample = null
                         postReadyControlTickApplied = true
+                        if (
+                            pendingSample.fraction >= 1f &&
+                            hwcCompositionCoverage != null &&
+                            !hwcCompositionProbeResolved
+                        ) {
+                            collectTargetHwcCompositionEvidence(
+                                boundaryMs = SystemClock.elapsedRealtime(),
+                                expectedProducerCount =
+                                    pendingCoverageProducerCount,
+                                expectedTopologyRevision =
+                                    pendingCoverageTopologyRevision,
+                            )?.let { completedAtMs ->
+                                nextControlTickAtMs = completedAtMs
+                                compositionVerificationBoundaryHandled = true
+                            }
+                        }
                     }
+                }
+                if (compositionVerificationBoundaryHandled) {
+                    // The bounded probe can overlap a renderer callback or safety transaction.
+                    // Refresh every readiness/control input before publishing another setpoint.
+                    continue
                 }
                 if (producerReadiness.topologyMissed) {
                     throw InconclusiveRunException(
@@ -2030,7 +4443,10 @@ class LabController(
                     abs(runtimePhase.requestedDisplayHz - lastAppliedDisplayHz) >=
                     DISPLAY_REQUEST_EPSILON_HZ
                 ) {
-                    requestDisplayMode(runtimePhase.requestedDisplayHz)
+                    requestDisplayModeOrAbort(
+                        runtimePhase.requestedDisplayHz,
+                        "phase '${targetPhase.id}' runtime target",
+                    )
                     lastAppliedDisplayHz = runtimePhase.requestedDisplayHz
                 }
                 if (firstControlTick || runtimePhase.workloads != lastAppliedWorkloads) {
@@ -2145,14 +4561,58 @@ class LabController(
                 if (activePhaseClock === phaseClock) {
                     activePhaseClock = null
                 }
+                hwcCompositionCoverage?.let { coverage ->
+                    hwcCompositionProbePriorityGate.release(coverage)
+                }
+                activeHwcCompositionCoverage.compareAndSet(
+                    hwcCompositionCoverage,
+                    null,
+                )
+            }
+            hwcCompositionCoverage?.result()?.let { coverage ->
+                val chain = advanceHwcCompositionChain(
+                    prior = hwcCompositionChainAnchor,
+                    coverage = coverage,
+                    requestedActiveLayers = requestedPhase.activeLayers,
+                )
+                hwcCompositionChainAnchor = chain.nextAnchor
+                val detail =
+                    "phase=${targetPhase.id}; " +
+                        "${coverage.eventSummary(runStartMonotonicMs)}; " +
+                        chain.eventSummary(runStartMonotonicMs)
+                val combinedFailure = listOfNotNull(
+                    coverage.failureReason,
+                    chain.failureReason,
+                ).joinToString("; ").takeIf { it.isNotEmpty() }
+                if (combinedFailure == null) {
+                    runEvents += event("HWC_EXPECTATION_VERIFIED", detail)
+                } else {
+                    val reason =
+                        "Phase '${targetPhase.id}' HWC composition expectation " +
+                            "미충족: $combinedFailure"
+                    if (hwcCompositionCoverageFailureReason == null) {
+                        hwcCompositionCoverageFailureReason =
+                            reason.take(MAX_EVENT_MESSAGE_CHARS)
+                    }
+                    runEvents += event(
+                        "HWC_EXPECTATION_FAILED",
+                        "$detail; reason=$combinedFailure",
+                    )
+                }
             }
             val phaseControlCompletedAtMs = SystemClock.elapsedRealtime()
             producerFrameBudget.observePhysicalFrames(
                 totalFrames = frameTracker.totalPhysicalProducedFrames(),
                 countAsActive = true,
             )
-            phaseClock.pause(phaseControlCompletedAtMs)
-            producerFrameBudget.pause(phaseControlCompletedAtMs)
+            phaseClock.pause(
+                phaseControlCompletedAtMs,
+                PhasePauseOwner.PHASE_COMPLETE,
+            )
+            producerFrameBudget.pause(
+                phaseControlCompletedAtMs,
+                PhasePauseOwner.PHASE_COMPLETE,
+            )
             val phaseEndWorkloads = if (thermalReduced) {
                 applyPersistentSafety(lastRawRuntime).workloads
             } else {
@@ -2387,7 +4847,7 @@ class LabController(
      * next plan is fail-closed instead of resetting underneath an SBWC/codec/EGL producer.
      */
     private suspend fun releaseActiveLoadsForRun(): Boolean {
-        if (closed) return controllerCloseCleanupConfirmed == true
+        controllerCloseCleanupConfirmed.get()?.let { return it }
         if (progress.phase != null || progress.targetPhase != null) {
             progress = progress.copy(
                 phase = null,
@@ -2404,19 +4864,19 @@ class LabController(
     }
 
     private suspend fun releaseGeneratedLoadsForRun(): Boolean {
-        if (closed) return controllerCloseCleanupConfirmed == true
+        controllerCloseCleanupConfirmed.get()?.let { return it }
         var released = confirmGeneratedLoadRelease()
-        if (closed) return controllerCloseCleanupConfirmed == true
+        controllerCloseCleanupConfirmed.get()?.let { return it }
         if (!released) released = confirmGeneratedLoadRelease()
-        return if (closed) controllerCloseCleanupConfirmed == true else released
+        return controllerCloseCleanupConfirmed.get() ?: released
     }
 
     private suspend fun releaseCompressionRouteForRun(): Boolean {
-        if (closed) return controllerCloseCleanupConfirmed == true
+        controllerCloseCleanupConfirmed.get()?.let { return it }
         var released = resetCompressionRoute()
-        if (closed) return controllerCloseCleanupConfirmed == true
+        controllerCloseCleanupConfirmed.get()?.let { return it }
         if (!released) released = resetCompressionRoute()
-        return if (closed) controllerCloseCleanupConfirmed == true else released
+        return controllerCloseCleanupConfirmed.get() ?: released
     }
 
     private suspend fun resetCompressionRoute(): Boolean {
@@ -2570,6 +5030,24 @@ class LabController(
             false
         }
 
+    private fun requestDisplayModeOrAbort(refreshHz: Float, operation: String) {
+        val applied = runCatching {
+            requestDisplayMode(refreshHz)
+        }.getOrElse { error ->
+            val reason =
+                "$operation display mode 요청 예외: ${error.javaClass.simpleName}"
+                    .take(MAX_EVENT_MESSAGE_CHARS)
+            runEvents += event("DISPLAY_REQUEST_FAILED", reason)
+            throw InconclusiveRunException(reason)
+        }
+        if (applied) return
+        val reason =
+            "$operation display mode 요청을 Window/display가 거부했습니다."
+                .take(MAX_EVENT_MESSAGE_CHARS)
+        runEvents += event("DISPLAY_REQUEST_FAILED", reason)
+        throw InconclusiveRunException(reason)
+    }
+
     private fun setWakeStateSafely(awake: Boolean): Boolean =
         runCatching {
             setWakeState(awake)
@@ -2693,6 +5171,43 @@ class LabController(
         throw PlanAbortException(reason)
     }
 
+    private fun verifyPerformanceEnvironmentBeforeProducer() {
+        val environment = runCatching {
+            PerformanceEnvironment(
+                powerSaveMode = powerManager.isPowerSaveMode,
+                interactive = powerManager.isInteractive,
+                deviceIdleMode = powerManager.isDeviceIdleMode,
+                thermalStatus = powerManager.currentThermalStatus,
+            )
+        }.getOrElse { error ->
+            val reason =
+                "시작 전 power/thermal 상태를 읽을 수 없습니다: ${error.javaClass.simpleName}"
+                    .take(MAX_EVENT_MESSAGE_CHARS)
+            runEvents += event("PERFORMANCE_PREFLIGHT_FAILED", reason)
+            throw InconclusiveRunException(reason)
+        }
+        performancePreflightFailure(
+            environment = environment,
+            protectionPolicy = activeRuntimeProtectionPolicy,
+        )?.let { failure ->
+            val reason = failure.userMessage().take(MAX_EVENT_MESSAGE_CHARS)
+            runEvents += event(
+                "PERFORMANCE_PREFLIGHT_FAILED",
+                    "$reason thermal=${environment.thermalStatus}; " +
+                    "interactive=${environment.interactive}; " +
+                    "idle=${environment.deviceIdleMode}",
+            )
+            throw InconclusiveRunException(reason)
+        }
+        runEvents += event(
+            "PERFORMANCE_PREFLIGHT",
+            "Battery Saver=off; interactive=true; deviceIdle=false; " +
+                "thermal=${environment.thermalStatus}; " +
+                runtimeProtectionPolicyDescription(activeRuntimeProtectionPolicy),
+        )
+        recordUnmitigatedSevereThermalObservation(environment.thermalStatus)
+    }
+
     private suspend fun enforceRuntimeSafety(snapshot: TelemetrySnapshot) {
         if (abortForLocalWorkerFailure()) return
         when (
@@ -2738,20 +5253,60 @@ class LabController(
             )
             return
         }
-        if (!thermalReduced && snapshot.thermalStatus >= PowerManager.THERMAL_STATUS_SEVERE) {
+        recordUnmitigatedSevereThermalObservation(snapshot.thermalStatus)
+        if (
+            shouldApplySevereThermalDerating(
+                thermalStatus = snapshot.thermalStatus,
+                alreadyDerated = thermalReduced,
+                protectionPolicy = activeRuntimeProtectionPolicy,
+            )
+        ) {
             val derateOwner = runJob ?: return
             val derateGeneration = progress.producerGeneration
+            val typedHwcTargetBeforeDerate = progress.targetPhase
             thermalReduced = true
+            val typedHwcTargetAfterDerate =
+                typedHwcTargetBeforeDerate?.let(::applyPersistentSafety)
+            if (
+                typedHwcTargetBeforeDerate != null &&
+                typedHwcTargetAfterDerate != null &&
+                !hwcCompositionContractPreserved(
+                    requested = typedHwcTargetBeforeDerate,
+                    effective = typedHwcTargetAfterDerate,
+                )
+            ) {
+                activeHwcCompositionCoverage.get()?.recordContractFailure(
+                    "typed HWC target changed during thermal derate: " +
+                        hwcCompositionContractDeltaSummary(
+                            requested = typedHwcTargetBeforeDerate,
+                            effective = typedHwcTargetAfterDerate,
+                        ),
+                )
+                runEvents += event(
+                    "HWC_EXPECTATION_INVALIDATED",
+                    "phase=${typedHwcTargetBeforeDerate.id}; thermal=${snapshot.thermalLabel}; " +
+                        hwcCompositionContractDeltaSummary(
+                            requested = typedHwcTargetBeforeDerate,
+                            effective = typedHwcTargetAfterDerate,
+                        ),
+                )
+            }
             val reduced = progress.phase?.let(::applyPersistentSafety)
             if (reduced != null) {
                 val pauseStartedAtMs = SystemClock.elapsedRealtime()
                 val thermalOwnsClockPause = !producerRecoveryPaused
+                val thermalPhaseClock = activePhaseClock
+                val thermalFrameBudget = activeProducerFrameBudget
                 runtimeControlPaused = true
                 if (thermalOwnsClockPause) {
-                    activePhaseClock?.pause(pauseStartedAtMs)
-                    activeProducerFrameBudget?.pauseAtPhysicalBoundary(
+                    thermalPhaseClock?.pause(
+                        pauseStartedAtMs,
+                        PhasePauseOwner.THERMAL_DERATE,
+                    )
+                    thermalFrameBudget?.pauseAtPhysicalBoundary(
                         atMonotonicMs = pauseStartedAtMs,
                         totalFrames = frameTracker.totalPhysicalProducedFrames(),
+                        owner = PhasePauseOwner.THERMAL_DERATE,
                     )
                 }
                 progress = progress.copy(
@@ -2760,10 +5315,10 @@ class LabController(
                     statusText = "${reduced.label} · thermal zero 확인 중",
                     thermalDerated = true,
                 )
-                var orderedZeroConfirmed = false
+                var orderedZeroConfirmed: Boolean
                 var workloadApplied = false
                 var displayApplied = false
-                var ownerStillActive = true
+                var ownerStillActive: Boolean
                 try {
                     loadControlMutex.withLock {
                         orderedZeroConfirmed = confirmGeneratedLoadQuiesceLocked()
@@ -2865,7 +5420,7 @@ class LabController(
                             generation = derateGeneration,
                         )
                     ) {
-                        activeProducerFrameBudget?.observePhysicalFrames(
+                        thermalFrameBudget?.observePhysicalFrames(
                             totalFrames = frameTracker.totalPhysicalProducedFrames(),
                             countAsActive = false,
                         )
@@ -2873,13 +5428,21 @@ class LabController(
                             frameTracker.producerReadiness(derateGeneration)
                                 .expectedCount
                                 .coerceIn(1, ScenarioSafetyPolicy.HARD_MAX_LAYERS)
-                        activeProducerFrameBudget?.apply(
+                        thermalFrameBudget?.apply(
                             atMonotonicMs = resumeAtMs,
                             producerFps = reduced.producerFps,
                             activeLayers = committedProducerCount,
                         )
-                        activePhaseClock?.resume(resumeAtMs)
-                        activeProducerFrameBudget?.resume(resumeAtMs)
+                    }
+                    if (thermalOwnsClockPause) {
+                        thermalPhaseClock?.resume(
+                            resumeAtMs,
+                            PhasePauseOwner.THERMAL_DERATE,
+                        )
+                        thermalFrameBudget?.resume(
+                            resumeAtMs,
+                            PhasePauseOwner.THERMAL_DERATE,
+                        )
                     }
                     runtimeControlPaused = false
                 }
@@ -2904,12 +5467,93 @@ class LabController(
         }
     }
 
+    private fun recordUnmitigatedSevereThermalObservation(thermalStatus: Int) {
+        if (
+            severeThermalPolicyObservationRecorded ||
+            activeRuntimeProtectionPolicy.severeThermalDeratingEnabled ||
+            thermalStatus < PowerManager.THERMAL_STATUS_SEVERE ||
+            thermalStatus >= PowerManager.THERMAL_STATUS_CRITICAL
+        ) {
+            return
+        }
+        severeThermalPolicyObservationRecorded = true
+        runEvents += event(
+            "THERMAL_SEVERE_APP_DERATE_DISABLED",
+            "thermal=$thermalStatus; requested load retained; " +
+                "Android/kernel thermal mitigation remains authoritative",
+        )
+    }
+
     private fun thermalDerateOwnerStillActive(owner: Job, generation: Long): Boolean =
         runJob === owner &&
             owner.isActive &&
             cancellationReason == null &&
             isRunning &&
             progress.producerGeneration == generation
+
+    private fun enforcePerformanceIsolationContinuity(snapshot: TelemetrySnapshot) {
+        if (!shouldMonitorPerformanceIsolation(performanceIsolationLifecycle)) return
+        val powerState = runCatching {
+            Triple(
+                powerManager.isPowerSaveMode,
+                powerManager.isInteractive,
+                powerManager.isDeviceIdleMode,
+            )
+        }.getOrElse { error ->
+            abortForSafety(
+                reason =
+                    "실행 중 power 격리 상태 확인 실패: " +
+                        error.javaClass.simpleName,
+                eventType = "PERFORMANCE_ISOLATION_LOST",
+            )
+            return
+        }
+        val expectedSession = performanceSessionTicket?.serviceSession
+        when (
+            performanceIsolationContinuityFailure(
+                sampledPowerSaveMode = snapshot.powerSaveMode,
+                directPowerSaveMode = powerState.first,
+                interactive = powerState.second,
+                deviceIdleMode = powerState.third,
+                expectedVendorSession = expectedSession,
+                observedVendorSession = snapshot.vendorServiceSession,
+            )
+        ) {
+            PerformanceIsolationContinuityFailure.POWER_SAVE_ACTIVE -> {
+                abortForSafety(
+                    reason = "실행 중 Battery Saver가 활성화되어 성능 격리를 잃었습니다.",
+                    eventType = "SAFETY_ENVELOPE_CHANGED",
+                )
+                return
+            }
+            PerformanceIsolationContinuityFailure.DISPLAY_NOT_INTERACTIVE -> {
+                abortForSafety(
+                    reason = "실행 중 display가 non-interactive 상태로 전환됐습니다.",
+                    eventType = "PERFORMANCE_ISOLATION_LOST",
+                )
+                return
+            }
+            PerformanceIsolationContinuityFailure.DEVICE_IDLE_ACTIVE -> {
+                abortForSafety(
+                    reason = "실행 중 device-idle 상태로 전환됐습니다.",
+                    eventType = "PERFORMANCE_ISOLATION_LOST",
+                )
+                return
+            }
+            PerformanceIsolationContinuityFailure.VENDOR_SESSION_CHANGED -> {
+                performanceSessionIntegrityConfirmed.set(false)
+                performanceIsolationStatus = "실패 · vendor session 변경"
+                abortForSafety(
+                    reason =
+                        "성능 격리 vendor session이 S${expectedSession ?: "N/A"} → " +
+                            "S${snapshot.vendorServiceSession ?: "disconnected"}로 변경됐습니다.",
+                    eventType = "PERFORMANCE_ISOLATION_LOST",
+                )
+                return
+            }
+            null -> Unit
+        }
+    }
 
     private fun enforceCompressionSessionContinuity(snapshot: TelemetrySnapshot) {
         val activeRoute = progress.phase?.pixelRoute ?: progress.targetPhase?.pixelRoute
@@ -3033,6 +5677,18 @@ class LabController(
                     "verified exactDelta=$exactDelta controls the verdict",
             )
         }
+        val evidenceVerdict = underrunVerdict(exactDelta, suspectedDelta)
+        val compositionAdjustedVerdict = verdictWithHwcCompositionCoverage(
+            evidenceVerdict = evidenceVerdict,
+            coverageFailureReason = hwcCompositionCoverageFailureReason,
+        )
+        if (compositionAdjustedVerdict != evidenceVerdict) {
+            runEvents += event(
+                "INCONCLUSIVE",
+                checkNotNull(hwcCompositionCoverageFailureReason),
+            )
+            return compositionAdjustedVerdict
+        }
         if (exactDelta?.let { it > 0L } != true && producerRateShortfallReason != null) {
             runEvents += event(
                 "INCONCLUSIVE",
@@ -3040,7 +5696,7 @@ class LabController(
             )
             return RunVerdict.INCONCLUSIVE
         }
-        return underrunVerdict(exactDelta, suspectedDelta)
+        return evidenceVerdict
     }
 
     private fun exactUnderrunDelta(): Long? {
@@ -3111,7 +5767,7 @@ class LabController(
         )
         lastSummary = summary
         val reportFile = try {
-            withContext(Dispatchers.IO) { ReportWriter.write(activity, summary) }
+            withContext(Dispatchers.IO) { ReportWriter.write(appContext, summary) }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Exception) {
@@ -3122,11 +5778,200 @@ class LabController(
         return ScenarioRunArtifact(summary, reportFile)
     }
 
+    /**
+     * Scenario JSON is initially published after the terminal counter sample. The plan-wide
+     * performance lease ends later, so atomically publish a revised final scenario report that
+     * contains the exact restore outcome. A failed first END followed by a successful finalizer
+     * retry is preserved as two events rather than rewritten into a false first-pass success.
+     */
+    private suspend fun persistPerformanceRestoreOutcome(
+        restored: Boolean,
+        releaseReason: String,
+    ): Boolean {
+        val currentSummary = lastSummary ?: return true
+        val transition = performanceRestoreReportTransition(
+            existingEventTypes = currentSummary.events.map(RunEvent::type),
+            restored = restored,
+        )
+        val updatedSummary = when (transition) {
+            PerformanceRestoreReportTransition.NONE -> currentSummary
+            PerformanceRestoreReportTransition.CONFIRMED ->
+                currentSummary.copy(
+                    finishedEpochMs = System.currentTimeMillis(),
+                    events = currentSummary.events + RunEvent(
+                        monotonicMs =
+                            (SystemClock.elapsedRealtime() - runStartMonotonicMs)
+                                .coerceAtLeast(0L),
+                        type = PERFORMANCE_RESTORE_CONFIRMED_EVENT,
+                        message =
+                            "Performance isolation cleanup confirmed; any app-owned Battery " +
+                                "Saver mutation was restored to its producer-before-BEGIN state; " +
+                                "reason=$releaseReason",
+                    ),
+                )
+            PerformanceRestoreReportTransition.FAILED ->
+                currentSummary.copy(
+                    finishedEpochMs = System.currentTimeMillis(),
+                    verdict = RunVerdict.ABORTED,
+                    events = currentSummary.events + RunEvent(
+                        monotonicMs =
+                            (SystemClock.elapsedRealtime() - runStartMonotonicMs)
+                                .coerceAtLeast(0L),
+                        type = PERFORMANCE_RESTORE_FAILED_EVENT,
+                        message =
+                            "Battery Saver policy restore or renewal shutdown was not confirmed; " +
+                                "reason=$releaseReason",
+                    ),
+                )
+            PerformanceRestoreReportTransition.CONFIRMED_AFTER_RETRY ->
+                currentSummary.copy(
+                    finishedEpochMs = System.currentTimeMillis(),
+                    events = currentSummary.events + RunEvent(
+                        monotonicMs =
+                            (SystemClock.elapsedRealtime() - runStartMonotonicMs)
+                                .coerceAtLeast(0L),
+                        type = PERFORMANCE_RESTORE_CONFIRMED_AFTER_RETRY_EVENT,
+                        message =
+                            "A later finalizer END confirmed exact Battery Saver restoration; " +
+                                "the run remains ABORTED because the first cleanup boundary failed",
+                    ),
+                )
+        }
+        if (transition == PerformanceRestoreReportTransition.FAILED) {
+            val invalidation = invalidateEarlierPlanResultsForRestoreFailure(
+                results = mutablePlanResultHistory,
+                currentStartedEpochMs = currentSummary.startedEpochMs,
+                currentScenarioId = currentSummary.scenario.id,
+                terminalReason =
+                    "Plan-wide Battery Saver 원상복구가 확인되지 않아 이전 개별 보고서를 " +
+                        "무효화했습니다.",
+            )
+            invalidation.updatedResults.forEachIndexed { index, result ->
+                mutablePlanResultHistory[index] = result
+            }
+            withContext(NonCancellable + Dispatchers.IO) {
+                val reportsDirectory = File(appContext.filesDir, "reports")
+                invalidation.invalidatedReportPaths.forEach { path ->
+                    deleteManagedCompletedReportBestEffort(
+                        reportsDirectory = reportsDirectory,
+                        reportFile = File(path),
+                    )
+                }
+            }
+        }
+        if (
+            transition == PerformanceRestoreReportTransition.NONE &&
+            lastPerformanceRestoreReportPersisted
+        ) {
+            return true
+        }
+
+        lastSummary = updatedSummary
+        updateLatestPlanResultFromSummary(
+            summary = updatedSummary,
+            reportFile = lastReportFile,
+        )
+        val previousReport = lastReportFile
+        val replacement = try {
+            withContext(NonCancellable + Dispatchers.IO) {
+                ReportWriter.write(appContext, updatedSummary)
+            }
+        } catch (error: Exception) {
+            val publicationFailureSummary =
+                markPerformanceRestoreReportPublicationFailed(
+                    summary = updatedSummary,
+                    finishedEpochMs = System.currentTimeMillis(),
+                    monotonicMs =
+                        (SystemClock.elapsedRealtime() - runStartMonotonicMs)
+                            .coerceAtLeast(0L),
+                    failureType = error.javaClass.simpleName,
+                )
+            lastPerformanceRestoreReportPersisted = false
+            // The previous JSON predates the plan-wide performance-policy END. Once final
+            // publication fails it must not remain reachable through either "last report" or
+            // result history, otherwise a caller could share a CLEAN/PASSED artifact for an
+            // ABORTED cleanup boundary.
+            lastSummary = publicationFailureSummary
+            lastReportFile = null
+            updateLatestPlanResultFromSummary(
+                summary = publicationFailureSummary,
+                reportFile = null,
+            )
+            errorMessage =
+                "성능 정책 복원 결과 보고서 저장 실패: ${error.javaClass.simpleName}"
+                    .take(MAX_EVENT_MESSAGE_CHARS)
+            withContext(NonCancellable + Dispatchers.IO) {
+                deleteManagedCompletedReportBestEffort(
+                    reportsDirectory = File(appContext.filesDir, "reports"),
+                    reportFile = previousReport,
+                )
+            }
+            return false
+        }
+        lastReportFile = replacement
+        lastPerformanceRestoreReportPersisted = true
+        updateLatestPlanResultFromSummary(
+            summary = updatedSummary,
+            reportFile = replacement,
+        )
+        if (previousReport != null && previousReport != replacement) {
+            withContext(NonCancellable + Dispatchers.IO) {
+                deleteManagedCompletedReportBestEffort(
+                    reportsDirectory = File(appContext.filesDir, "reports"),
+                    reportFile = previousReport,
+                )
+            }
+        }
+        return true
+    }
+
+    private fun updateLatestPlanResultFromSummary(
+        summary: RunSummary,
+        reportFile: File?,
+    ) {
+        val resultIndex = mutablePlanResultHistory.indexOfLast { result ->
+            result.startedEpochMs == summary.startedEpochMs &&
+                result.scenario.id == summary.scenario.id
+        }
+        if (resultIndex < 0) return
+        val previous = mutablePlanResultHistory[resultIndex]
+        mutablePlanResultHistory[resultIndex] = previous.copy(
+            verdict = summary.verdict,
+            finishedEpochMs = summary.finishedEpochMs,
+            exactUnderrunDelta = summary.exactUnderrunDelta,
+            suspectedUnderrunDelta = summary.suspectedUnderrunDelta,
+            reportPath = reportFile?.absolutePath,
+            terminalReason = summary.terminalReason(MAX_TERMINAL_REASON_CHARS),
+        )
+    }
+
     private suspend fun finalizeProtected(
         scenario: ScenarioSpec,
         preselectedVerdict: RunVerdict?,
+        pendingMediaSource: AtomicReference<PinnedMediaSource?>,
     ): ScenarioRunArtifact = withContext(NonCancellable) {
         val rendererReleased = awaitRendererTeardownBarrier()
+        val selectedDescriptorReleased = closeSelectedVideoDecoder()
+        val pendingDescriptorReleased =
+            pendingMediaSource.getAndSet(null)?.closeWithResult() ?: true
+        val mediaDescriptorsReleased = mediaDescriptorCleanupConfirmed(
+            selectedDescriptorReleased = selectedDescriptorReleased,
+            pendingDescriptorReleased = pendingDescriptorReleased,
+            processCleanupUnconfirmed = PinnedMediaCleanupState.hasUnconfirmedCleanup(),
+        )
+        if (!mediaDescriptorsReleased) {
+            val detail = PinnedMediaCleanupState.detail() ?: "unknown close failure"
+            runEvents += event(
+                "PINNED_MEDIA_CLEANUP_FAILED",
+                "selected-media descriptor cleanup was not confirmed: $detail",
+            )
+            cancellationReason = preserveFirstCancellationReason(
+                current = cancellationReason,
+                requested = "Selected-media descriptor 종료를 확인할 수 없습니다.",
+                fallback = "Selected-media descriptor cleanup failed",
+                maxChars = MAX_EVENT_MESSAGE_CHARS,
+            )
+        }
         if (shouldCollectFinalTelemetrySample(preselectedVerdict, rendererReleased)) {
             progress = progress.copy(statusText = "최종 counter 연속성 확인 중")
             try {
@@ -3149,15 +5994,22 @@ class LabController(
             }
         }
         val derivedVerdict = preselectedVerdict ?: deriveVerdict()
-        val effectiveVerdict = finalVerdictAfterTeardown(
-            preselectedVerdict = preselectedVerdict,
-            rendererReleased = rendererReleased,
-            cancellationPresent = cancellationReason != null,
-            derivedVerdict = derivedVerdict,
-        )
-        if (!rendererReleased) {
-            val teardownReason =
+        val effectiveVerdict = if (!mediaDescriptorsReleased) {
+            RunVerdict.ABORTED
+        } else {
+            finalVerdictAfterTeardown(
+                preselectedVerdict = preselectedVerdict,
+                rendererReleased = rendererReleased,
+                cancellationPresent = cancellationReason != null,
+                derivedVerdict = derivedVerdict,
+            )
+        }
+        if (!rendererReleased || !mediaDescriptorsReleased) {
+            val teardownReason = if (!rendererReleased) {
                 "Physical producer의 최종 teardown 확인에 실패해 후속 queue를 차단했습니다."
+            } else {
+                "Selected-media descriptor cleanup 확인에 실패해 후속 queue를 차단했습니다."
+            }
             cancellationReason = listOfNotNull(cancellationReason, teardownReason)
                 .distinct()
                 .joinToString(" · ")
@@ -3289,12 +6141,150 @@ class LabController(
         message = message.take(MAX_EVENT_MESSAGE_CHARS),
     )
 
+    private suspend fun awaitTestWindowIsolation(token: Long): Boolean {
+        val deadline = saturatingAdd(
+            SystemClock.elapsedRealtime(),
+            SYSTEM_UI_ISOLATION_TIMEOUT_MS,
+        )
+        while (currentCoroutineContext().isActive) {
+            if (activeTestWindowIsolationToken != token) return false
+            if (testWindowIsolation.isConfirmed(token)) return true
+            if (SystemClock.elapsedRealtime() >= deadline) return false
+            delay(SYSTEM_UI_ISOLATION_POLL_MS)
+        }
+        return false
+    }
+
+    private fun clearReleasedTestWindowIsolationToken(token: Long): Boolean {
+        if (activeTestWindowIsolationToken != token) return false
+        val restored = runCatching {
+            testWindowIsolation.releaseStatus(token) == ReleaseStatus.RESTORED
+        }.getOrDefault(false)
+        if (restored && activeTestWindowIsolationToken == token) {
+            activeTestWindowIsolationToken = null
+        }
+        return restored
+    }
+
+    private fun ensureTestWindowIsolationReleased(token: Long): Deferred<Boolean> {
+        val existing = isolationReleaseDeferred
+        if (
+            isolationReleaseToken == token &&
+            existing != null &&
+            !existing.isCompleted
+        ) {
+            return existing
+        }
+        val deferred = isolationCleanupScope.async {
+            if (activeTestWindowIsolationToken != token) return@async false
+            val deadline = saturatingAdd(
+                SystemClock.elapsedRealtime(),
+                SYSTEM_UI_RESTORE_TIMEOUT_MS,
+            )
+            var attempts = 0
+            var nextAttemptMs = 0L
+            while (currentCoroutineContext().isActive) {
+                if (clearReleasedTestWindowIsolationToken(token)) return@async true
+                if (activeTestWindowIsolationToken != token) return@async false
+                val now = SystemClock.elapsedRealtime()
+                if (now >= deadline) break
+                if (
+                    attempts < SYSTEM_UI_RESTORE_MAX_ATTEMPTS &&
+                    now >= nextAttemptMs
+                ) {
+                    runCatching {
+                        testWindowIsolation.release(token)
+                    }
+                    attempts += 1
+                    nextAttemptMs = saturatingAdd(
+                        now,
+                        SYSTEM_UI_RESTORE_RETRY_MS,
+                    )
+                    if (clearReleasedTestWindowIsolationToken(token)) return@async true
+                }
+                delay(SYSTEM_UI_ISOLATION_POLL_MS)
+            }
+            clearReleasedTestWindowIsolationToken(token)
+        }
+        isolationReleaseToken = token
+        isolationReleaseDeferred = deferred
+        return deferred
+    }
+
+    private fun beginTestWindowIsolationReleaseAfterRendererTeardown(
+        token: Long,
+    ): Deferred<Boolean> {
+        val existing = isolationBarrierReleaseDeferred
+        if (
+            isolationBarrierReleaseToken == token &&
+            existing != null &&
+            !existing.isCompleted
+        ) {
+            return existing
+        }
+        return isolationCleanupScope.async {
+            releaseTestWindowIsolationAfterRendererTeardown(token)
+        }.also { deferred ->
+            isolationBarrierReleaseToken = token
+            isolationBarrierReleaseDeferred = deferred
+        }
+    }
+
+    private fun closeIsolationCleanupScopeAfter(deferred: Deferred<Boolean>) {
+        deferred.invokeOnCompletion {
+            mainHandler.post {
+                isolationCleanupScope.cancel()
+            }
+        }
+    }
+
+    private suspend fun releaseTestWindowIsolationAfterRendererTeardown(
+        token: Long,
+    ): Boolean {
+        if (activeTestWindowIsolationToken != token) return false
+        return when (
+            releaseIsolationAfterRendererBarrier(
+                awaitRendererTeardown = ::awaitRendererTeardownBarrier,
+                releaseIsolation = { releaseTestWindowIsolation(token) },
+            )
+        ) {
+            BarrierGatedIsolationReleaseResult.RELEASED -> true
+            BarrierGatedIsolationReleaseResult.RELEASE_FAILED -> false
+            BarrierGatedIsolationReleaseResult.RENDERER_UNCONFIRMED -> {
+                errorMessage =
+                    (
+                        "Physical producer teardown이 확인되지 않아 SystemUI 복원을 보류했습니다. " +
+                            "새 plan은 process 재시작 전 차단됩니다."
+                        ).take(MAX_EVENT_MESSAGE_CHARS)
+                false
+            }
+        }
+    }
+
+    private suspend fun releaseTestWindowIsolation(token: Long): Boolean {
+        if (activeTestWindowIsolationToken != token) return false
+        val released = runCatching {
+            ensureTestWindowIsolationReleased(token).await()
+        }.getOrDefault(false)
+        if (!released) {
+            errorMessage =
+                "SystemUI 복원 확인 실패 · 새 plan은 process 재시작 전 차단됩니다."
+                    .take(MAX_EVENT_MESSAGE_CHARS)
+        }
+        return released
+    }
+
     private fun setWakeState(awake: Boolean) {
-        screenAwake = awake
         if (awake) {
             activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            screenAwake = true
         } else {
-            activity.window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            if (keepScreenOnInitially) {
+                activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            } else {
+                activity.window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+            screenAwake = false
         }
     }
 
@@ -3316,28 +6306,32 @@ class LabController(
                     var local: AssetFileDescriptor? = null
                     try {
                         local = resolver.openAssetFileDescriptor(uri, "r", cancellationSignal)
-                        if (local == null) {
+                        val openedDescriptor = local
+                        if (openedDescriptor == null) {
                             failure.compareAndSet(
                                 null,
                                 IllegalArgumentException("Provider returned no descriptor"),
                             )
                         } else if (abandoned.get()) {
-                            local.close()
+                            closePinnedMediaDescriptor(openedDescriptor)
                             local = null
                         } else {
-                            opened.set(local)
+                            opened.set(openedDescriptor)
                             local = null
                             if (abandoned.get()) {
-                                opened.getAndSet(null)?.close()
+                                opened.getAndSet(null)?.let(::closePinnedMediaDescriptor)
                             }
                         }
                     } catch (error: Throwable) {
                         if (error is ThreadDeath) throw error
                         failure.compareAndSet(null, error)
                     } finally {
-                        runCatching { local?.close() }
-                        completed.countDown()
-                        workerLease.close()
+                        try {
+                            local?.let(::closePinnedMediaDescriptor)
+                        } finally {
+                            completed.countDown()
+                            workerLease.close()
+                        }
                     }
                 },
                 "DpuLab-MediaProviderOpen",
@@ -3362,9 +6356,19 @@ class LabController(
         }
         fun abandonProviderOpen() {
             abandoned.set(true)
-            opened.getAndSet(null)?.close()
-            runCatching { cancellationSignal.cancel() }
-            worker.interrupt()
+            try {
+                opened.getAndSet(null)?.let(::closePinnedMediaDescriptor)
+            } finally {
+                try {
+                    try {
+                        cancellationSignal.cancel()
+                    } catch (error: Throwable) {
+                        if (error is ThreadDeath) throw error
+                    }
+                } finally {
+                    worker.interrupt()
+                }
+            }
         }
         val completedInTime = try {
             awaitLatchCancellable(completed, MEDIA_PROVIDER_OPEN_TIMEOUT_MS)
@@ -3379,7 +6383,15 @@ class LabController(
                 "반환하지 않아 안전 중단했습니다.",
             )
         }
-        currentCoroutineContext().ensureActive()
+        try {
+            currentCoroutineContext().ensureActive()
+        } catch (cancelled: CancellationException) {
+            // Cancellation can arrive after the provider worker has published its descriptor but
+            // before ownership is transferred below. Reclaim that completed result as well as a
+            // still-running provider open.
+            abandonProviderOpen()
+            throw cancelled
+        }
         failure.get()?.let { error ->
             throw UnsupportedRunException(
                 "선택한 영상 descriptor를 열 수 없습니다 (${error.javaClass.simpleName}).",
@@ -3388,9 +6400,19 @@ class LabController(
         val descriptor = opened.getAndSet(null)
             ?: throw UnsupportedRunException("선택한 영상 descriptor가 비어 있습니다.")
         return try {
-            PinnedMediaSource(uri, descriptor)
+            constructWithOwnedCloseOnFailure(
+                resource = descriptor,
+                onCloseFailure = { cleanupError ->
+                    PinnedMediaCleanupState.markUnconfirmed(
+                        cleanupError.javaClass.simpleName.ifBlank {
+                            cleanupError.javaClass.name
+                        },
+                    )
+                },
+            ) { ownedDescriptor ->
+                PinnedMediaSource(uri, ownedDescriptor)
+            }
         } catch (error: Exception) {
-            runCatching { descriptor.close() }
             throw UnsupportedRunException(
                 "seek 가능한 고정 영상 descriptor가 필요합니다 (${error.javaClass.simpleName}).",
             )
@@ -3473,7 +6495,7 @@ class LabController(
         val extractor = MediaExtractor()
         try {
             source.openDuplicate().use { descriptor ->
-                extractor.setDataSource(descriptor)
+                extractor.setDataSource(descriptor.resource)
             }
             val trackCount = extractor.trackCount
             require(trackCount in 1..MAX_MEDIA_TRACK_COUNT) {
@@ -3580,7 +6602,15 @@ class LabController(
             }
             return MediaTrackInspection(detail = "track=no video track")
         } finally {
-            extractor.release()
+            try {
+                extractor.release()
+            } catch (error: Throwable) {
+                if (error is ThreadDeath) throw error
+                PinnedMediaCleanupState.markUnconfirmed(
+                    error.javaClass.simpleName.ifBlank { error.javaClass.name },
+                )
+                throw error
+            }
         }
     }
 
@@ -3942,6 +6972,21 @@ class LabController(
         const val MONITOR_STALE_TIMEOUT_MS = 5_000L
         const val PRECHECK_DELAY_MS = 700L
         const val WARMUP_DELAY_MS = 1_200L
+        const val HWC_CAPACITY_CALIBRATION_PHASE_BUDGET_MS = 5_000L
+        const val HWC_CAPACITY_CALIBRATION_TOPOLOGY_TIMEOUT_MS = 5_000L
+        const val HWC_CAPACITY_CALIBRATION_STABILIZE_MS = 100L
+        const val HWC_CAPACITY_CALIBRATION_SETTLE_MS = 3_000L
+        const val HWC_CAPACITY_CALIBRATION_PRODUCER_FPS = 30f
+        const val SYSTEM_UI_ISOLATION_TIMEOUT_MS = 3_000L
+        const val SYSTEM_UI_ISOLATION_POLL_MS = 16L
+        const val SYSTEM_UI_RESTORE_TIMEOUT_MS = 3_000L
+        const val SYSTEM_UI_RESTORE_RETRY_MS = 250L
+        const val SYSTEM_UI_RESTORE_MAX_ATTEMPTS = 8
+        const val RENDERER_CONTAINER_DISPOSE_TIMEOUT_MS = 6_000L
+        const val PERFORMANCE_POLICY_PROPAGATION_TIMEOUT_MS = 1_000L
+        const val PERFORMANCE_POLICY_POLL_MS = 50L
+        const val PERFORMANCE_RENEWAL_JOIN_TIMEOUT_MS = 2_500L
+        const val POWER_RECEIVER_UNREGISTER_ATTEMPTS = 2
         const val PROGRESS_INTERVAL_MS = LOAD_CONTROL_CADENCE_MS
         const val DISPLAY_REQUEST_EPSILON_HZ = 0.05f
         const val PRODUCER_STARTUP_GRACE_MS = 3_000L
@@ -4461,18 +7506,42 @@ internal fun adaptiveProxyBoundaryThreshold(appliedProducerFrames: Double): Long
  * The helper is intentionally pure and timestamp-driven so transition fraction, progress, phase
  * completion, and expected-frame accounting can share one testable notion of active time.
  */
+internal enum class PhasePauseOwner {
+    LEGACY,
+    PRODUCER_RECOVERY,
+    THERMAL_DERATE,
+    PHASE_COMPLETE,
+}
+
 internal class ActivePhaseClock(startedAtMs: Long) {
     private val startedAtMs = startedAtMs.coerceAtLeast(0L)
     private var completedPauseMs = 0L
-    private var pausedAtMs: Long? = null
+    private var unionPausedAtMs: Long? = null
+    private val ownerPausedAtMs =
+        LongArray(PhasePauseOwner.entries.size) { PAUSE_NOT_ACTIVE }
 
-    fun pause(atMonotonicMs: Long) {
-        if (pausedAtMs != null) return
-        pausedAtMs = atMonotonicMs.coerceAtLeast(startedAtMs)
+    fun pause(
+        atMonotonicMs: Long,
+        owner: PhasePauseOwner = PhasePauseOwner.LEGACY,
+    ) {
+        val ownerIndex = owner.ordinal
+        if (ownerPausedAtMs[ownerIndex] != PAUSE_NOT_ACTIVE) return
+        val boundedAtMs = atMonotonicMs.coerceAtLeast(startedAtMs)
+        ownerPausedAtMs[ownerIndex] = boundedAtMs
+        unionPausedAtMs = unionPausedAtMs
+            ?.let { minOf(it, boundedAtMs) }
+            ?: boundedAtMs
     }
 
-    fun resume(atMonotonicMs: Long) {
-        val pausedAt = pausedAtMs ?: return
+    fun resume(
+        atMonotonicMs: Long,
+        owner: PhasePauseOwner = PhasePauseOwner.LEGACY,
+    ) {
+        val ownerIndex = owner.ordinal
+        if (ownerPausedAtMs[ownerIndex] == PAUSE_NOT_ACTIVE) return
+        ownerPausedAtMs[ownerIndex] = PAUSE_NOT_ACTIVE
+        if (ownerPausedAtMs.any { it != PAUSE_NOT_ACTIVE }) return
+        val pausedAt = unionPausedAtMs ?: return
         completedPauseMs = saturatingAdd(
             completedPauseMs,
             nonNegativeMonotonicDelta(
@@ -4480,7 +7549,7 @@ internal class ActivePhaseClock(startedAtMs: Long) {
                 earlierMs = pausedAt,
             ),
         )
-        pausedAtMs = null
+        unionPausedAtMs = null
     }
 
     fun elapsedMs(atMonotonicMs: Long): Long {
@@ -4495,12 +7564,28 @@ internal class ActivePhaseClock(startedAtMs: Long) {
         return saturatingAdd(completedPauseMs, currentPauseMs(atMonotonicMs))
     }
 
-    fun currentPauseMs(atMonotonicMs: Long): Long = pausedAtMs?.let { pausedAt ->
-        nonNegativeMonotonicDelta(
-            laterMs = atMonotonicMs.coerceAtLeast(startedAtMs),
-            earlierMs = pausedAt,
-        )
-    } ?: 0L
+    fun isPaused(): Boolean = unionPausedAtMs != null
+
+    fun currentPauseMs(
+        atMonotonicMs: Long,
+        owner: PhasePauseOwner? = null,
+    ): Long {
+        val pausedAt = if (owner == null) {
+            unionPausedAtMs
+        } else {
+            ownerPausedAtMs[owner.ordinal].takeUnless { it == PAUSE_NOT_ACTIVE }
+        }
+        return pausedAt?.let { activePauseAtMs ->
+            nonNegativeMonotonicDelta(
+                laterMs = atMonotonicMs.coerceAtLeast(startedAtMs),
+                earlierMs = activePauseAtMs,
+            )
+        } ?: 0L
+    }
+
+    private companion object {
+        const val PAUSE_NOT_ACTIVE = Long.MIN_VALUE
+    }
 }
 
 private fun nonNegativeMonotonicDelta(laterMs: Long, earlierMs: Long): Long =
@@ -4537,6 +7622,7 @@ internal fun safeWarmupPhaseFor(target: PhaseSpec): PhaseSpec =
         workloads = LoadSetpoints(),
         alphaOverlap = false,
         includeGlLayer = false,
+        hwcCompositionExpectation = HwcCompositionExpectation.NONE,
     )
 
 internal fun rendererAllocationRouteChanges(
@@ -4587,6 +7673,7 @@ internal fun rendererPreparationPhase(initialRuntime: PhaseSpec): PhaseSpec =
         requestedDisplayHz = min(60f, initialRuntime.requestedDisplayHz),
         motion = MotionProfile.STATIC,
         workloads = LoadSetpoints(),
+        hwcCompositionExpectation = HwcCompositionExpectation.NONE,
     )
 
 internal fun progressForControllerPause(
@@ -4709,17 +7796,23 @@ internal class AppliedProducerFrameBudget(
     }
 
     @Synchronized
-    fun pause(atMonotonicMs: Long) {
+    fun pause(
+        atMonotonicMs: Long,
+        owner: PhasePauseOwner = PhasePauseOwner.LEGACY,
+    ) {
         if (finished) return
         accountThrough(atMonotonicMs)
-        activeClock.pause(atMonotonicMs)
+        activeClock.pause(atMonotonicMs, owner)
     }
 
     @Synchronized
-    fun resume(atMonotonicMs: Long) {
+    fun resume(
+        atMonotonicMs: Long,
+        owner: PhasePauseOwner = PhasePauseOwner.LEGACY,
+    ) {
         if (finished) return
         accountThrough(atMonotonicMs)
-        activeClock.resume(atMonotonicMs)
+        activeClock.resume(atMonotonicMs, owner)
     }
 
     @Synchronized
@@ -4743,11 +7836,18 @@ internal class AppliedProducerFrameBudget(
     }
 
     @Synchronized
-    fun pauseAtPhysicalBoundary(atMonotonicMs: Long, totalFrames: Long) {
+    fun pauseAtPhysicalBoundary(
+        atMonotonicMs: Long,
+        totalFrames: Long,
+        owner: PhasePauseOwner = PhasePauseOwner.LEGACY,
+    ) {
         if (finished) return
-        observePhysicalFramesLocked(totalFrames, countAsActive = true)
+        observePhysicalFramesLocked(
+            totalFrames,
+            countAsActive = !activeClock.isPaused(),
+        )
         accountThrough(atMonotonicMs)
-        activeClock.pause(atMonotonicMs)
+        activeClock.pause(atMonotonicMs, owner)
     }
 
     private fun observePhysicalFramesLocked(totalFrames: Long, countAsActive: Boolean) {
@@ -4969,6 +8069,873 @@ internal class TransitionCoverageTracker(
     }
 }
 
+/**
+ * Converts every monotonic timestamp persisted in a run sample onto the same run-relative axis.
+ *
+ * A valid cached observation captured before the run keeps a signed negative timestamp so
+ * `sample.tMs - evidence.tMs == ageMs` remains true. A future/malformed observation is removed
+ * atomically with its DEVICE/CLIENT or SurfaceFlinger values and provenance. A full sample that
+ * completed before the run is projected to t=0 only as a defensive fallback and cannot retain
+ * independent evidence.
+ */
+internal fun TelemetrySnapshot.toRunRelativeTelemetry(
+    runStartMonotonicMs: Long,
+): TelemetrySnapshot {
+    val boundedRunStartMs = runStartMonotonicMs.coerceAtLeast(0L)
+    val boundedSampleMs = monotonicMs.coerceAtLeast(0L)
+    val sampleBelongsToRun = boundedSampleMs >= boundedRunStartMs
+    fun relativeEvidence(timestampMs: Long?, ageMs: Long?): Long? {
+        val timestamp = timestampMs ?: return null
+        if (
+            !sampleBelongsToRun ||
+            timestamp < 0L ||
+            timestamp > boundedSampleMs ||
+            ageMs == null ||
+            ageMs < 0L ||
+            ageMs != boundedSampleMs - timestamp
+        ) {
+            return null
+        }
+        return timestamp - boundedRunStartMs
+    }
+
+    val relativeHwcEvidenceMs =
+        relativeEvidence(
+            hwcCompositionEvidenceMonotonicMs,
+            hwcCompositionEvidenceAgeMs,
+        )
+    val relativeSurfaceFlingerEvidenceMs =
+        relativeEvidence(
+            surfaceFlingerEvidenceMonotonicMs,
+            surfaceFlingerEvidenceAgeMs,
+        )
+    return copy(
+        monotonicMs =
+            (boundedSampleMs - boundedRunStartMs).coerceAtLeast(0L),
+        hwcDeviceLayers = hwcDeviceLayers.takeIf {
+            relativeHwcEvidenceMs != null
+        },
+        hwcDeviceLayersQuality = hwcDeviceLayersQuality.takeIf {
+            relativeHwcEvidenceMs != null
+        } ?: MetricQuality.UNAVAILABLE,
+        hwcDeviceLayersSource = hwcDeviceLayersSource.takeIf {
+            relativeHwcEvidenceMs != null
+        }.orEmpty(),
+        hwcClientLayers = hwcClientLayers.takeIf {
+            relativeHwcEvidenceMs != null
+        },
+        hwcClientLayersQuality = hwcClientLayersQuality.takeIf {
+            relativeHwcEvidenceMs != null
+        } ?: MetricQuality.UNAVAILABLE,
+        hwcClientLayersSource = hwcClientLayersSource.takeIf {
+            relativeHwcEvidenceMs != null
+        }.orEmpty(),
+        hwcCompositionEvidenceMonotonicMs = relativeHwcEvidenceMs,
+        hwcCompositionEvidenceAgeMs =
+            hwcCompositionEvidenceAgeMs.takeIf {
+                relativeHwcEvidenceMs != null
+            },
+        surfaceFlingerHwcMissed = surfaceFlingerHwcMissed.takeIf {
+            relativeSurfaceFlingerEvidenceMs != null
+        },
+        surfaceFlingerGpuMissed = surfaceFlingerGpuMissed.takeIf {
+            relativeSurfaceFlingerEvidenceMs != null
+        },
+        surfaceFlingerMissSource = surfaceFlingerMissSource.takeIf {
+            relativeSurfaceFlingerEvidenceMs != null
+        }.orEmpty(),
+        surfaceFlingerEvidenceMonotonicMs =
+            relativeSurfaceFlingerEvidenceMs,
+        surfaceFlingerEvidenceAgeMs =
+            surfaceFlingerEvidenceAgeMs.takeIf {
+                relativeSurfaceFlingerEvidenceMs != null
+            },
+    )
+}
+
+internal fun monotonicTimestampRelativeToRun(
+    timestampMs: Long?,
+    runStartMonotonicMs: Long,
+): Long? {
+    val timestamp = timestampMs ?: return null
+    val boundedRunStartMs = runStartMonotonicMs.coerceAtLeast(0L)
+    if (timestamp < boundedRunStartMs || timestamp < 0L) return null
+    return timestamp - boundedRunStartMs
+}
+
+internal fun hwcCompositionProbeCanStart(
+    remainingActiveMs: Long,
+    sampleTimeoutMs: Long,
+    completionReserveMs: Long,
+): Boolean {
+    if (
+        remainingActiveMs < 0L ||
+        sampleTimeoutMs <= 0L ||
+        completionReserveMs < 0L
+    ) {
+        return false
+    }
+    if (sampleTimeoutMs > Long.MAX_VALUE - completionReserveMs) return false
+    return remainingActiveMs >= sampleTimeoutMs + completionReserveMs
+}
+
+internal enum class PeriodicTelemetryArbitration {
+    SAMPLE,
+    DROP_BUSY,
+    DROP_TYPED_HWC_PRIORITY,
+}
+
+internal fun periodicTelemetryArbitration(
+    mutexAcquired: Boolean,
+    typedHwcProbePriority: Boolean,
+): PeriodicTelemetryArbitration = when {
+    !mutexAcquired -> PeriodicTelemetryArbitration.DROP_BUSY
+    typedHwcProbePriority -> PeriodicTelemetryArbitration.DROP_TYPED_HWC_PRIORITY
+    else -> PeriodicTelemetryArbitration.SAMPLE
+}
+
+internal fun surfaceFlingerProbePolicy(
+    forceCompositionProbe: Boolean,
+    activeRun: Boolean,
+): SurfaceFlingerProbePolicy = when {
+    forceCompositionProbe -> SurfaceFlingerProbePolicy.TYPED_BOUNDARY
+    activeRun -> SurfaceFlingerProbePolicy.SUPPRESS_DURING_LOAD
+    else -> SurfaceFlingerProbePolicy.PERIODIC
+}
+
+internal enum class HwcCapacityGenerationAction {
+    WAIT,
+    ACTIVATE,
+    OBSERVE,
+}
+
+/**
+ * Keeps calibration activation behind the same committed-topology and cleanup barriers as a
+ * measured phase. A failed ACTIVATE attempt remains WAIT/ACTIVATE eligible until the caller's
+ * bounded deadline, while a successful activation is never issued a second time.
+ */
+internal fun hwcCapacityGenerationAction(
+    generationActivated: Boolean,
+    topologyPublished: Boolean,
+    topologyPending: Boolean,
+    expectedProducerCount: Int,
+    candidateLayers: Int,
+    rendererCleanupPending: Boolean,
+): HwcCapacityGenerationAction = when {
+    generationActivated -> HwcCapacityGenerationAction.OBSERVE
+    candidateLayers <= 0 ||
+        !topologyPublished ||
+        topologyPending ||
+        expectedProducerCount != candidateLayers ||
+        rendererCleanupPending -> HwcCapacityGenerationAction.WAIT
+    else -> HwcCapacityGenerationAction.ACTIVATE
+}
+
+internal fun hwcCapacityCalibrationResult(
+    candidateLayers: Int,
+    expectedProducerCount: Int,
+    observedProducerCount: Int,
+    sampleStartedMonotonicMs: Long,
+    snapshot: TelemetrySnapshot,
+): HwcCapacityCalibrationResult {
+    require(candidateLayers > 0)
+    require(sampleStartedMonotonicMs >= 0L)
+    val topologyConfirmed =
+        expectedProducerCount == candidateLayers &&
+            observedProducerCount == candidateLayers
+    val device = snapshot.hwcDeviceLayers
+    val client = snapshot.hwcClientLayers
+    val deviceSource = snapshot.hwcDeviceLayersSource.trim()
+    val clientSource = snapshot.hwcClientLayersSource.trim()
+    val quality = snapshot.hwcDeviceLayersQuality
+    val evidenceMs = snapshot.hwcCompositionEvidenceMonotonicMs
+    val evidenceAgeMs = snapshot.hwcCompositionEvidenceAgeMs
+    val evidenceFresh =
+            evidenceMs != null &&
+            evidenceMs >= 0L &&
+            evidenceMs >= sampleStartedMonotonicMs &&
+            evidenceMs <= snapshot.monotonicMs &&
+            evidenceAgeMs != null &&
+            evidenceAgeMs == snapshot.monotonicMs - evidenceMs &&
+            evidenceAgeMs in 0L..HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS
+    val pairComplete =
+        device != null &&
+            client != null &&
+            device >= 0 &&
+            client >= 0 &&
+            quality == snapshot.hwcClientLayersQuality &&
+            quality in HWC_COMPOSITION_QUALITIES &&
+            deviceSource.isNotEmpty() &&
+            deviceSource == clientSource
+    return if (topologyConfirmed && evidenceFresh && pairComplete) {
+        HwcCapacityCalibrationResult(
+            status = HwcCapacityCalibrationStatus.OBSERVED_AT_CANDIDATE,
+            candidateLayers = candidateLayers,
+            observedDeviceLayers = device,
+            observedClientLayers = client,
+            source = deviceSource.take(MAX_HWC_EVENT_SOURCE_CHARS),
+            quality = quality,
+            evidenceMonotonicMs = evidenceMs,
+            detail =
+                "one fresh plan-start snapshot; physical topology fully ready; " +
+                    "not a universal hardware maximum",
+        )
+    } else {
+        HwcCapacityCalibrationResult(
+            status = HwcCapacityCalibrationStatus.UNAVAILABLE,
+            candidateLayers = candidateLayers,
+            detail =
+                "one-shot evidence incomplete; expected=$expectedProducerCount; " +
+                    "observed=$observedProducerCount; pairComplete=$pairComplete; " +
+                    "fresh=$evidenceFresh",
+        )
+    }
+}
+
+/**
+ * Reuses the one-shot result only as a topology-local boundary reference. It is deliberately not
+ * fed into ScenarioSafetyPolicy: another pixel format, crop, transform, alpha or system-surface
+ * set can have a different plane limit and still needs fresh vendor phase evidence.
+ */
+internal fun capacityReuseGuidance(
+    calibration: HwcCapacityCalibrationResult,
+): HwcCapacityReuseGuidance {
+    val candidate = calibration.candidateLayers
+    val device = calibration.observedDeviceLayers
+    if (
+        calibration.status != HwcCapacityCalibrationStatus.OBSERVED_AT_CANDIDATE ||
+        candidate == null ||
+        candidate <= 0 ||
+        device == null ||
+        device < 0
+    ) {
+        return HwcCapacityReuseGuidance(
+            detail = "calibration unavailable; preserve catalog target and verify fresh vendor pair",
+        )
+    }
+    val deviceCeiling = minOf(device, candidate)
+    val clientCandidate = (deviceCeiling + 1)
+        .takeIf { it in 1..candidate }
+    return HwcCapacityReuseGuidance(
+        deviceCandidateCeiling = deviceCeiling,
+        clientPressureCandidate = clientCandidate,
+        detail =
+            "advisory only for matching opaque RGB/crop topology; never a universal safety cap",
+    )
+}
+
+internal class HwcCompositionProbePriorityGate {
+    private val owner = AtomicReference<Any?>()
+
+    fun acquire(requestedOwner: Any): Boolean {
+        val current = owner.get()
+        return when {
+            current === requestedOwner -> true
+            current != null -> false
+            else ->
+                owner.compareAndSet(null, requestedOwner) ||
+                    owner.get() === requestedOwner
+        }
+    }
+
+    fun release(requestedOwner: Any): Boolean =
+        owner.compareAndSet(requestedOwner, null)
+
+    fun isActive(): Boolean = owner.get() != null
+
+    fun reset() {
+        owner.set(null)
+    }
+}
+
+internal enum class HwcCompositionProbeAction {
+    COMPLETE,
+    FORCE_SAMPLE,
+    EXHAUSTED,
+}
+
+internal fun hwcCompositionProbeAction(
+    expectation: HwcCompositionExpectation,
+    matchingEvidenceCount: Int,
+    terminalFailure: Boolean,
+    forcedAttempts: Int,
+): HwcCompositionProbeAction {
+    val requiredEvidence = requiredHwcMatchingEvidenceCount(expectation)
+    if (
+        terminalFailure ||
+        requiredEvidence == 0 ||
+        matchingEvidenceCount.coerceAtLeast(0) >= requiredEvidence
+    ) {
+        return HwcCompositionProbeAction.COMPLETE
+    }
+    return if (forcedAttempts.coerceAtLeast(0) >= requiredEvidence) {
+        HwcCompositionProbeAction.EXHAUSTED
+    } else {
+        HwcCompositionProbeAction.FORCE_SAMPLE
+    }
+}
+
+internal fun hwcCompositionContractPreserved(
+    requested: PhaseSpec,
+    effective: PhaseSpec,
+): Boolean {
+    if (requested.hwcCompositionExpectation == HwcCompositionExpectation.NONE) return true
+    return requested.hwcCompositionExpectation == effective.hwcCompositionExpectation &&
+        requested.activeLayers == effective.activeLayers &&
+        requested.producerFps == effective.producerFps &&
+        requested.requestedDisplayHz == effective.requestedDisplayHz &&
+        requested.backend == effective.backend &&
+        requested.pixelRoute == effective.pixelRoute &&
+        requested.bufferSize == effective.bufferSize &&
+        requested.motion == effective.motion &&
+        requested.workloads == effective.workloads &&
+        requested.alphaOverlap == effective.alphaOverlap &&
+        requested.includeGlLayer == effective.includeGlLayer
+}
+
+internal fun hwcCompositionContractDeltaSummary(
+    requested: PhaseSpec,
+    effective: PhaseSpec,
+): String =
+    "layers=${requested.activeLayers}→${effective.activeLayers}; " +
+        "producerFps=${requested.producerFps}→${effective.producerFps}; " +
+        "displayHz=${requested.requestedDisplayHz}→${effective.requestedDisplayHz}; " +
+        "gpu=${requested.workloads.gpu}→${effective.workloads.gpu}; " +
+        "gl=${requested.includeGlLayer}→${effective.includeGlLayer}"
+
+internal data class HwcCompositionCoverageResult(
+    val expectation: HwcCompositionExpectation,
+    val targetReadyAtMs: Long?,
+    val freshEvidenceCount: Int,
+    val matchingEvidenceCount: Int,
+    val gapCount: Int,
+    val lastDeviceLayers: Int?,
+    val lastClientLayers: Int?,
+    val lastQuality: MetricQuality?,
+    val lastSource: String?,
+    val lastEvidenceMonotonicMs: Long?,
+    val validDeviceLayers: Int?,
+    val validClientLayers: Int?,
+    val validQuality: MetricQuality?,
+    val validSource: String?,
+    val validEvidenceMonotonicMs: Long?,
+    val failureReason: String?,
+) {
+    val satisfied: Boolean
+        get() = failureReason == null
+
+    fun eventSummary(runStartMonotonicMs: Long): String =
+        "expectation=${expectation.name}; " +
+            "targetReadyRunMs=" +
+            "${monotonicTimestampRelativeToRun(targetReadyAtMs, runStartMonotonicMs) ?: "N/A"}; " +
+            "fresh=$freshEvidenceCount; matched=$matchingEvidenceCount; gaps=$gapCount; " +
+            "lastDevice=${lastDeviceLayers ?: "N/A"}; " +
+            "lastClient=${lastClientLayers ?: "N/A"}; " +
+            "quality=${lastQuality?.name ?: "N/A"}; " +
+            "source=${lastSource?.take(MAX_HWC_EVENT_SOURCE_CHARS) ?: "N/A"}; " +
+            "evidenceRunMs=" +
+            "${monotonicTimestampRelativeToRun(
+                lastEvidenceMonotonicMs,
+                runStartMonotonicMs,
+            ) ?: "N/A"}; " +
+            "validDevice=${validDeviceLayers ?: "N/A"}; " +
+            "validClient=${validClientLayers ?: "N/A"}"
+}
+
+internal data class HwcCompositionChainAnchor(
+    val expectation: HwcCompositionExpectation,
+    val quality: MetricQuality,
+    val source: String,
+    val deviceLayers: Int,
+    val clientLayers: Int,
+    val evidenceMonotonicMs: Long,
+    val requestedActiveLayers: Int,
+)
+
+internal data class HwcCompositionChainResult(
+    val priorAnchor: HwcCompositionChainAnchor?,
+    val currentAnchor: HwcCompositionChainAnchor?,
+    val nextAnchor: HwcCompositionChainAnchor?,
+    val failureReason: String?,
+) {
+    fun eventSummary(runStartMonotonicMs: Long): String {
+        val prior = priorAnchor
+        val current = currentAnchor
+        val deviceDelta =
+            if (prior != null && current != null) {
+                current.deviceLayers - prior.deviceLayers
+            } else {
+                null
+            }
+        val clientDelta =
+            if (prior != null && current != null) {
+                current.clientLayers - prior.clientLayers
+            } else {
+                null
+            }
+        val requestedLayerDelta =
+            if (prior != null && current != null) {
+                current.requestedActiveLayers - prior.requestedActiveLayers
+            } else {
+                null
+            }
+        return "chainBaselineDevice=${prior?.deviceLayers ?: "N/A"}; " +
+            "chainBaselineClient=${prior?.clientLayers ?: "N/A"}; " +
+            "chainCurrentDevice=${current?.deviceLayers ?: "N/A"}; " +
+            "chainCurrentClient=${current?.clientLayers ?: "N/A"}; " +
+            "deviceDelta=${deviceDelta ?: "N/A"}; " +
+            "clientDelta=${clientDelta ?: "N/A"}; " +
+            "requestedLayerDelta=${requestedLayerDelta ?: "N/A"}; " +
+            "chainEvidenceRunMs=" +
+            "${monotonicTimestampRelativeToRun(
+                current?.evidenceMonotonicMs,
+                runStartMonotonicMs,
+            ) ?: "N/A"}"
+    }
+}
+
+/**
+ * Links typed HWC phases into one causal, same-provenance observation chain.
+ *
+ * CLIENT_REQUIRED must increase CLIENT composition relative to a prior typed baseline. Consecutive
+ * DEVICE_ONLY phases follow the requested layer-count edge: low→high must increase DEVICE count and
+ * high→low must decrease it. A CLIENT_REQUIRED→DEVICE_ONLY release instead proves that CLIENT
+ * composition fell to zero; DEVICE count may legitimately stay level or rise. A phase-local
+ * expectation failure does not stop the chain from advancing with a valid pair, so later
+ * burst/release phases still run and preserve their evidence.
+ */
+internal fun advanceHwcCompositionChain(
+    prior: HwcCompositionChainAnchor?,
+    coverage: HwcCompositionCoverageResult,
+    requestedActiveLayers: Int,
+): HwcCompositionChainResult {
+    val validDeviceLayers = coverage.validDeviceLayers
+    val validClientLayers = coverage.validClientLayers
+    val validQuality = coverage.validQuality
+    val validSource = coverage.validSource?.takeIf { it.isNotBlank() }
+    val validEvidenceMonotonicMs = coverage.validEvidenceMonotonicMs
+    val current = if (
+        validDeviceLayers != null &&
+        validClientLayers != null &&
+        validQuality != null &&
+        validSource != null &&
+        validEvidenceMonotonicMs != null
+    ) {
+        HwcCompositionChainAnchor(
+            expectation = coverage.expectation,
+            quality = validQuality,
+            source = validSource,
+            deviceLayers = validDeviceLayers,
+            clientLayers = validClientLayers,
+            evidenceMonotonicMs = validEvidenceMonotonicMs,
+            requestedActiveLayers = requestedActiveLayers.coerceIn(
+                1,
+                ScenarioSafetyPolicy.HARD_MAX_LAYERS,
+            ),
+        )
+    } else {
+        null
+    }
+    if (current == null) {
+        return HwcCompositionChainResult(
+            priorAnchor = prior,
+            currentAnchor = null,
+            nextAnchor = prior,
+            failureReason = null,
+        )
+    }
+    if (prior == null) {
+        return HwcCompositionChainResult(
+            priorAnchor = null,
+            currentAnchor = current,
+            nextAnchor = current,
+            failureReason = if (
+                coverage.expectation == HwcCompositionExpectation.CLIENT_REQUIRED
+            ) {
+                "CLIENT_REQUIRED has no prior typed HWC baseline"
+            } else {
+                null
+            },
+        )
+    }
+    if (current.quality != prior.quality || current.source != prior.source) {
+        return HwcCompositionChainResult(
+            priorAnchor = prior,
+            currentAnchor = current,
+            nextAnchor = prior,
+            failureReason =
+                "HWC composition quality/source changed across expectation phases",
+        )
+    }
+    if (current.evidenceMonotonicMs <= prior.evidenceMonotonicMs) {
+        return HwcCompositionChainResult(
+            priorAnchor = prior,
+            currentAnchor = current,
+            nextAnchor = prior,
+            failureReason =
+                "HWC composition evidence did not advance across expectation phases",
+        )
+    }
+
+    val requestedLayerDelta =
+        current.requestedActiveLayers - prior.requestedActiveLayers
+    val failureReason = when (coverage.expectation) {
+        HwcCompositionExpectation.CLIENT_REQUIRED ->
+            if (current.clientLayers <= prior.clientLayers) {
+                "CLIENT_REQUIRED did not increase CLIENT count from the prior typed baseline; " +
+                    "baseline=${prior.clientLayers} current=${current.clientLayers}"
+            } else {
+                null
+            }
+        HwcCompositionExpectation.DEVICE_ONLY ->
+            if (prior.expectation == HwcCompositionExpectation.CLIENT_REQUIRED) {
+                if (current.clientLayers >= prior.clientLayers) {
+                    "CLIENT_REQUIRED→DEVICE_ONLY release did not reduce CLIENT count; " +
+                        "baseline=${prior.clientLayers} current=${current.clientLayers}"
+                } else {
+                    null
+                }
+            } else {
+                when {
+                    requestedLayerDelta > 0 &&
+                        current.deviceLayers <= prior.deviceLayers ->
+                        "DEVICE_ONLY low→high edge did not increase DEVICE count; " +
+                            "baseline=${prior.deviceLayers} current=${current.deviceLayers}"
+                    requestedLayerDelta < 0 &&
+                        current.deviceLayers >= prior.deviceLayers ->
+                        "DEVICE_ONLY high→low edge did not decrease DEVICE count; " +
+                            "baseline=${prior.deviceLayers} current=${current.deviceLayers}"
+                    else -> null
+                }
+            }
+        HwcCompositionExpectation.NONE -> null
+    }
+    return HwcCompositionChainResult(
+        priorAnchor = prior,
+        currentAnchor = current,
+        nextAnchor = current,
+        failureReason = failureReason,
+    )
+}
+
+internal fun hwcCompositionTargetReadyForArm(
+    ready: Boolean,
+    topologyPublished: Boolean,
+    topologyPending: Boolean,
+    processLeaseActive: Boolean,
+    pendingBoundaryExists: Boolean,
+    teardownFailed: Boolean,
+    runtimeFailurePresent: Boolean,
+    expectedProducerCount: Int,
+    observedProducerCount: Int,
+    expectedTopologyRevision: Long,
+    observedTopologyRevision: Long,
+): Boolean =
+    ready &&
+        topologyPublished &&
+        !topologyPending &&
+        !processLeaseActive &&
+        !pendingBoundaryExists &&
+        !teardownFailed &&
+        !runtimeFailurePresent &&
+        expectedProducerCount > 0 &&
+        observedProducerCount == expectedProducerCount &&
+        expectedTopologyRevision >= 0L &&
+        observedTopologyRevision == expectedTopologyRevision
+
+/**
+ * Verifies a phase's composition observation contract without treating topology as a guarantee.
+ *
+ * The controller arms this tracker only after the STEP target's producer topology and first
+ * generation-scoped buffers are acknowledged. A sample that started before that boundary, cached
+ * evidence captured before that sample, stale evidence, mixed DEVICE/CLIENT provenance, and
+ * repeated evidence timestamps cannot satisfy coverage.
+ */
+internal class HwcCompositionCoverageTracker(
+    private val expectation: HwcCompositionExpectation,
+) {
+    private data class EvidenceTuple(
+        val deviceLayers: Int?,
+        val clientLayers: Int?,
+        val deviceQuality: MetricQuality,
+        val clientQuality: MetricQuality,
+        val deviceSource: String,
+        val clientSource: String,
+    )
+
+    private var targetReadyAtMs: Long? = null
+    private var lastEvidenceMonotonicMs: Long? = null
+    private var lastEvidenceTuple: EvidenceTuple? = null
+    private var stableQuality: MetricQuality? = null
+    private var stableSource: String? = null
+    private var freshEvidenceCount = 0
+    private var matchingEvidenceCount = 0
+    private var gapCount = 0
+    private var lastDeviceLayers: Int? = null
+    private var lastClientLayers: Int? = null
+    private var lastObservedQuality: MetricQuality? = null
+    private var lastObservedSource: String? = null
+    private var lastValidDeviceLayers: Int? = null
+    private var lastValidClientLayers: Int? = null
+    private var lastValidEvidenceMonotonicMs: Long? = null
+    private var firstFailureReason: String? = null
+
+    init {
+        require(expectation != HwcCompositionExpectation.NONE) {
+            "NONE does not require a composition coverage tracker"
+        }
+    }
+
+    @Synchronized
+    fun activateTarget(targetReadyAtMs: Long): Boolean {
+        if (this.targetReadyAtMs != null) return false
+        this.targetReadyAtMs = targetReadyAtMs.coerceAtLeast(0L)
+        return true
+    }
+
+    @Synchronized
+    fun targetActivated(): Boolean = targetReadyAtMs != null
+
+    @Synchronized
+    fun hasSatisfiedEvidence(): Boolean =
+        firstFailureReason == null &&
+            matchingEvidenceCount >= requiredHwcMatchingEvidenceCount(expectation)
+
+    @Synchronized
+    fun probeAction(forcedAttempts: Int): HwcCompositionProbeAction =
+        hwcCompositionProbeAction(
+            expectation = expectation,
+            matchingEvidenceCount = matchingEvidenceCount,
+            terminalFailure = firstFailureReason != null,
+            forcedAttempts = forcedAttempts,
+        )
+
+    @Synchronized
+    fun hasTerminalFailure(): Boolean = firstFailureReason != null
+
+    @Synchronized
+    fun recordContractFailure(reason: String) {
+        failOnce(reason.ifBlank { "typed HWC target contract changed at runtime" })
+    }
+
+    @Synchronized
+    fun recordProbeFailure(reason: String) {
+        if (targetReadyAtMs == null) return
+        gapCount++
+        failOnce(reason.ifBlank { "forced HWC composition sample failed" })
+    }
+
+    @Synchronized
+    fun observe(
+        sampleStartedMonotonicMs: Long,
+        snapshot: TelemetrySnapshot,
+    ) {
+        val boundaryMs = targetReadyAtMs ?: return
+        if (sampleStartedMonotonicMs < boundaryMs) return
+
+        val evidenceMs = snapshot.hwcCompositionEvidenceMonotonicMs
+        if (evidenceMs == null) {
+            gapCount++
+            failOnce("HWC composition evidence timestamp became unavailable")
+            return
+        }
+        if (evidenceMs < 0L) {
+            gapCount++
+            failOnce("HWC composition evidence timestamp was negative")
+            return
+        }
+        if (evidenceMs < boundaryMs) {
+            // A pre-target SurfaceFlinger cache entry is neither evidence nor an active gap.
+            return
+        }
+
+        val tuple = EvidenceTuple(
+            deviceLayers = snapshot.hwcDeviceLayers,
+            clientLayers = snapshot.hwcClientLayers,
+            deviceQuality = snapshot.hwcDeviceLayersQuality,
+            clientQuality = snapshot.hwcClientLayersQuality,
+            deviceSource = snapshot.hwcDeviceLayersSource,
+            clientSource = snapshot.hwcClientLayersSource,
+        )
+        val evidenceAgeMs = snapshot.hwcCompositionEvidenceAgeMs
+        val computedAgeMs = if (snapshot.monotonicMs >= evidenceMs) {
+            snapshot.monotonicMs - evidenceMs
+        } else {
+            null
+        }
+        if (
+            evidenceAgeMs == null ||
+            computedAgeMs == null ||
+            evidenceAgeMs != computedAgeMs ||
+            evidenceAgeMs !in 0L..HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS
+        ) {
+            gapCount++
+            failOnce("HWC composition evidence age was unavailable, inconsistent, or stale")
+            return
+        }
+        val previousEvidenceMs = lastEvidenceMonotonicMs
+        if (previousEvidenceMs != null && evidenceMs <= previousEvidenceMs) {
+            if (evidenceMs < previousEvidenceMs) {
+                gapCount++
+                failOnce("HWC composition evidence timestamp regressed")
+            } else if (lastEvidenceTuple != tuple) {
+                gapCount++
+                failOnce("HWC composition values changed under one evidence timestamp")
+            }
+            // Identical cached evidence is intentionally counted once.
+            return
+        }
+        if (evidenceMs < sampleStartedMonotonicMs) {
+            // This sample only projected a cache entry captured by an earlier request.
+            return
+        }
+
+        lastEvidenceMonotonicMs = evidenceMs
+        lastEvidenceTuple = tuple
+        lastDeviceLayers = tuple.deviceLayers
+        lastClientLayers = tuple.clientLayers
+        lastObservedQuality = tuple.deviceQuality
+            .takeIf { it == tuple.clientQuality }
+        lastObservedSource = if (tuple.deviceSource == tuple.clientSource) {
+            tuple.deviceSource.take(MAX_HWC_EVENT_SOURCE_CHARS)
+        } else {
+            tuple.deviceSource.take(MAX_HWC_EVENT_SOURCE_CHARS / 2) +
+                "|" +
+                tuple.clientSource.take(MAX_HWC_EVENT_SOURCE_CHARS / 2)
+        }
+        freshEvidenceCount++
+
+        val device = tuple.deviceLayers
+        val client = tuple.clientLayers
+        val deviceSource = tuple.deviceSource.trim()
+        val clientSource = tuple.clientSource.trim()
+        val validQuality =
+            tuple.deviceQuality == tuple.clientQuality &&
+                tuple.deviceQuality in HWC_COMPOSITION_QUALITIES
+        if (
+            device == null ||
+            client == null ||
+            device < 0 ||
+            client < 0 ||
+            !validQuality ||
+            deviceSource.isEmpty() ||
+            deviceSource != clientSource
+        ) {
+            gapCount++
+            failOnce(
+                "HWC DEVICE/CLIENT pair was unavailable or had mixed provenance",
+            )
+            return
+        }
+
+        val priorQuality = stableQuality
+        val priorSource = stableSource
+        if (
+            (priorQuality != null && priorQuality != tuple.deviceQuality) ||
+            (priorSource != null && priorSource != deviceSource)
+        ) {
+            failOnce("HWC composition quality/source changed during the target window")
+            return
+        }
+        stableQuality = tuple.deviceQuality
+        stableSource = deviceSource
+        lastValidDeviceLayers = device
+        lastValidClientLayers = client
+        lastValidEvidenceMonotonicMs = evidenceMs
+
+        when (expectation) {
+            HwcCompositionExpectation.DEVICE_ONLY -> {
+                if (device > 0 && client == 0) {
+                    matchingEvidenceCount++
+                } else {
+                    failOnce(
+                        "DEVICE_ONLY requires device>0 and client==0; " +
+                            "observed device=$device client=$client",
+                    )
+                }
+            }
+            HwcCompositionExpectation.CLIENT_REQUIRED -> {
+                if (client > 0) matchingEvidenceCount++
+            }
+            HwcCompositionExpectation.NONE -> Unit
+        }
+    }
+
+    @Synchronized
+    fun result(): HwcCompositionCoverageResult {
+        val requiredMatches = requiredHwcMatchingEvidenceCount(expectation)
+        val finalFailure = firstFailureReason ?: when {
+            targetReadyAtMs == null ->
+                "target producer topology never reached an acknowledged STEP target"
+            freshEvidenceCount == 0 ->
+                "no fresh HWC composition evidence was observed after target readiness"
+            matchingEvidenceCount < requiredMatches &&
+                expectation == HwcCompositionExpectation.CLIENT_REQUIRED ->
+                "CLIENT_REQUIRED requires $requiredMatches distinct fresh client>0 observations; " +
+                    "observed=$matchingEvidenceCount"
+            matchingEvidenceCount < requiredMatches ->
+                "DEVICE_ONLY did not observe device>0 and client==0"
+            else -> null
+        }
+        return HwcCompositionCoverageResult(
+            expectation = expectation,
+            targetReadyAtMs = targetReadyAtMs,
+            freshEvidenceCount = freshEvidenceCount,
+            matchingEvidenceCount = matchingEvidenceCount,
+            gapCount = gapCount,
+            lastDeviceLayers = lastDeviceLayers,
+            lastClientLayers = lastClientLayers,
+            lastQuality = lastObservedQuality,
+            lastSource = lastObservedSource,
+            lastEvidenceMonotonicMs = lastEvidenceMonotonicMs,
+            validDeviceLayers = lastValidDeviceLayers,
+            validClientLayers = lastValidClientLayers,
+            validQuality = stableQuality,
+            validSource = stableSource,
+            validEvidenceMonotonicMs = lastValidEvidenceMonotonicMs,
+            failureReason = finalFailure,
+        )
+    }
+
+    private fun failOnce(reason: String) {
+        if (firstFailureReason == null) {
+            firstFailureReason = reason.take(MAX_HWC_FAILURE_REASON_CHARS)
+        }
+    }
+}
+
+internal fun requiredHwcMatchingEvidenceCount(
+    expectation: HwcCompositionExpectation,
+): Int = when (expectation) {
+    HwcCompositionExpectation.CLIENT_REQUIRED -> 2
+    HwcCompositionExpectation.DEVICE_ONLY -> 1
+    HwcCompositionExpectation.NONE -> 0
+}
+
+internal fun verdictWithHwcCompositionCoverage(
+    evidenceVerdict: RunVerdict,
+    coverageFailureReason: String?,
+): RunVerdict {
+    if (coverageFailureReason.isNullOrBlank()) return evidenceVerdict
+    return when (evidenceVerdict) {
+        RunVerdict.UNDERRUN_DETECTED,
+        RunVerdict.UNSUPPORTED,
+        RunVerdict.ABORTED,
+        -> evidenceVerdict
+        RunVerdict.CLEAN,
+        RunVerdict.SUSPECTED_PROXY,
+        RunVerdict.INCONCLUSIVE,
+        -> RunVerdict.INCONCLUSIVE
+    }
+}
+
+private val HWC_COMPOSITION_QUALITIES = setOf(
+    MetricQuality.HARDWARE_COUNTER,
+    MetricQuality.SYSTEM_SERVICE,
+)
+private const val MAX_HWC_EVENT_SOURCE_CHARS = 256
+private const val MAX_HWC_FAILURE_REASON_CHARS = 512
+
 internal fun safetyEnvelopeInvalidatedByPowerSave(
     envelopePowerSaveMode: Boolean,
     currentPowerSaveMode: Boolean,
@@ -5055,7 +9022,122 @@ internal fun resolveManagedReportFile(
     return canonicalFile.takeIf(File::isFile)
 }
 
+/**
+ * Best-effort deletion for an obsolete publication. The same strict resolver used by report
+ * sharing keeps a corrupted/injected path from deleting foreign files.
+ */
+internal fun deleteManagedCompletedReportBestEffort(
+    reportsDirectory: File,
+    reportFile: File?,
+): Boolean = runCatching {
+    val managed = resolveManagedReportFile(
+        reportsDirectory = reportsDirectory,
+        reportPath = reportFile?.absolutePath,
+    ) ?: return@runCatching false
+    managed.delete()
+}.getOrDefault(false)
+
+/**
+ * Allows sharing only artifacts still published by current controller state. A stale Compose click
+ * callback can retain an old PlanRunResult briefly after recomposition, so the managed-file check
+ * alone is insufficient when best-effort deletion fails.
+ */
+internal fun isPublishedReportForSharing(
+    reportFile: File,
+    lastReportFile: File?,
+    planResultPaths: Sequence<String?>,
+): Boolean {
+    val canonicalReportPath = runCatching { reportFile.canonicalPath }.getOrNull() ?: return false
+    fun matches(candidatePath: String?): Boolean {
+        val boundedPath = candidatePath
+            ?.takeIf { it.isNotBlank() && it.length <= MAX_SHARE_REPORT_PATH_CHARS }
+            ?: return false
+        val candidate = File(boundedPath)
+        if (!candidate.isAbsolute) return false
+        return runCatching { candidate.canonicalPath == canonicalReportPath }.getOrDefault(false)
+    }
+    return matches(lastReportFile?.absolutePath) || planResultPaths.any(::matches)
+}
+
+internal data class PlanRestoreFailureInvalidation(
+    val updatedResults: List<PlanRunResult>,
+    val invalidatedReportPaths: List<String>,
+)
+
+/**
+ * A successful END is not enough to publish a successful run when its revised report could not be
+ * atomically written. Preserve any exact restore event, but make the durable summary terminally
+ * ABORTED so a later finalizer retry cannot republish the pre-failure CLEAN/PASSED verdict.
+ */
+internal fun markPerformanceRestoreReportPublicationFailed(
+    summary: RunSummary,
+    finishedEpochMs: Long,
+    monotonicMs: Long,
+    failureType: String,
+): RunSummary {
+    val boundedFailure = failureType
+        .trim()
+        .ifEmpty { "Unknown" }
+        .take(MAX_REPORT_PUBLICATION_FAILURE_TYPE_CHARS)
+    val events = if (
+        summary.events.any { it.type == PERFORMANCE_RESTORE_REPORT_WRITE_FAILED_EVENT }
+    ) {
+        summary.events
+    } else {
+        summary.events + RunEvent(
+            monotonicMs = monotonicMs.coerceAtLeast(0L),
+            type = PERFORMANCE_RESTORE_REPORT_WRITE_FAILED_EVENT,
+            message =
+                "Performance restore outcome report publication failed: $boundedFailure",
+        )
+    }
+    return summary.copy(
+        finishedEpochMs = finishedEpochMs.coerceAtLeast(summary.startedEpochMs),
+        verdict = RunVerdict.ABORTED,
+        events = events,
+    )
+}
+
+/**
+ * Reports written before a plan-wide performance lease ends cannot truthfully claim that cleanup
+ * succeeded. If END/renewal cleanup fails, retain their compact UI rows as ABORTED evidence but
+ * withdraw every earlier JSON publication. The current run is rewritten separately with the
+ * detailed restore-failure event.
+ */
+internal fun invalidateEarlierPlanResultsForRestoreFailure(
+    results: List<PlanRunResult>,
+    currentStartedEpochMs: Long,
+    currentScenarioId: String,
+    terminalReason: String,
+): PlanRestoreFailureInvalidation {
+    val currentIndex = results.indexOfLast { result ->
+        result.startedEpochMs == currentStartedEpochMs &&
+            result.scenario.id == currentScenarioId
+    }
+    val invalidationEndExclusive = if (currentIndex >= 0) currentIndex else results.size
+    val boundedReason = terminalReason.take(MAX_PLAN_RESTORE_FAILURE_REASON_CHARS)
+    val invalidatedPaths = ArrayList<String>(invalidationEndExclusive)
+    val updated = results.mapIndexed { index, result ->
+        if (index >= invalidationEndExclusive) {
+            result
+        } else {
+            result.reportPath?.let(invalidatedPaths::add)
+            result.copy(
+                verdict = RunVerdict.ABORTED,
+                reportPath = null,
+                terminalReason = boundedReason,
+            )
+        }
+    }
+    return PlanRestoreFailureInvalidation(
+        updatedResults = updated,
+        invalidatedReportPaths = invalidatedPaths,
+    )
+}
+
 private const val MAX_SHARE_REPORT_PATH_CHARS = 4_096
+private const val MAX_PLAN_RESTORE_FAILURE_REASON_CHARS = 300
+private const val MAX_REPORT_PUBLICATION_FAILURE_TYPE_CHARS = 80
 private const val MEDIA_PREFLIGHT_AWAIT_POLL_MS = 20L
 private const val MEDIA_PREFLIGHT_AWAIT_MAX_POLL_MS = 50L
 private const val NANOS_PER_MILLISECOND = 1_000_000L
@@ -5161,6 +9243,15 @@ internal fun preserveFirstCancellationReason(
         ?: fallback.trim().ifEmpty { "Cancelled" }.take(maxChars)
 }
 
+internal fun mediaDescriptorCleanupConfirmed(
+    selectedDescriptorReleased: Boolean,
+    pendingDescriptorReleased: Boolean,
+    processCleanupUnconfirmed: Boolean,
+): Boolean =
+    selectedDescriptorReleased &&
+        pendingDescriptorReleased &&
+        !processCleanupUnconfirmed
+
 internal class TelemetrySampleGenerationGate {
     private var lastIssued = 0L
     private var currentRunFloor = Long.MAX_VALUE
@@ -5184,6 +9275,156 @@ internal class TelemetrySampleGenerationGate {
     fun belongsToCurrentRun(generation: Long): Boolean =
         generation >= currentRunFloor
 }
+
+internal fun telemetrySampleDeadlineMs(
+    sampleStartedMs: Long,
+    sampleTimeoutMs: Long,
+    completionGraceMs: Long,
+): Long {
+    require(sampleStartedMs >= 0L)
+    require(sampleTimeoutMs > 0L)
+    require(completionGraceMs >= 0L)
+    return saturatingAddNonNegative(
+        saturatingAddNonNegative(sampleStartedMs, sampleTimeoutMs),
+        completionGraceMs,
+    )
+}
+
+internal fun shouldAbortTelemetryWatchdog(
+    nowMs: Long,
+    lastSuccessfulSampleMs: Long,
+    staleTimeoutMs: Long,
+    inFlightDeadlineMs: Long?,
+): Boolean {
+    require(nowMs >= 0L)
+    require(lastSuccessfulSampleMs >= 0L)
+    require(staleTimeoutMs > 0L)
+    require(inFlightDeadlineMs == null || inFlightDeadlineMs >= 0L)
+    val staleDeadline = saturatingAddNonNegative(
+        lastSuccessfulSampleMs,
+        staleTimeoutMs,
+    )
+    if (nowMs <= staleDeadline) return false
+    return inFlightDeadlineMs == null || nowMs > inFlightDeadlineMs
+}
+
+internal fun isFatalControllerStartupFailure(error: Throwable): Boolean =
+    error is Error
+
+internal fun isFatalTelemetryStartupFailure(error: Throwable): Boolean =
+    isFatalControllerStartupFailure(error)
+
+internal fun unexpectedJobCompletionReason(
+    operation: String,
+    cause: Throwable?,
+): String? =
+    if (cause != null && cause !is CancellationException) {
+        "$operation Job failed unexpectedly: ${cause.javaClass.simpleName}"
+    } else {
+        null
+    }
+
+internal enum class TelemetryPairStartDecision {
+    START_NEW_PAIR,
+    REUSE_ACTIVE_PAIR,
+    WAIT_FOR_TERMINATION,
+    REJECT_UNTRUSTED_LIFECYCLE,
+}
+
+/**
+ * Monitor and watchdog form one ownership generation. Never overwrite a surviving half or treat a
+ * cancellation request as terminal evidence; replacement waits until both completion callbacks
+ * have cleared their exact published identities.
+ */
+internal fun telemetryPairStartDecision(
+    monitorPresent: Boolean,
+    monitorActive: Boolean,
+    watchdogPresent: Boolean,
+    watchdogActive: Boolean,
+    lifecycleIntegrityConfirmed: Boolean,
+): TelemetryPairStartDecision {
+    require(!monitorActive || monitorPresent)
+    require(!watchdogActive || watchdogPresent)
+    if (!lifecycleIntegrityConfirmed) {
+        return TelemetryPairStartDecision.REJECT_UNTRUSTED_LIFECYCLE
+    }
+    if (!monitorPresent && !watchdogPresent) {
+        return TelemetryPairStartDecision.START_NEW_PAIR
+    }
+    if (monitorActive && watchdogActive) {
+        return TelemetryPairStartDecision.REUSE_ACTIVE_PAIR
+    }
+    return TelemetryPairStartDecision.WAIT_FOR_TERMINATION
+}
+
+internal fun unexpectedLongLivedWorkerCompletionReason(
+    operation: String,
+    cause: Throwable?,
+    expectedStop: Boolean,
+): String? = when {
+    cause != null && cause !is CancellationException ->
+        "$operation Job failed unexpectedly: ${cause.javaClass.simpleName}"
+    expectedStop -> null
+    cause is CancellationException ->
+        "$operation Job was cancelled without an owning stop request"
+    else -> "$operation Job exited while continuous monitoring was required"
+}
+
+internal fun shouldFailPerformanceIsolationAfterRenewalCompletion(
+    operationFailure: String?,
+    runOwnerMatches: Boolean,
+    runOwnerActive: Boolean,
+    isolationMonitoringExpected: Boolean,
+): Boolean =
+    operationFailure != null &&
+        runOwnerMatches &&
+        runOwnerActive &&
+        isolationMonitoringExpected
+
+private fun bestEffortCleanup(
+    primaryFailure: Throwable,
+    cleanup: () -> Unit,
+) {
+    try {
+        cleanup()
+    } catch (cleanupFailure: Throwable) {
+        if (cleanupFailure !== primaryFailure) {
+            try {
+                primaryFailure.addSuppressed(cleanupFailure)
+            } catch (_: Throwable) {
+                // Preserve the original startup failure even when suppression is unavailable.
+            }
+        }
+    }
+}
+
+/**
+ * A completion callback should normally be attached immediately after LAZY Job construction. If
+ * callback attachment itself fails, cancellation of an unstarted Job is usually synchronous; if
+ * it is not, install one final Activity-free callback and leave the completion group pending when
+ * even that cannot be established.
+ */
+private fun completeUnattachedStartupOperation(
+    job: Job?,
+    completion: TransactionalCompletionRegistration,
+    primaryFailure: Throwable,
+    onTerminal: (() -> Unit)? = null,
+) {
+    if (job == null || job.isCompleted) {
+        bestEffortCleanup(primaryFailure) { completion.completeOperation() }
+        if (job != null) bestEffortCleanup(primaryFailure) { onTerminal?.invoke() }
+        return
+    }
+    bestEffortCleanup(primaryFailure) {
+        job.invokeOnCompletion {
+            completion.completeOperation()
+            bestEffortCleanup(primaryFailure) { onTerminal?.invoke() }
+        }
+    }
+}
+
+private fun saturatingAddNonNegative(left: Long, right: Long): Long =
+    if (left > Long.MAX_VALUE - right) Long.MAX_VALUE else left + right
 
 internal fun shouldAppendAbortedPlanResult(
     activeRunIndex: Int,
