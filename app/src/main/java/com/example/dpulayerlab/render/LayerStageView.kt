@@ -30,9 +30,11 @@ import android.widget.FrameLayout
 import androidx.core.graphics.withSave
 import com.example.dpulayerlab.model.ABRUPT_LAYER_SIZE_PROFILE_STEPS
 import com.example.dpulayerlab.model.BufferSize
+import com.example.dpulayerlab.model.BufferPresentation
 import com.example.dpulayerlab.model.GRADUAL_MID_MIN_FRACTION
 import com.example.dpulayerlab.model.LayerBackend
 import com.example.dpulayerlab.model.LayerSizeProfile
+import com.example.dpulayerlab.model.LayerOrientation
 import com.example.dpulayerlab.model.LoadShape
 import com.example.dpulayerlab.model.LoadShapeEvaluator
 import com.example.dpulayerlab.model.MotionProfile
@@ -49,6 +51,7 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.LockSupport
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.cos
 import kotlin.math.roundToInt
@@ -636,6 +639,8 @@ class LayerStageView @JvmOverloads constructor(
             backend = current.backend,
             pixelRoute = current.pixelRoute,
             bufferSize = current.bufferSize,
+            bufferPresentation = current.bufferPresentation,
+            layerOrientation = current.layerOrientation,
             activeLayers = current.activeLayers,
             includeGlLayer = current.includeGlLayer,
             alphaOverlap = current.alphaOverlap,
@@ -1008,6 +1013,8 @@ class LayerStageView @JvmOverloads constructor(
         next.backend != LayerBackend.FLATTENED_TEXTURE &&
         previous.pixelRoute == next.pixelRoute &&
         previous.bufferSize == next.bufferSize &&
+        previous.bufferPresentation == next.bufferPresentation &&
+        previous.layerOrientation == next.layerOrientation &&
         previous.alphaOverlap == next.alphaOverlap &&
         previous.mediaUri == next.mediaUri &&
         previous.videoDecoderSelection == next.videoDecoderSelection
@@ -1657,6 +1664,12 @@ class LayerStageView @JvmOverloads constructor(
 
     private fun applyTransformsAt(current: PhaseSpec, frameTimeNanos: Long) {
         if (width <= 0 || height <= 0) return
+        val cropStageOverflow =
+            current.bufferPresentation == BufferPresentation.PIXEL_1_TO_1_CROP
+        if (clipChildren != cropStageOverflow) {
+            clipChildren = cropStageOverflow
+            clipToPadding = cropStageOverflow
+        }
         val motionElapsedNanos = elapsedSince(startNanos, frameTimeNanos)
         val desiredPhaseFraction = currentLayerSizePhaseFraction(current, frameTimeNanos)
         val phaseFraction = layerSizeFractionForGeometryCommit(
@@ -1827,6 +1840,44 @@ class LayerStageView @JvmOverloads constructor(
             )
             val profileScaleX = profileSize.widthScale
             val profileScaleY = profileSize.heightScale
+            val decoderSelection = if (
+                index == 0 &&
+                current.pixelRoute.usesSelectedMediaDecoder()
+            ) {
+                videoDecoderSelection
+            } else {
+                null
+            }
+            val decoderQuarterTurn =
+                decoderSelection?.expectedRotationDegrees == 90 ||
+                    decoderSelection?.expectedRotationDegrees == 270
+            val sourceWidth = when {
+                decoderSelection != null && decoderQuarterTurn ->
+                    decoderSelection.expectedVisibleHeightPx
+                decoderSelection != null -> decoderSelection.expectedVisibleWidthPx
+                index == 0 && current.bufferSize != BufferSize.DISPLAY ->
+                    current.bufferSize.width
+                else -> width
+            }
+            val sourceHeight = when {
+                decoderSelection != null && decoderQuarterTurn ->
+                    decoderSelection.expectedVisibleWidthPx
+                decoderSelection != null -> decoderSelection.expectedVisibleHeightPx
+                index == 0 && current.bufferSize != BufferSize.DISPLAY ->
+                    current.bufferSize.height
+                else -> height
+            }
+            val presentationScale = bufferPresentationScalePacked(
+                stageWidth = width,
+                stageHeight = height,
+                sourceWidth = sourceWidth,
+                sourceHeight = sourceHeight,
+                presentation = current.bufferPresentation,
+                orientation = current.layerOrientation,
+            )
+            val baseScaleX = profileScaleX * packedPresentationScaleX(presentationScale)
+            val baseScaleY = profileScaleY * packedPresentationScaleY(presentationScale)
+            val baseRotation = current.layerOrientation.degrees
             val profileTranslationX = layerProfileBaseTranslationX(
                 stageWidth = width,
                 layerIndex = index,
@@ -1842,82 +1893,116 @@ class LayerStageView @JvmOverloads constructor(
 
             when (current.motion) {
                 MotionProfile.STATIC -> {
-                    child.scaleX = profileScaleX
-                    child.scaleY = profileScaleY
+                    child.scaleX = baseScaleX
+                    child.scaleY = baseScaleY
                     child.translationX = profileTranslationX
                     child.translationY = profileTranslationY
-                    child.rotation = 0f
+                    child.rotation = baseRotation
                 }
 
                 MotionProfile.CAPACITY_TILES -> Unit
 
                 MotionProfile.SCROLL -> {
-                    child.scaleX = profileScaleX
-                    child.scaleY = profileScaleY
+                    child.scaleX = baseScaleX
+                    child.scaleY = baseScaleY
                     child.translationX = profileTranslationX +
                         ((time * (80 + index * 13)) % (width * 1.6f)) -
                         width * 0.8f
                     child.translationY =
                         profileTranslationY + wave2 * height * 0.24f
-                    child.rotation = 0f
+                    child.rotation = baseRotation
                 }
 
                 MotionProfile.ZOOM_PAN -> {
-                    val motionScale = 0.72f + (wave + 1f) * 0.28f
-                    child.scaleX = profileScaleX * motionScale
-                    child.scaleY = profileScaleY * motionScale
+                    val motionScale = if (
+                        current.bufferPresentation == BufferPresentation.FIT &&
+                        current.layerOrientation == LayerOrientation.ROTATION_90
+                    ) {
+                        // Keep a fixed-90° fit phase inside its letterbox while still exercising
+                        // bounded zoom-out/return work.
+                        0.72f + (wave + 1f) * 0.14f
+                    } else {
+                        0.72f + (wave + 1f) * 0.28f
+                    }
+                    child.scaleX = baseScaleX * motionScale
+                    child.scaleY = baseScaleY * motionScale
                     child.translationX =
                         profileTranslationX + wave2 * width * 0.22f
                     child.translationY =
                         profileTranslationY + wave * height * 0.18f
-                    child.rotation = 0f
+                    child.rotation = baseRotation
                 }
 
                 MotionProfile.ROTATE -> {
-                    child.scaleX = profileScaleX
-                    child.scaleY = profileScaleY
+                    child.scaleX = baseScaleX
+                    child.scaleY = baseScaleY
                     child.translationX =
                         profileTranslationX + wave2 * width * 0.2f
                     child.translationY =
                         profileTranslationY + wave * height * 0.16f
-                    child.rotation = (time * (17f + index * 2.2f) + index * 29f) % 360f
+                    child.rotation =
+                        baseRotation +
+                            (time * (17f + index * 2.2f) + index * 29f) % 360f
                 }
 
                 MotionProfile.PARALLAX -> {
-                    child.scaleX = profileScaleX
-                    child.scaleY = profileScaleY
+                    child.scaleX = baseScaleX
+                    child.scaleY = baseScaleY
                     child.translationX = profileTranslationX +
                         sin(time * (0.55f + index * 0.025f) + phaseOffset) *
                         width * 0.34f
                     child.translationY = profileTranslationY +
                         cos(time * (0.43f + index * 0.02f) + phaseOffset) *
                         height * 0.28f
-                    child.rotation = if (current.alphaOverlap) wave * 8f else 0f
+                    child.rotation =
+                        baseRotation + if (current.alphaOverlap) wave * 8f else 0f
                 }
 
                 MotionProfile.TRANSFORM_STORM -> {
                     child.scaleX =
-                        profileScaleX * (0.58f + (wave2 + 1f) * 0.34f)
+                        baseScaleX * (0.58f + (wave2 + 1f) * 0.34f)
                     child.scaleY =
-                        profileScaleY * (0.68f + (wave + 1f) * 0.27f)
+                        baseScaleY * (0.68f + (wave + 1f) * 0.27f)
                     child.translationX =
                         profileTranslationX + wave * width * 0.37f
                     child.translationY =
                         profileTranslationY + wave2 * height * 0.31f
-                    child.rotation = (time * (21f + index * 3.3f)) % 360f
+                    child.rotation =
+                        baseRotation + (time * (21f + index * 3.3f)) % 360f
                 }
 
                 MotionProfile.Z_ORDER_SWAP -> {
-                    child.scaleX = profileScaleX
-                    child.scaleY = profileScaleY
+                    child.scaleX = baseScaleX
+                    child.scaleY = baseScaleY
                     child.translationX =
                         profileTranslationX + wave * width * 0.3f
                     child.translationY =
                         profileTranslationY + wave2 * height * 0.24f
-                    child.rotation = wave * 12f
+                    child.rotation = baseRotation + wave * 12f
                     child.translationZ =
                         (((time * 1.5f).toInt() + index) % layerCount).toFloat()
                 }
+            }
+            if (
+                current.bufferPresentation == BufferPresentation.FIT &&
+                current.layerOrientation == LayerOrientation.ROTATION_90 &&
+                current.motion != MotionProfile.ROTATE &&
+                current.motion != MotionProfile.TRANSFORM_STORM &&
+                current.motion != MotionProfile.Z_ORDER_SWAP
+            ) {
+                // Fixed-quarter-turn FIT phases keep the complete transformed child inside the
+                // stage. Motion is bounded by the current letterbox slack after size-profile and
+                // zoom scales, so 2K/4K/8K comparisons do not accidentally become crop tests.
+                child.translationX = clampFitTranslation(
+                    requested = child.translationX,
+                    stageExtent = width.toFloat(),
+                    contentExtent = height.toFloat() * abs(child.scaleY),
+                )
+                child.translationY = clampFitTranslation(
+                    requested = child.translationY,
+                    stageExtent = height.toFloat(),
+                    contentExtent = width.toFloat() * abs(child.scaleX),
+                )
             }
             child.alpha = if (current.alphaOverlap) {
                 (0.58f + 0.38f * ((wave + 1f) * 0.5f)).coerceIn(0.15f, 1f)
@@ -1992,6 +2077,8 @@ class LayerStageView @JvmOverloads constructor(
         val backend: LayerBackend,
         val pixelRoute: PixelRoute,
         val bufferSize: BufferSize,
+        val bufferPresentation: BufferPresentation,
+        val layerOrientation: LayerOrientation,
         val activeLayers: Int,
         val includeGlLayer: Boolean,
         val alphaOverlap: Boolean,
@@ -2022,6 +2109,79 @@ class LayerStageView @JvmOverloads constructor(
         val view: View,
         val relay: ProducerFrameRelay,
     )
+}
+
+/**
+ * Packs the pre-rotation View scales needed to preserve source pixels/aspect without allocating on
+ * the frame path. FIT applies one uniform source-to-stage factor after accounting for a fixed 90°
+ * orientation. PIXEL_1_TO_1_CROP keeps that factor at one and lets the stage clip overflow; safety
+ * policy prevents a scaling profile/motion from changing that factor.
+ */
+internal fun bufferPresentationScalePacked(
+    stageWidth: Int,
+    stageHeight: Int,
+    sourceWidth: Int,
+    sourceHeight: Int,
+    presentation: BufferPresentation,
+    orientation: LayerOrientation,
+): Long {
+    if (stageWidth <= 0 || stageHeight <= 0 || sourceWidth <= 0 || sourceHeight <= 0) {
+        return packPresentationScales(1f, 1f)
+    }
+    val orientedSourceWidth = if (orientation == LayerOrientation.ROTATION_90) {
+        sourceHeight
+    } else {
+        sourceWidth
+    }
+    val orientedSourceHeight = if (orientation == LayerOrientation.ROTATION_90) {
+        sourceWidth
+    } else {
+        sourceHeight
+    }
+    val sourceToDisplay = when (presentation) {
+        BufferPresentation.FIT -> minOf(
+            stageWidth.toDouble() / orientedSourceWidth.toDouble(),
+            stageHeight.toDouble() / orientedSourceHeight.toDouble(),
+        )
+
+        BufferPresentation.PIXEL_1_TO_1_CROP -> 1.0
+    }
+    val scaleX =
+        (sourceWidth.toDouble() * sourceToDisplay / stageWidth.toDouble()).toFloat()
+    val scaleY =
+        (sourceHeight.toDouble() * sourceToDisplay / stageHeight.toDouble()).toFloat()
+    if (!scaleX.isFinite() || !scaleY.isFinite() || scaleX <= 0f || scaleY <= 0f) {
+        return packPresentationScales(1f, 1f)
+    }
+    return packPresentationScales(scaleX, scaleY)
+}
+
+internal fun packedPresentationScaleX(packed: Long): Float =
+    Float.fromBits((packed ushr 32).toInt())
+
+internal fun packedPresentationScaleY(packed: Long): Float =
+    Float.fromBits(packed.toInt())
+
+private fun packPresentationScales(scaleX: Float, scaleY: Float): Long =
+    (scaleX.toRawBits().toLong() shl 32) or
+        (scaleY.toRawBits().toLong() and 0xffff_ffffL)
+
+internal fun clampFitTranslation(
+    requested: Float,
+    stageExtent: Float,
+    contentExtent: Float,
+): Float {
+    if (
+        !requested.isFinite() ||
+        !stageExtent.isFinite() ||
+        !contentExtent.isFinite() ||
+        stageExtent <= 0f ||
+        contentExtent < 0f
+    ) {
+        return 0f
+    }
+    val slack = ((stageExtent - contentExtent) * 0.5f).coerceAtLeast(0f)
+    return requested.coerceIn(-slack, slack)
 }
 
 private fun elapsedSince(startNanos: Long, frameTimeNanos: Long): Long {

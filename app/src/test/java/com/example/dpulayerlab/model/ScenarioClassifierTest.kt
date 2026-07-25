@@ -284,6 +284,36 @@ class ScenarioClassifierTest {
     }
 
     @Test
+    fun oneTwoKCropAndFixedNinetyConditionsAreDiscoverable() {
+        val projected = ScenarioSpec(
+            id = "projected-resolution",
+            name = "projected-resolution",
+            description = "projected-resolution",
+            category = ScenarioCategory.TRANSFORM,
+            risk = RiskLevel.MEDIUM,
+            tags = emptySet(),
+            phases = listOf(
+                phase("one-k").copy(
+                    bufferSize = BufferSize.HD_1K,
+                    bufferPresentation = BufferPresentation.PIXEL_1_TO_1_CROP,
+                ),
+                phase("two-k").copy(
+                    bufferSize = BufferSize.FHD,
+                    layerOrientation = LayerOrientation.ROTATION_90,
+                ),
+            ),
+        )
+
+        val conditions = ScenarioClassifier.conditions(projected)
+
+        assertTrue(ScenarioCondition.ONE_K in conditions)
+        assertTrue(ScenarioCondition.TWO_K in conditions)
+        assertTrue(ScenarioCondition.PIXEL_1_TO_1 in conditions)
+        assertTrue(ScenarioCondition.ROTATED_90 in conditions)
+        assertTrue(ScenarioCondition.TRANSFORM in conditions)
+    }
+
+    @Test
     fun rgbResolutionDoesNotPretendToUseVideoDecoder() {
         val rgb4k = scenario(
             "rgb-4k",

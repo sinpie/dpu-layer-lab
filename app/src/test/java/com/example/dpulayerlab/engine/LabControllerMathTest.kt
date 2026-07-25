@@ -1,10 +1,12 @@
 package com.example.dpulayerlab.engine
 
 import android.media.MediaCodecInfo
+import com.example.dpulayerlab.model.BufferPresentation
 import com.example.dpulayerlab.model.BufferSize
 import com.example.dpulayerlab.model.Gauge
 import com.example.dpulayerlab.model.HwcCompositionExpectation
 import com.example.dpulayerlab.model.LayerBackend
+import com.example.dpulayerlab.model.LayerOrientation
 import com.example.dpulayerlab.model.LayerSizeProfile
 import com.example.dpulayerlab.model.LoadTransitionEvaluator
 import com.example.dpulayerlab.model.LoadSetpoints
@@ -13,6 +15,9 @@ import com.example.dpulayerlab.model.MotionProfile
 import com.example.dpulayerlab.model.PhaseSpec
 import com.example.dpulayerlab.model.PixelRoute
 import com.example.dpulayerlab.model.PlanRunResult
+import com.example.dpulayerlab.model.PlanProgress
+import com.example.dpulayerlab.model.PlanSource
+import com.example.dpulayerlab.model.PlanState
 import com.example.dpulayerlab.model.RunProgress
 import com.example.dpulayerlab.model.RunEvent
 import com.example.dpulayerlab.model.RunSummary
@@ -47,6 +52,41 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class LabControllerMathTest {
+    @Test
+    fun planPositionEventPreservesTheRequestedDurationMultiplier() {
+        val progress = PlanProgress(
+            state = PlanState.RUNNING,
+            source = PlanSource.USER_SELECTION,
+            repeatIndex = 1,
+            repeatCount = 3,
+            durationMultiplier = 100,
+            queueIndex = 2,
+            queueSize = 4,
+            completedRuns = 6,
+            totalRuns = 12,
+        )
+
+        assertEquals(
+            "source=USER_SELECTION; run=7/12; repeat=2/3; queue=3/4; " +
+                "durationMultiplier=100",
+            planPositionEventMessage(progress),
+        )
+    }
+
+    @Test
+    fun staleSnackbarConsumeCannotClearANewerAtomicErrorNotice() {
+        val old = ErrorNotice(
+            id = 1,
+            message = "Battery Saver active",
+            recoveryAction = ErrorRecoveryAction.OPEN_BATTERY_SAVER_SETTINGS,
+        )
+        val newer = ErrorNotice(id = 2, message = "Settings could not be opened")
+
+        assertNull(errorNoticeAfterConsume(old, old.id))
+        assertSame(newer, errorNoticeAfterConsume(newer, old.id))
+        assertNull(errorNoticeAfterConsume(newer, null))
+    }
+
     @Test
     fun processSessionCalibrationTopologyIsExactlyTwentyDisplayOnlyLayers() {
         val phase = processSessionHwcCapacityCalibrationPhase()
@@ -1606,6 +1646,61 @@ class LabControllerMathTest {
         )
         assertFalse(safeGpuRelease.includeGlLayer)
         assertEquals(0f, safeGpuRelease.workloads.gpu, 0f)
+    }
+
+    @Test
+    fun projectionAndOrientationKeepMeasuredOriginUntilDiscreteTargetStarts() {
+        val origin = checkNotNull(ScenarioCatalog.byId("baseline-display-modes"))
+            .phases.first()
+            .copy(
+                bufferSize = BufferSize.UHD_8K,
+                bufferPresentation = BufferPresentation.FIT,
+                layerOrientation = LayerOrientation.ROTATION_0,
+                motion = MotionProfile.STATIC,
+                layerSizeProfile = LayerSizeProfile.FULL_SCREEN,
+            )
+        val target = origin.copy(
+            id = "projected-target",
+            pixelRoute = PixelRoute.SBWC_REQUIRED,
+            bufferPresentation = BufferPresentation.PIXEL_1_TO_1_CROP,
+            layerOrientation = LayerOrientation.ROTATION_90,
+        )
+
+        val fractionZero = LoadTransitionEvaluator.interpolate(origin, target, 0f)
+        val preparedZero = allocationRouteSafePhase(fractionZero, target)
+        assertEquals(target.pixelRoute, preparedZero.pixelRoute)
+        assertEquals(origin.bufferPresentation, preparedZero.bufferPresentation)
+        assertEquals(origin.layerOrientation, preparedZero.layerOrientation)
+
+        val fractionPositive = LoadTransitionEvaluator.interpolate(origin, target, 0.01f)
+        val preparedPositive = allocationRouteSafePhase(fractionPositive, target)
+        assertEquals(target.bufferPresentation, preparedPositive.bufferPresentation)
+        assertEquals(target.layerOrientation, preparedPositive.layerOrientation)
+
+        assertTrue(rendererTopologyChanged(origin, target))
+        assertTrue(
+            rendererTopologyChanged(
+                origin,
+                origin.copy(layerOrientation = LayerOrientation.ROTATION_90),
+            ),
+        )
+        val typedOrigin = origin.copy(
+            hwcCompositionExpectation = HwcCompositionExpectation.DEVICE_ONLY,
+        )
+        assertFalse(
+            hwcCompositionContractPreserved(
+                typedOrigin,
+                typedOrigin.copy(
+                    bufferPresentation = BufferPresentation.PIXEL_1_TO_1_CROP,
+                ),
+            ),
+        )
+        assertFalse(
+            hwcCompositionContractPreserved(
+                typedOrigin,
+                typedOrigin.copy(layerOrientation = LayerOrientation.ROTATION_90),
+            ),
+        )
     }
 
     @Test

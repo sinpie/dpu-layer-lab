@@ -92,10 +92,10 @@ release configuration에 local keystore, platform key 경로나 credential을 �
 | Test | 계약 |
 |---|---|
 | `model/LabModelsTest.kt` | model normalization, duration, terminal reason, dynamic size coverage mask |
-| `model/ScenarioPlanPolicyTest.kt` | queue/repeat/expanded-run cap |
+| `model/ScenarioPlanPolicyTest.kt` | UI 400/external 40 source cap, whole-queue repeat, 지원 시간 배율, overflow, immutable single materialization과 duration safety cap |
 | `model/ScenarioQueueEditorTest.kt` | duplicate, order, move, unknown restore |
-| `model/ScenarioSafetyPolicyTest.kt` | hard cap, negative/sub-effective load reject, duration, graphics budget, typed phase |
-| `model/ScenarioClassifierTest.kt` | facet OR/AND 입력과 intensity |
+| `model/ScenarioSafetyPolicyTest.kt` | hard cap, negative/sub-effective load reject, duration, graphics budget, typed phase, FIT/1:1/90°와 capacity-tile 조합 |
+| `model/ScenarioClassifierTest.kt` | facet OR/AND, 1K/2K/1:1/90° 조건과 intensity |
 | `model/LoadShapeEvaluatorTest.kt` | worker modulation |
 | `model/LoadTransitionEvaluatorTest.kt` | STEP/ramp/stair/pulse/triangle/soak |
 | `model/LayerTrafficEstimatorTest.kt` | format/dimensions/linear traffic와 N/A |
@@ -104,8 +104,8 @@ release configuration에 local keystore, platform key 경로나 credential을 �
 
 | Test | 계약 |
 |---|---|
-| `engine/ScenarioCatalogTest.kt` | preset uniqueness, phase validity, catalog semantics |
-| `engine/LabControllerMathTest.kt` | verdict, telemetry/HWC coverage, session-calibration deadline, size-profile arm·coverage, terminal linear endpoint revision/timeout/recovery/fidelity seal, cleanup fatal precedence와 media-worker fatal relay |
+| `engine/ScenarioCatalogTest.kt` | 36개 preset uniqueness/validity, 1K↔8K, 2K/4K/8K 90° FIT, resolution-only와 FIT/crop A/B/A |
+| `engine/LabControllerMathTest.kt` | verdict, telemetry/HWC coverage, session-calibration deadline, projection/orientation origin·topology·HWC contract, atomic error notice, size-profile arm·coverage, terminal linear endpoint revision/timeout/recovery/fidelity seal, cleanup fatal precedence와 media-worker fatal relay |
 | `engine/HwcCapacityCalibrationSessionTest.kt` | process one-shot claim/reuse, terminal N/A, Activity recreation scope와 display projection invalidation |
 | `engine/DeviceRenderSafetyTest.kt` | RAM/power-save/low-RAM envelope |
 | `engine/AutomationIntentContractTest.kt` | explicit action, malformed extras, STOP ordering |
@@ -116,7 +116,7 @@ release configuration에 local keystore, platform key 경로나 credential을 �
 
 | Test | 계약 |
 |---|---|
-| `render/LayerStageViewMathTest.kt` | geometry function, controller elapsed re-anchor, dynamic cadence/final sample, narrow-stage visibility |
+| `render/LayerStageViewMathTest.kt` | FIT/1:1 scale, 90° source-axis swap, fit translation clamp, geometry function, controller elapsed re-anchor, dynamic cadence/final sample, narrow-stage visibility |
 | `render/ProducerFrameRelayTest.kt` | generation·producer ID·control revision 2-phase relay와 decoder epoch+PTS queue/barrier |
 | `render/ProducerFrameCommitTest.kt` | callback/native draw failure의 worker revoke, cleanup와 VM fatal 원본 전파 |
 | `render/RendererSafetyStateTest.kt` | process-wide teardown latch |
@@ -155,10 +155,10 @@ release configuration에 local keystore, platform key 경로나 credential을 �
 
 | Test | 계약 |
 |---|---|
-| `ui/DpuLayerLabAppMathTest.kt`, `engine/LabControllerMathTest.kt` | 목적/facet/preview, bounded queue preview, decoder-media 노출 조건, topology-pending 즉시 `—P`를 포함한 HUD pure helper |
+| `ui/DpuLayerLabAppMathTest.kt`, `engine/LabControllerMathTest.kt` | 목적/facet/preview, bounded queue, whole-loop repeat/time 배율 복원, 400-run/장시간 format, decoder-media 노출, topology-pending 즉시 `—P`와 atomic notice |
 | `ui/RendererContainerRememberOwnerTest.kt` | Compose renderer owner identity |
-| `MainActivityMathTest.kt` | display/window/automation helper |
-| `engine/ReportWriterMathTest.kt` | schema/provenance/retention/atomic naming helper |
+| `MainActivityMathTest.kt` | display/window/automation, Battery Saver 전용→일반 settings 순서와 cleanup defer |
+| `engine/ReportWriterMathTest.kt` | projection/orientation/effective duration schema, provenance, 400 retention, atomic naming helper |
 | `AppVersionTest.kt` | versionName/versionCode 계약 |
 
 ## Process-session HWC capacity 검증
@@ -284,6 +284,9 @@ Capacity 변경은 다음 경계를 별도로 검증해야 한다.
 - empty/oversized/non-finite scenario field
 - `0 < load <= 0.001`
 - phase와 total duration overflow
+- unsupported duration multiplier, 중복 materialization과 100× 뒤 duration cap
+- UI 40×10=400 whole-queue loop와 외부 40-run 분리
+- 1:1 + scaling motion/dynamic size reject, capacity tiles + crop/90° reject
 - typed HWC minimum duration 부족
 - malformed START extra와 oversized queue
 - restored unknown preset ID
@@ -461,6 +464,8 @@ if ($missing.Count -gt 0) {
 - `N/A`를 0으로 바꾸지 않는가?
 - typed contract를 safety clamp 후 다른 실험으로 실행하지 않는가?
 - report schema와 문서가 새 field를 포함하는가?
+- Battery settings 이동이 performance restore와 Window isolation 복구 전에는 defer되고,
+  stale Snackbar consume이 후속 오류를 지우지 않는가?
 
 ## 실기기 검증 정책
 
@@ -469,6 +474,7 @@ if ($missing.Count -gt 0) {
 - 대상 실험기와 build fingerprint
 - 허용할 catalog/custom scenario
 - repeat와 최대 실행 시간
+- duration multiplier
 - thermal/power 환경
 - report 저장·공유 범위
 
@@ -493,6 +499,9 @@ if ($missing.Count -gt 0) {
   동일 terminal result가 재사용되고 두 번째 calibration producer burst가 없는지
 - requested 20L와 safety-approved actual candidate, calibration display scope가 HUD와
   `SESSION_HWC_CAPACITY_*` report event에 구분되어 남는지
+- 2K/4K/8K 90° FIT phase에서 전체 source가 보이고, 8K 1:1은 centered crop인지
+- whole-queue repeat 경계가 마지막→첫 scenario 순서이고 선택 배율별 effective phase
+  시간이 report와 일치하는지
 - exact baseline과 post-teardown terminal sample continuity
 - STOP/완료 뒤 thread, Surface, codec, NPU/SBWC, wake/display와 system bar 복구
 - 새 plan 시작 전에 sticky cleanup latch 없음

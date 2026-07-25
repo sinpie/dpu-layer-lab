@@ -21,10 +21,12 @@ import androidx.compose.runtime.setValue
 import androidx.core.content.FileProvider
 import androidx.core.content.ContextCompat
 import com.example.dpulayerlab.model.BufferSize
+import com.example.dpulayerlab.model.BufferPresentation
 import com.example.dpulayerlab.model.DecoderLinearReference
 import com.example.dpulayerlab.model.Gauge
 import com.example.dpulayerlab.model.HwcCompositionExpectation
 import com.example.dpulayerlab.model.LayerBackend
+import com.example.dpulayerlab.model.LayerOrientation
 import com.example.dpulayerlab.model.LayerSizeProfile
 import com.example.dpulayerlab.model.LOAD_CONTROL_CADENCE_MS
 import com.example.dpulayerlab.model.MIN_EFFECTIVE_LOAD
@@ -57,6 +59,7 @@ import com.example.dpulayerlab.model.TransitionSample
 import com.example.dpulayerlab.model.TransitionSegment
 import com.example.dpulayerlab.model.TransitionSpec
 import com.example.dpulayerlab.model.coverageBitAt
+import com.example.dpulayerlab.model.materializeDurationMultiplier
 import com.example.dpulayerlab.model.requiresSelectedDecoderProducer
 import com.example.dpulayerlab.model.requiredCoverageMask
 import com.example.dpulayerlab.model.terminalReason
@@ -728,8 +731,20 @@ class LabController internal constructor(
         ) ?: HwcCapacityCalibrationResult(HwcCapacityCalibrationStatus.PENDING),
     )
         private set
-    var errorMessage by mutableStateOf<String?>(null)
+    private val errorNoticeSequence = AtomicInteger()
+    var errorNotice by mutableStateOf<ErrorNotice?>(null)
         private set
+    var errorMessage: String?
+        get() = errorNotice?.message
+        private set(value) {
+            if (value == null) {
+                errorNotice = null
+            } else {
+                publishError(value)
+            }
+        }
+    val errorRecoveryAction: ErrorRecoveryAction?
+        get() = errorNotice?.recoveryAction
     var safetyLimits by mutableStateOf(frontendInputs.initialSafetyLimits)
         private set
     var lastSafetyAdjustments by mutableStateOf<List<String>>(emptyList())
@@ -738,6 +753,14 @@ class LabController internal constructor(
         private set
     val canConfigureRuntimeProtection: Boolean
         get() = !planStartBlocked(runJobPresent = runJob != null, isRunning = isRunning)
+    val canOpenBatterySaverSettings: Boolean
+        get() =
+            canConfigureRuntimeProtection &&
+                performancePolicyRestoreConfirmed.get() &&
+                performanceIsolationLifecycle == PerformanceIsolationLifecycle.IDLE &&
+                !performanceIsolationOwned &&
+                performanceSessionTicket == null &&
+                performanceRenewalJob == null
     val activeSevereThermalDeratingEnabled: Boolean
         get() = activeRuntimeProtectionPolicy.severeThermalDeratingEnabled
     val directSensors = mutableStateListOf<SensorReading>()
@@ -1091,8 +1114,8 @@ class LabController internal constructor(
         selectedMediaLinearReference = null
     }
 
-    fun clearError() {
-        errorMessage = null
+    fun clearError(noticeId: Int? = null) {
+        errorNotice = errorNoticeAfterConsume(errorNotice, noticeId)
     }
 
     /**
@@ -1109,7 +1132,25 @@ class LabController internal constructor(
     }
 
     fun showError(message: String) {
-        errorMessage = message.take(MAX_EVENT_MESSAGE_CHARS)
+        publishError(message)
+    }
+
+    fun showBatterySaverSettingsError(message: String) {
+        publishError(
+            message = message,
+            recoveryAction = ErrorRecoveryAction.OPEN_BATTERY_SAVER_SETTINGS,
+        )
+    }
+
+    private fun publishError(
+        message: String,
+        recoveryAction: ErrorRecoveryAction? = null,
+    ) {
+        errorNotice = ErrorNotice(
+            id = nextBoundedSequence(errorNoticeSequence),
+            message = message.take(MAX_EVENT_MESSAGE_CHARS),
+            recoveryAction = recoveryAction,
+        )
     }
 
     fun startScenario(requestedScenario: ScenarioSpec) {
@@ -1299,15 +1340,7 @@ class LabController internal constructor(
         val runtimeProtectionPolicySnapshot = RuntimeProtectionPolicy(
             severeThermalDeratingEnabled = severeThermalDeratingEnabled,
         )
-        val plan = requestedPlan.copy(
-            scenarios = requestedPlan.scenarios.map { scenario ->
-                scenario.copy(
-                    tags = scenario.tags.toSet(),
-                    requirements = scenario.requirements.toSet(),
-                    phases = scenario.phases.map { it.copy() },
-                )
-            },
-        )
+        val plan = requestedPlan.materializeDurationMultiplier()
 
         resetPlanState()
         activeRuntimeProtectionPolicy = runtimeProtectionPolicySnapshot
@@ -1378,6 +1411,7 @@ class LabController internal constructor(
             source = plan.source,
             repeatIndex = 0,
             repeatCount = plan.repeatCount,
+            durationMultiplier = requestedPlan.durationMultiplier,
             queueIndex = 0,
             queueSize = plan.scenarios.size,
             completedRuns = 0,
@@ -2313,6 +2347,7 @@ class LabController internal constructor(
                     )
                     failPerformanceIsolation(
                         "broker 승인 뒤에도 Battery Saver=off를 확인할 수 없습니다.",
+                        ErrorRecoveryAction.OPEN_BATTERY_SAVER_SETTINGS,
                     )
                 }
                 performanceIsolationLifecycle = PerformanceIsolationLifecycle.ACTIVE
@@ -2345,7 +2380,15 @@ class LabController internal constructor(
                         "remote 정책 변경/복원이 불명확한 ticket을 반환함"
                     else -> result.detail
                 }
-                failPerformanceIsolation("성능 격리 broker 승인 실패: $policyDetail")
+                failPerformanceIsolation(
+                    reason = "성능 격리 broker 승인 실패: $policyDetail",
+                    recoveryAction =
+                        if (batterySaverActive) {
+                            ErrorRecoveryAction.OPEN_BATTERY_SAVER_SETTINGS
+                        } else {
+                            null
+                        },
+                )
             }
         }
     }
@@ -2819,12 +2862,15 @@ class LabController internal constructor(
         return false
     }
 
-    private fun failPerformanceIsolation(reason: String): Nothing {
+    private fun failPerformanceIsolation(
+        reason: String,
+        recoveryAction: ErrorRecoveryAction? = null,
+    ): Nothing {
         val bounded = reason.take(MAX_EVENT_MESSAGE_CHARS)
         performanceIsolationLifecycle = PerformanceIsolationLifecycle.FAILED
         performanceIsolationStatus = "실패 · 시작 거부"
         cancellationReason = bounded
-        errorMessage = bounded
+        publishError(bounded, recoveryAction)
         throw PlanAbortException(bounded)
     }
 
@@ -3643,10 +3689,7 @@ class LabController internal constructor(
             }
             runEvents += event(
                 "PLAN_POSITION",
-                "source=${planProgress.source.name}; " +
-                    "run=${planProgress.completedRuns + 1}/${planProgress.totalRuns}; " +
-                    "repeat=${planProgress.currentRepeat}/${planProgress.repeatCount}; " +
-                    "queue=${planProgress.currentQueuePosition}/${planProgress.queueSize}",
+                planPositionEventMessage(planProgress),
             )
             if (thermalReduced) {
                 runEvents += event(
@@ -6518,6 +6561,7 @@ class LabController internal constructor(
             abortForSafety(
                 reason = "실행 중 Battery Saver가 활성화되어 기존 safety envelope를 폐기합니다.",
                 eventType = "SAFETY_ENVELOPE_CHANGED",
+                recoveryAction = ErrorRecoveryAction.OPEN_BATTERY_SAVER_SETTINGS,
             )
             return
         }
@@ -6847,6 +6891,7 @@ class LabController internal constructor(
                 abortForSafety(
                     reason = "실행 중 Battery Saver가 활성화되어 성능 격리를 잃었습니다.",
                     eventType = "SAFETY_ENVELOPE_CHANGED",
+                    recoveryAction = ErrorRecoveryAction.OPEN_BATTERY_SAVER_SETTINGS,
                 )
                 return
             }
@@ -6936,11 +6981,15 @@ class LabController internal constructor(
             workloads = LoadSetpoints(shape = target.workloads.shape),
         )
 
-    private fun abortForSafety(reason: String, eventType: String) {
+    private fun abortForSafety(
+        reason: String,
+        eventType: String,
+        recoveryAction: ErrorRecoveryAction? = null,
+    ) {
         if (cancellationReason != null) return
         cancellationReason = reason
         runEvents += event(eventType, reason)
-        errorMessage = "$reason. 테스트를 중단했습니다."
+        publishError("$reason. 테스트를 중단했습니다.", recoveryAction)
         // Publish producer removal and zero local/NPU setpoints at the observation point. The
         // run coroutine may currently be waiting in a bounded vendor call and will perform the
         // confirmed/retried cleanup when cancellation reaches it.
@@ -7199,7 +7248,11 @@ class LabController internal constructor(
         val previousReport = lastReportFile
         val replacement = try {
             withContext(NonCancellable + Dispatchers.IO) {
-                ReportWriter.write(appContext, updatedSummary)
+                ReportWriter.replace(
+                    context = appContext,
+                    summary = updatedSummary,
+                    obsoleteReport = previousReport,
+                )
             }
         } catch (error: Exception) {
             val publicationFailureSummary =
@@ -7239,14 +7292,6 @@ class LabController internal constructor(
             summary = updatedSummary,
             reportFile = replacement,
         )
-        if (previousReport != null && previousReport != replacement) {
-            withContext(NonCancellable + Dispatchers.IO) {
-                deleteManagedCompletedReportBestEffort(
-                    reportsDirectory = File(appContext.filesDir, "reports"),
-                    reportFile = previousReport,
-                )
-            }
-        }
         return true
     }
 
@@ -8465,6 +8510,30 @@ class LabController internal constructor(
     }
 }
 
+enum class ErrorRecoveryAction {
+    OPEN_BATTERY_SAVER_SETTINGS,
+}
+
+data class ErrorNotice(
+    val id: Int,
+    val message: String,
+    val recoveryAction: ErrorRecoveryAction? = null,
+)
+
+internal fun errorNoticeAfterConsume(
+    current: ErrorNotice?,
+    consumedId: Int?,
+): ErrorNotice? =
+    if (consumedId == null || current?.id == consumedId) null else current
+
+private fun nextBoundedSequence(sequence: AtomicInteger): Int {
+    while (true) {
+        val current = sequence.get()
+        val next = if (current == Int.MAX_VALUE) 1 else (current + 1).coerceAtLeast(1)
+        if (sequence.compareAndSet(current, next)) return next
+    }
+}
+
 private fun MediaFormat.numberOrNull(key: String): Number? =
     if (containsKey(key)) runCatching { getNumber(key) }.getOrNull() else null
 
@@ -9067,6 +9136,8 @@ internal fun safeWarmupPhaseFor(target: PhaseSpec): PhaseSpec =
         backend = LayerBackend.INDEPENDENT_SURFACES,
         pixelRoute = PixelRoute.RGB_8888,
         bufferSize = BufferSize.DISPLAY,
+        bufferPresentation = BufferPresentation.FIT,
+        layerOrientation = LayerOrientation.ROTATION_0,
         motion = MotionProfile.STATIC,
         layerSizeProfile = LayerSizeProfile.FULL_SCREEN,
         workloads = LoadSetpoints(),
@@ -9087,6 +9158,8 @@ internal fun rendererTopologyChanged(active: PhaseSpec?, target: PhaseSpec): Boo
         active.backend != target.backend ||
         active.pixelRoute != target.pixelRoute ||
         active.bufferSize != target.bufferSize ||
+        active.bufferPresentation != target.bufferPresentation ||
+        active.layerOrientation != target.layerOrientation ||
         active.includeGlLayer != target.includeGlLayer ||
         active.alphaOverlap != target.alphaOverlap
 
@@ -10134,6 +10207,8 @@ internal fun hwcCompositionContractPreserved(
         requested.backend == effective.backend &&
         requested.pixelRoute == effective.pixelRoute &&
         requested.bufferSize == effective.bufferSize &&
+        requested.bufferPresentation == effective.bufferPresentation &&
+        requested.layerOrientation == effective.layerOrientation &&
         requested.motion == effective.motion &&
         requested.layerSizeProfile == effective.layerSizeProfile &&
         requested.workloads == effective.workloads &&
@@ -10148,6 +10223,8 @@ internal fun hwcCompositionContractDeltaSummary(
     "layers=${requested.activeLayers}→${effective.activeLayers}; " +
         "producerFps=${requested.producerFps}→${effective.producerFps}; " +
         "displayHz=${requested.requestedDisplayHz}→${effective.requestedDisplayHz}; " +
+        "presentation=${requested.bufferPresentation.name}→${effective.bufferPresentation.name}; " +
+        "orientation=${requested.layerOrientation.name}→${effective.layerOrientation.name}; " +
         "size=${requested.layerSizeProfile.name}→${effective.layerSizeProfile.name}; " +
         "gpu=${requested.workloads.gpu}→${effective.workloads.gpu}; " +
         "gl=${requested.includeGlLayer}→${effective.includeGlLayer}"
@@ -11273,6 +11350,13 @@ internal fun scenarioAtExpandedIndex(
     }
     return plan.scenarios[expandedIndex % plan.scenarios.size]
 }
+
+internal fun planPositionEventMessage(progress: PlanProgress): String =
+    "source=${progress.source.name}; " +
+        "run=${progress.completedRuns + 1}/${progress.totalRuns}; " +
+        "repeat=${progress.currentRepeat}/${progress.repeatCount}; " +
+        "queue=${progress.currentQueuePosition}/${progress.queueSize}; " +
+        "durationMultiplier=${progress.durationMultiplier}"
 
 private const val ADAPTIVE_HUNT_SCENARIO_ID = "adaptive-underrun-hunt"
 private const val ADAPTIVE_HUNT_PHASE_PREFIX = "hunt-"

@@ -6,13 +6,68 @@ import com.example.dpulayerlab.model.HwcCompositionExpectation
 import com.example.dpulayerlab.model.MetricQuality
 import com.example.dpulayerlab.model.RunSummary
 import com.example.dpulayerlab.model.RunVerdict
+import com.example.dpulayerlab.model.ScenarioPlanPolicy
 import com.example.dpulayerlab.model.TelemetrySnapshot
+import java.nio.file.Files
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ReportWriterMathTest {
+    @Test
+    fun reportRetentionCoversTheLargestInAppPlan() {
+        assertEquals(400, MANAGED_REPORT_RETENTION_COUNT)
+        assertEquals(
+            ScenarioPlanPolicy.MAX_USER_TOTAL_PLAN_RUNS,
+            MANAGED_REPORT_RETENTION_COUNT,
+        )
+    }
+
+    @Test
+    fun replacementRemovesObsoleteReportBeforeApplyingThe400ReportLimit() {
+        val directory = Files.createTempDirectory("dpu-report-replacement").toFile()
+        try {
+            val reports = List(MANAGED_REPORT_RETENTION_COUNT) { index ->
+                java.io.File(
+                    directory,
+                    "dpu-layer-lab-20260724-010101-001-scenario-$index.json",
+                ).apply {
+                    writeText("{}")
+                    setLastModified(index.toLong() + 1L)
+                }
+            }
+            val oldest = reports.first()
+            val obsolete = reports.last()
+            val replacement = java.io.File(
+                directory,
+                "dpu-layer-lab-20260724-010102-001-scenario.json",
+            ).apply {
+                writeText("{}")
+                setLastModified(Long.MAX_VALUE)
+            }
+
+            assertTrue(
+                finalizePublishedReportRetention(
+                    directory = directory,
+                    protectedReport = replacement,
+                    obsoleteReport = obsolete,
+                    keepCount = MANAGED_REPORT_RETENTION_COUNT,
+                ),
+            )
+
+            val retained = directory.listFiles()
+                .orEmpty()
+                .filter { isManagedCompletedReportName(it.name) }
+            assertEquals(MANAGED_REPORT_RETENTION_COUNT, retained.size)
+            assertTrue(oldest.isFile)
+            assertFalse(obsolete.exists())
+            assertTrue(replacement.isFile)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
     @Test
     fun nonFiniteFloatsNeverProduceInvalidJsonTokens() {
         assertEquals("null", jsonNumber(null))
@@ -225,6 +280,43 @@ class ReportWriterMathTest {
         assertTrue(json.contains(""""layerSizeProfile": "SMALL_UNIFORM""""))
         assertTrue(json.contains(""""layerSizeProfile": "GRADUAL_SMALL_TO_FULL""""))
         assertTrue(json.contains(""""layerSizeProfile": "FULL_SCREEN""""))
+    }
+
+    @Test
+    fun reportPreservesBufferPresentationAndFixedOrientation() {
+        val summary = RunSummary(
+            scenario = ScenarioCatalog.byId("rotated-resolution-fit-matrix")!!,
+            startedEpochMs = 1_000L,
+            finishedEpochMs = 2_000L,
+            verdict = RunVerdict.INCONCLUSIVE,
+            exactUnderrunDelta = null,
+            exactUnderrunSource = null,
+            exactUnderrunQuality = MetricQuality.UNAVAILABLE,
+            suspectedUnderrunDelta = 0L,
+            peakCpu = null,
+            peakMemoryUsed = null,
+            peakGeneratedBandwidth = null,
+            events = emptyList(),
+            samples = emptyList(),
+        )
+
+        val json = ReportWriter.toJson(summary, TEST_DEVICE)
+        val cropJson = ReportWriter.toJson(
+            summary.copy(
+                scenario = ScenarioCatalog.byId("8k-presentation-fit-crop-aba")!!,
+            ),
+            TEST_DEVICE,
+        )
+
+        assertTrue(json.contains(""""bufferPresentation": "FIT""""))
+        assertTrue(json.contains(""""layerOrientation": "ROTATION_90""""))
+        assertTrue(json.contains(""""bufferSize": "UHD_8K""""))
+        assertTrue(
+            cropJson.contains(
+                """"bufferPresentation": "PIXEL_1_TO_1_CROP"""",
+            ),
+        )
+        assertTrue(cropJson.contains(""""layerOrientation": "ROTATION_0""""))
     }
 
     @Test

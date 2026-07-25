@@ -300,6 +300,25 @@ object ScenarioSafetyPolicy {
                 return "Phase '${phase.id}' layer count must be positive"
             }
             if (
+                phase.motion == MotionProfile.CAPACITY_TILES &&
+                (
+                    phase.bufferPresentation != BufferPresentation.FIT ||
+                        phase.layerOrientation != LayerOrientation.ROTATION_0
+                    )
+            ) {
+                return "Phase '${phase.id}' capacity tiles require FIT and 0° orientation"
+            }
+            if (
+                phase.bufferPresentation == BufferPresentation.PIXEL_1_TO_1_CROP &&
+                (
+                    phase.layerSizeProfile != LayerSizeProfile.FULL_SCREEN ||
+                        phase.motion == MotionProfile.ZOOM_PAN ||
+                        phase.motion == MotionProfile.TRANSFORM_STORM
+                    )
+            ) {
+                return "Phase '${phase.id}' 1:1 crop requires FULL_SCREEN and a non-scaling motion"
+            }
+            if (
                 phase.backend == LayerBackend.FLATTENED_TEXTURE &&
                 (
                     phase.pixelRoute != PixelRoute.RGB_8888 ||
@@ -821,6 +840,8 @@ object ScenarioSafetyPolicy {
             first.backend != second.backend ||
             first.pixelRoute != second.pixelRoute ||
             first.bufferSize != second.bufferSize ||
+            first.bufferPresentation != second.bufferPresentation ||
+            first.layerOrientation != second.layerOrientation ||
             first.includeGlLayer != second.includeGlLayer ||
             first.alphaOverlap != second.alphaOverlap
 

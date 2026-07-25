@@ -94,7 +94,7 @@ unmarshal한다. `STOP`은 pending START보다 우선한다. 계약과 cap은
 Compose의 주요 section은 다음과 같다.
 
 - Dashboard: 현재 capability와 metric overview, 목적별 빠른 시작
-- Scenario catalog: saveable한 `테스트 선택`/`순서·반복` 두 단계, 목적과
+- Scenario catalog: saveable한 `테스트 선택`/`순서·반복·시간` 두 단계, 목적과
   category/pattern/load/condition facet, bounded vertical queue 구성
 - Custom builder: 단일 scenario의 topology·format·motion·workload·transition 설정
 - System: permission, codec, display mode, direct probe와 runtime protection 상태
@@ -109,16 +109,22 @@ policy를 다시 통과한다.
 `model/LabModels.kt`의 계층은 다음과 같다.
 
 - `PhaseSpec`: duration, layer count, producer FPS, requested display Hz, backend, pixel route,
-  buffer size, motion, workload, alpha/GL, transition, HWC expectation
+  buffer size, FIT/1:1 projection, fixed 0°/90° orientation, motion, workload, alpha/GL,
+  transition, HWC expectation
 - `ScenarioSpec`: metadata와 순서가 있는 phase 목록
-- `ScenarioRunPlan`: 순서를 보존하는 scenario queue, repeat와 source
-- `PlanProgress`: queue/repeat 전체 진행과 terminal reason
+- `ScenarioRunPlan`: 순서를 보존하는 scenario queue, whole-queue repeat, duration multiplier,
+  source
+- `PlanProgress`: queue/repeat 전체 진행, 요청 duration multiplier와 terminal reason
 - `RunProgress`: 현재 stage/phase/target, transition fraction, producer generation/readiness
 - `TelemetrySnapshot`: 값·단위·quality·source가 결속된 한 번의 telemetry transaction
 - `RunSummary`: verdict, exact/proxy delta, peak, event와 sample
 
 queue의 duplicate는 A/B/A를 표현하기 위해 의도적으로 유지한다. 외부 automation은
 catalog preset만 사용할 수 있고 repeat 10, expanded run 40 상한을 가진다.
+앱 UI plan은 bounded 40-entry queue 전체를 최대 10회 loop해 최대 400 run을 허용한다.
+`durationMultiplier`는 1/2/5/10/50/100 중 하나이며 controller가 immutable execution
+copy를 만들 때 phase duration과 transition window/cycle에 한 번만 적용한다. 이후
+device safety policy가 phase 10분/scenario 30분 상한을 명시적으로 적용한다.
 
 ### Layer 표시 크기
 
@@ -191,6 +197,21 @@ screen-equivalent와 physical producer당 평균 `%`로 별도 표시한다. `CA
 `MotionProfile` scale, overlap, clipping/crop, rotation과 off-screen loss를 제외한
 geometry estimate이며 conservative
 full-buffer read/write traffic이나 measured bus를 대체하지 않는다.
+
+### Source buffer projection과 orientation
+
+`BufferPresentation`은 source buffer allocation과 분리된 base projection 계약이다.
+`FIT`은 고정 orientation까지 반영해 motion 전 전체 source를 aspect-ratio preserving
+letterbox로 stage 안에 놓고, `PIXEL_1_TO_1_CROP`은 source 1 px를 display 1 px로 유지한
+채 centered overflow를 stage에서 clip한다. `LayerOrientation`의 0°/90°는 motion과
+별도이며 explicit primary에는 실제 buffer dimensions, overlay에는 display dimensions를
+사용해 allocation-free scale을 계산한다.
+
+Safety policy는 1:1에 `FULL_SCREEN`과 non-scaling motion만 허용하고
+`CAPACITY_TILES`에는 FIT/0°만 허용한다. Projection/orientation 변경은 full source
+graphics budget과 traffic estimate를 바꾸지 않는다. Discrete 변경은 fresh producer
+generation/topology readiness를 다시 통과하므로 이전 geometry/first-buffer/HWC evidence를
+이어 쓰지 않는다.
 
 ## Runtime orchestration summary
 
@@ -402,7 +423,7 @@ sticky cleanup latch가 남으면 같은 process에서 새 controller/plan을 �
 `ReportWriter`는 credential-encrypted `filesDir/reports`에
 `dpu-layer-lab-*.json.part`를 쓰고 flush/fsync한 뒤 `.json`으로 rename한다.
 publisher는 process 안에서 직렬화된다. 방금 게시한 파일을 보호하면서 managed completed
-JSON만 최신 200개로 best-effort 보존한다.
+JSON만 최신 400개로 best-effort 보존한다.
 
 report에는 device fingerprint와 vendor provenance가 포함되며 네트워크로 자동 전송하지
 않는다. schema와 metric 의미는 [docs/METRICS.md](docs/METRICS.md), privacy와 사용자

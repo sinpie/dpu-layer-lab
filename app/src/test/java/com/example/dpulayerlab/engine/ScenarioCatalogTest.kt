@@ -1,8 +1,10 @@
 package com.example.dpulayerlab.engine
 
 import com.example.dpulayerlab.model.BufferSize
+import com.example.dpulayerlab.model.BufferPresentation
 import com.example.dpulayerlab.model.HwcCompositionExpectation
 import com.example.dpulayerlab.model.LayerBackend
+import com.example.dpulayerlab.model.LayerOrientation
 import com.example.dpulayerlab.model.LayerSizeProfile
 import com.example.dpulayerlab.model.LoadSetpoints
 import com.example.dpulayerlab.model.LoadShape
@@ -25,10 +27,126 @@ import org.junit.Test
 
 class ScenarioCatalogTest {
     @Test
+    fun rotatedFitMatrixCoversTwoFourAndEightKAtFixedNinetyDegrees() {
+        val scenario = requireNotNull(ScenarioCatalog.byId("rotated-resolution-fit-matrix"))
+        assertTrue(
+            setOf(BufferSize.FHD, BufferSize.UHD_4K, BufferSize.UHD_8K)
+                .all { size -> scenario.phases.any { it.bufferSize == size } },
+        )
+        assertTrue(
+            scenario.phases.all {
+                it.bufferPresentation == BufferPresentation.FIT &&
+                    it.layerOrientation == LayerOrientation.ROTATION_90
+            },
+        )
+        assertTrue(
+            scenario.phases.count { it.bufferSize == BufferSize.UHD_8K } >= 3,
+        )
+        assertTrue(scenario.phases.any { it.motion == MotionProfile.ZOOM_PAN })
+        assertTrue(scenario.phases.any { it.motion == MotionProfile.PARALLAX })
+    }
+
+    @Test
+    fun resolutionOnlySweepChangesNoOtherExperimentAxis() {
+        val scenario = requireNotNull(ScenarioCatalog.byId("resolution-only-sweep"))
+        assertEquals(
+            listOf(
+                BufferSize.HD_1K,
+                BufferSize.FHD,
+                BufferSize.UHD_4K,
+                BufferSize.UHD_8K,
+                BufferSize.UHD_4K,
+                BufferSize.FHD,
+                BufferSize.HD_1K,
+            ),
+            scenario.phases.map { it.bufferSize },
+        )
+        val reference = scenario.phases.first()
+        scenario.phases.drop(1).forEach { phase ->
+            assertEquals(
+                reference.copy(
+                    id = phase.id,
+                    label = phase.label,
+                    bufferSize = phase.bufferSize,
+                ),
+                phase,
+            )
+        }
+        scenario.phases.forEach {
+            assertEquals(1, it.activeLayers)
+            assertEquals(30f, it.producerFps)
+            assertEquals(60f, it.requestedDisplayHz)
+            assertEquals(BufferPresentation.FIT, it.bufferPresentation)
+            assertEquals(LayerOrientation.ROTATION_0, it.layerOrientation)
+            assertEquals(MotionProfile.STATIC, it.motion)
+            assertEquals(LoadSetpoints(), it.workloads)
+        }
+    }
+
+    @Test
+    fun eightKPresentationAbaChangesOnlyProjectionMode() {
+        val scenario = requireNotNull(ScenarioCatalog.byId("8k-presentation-fit-crop-aba"))
+        assertEquals(
+            listOf(
+                BufferPresentation.FIT,
+                BufferPresentation.PIXEL_1_TO_1_CROP,
+                BufferPresentation.FIT,
+            ),
+            scenario.phases.map { it.bufferPresentation },
+        )
+        val reference = scenario.phases.first()
+        scenario.phases.drop(1).forEach { phase ->
+            assertEquals(
+                reference.copy(
+                    id = phase.id,
+                    label = phase.label,
+                    bufferPresentation = phase.bufferPresentation,
+                ),
+                phase,
+            )
+        }
+    }
+
+    @Test
+    fun resolutionLoadSweepCoversOneToEightKInBothDirections() {
+        val scenario = requireNotNull(ScenarioCatalog.byId("resolution-load-sweep"))
+        assertEquals(
+            listOf(
+                BufferSize.HD_1K,
+                BufferSize.FHD,
+                BufferSize.UHD_4K,
+                BufferSize.UHD_8K,
+                BufferSize.UHD_4K,
+                BufferSize.FHD,
+                BufferSize.HD_1K,
+            ),
+            scenario.phases.map { it.bufferSize },
+        )
+        val peakIndex = scenario.phases.indexOfFirst {
+            it.bufferSize == BufferSize.UHD_8K
+        }
+        assertEquals(3, peakIndex)
+        assertTrue(
+            scenario.phases.take(peakIndex + 1)
+                .zipWithNext()
+                .all { (first, second) ->
+                    second.workloads.memory >= first.workloads.memory
+                },
+        )
+        assertTrue(
+            scenario.phases.drop(peakIndex)
+                .zipWithNext()
+                .all { (first, second) ->
+                    second.workloads.memory <= first.workloads.memory
+                },
+        )
+    }
+
+    @Test
     fun presetIdsAreUniqueAndPhasesAreRunnable() {
         val presets = ScenarioCatalog.presets
         assertEquals(presets.size, presets.map { it.id }.distinct().size)
-        assertEquals(32, presets.size)
+        assertEquals(36, presets.size)
         assertTrue(
             setOf(
                 "dpu-device-envelope-burst",
@@ -821,7 +939,7 @@ class ScenarioCatalogTest {
         val scenarios = ScenarioCatalog.presets.filter {
             it.category == ScenarioCategory.TRANSITION
         }
-        assertEquals(9, scenarios.size)
+        assertEquals(10, scenarios.size)
         assertEquals(
             setOf(
                 "instant-isolated-contention",
@@ -833,6 +951,7 @@ class ScenarioCatalogTest {
                 "gradual-layer-size-expansion",
                 "abrupt-layer-size-toggle",
                 "layer-size-fps-burst",
+                "resolution-load-sweep",
             ),
             scenarios.mapTo(mutableSetOf()) { it.id },
         )
@@ -1223,6 +1342,8 @@ class ScenarioCatalogTest {
         val backend: LayerBackend,
         val pixelRoute: PixelRoute,
         val bufferSize: BufferSize,
+        val bufferPresentation: BufferPresentation,
+        val layerOrientation: LayerOrientation,
         val motion: MotionProfile,
         val layerSizeProfile: LayerSizeProfile,
         val alphaOverlap: Boolean,
@@ -1236,6 +1357,8 @@ class ScenarioCatalogTest {
         backend = backend,
         pixelRoute = pixelRoute,
         bufferSize = bufferSize,
+        bufferPresentation = bufferPresentation,
+        layerOrientation = layerOrientation,
         motion = motion,
         layerSizeProfile = layerSizeProfile,
         alphaOverlap = alphaOverlap,
@@ -1249,6 +1372,8 @@ class ScenarioCatalogTest {
         val backend: LayerBackend,
         val pixelRoute: PixelRoute,
         val bufferSize: BufferSize,
+        val bufferPresentation: BufferPresentation,
+        val layerOrientation: LayerOrientation,
         val motion: MotionProfile,
         val layerSizeProfile: LayerSizeProfile,
         val workloads: LoadSetpoints,
@@ -1264,6 +1389,8 @@ class ScenarioCatalogTest {
         backend = backend,
         pixelRoute = pixelRoute,
         bufferSize = bufferSize,
+        bufferPresentation = bufferPresentation,
+        layerOrientation = layerOrientation,
         motion = motion,
         layerSizeProfile = layerSizeProfile,
         workloads = workloads,

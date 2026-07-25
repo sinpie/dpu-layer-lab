@@ -1,5 +1,6 @@
 package com.example.dpulayerlab
 
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Color
@@ -7,6 +8,7 @@ import android.hardware.display.DisplayManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.view.Gravity
 import android.view.View
 import android.widget.TextView
@@ -78,6 +80,8 @@ class MainActivity : ComponentActivity() {
     private var displayEnvelopeInvalidationReported = false
     private var displayListenerRegistered = false
     private var displayRunStateJob: Job? = null
+    private var batterySaverSettingsOpenPending = false
+    private var batterySaverSettingsOpenAttempts = 0
     private val pendingAutomation = ArrayDeque<AutomationIntentParseResult>()
     private val catalogIds: Set<String> =
         ScenarioCatalog.presets.mapTo(LinkedHashSet()) { it.id }
@@ -97,6 +101,35 @@ class MainActivity : ComponentActivity() {
         }
         automationStartWaitingForInsets = false
         drainPendingAutomation()
+    }
+    private val batterySaverSettingsOpenDrain = object : Runnable {
+        override fun run() {
+            if (!batterySaverSettingsOpenPending || destroyed) return
+            val planCleanupComplete =
+                controller?.canOpenBatterySaverSettings == true
+            if (
+                planCleanupComplete &&
+                testWindowIsolation.isExternalNavigationSafe()
+            ) {
+                batterySaverSettingsOpenPending = false
+                batterySaverSettingsOpenAttempts = 0
+                launchBatterySaverSettings()
+                return
+            }
+            batterySaverSettingsOpenAttempts++
+            if (
+                batterySaverSettingsOpenAttempts >=
+                MAX_BATTERY_SETTINGS_DEFER_ATTEMPTS
+            ) {
+                batterySaverSettingsOpenPending = false
+                batterySaverSettingsOpenAttempts = 0
+                controller?.showBatterySaverSettingsError(
+                    "테스트 정리 또는 SystemUI 복구가 완료되지 않아 설정 화면을 열지 않았습니다.",
+                )
+                return
+            }
+            mainHandler.postDelayed(this, BATTERY_SETTINGS_DEFER_POLL_MS)
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -128,10 +161,14 @@ class MainActivity : ComponentActivity() {
         } ?: run {
             initializeControllerIfAvailable()
         }
+        if (batterySaverSettingsOpenPending) {
+            batterySaverSettingsOpenDrain.run()
+        }
     }
 
     override fun onStop() {
         activityStarted = false
+        mainHandler.removeCallbacks(batterySaverSettingsOpenDrain)
         try {
             controller?.let { activeController ->
                 if (activeController.isRunning) {
@@ -321,6 +358,9 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         destroyed = true
         mainHandler.removeCallbacks(backendRetry)
+        mainHandler.removeCallbacks(batterySaverSettingsOpenDrain)
+        batterySaverSettingsOpenPending = false
+        batterySaverSettingsOpenAttempts = 0
         pendingAutomation.clear()
         automationStartWaitingForInsets = false
         window.decorView.removeCallbacks(automationWindowReadyDrain)
@@ -392,7 +432,10 @@ class MainActivity : ComponentActivity() {
             lastDisplayEnvelopeIdentity = currentDisplayEnvelopeIdentity()
             setContent {
                 DpuLabTheme {
-                    DpuLayerLabApp(initializedController)
+                    DpuLayerLabApp(
+                        controller = initializedController,
+                        onOpenBatterySaverSettings = ::openBatterySaverSettings,
+                    )
                 }
             }
             pendingControllerError?.let(initializedController::showError)
@@ -430,6 +473,31 @@ class MainActivity : ComponentActivity() {
                 "Backend/UI 초기화에 실패했습니다.\n부분 초기화 자원의 중복 생성을 막기 위해 " +
                     "현재 process에서 새 테스트를 차단했습니다.\n앱 process를 완전히 종료한 뒤 " +
                     "다시 실행하세요.\n\n${error.javaClass.simpleName}",
+            )
+        }
+    }
+
+    private fun openBatterySaverSettings() {
+        if (batterySaverSettingsOpenPending || destroyed) return
+        batterySaverSettingsOpenPending = true
+        batterySaverSettingsOpenAttempts = 0
+        batterySaverSettingsOpenDrain.run()
+    }
+
+    private fun launchBatterySaverSettings() {
+        val opened = batterySaverSettingsActionOrder().any { action ->
+            try {
+                startActivity(Intent(action))
+                true
+            } catch (_: ActivityNotFoundException) {
+                false
+            } catch (_: SecurityException) {
+                false
+            }
+        }
+        if (!opened) {
+            controller?.showBatterySaverSettingsError(
+                "배터리 절약 설정 화면을 열 수 없습니다.",
             )
         }
     }
@@ -658,9 +726,27 @@ class MainActivity : ComponentActivity() {
     private companion object {
         const val MAX_PENDING_AUTOMATION_COMMANDS = 8
         const val BACKEND_OWNER_RETRY_MS = 100L
+        const val BATTERY_SETTINGS_DEFER_POLL_MS = 100L
+        const val MAX_BATTERY_SETTINGS_DEFER_ATTEMPTS = 300
         const val AUTOMATION_ALIAS_CLASS = "com.example.dpulayerlab.AutomationActivity"
     }
 }
+
+internal fun batterySaverSettingsActionOrder(): List<String> = listOf(
+    Settings.ACTION_BATTERY_SAVER_SETTINGS,
+    Settings.ACTION_SETTINGS,
+)
+
+internal fun batterySaverSettingsNavigationReady(
+    planCleanupComplete: Boolean,
+    isolationPhase: TestWindowIsolationPhase,
+    processLeaseActive: Boolean,
+    foreignLeaseMasking: Boolean,
+): Boolean =
+    planCleanupComplete &&
+        isolationPhase == TestWindowIsolationPhase.IDLE &&
+        !processLeaseActive &&
+        !foreignLeaseMasking
 
 private object ProcessDisplayListenerCleanupState {
     private val cleanupConfirmed = AtomicBoolean(true)
@@ -816,6 +902,15 @@ private class ActivityTestWindowIsolation(
 
     fun hasRootWindowInsets(): Boolean =
         ViewCompat.getRootWindowInsets(decorView) != null
+
+    fun isExternalNavigationSafe(): Boolean =
+        batterySaverSettingsNavigationReady(
+            planCleanupComplete = true,
+            isolationPhase = state.phase,
+            processLeaseActive =
+                ProcessTestWindowIsolationLeaseRegistry.hasActiveLease(),
+            foreignLeaseMasking = foreignLeaseMasking,
+        )
 
     fun requestRootWindowInsets() {
         if (closing) return

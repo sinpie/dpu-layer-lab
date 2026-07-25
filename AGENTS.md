@@ -14,11 +14,11 @@ Launcher와 Gradle project의 표시 이름은 `DPULayerTest`이고 canonical re
 `https://github.com/sinpie/dpu-layer-lab`이다. 제품 호환성 계약인 package
 `com.example.dpulayerlab`, automation component/action, `dpu-layer-lab-` report
 prefix, Soong module/APK 이름 `DpuLayerLab`은 별도 migration 요구 없이 바꾸지 않는다.
-현재 release version은 `20260725_170750`(`versionCode 6`), debug version은
-`20260725_170750-debug`이며 tag는 `v20260725_170750`이다.
+현재 release version은 `20260725_232013`(`versionCode 7`), debug version은
+`20260725_232013-debug`이며 tag는 `v20260725_232013`이다.
 `yyyyMMdd_HHmmss`는 KST build 시각이다. Release asset은
-`DPULayerTest-20260725_170750-debug.apk`,
-`DPULayerTest-20260725_170750-release-unsigned.apk`, `SHA256SUMS.txt` 이름을 사용한다.
+`DPULayerTest-20260725_232013-debug.apk`,
+`DPULayerTest-20260725_232013-release-unsigned.apk`, `SHA256SUMS.txt` 이름을 사용한다.
 
 ## 기본 작업 규칙
 
@@ -70,6 +70,12 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 - Broker가 없을 때는 Battery Saver가 이미 OFF인 경우만 app-only monitoring을 허용한다.
   Saver ON 또는 remote mutation 가능성이 남은 모호한 응답을 성공으로 낮추지 않는다.
   Platform signing만으로 전역 power policy 접근이 생긴다고 가정하지 않는다.
+- Saver 때문에 시작이 거부된 오류의 설정 action은 performance-policy exact restore,
+  run finalizer와 Test Window/SystemUI 복구가 끝날 때까지 이동을 defer한다. 전용 Battery
+  Saver 설정을 먼저 열고 일반 설정으로 fallback하되 앱이 policy를 직접 변경하지 않는다.
+  오류 message/action은 하나의 notice identity로 결속하고 stale snackbar consume이 새
+  오류를 지우지 않게 한다. Background 전환 중 pending navigation을 잃지 않으며 defer
+  timeout 또는 설정 Activity 실행 실패에서는 같은 recovery action을 다시 제공한다.
 - 앱 선제 thermal SEVERE derating은 선택형이고 기본 OFF다. 설정은 plan 시작 시
   immutable snapshot으로 고정하며 외부 Intent extra로 우회하지 않는다. OFF이면
   SEVERE에서도 앱 setpoint를 유지하고 Android/kernel thermal mitigation에 맡긴다.
@@ -95,7 +101,7 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   phase의 ramp/soak window와 pulse/triangle cycle도 비례 조정하고,
   attack/hold/recovery 또는 한 cycle의 의미를 보존할 수 없으면 reject한다.
 - `FLATTENED_TEXTURE`는 display-sized RGBA 단일 physical producer다. Decoder route나
-  explicit 4K/8K buffer로 표시하지 않는다. Custom의 `0.001` 초과 GPU load는 실제
+  explicit non-DISPLAY buffer로 표시하지 않는다. Custom의 `0.001` 초과 GPU load는 실제
   GPU-backed producer를 가져야 하며, primary+GL topology가 graphics budget에 들어오지
   않으면 GPU 부하를 조용히 제거하지 말고 reject한다.
   Flattened 1-layer intensity도 policy-approved `0.001` 초과 값에서 1~8의 bounded
@@ -168,8 +174,12 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   폐기하며 기존 STOP과의 중복 제거보다 우선한다. Extra unmarshalling은 START에서만
   수행해 malformed START payload가 STOP 처리를 막지 않게 한다.
 - UI catalog facet은 같은 행 OR/서로 다른 행 AND 의미를 유지한다. Filtered
-  append/replace는 catalog 순서와 40-run cap을 지키고, queue의 중복·명시적 이동은
-  보존하되 복원된 unknown preset ID는 표시/index/실행 전에 제거한다.
+  append/replace는 catalog 순서와 40-entry queue cap을 지키고, queue의 중복·명시적
+  이동은 보존하되 복원된 unknown preset ID는 표시/index/실행 전에 제거한다.
+  앱 UI plan은 이 queue를 통째로 1~10회 loop해 최대 400 run을 허용하되 외부 Intent의
+  expanded 40-run cap은 유지한다. Duration multiplier는 1/2/5/10/50/100만 허용하고
+  immutable execution copy의 phase duration과 transition window/cycle에 정확히 한 번
+  적용한 뒤 기존 duration safety cap을 통과시킨다.
 - 외부 control은 explicit `AutomationActivity` alias에서만 처리한다. Release의
   `CONTROL_TESTS`(`signature|privileged`) 보호, debug-only permission 제거,
   `CATEGORY_DEFAULT` 부재와 direct `MainActivity` START 무시를 유지한다.
@@ -248,6 +258,13 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   누락은 `LAYER_SIZE_COVERAGE_MISSING` event와 `INCONCLUSIVE`, 성공은
   `LAYER_SIZE_COVERAGE` event로 남긴다. 좁은 stage의 centered scale-aware horizontal
   stagger는 각 layer의 최소 1 px visibility를 보존한다.
+  `BufferPresentation.FIT`은 고정 0°/90° orientation을 반영해 motion 전 source 전체를
+  aspect-preserving letterbox하고, `PIXEL_1_TO_1_CROP`은 source/display pixel 1:1의
+  centered overflow crop이다. 고정 orientation은 motion과 별도다. 1:1은
+  `FULL_SCREEN`과 non-scaling motion만, `CAPACITY_TILES`는 FIT/0°만 허용한다.
+  Projection·orientation은 full source allocation, graphics budget과 full-buffer
+  traffic을 줄이지 않으며 discrete 변경은 fresh producer generation/readiness를 다시
+  요구한다.
   HUD의 destination screen-equivalent footprint는 `LayerSizeProfile`의 base scale만
   합하고 MotionProfile scale, overlap, crop/clipping과 off-screen loss를 제외한다.
   단 `CAPACITY_TILES`는 explicit crop-union scope로 합계 1 screen-equivalent와 평균
@@ -518,8 +535,11 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 - report schema v2의 exact provenance, transition/event/sample 의미와 non-finite
   `null` 직렬화를 유지한다.
 - report 발행은 process 안에서 직렬화하고 temp write/fsync/rename 뒤 수행한다. 완료
-  `dpu-layer-lab-` prefix와 앱 파일명 형식이 확인된 `.json`만 최신 200개로 best-effort
+  `dpu-layer-lab-` prefix와 앱 파일명 형식이 확인된 `.json`만 최신 400개로 best-effort
   보존하되 방금 발행한 파일과 `.part`/unrelated `.json`은 삭제하지 않는다.
+  마지막 report의 performance-restore 결과 교체는 replacement publish → obsolete
+  managed report 삭제 확인 → 400개 prune 순서의 같은 transaction이다. Obsolete 삭제가
+  확인되지 않으면 다른 plan report를 잃지 않도록 그 transaction의 prune을 건너뛴다.
   Plan-wide Battery Saver restore가 실패하면 앞서 완료된 plan item도 `ABORTED`로
   무효화하고 report path를 철회하며 managed completed JSON만 best-effort 삭제한다.
 

@@ -25,9 +25,14 @@ dpu-layer-lab-yyyyMMdd-HHmmss-SSS-<safeScenarioId>[-<collision>].json
 - `.json.part` write/flush/fsync 뒤 rename
 - scenario ID는 `[A-Za-z0-9._-]`, 최대 80자
 - collision suffix는 1~999
-- newest 200 managed completed report 보존
+- newest 400 managed completed report 보존(40-entry UI queue × 10 whole-queue loops)
 - FileProvider 공유는 canonical internal completed file이면서 현재 controller의
   `lastReportFile` 또는 plan result history에 publish된 경로만 허용
+
+Plan-wide performance restore를 포함하도록 마지막 report를 교체할 때는 replacement를
+원자 publish한 뒤 obsolete managed report 삭제를 확인하고, 그 다음 400개 retention을
+적용한다. Obsolete 삭제가 확인되지 않으면 같은 transaction의 prune을 건너뛰어 다른
+plan report를 먼저 잃지 않는다.
 
 ## 공통 type 규칙
 
@@ -125,13 +130,15 @@ Key:
 | Field | Type | 의미 |
 |---|---|---|
 | `id` | string | phase ID |
-| `durationMs` | integer | effective duration |
+| `durationMs` | integer | plan 시간 배율 materialization과 safety cap 뒤 effective duration |
 | `layers` | integer | active logical layer |
 | `producerFps` | number/null | requested producer pacing |
 | `requestedDisplayHz` | number/null | requested display pacing |
 | `backend` | enum string | `LayerBackend` |
 | `pixelRoute` | enum string | `PixelRoute` |
 | `bufferSize` | enum string | `BufferSize` |
+| `bufferPresentation` | enum string | `FIT` 또는 centered `PIXEL_1_TO_1_CROP` |
+| `layerOrientation` | enum string | 고정 0°/90° orientation |
 | `motion` | enum string | `MotionProfile` |
 | `layerSizeProfile` | enum string | `LayerSizeProfile` |
 | `motionSemantics` | enum string | typed motion semantics |
@@ -153,6 +160,9 @@ Key:
 - `durationMs`, `cycleMs`, `stepCount`
 - `dutyCycle`, `floor`
 
+`transition.durationMs`와 `cycleMs`도 plan 시간 배율 materialization과 safety proportional
+adjustment 뒤의 effective 값이다.
+
 ## `events[]`
 
 | Field | Type | 의미 |
@@ -160,6 +170,11 @@ Key:
 | `tMs` | integer | run-relative event timestamp |
 | `type` | string | stable event type |
 | `message` | string | bounded human-readable detail |
+
+`PLAN_POSITION` message에는 `run`, `repeat`, `queue`, 요청 `durationMultiplier`가 함께
+기록된다. 이는 사람이 감사할 수 있는 bounded hint이고 별도 typed JSON field가 아니다.
+Machine consumer는 실제 실행 시간을 `phases[].durationMs`와 sample/event timestamp에서
+읽어야 하며 message parsing에 계약을 걸면 안 된다.
 
 Consumer는 모르는 event type을 무시할 수 있어야 하며 known event의 의미를 문자열
 pattern만으로 추론하지 않는다.
@@ -288,6 +303,8 @@ source와 결합하면 안 된다.
 6. HWC D/C 한쪽만 있는 sample을 완전한 pair로 만들지 않는다.
 7. estimated layer traffic은 현재 schema sample의 measured bus와 합치지 않는다.
 8. fingerprint와 status string을 외부 공유 전에 privacy 검토한다.
+9. 이전 schema v2 report에 `bufferPresentation`/`layerOrientation`이 없으면 명시적인
+   FIT 또는 90° 증거로 추정하지 않고 projection/orientation을 `UNKNOWN`으로 취급한다.
 
 ## Schema migration
 

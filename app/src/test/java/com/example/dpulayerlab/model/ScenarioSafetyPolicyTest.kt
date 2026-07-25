@@ -1036,6 +1036,110 @@ class ScenarioSafetyPolicyTest {
     }
 
     @Test
+    fun eightKFitCropAndRotationKeepTheSameFullAllocationBudget() {
+        val requiredBytes =
+            BufferSize.UHD_8K.width.toLong() *
+                BufferSize.UHD_8K.height.toLong() *
+                4L *
+                3L
+        listOf(
+            BufferPresentation.FIT to LayerOrientation.ROTATION_0,
+            BufferPresentation.FIT to LayerOrientation.ROTATION_90,
+            BufferPresentation.PIXEL_1_TO_1_CROP to LayerOrientation.ROTATION_0,
+            BufferPresentation.PIXEL_1_TO_1_CROP to LayerOrientation.ROTATION_90,
+        ).forEach { (presentation, orientation) ->
+            val requested = phase(bufferSize = BufferSize.UHD_8K).copy(
+                bufferPresentation = presentation,
+                layerOrientation = orientation,
+                layerSizeProfile = LayerSizeProfile.FULL_SCREEN,
+                motion = MotionProfile.STATIC,
+            )
+            assertAccepted(
+                ScenarioSafetyPolicy.evaluate(
+                    scenario(phases = listOf(requested)),
+                    limits(maxGraphicsBytes = requiredBytes),
+                ),
+            )
+            assertRejected(
+                ScenarioSafetyPolicy.evaluate(
+                    scenario(phases = listOf(requested)),
+                    limits(maxGraphicsBytes = requiredBytes - 1L),
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun capacityTilesRejectPresentationOrOrientationOverrides() {
+        listOf(
+            phase().copy(
+                motion = MotionProfile.CAPACITY_TILES,
+                bufferPresentation = BufferPresentation.PIXEL_1_TO_1_CROP,
+            ),
+            phase().copy(
+                motion = MotionProfile.CAPACITY_TILES,
+                layerOrientation = LayerOrientation.ROTATION_90,
+            ),
+        ).forEach { invalid ->
+            val decision = ScenarioSafetyPolicy.evaluate(
+                scenario(phases = listOf(invalid)),
+                limits(maxGraphicsBytes = Long.MAX_VALUE),
+            )
+            assertRejected(decision)
+            assertTrue(decision.rejectionReason!!.contains("capacity tiles"))
+        }
+    }
+
+    @Test
+    fun pixelOneToOneRejectsAdditionalScalingButAllowsTranslationAndRotation() {
+        listOf(
+            phase().copy(
+                bufferPresentation = BufferPresentation.PIXEL_1_TO_1_CROP,
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
+            ),
+            phase().copy(
+                bufferPresentation = BufferPresentation.PIXEL_1_TO_1_CROP,
+                motion = MotionProfile.ZOOM_PAN,
+            ),
+            phase().copy(
+                bufferPresentation = BufferPresentation.PIXEL_1_TO_1_CROP,
+                motion = MotionProfile.TRANSFORM_STORM,
+            ),
+        ).forEach { invalid ->
+            val decision = ScenarioSafetyPolicy.evaluate(
+                scenario(phases = listOf(invalid)),
+                limits(maxGraphicsBytes = Long.MAX_VALUE),
+            )
+            assertRejected(decision)
+            assertTrue(decision.rejectionReason!!.contains("1:1 crop"))
+        }
+
+        listOf(
+            MotionProfile.STATIC,
+            MotionProfile.SCROLL,
+            MotionProfile.PARALLAX,
+            MotionProfile.ROTATE,
+        ).forEach { motion ->
+            assertAccepted(
+                ScenarioSafetyPolicy.evaluate(
+                    scenario(
+                        phases = listOf(
+                            phase().copy(
+                                bufferPresentation =
+                                    BufferPresentation.PIXEL_1_TO_1_CROP,
+                                layerOrientation = LayerOrientation.ROTATION_90,
+                                layerSizeProfile = LayerSizeProfile.FULL_SCREEN,
+                                motion = motion,
+                            ),
+                        ),
+                    ),
+                    limits(maxGraphicsBytes = Long.MAX_VALUE),
+                ),
+            )
+        }
+    }
+
+    @Test
     fun flattenedBackendUsesOneDisplaySizedProducerForAnyLogicalLayerCount() {
         val decision = ScenarioSafetyPolicy.evaluate(
             scenario(

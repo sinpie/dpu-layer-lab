@@ -18,8 +18,8 @@ service를 연결하면 DPU·DDR·HWC·SBWC·NPU와 같은 제품 전용 기능�
 있습니다.
 
 현재 launcher/Gradle project 표시 이름은 **DPULayerTest**입니다. 현재 release는
-[`v20260725_170750`](https://github.com/sinpie/dpu-layer-lab/releases/tag/v20260725_170750)
-(`versionCode 6`), debug version은 `20260725_170750-debug`입니다. Version name은 KST
+[`v20260725_232013`](https://github.com/sinpie/dpu-layer-lab/releases/tag/v20260725_232013)
+(`versionCode 7`), debug version은 `20260725_232013-debug`입니다. Version name은 KST
 build 시각을 `yyyyMMdd_HHmmss`로 고정한
 형식입니다. 앱 상단과 실행 HUD에 실제 build version을 노출해 결과를 만든 바이너리를
 현장에서 바로 식별할 수 있습니다.
@@ -68,6 +68,10 @@ Soong module/APK 통합 이름 `DpuLayerLab`은 이름을 바꾸지 않는 호�
 - `FULL_SCREEN`(기본), `SMALL_UNIFORM`, `MIXED_SIZES`,
   `GRADUAL_SMALL_TO_FULL`, `ABRUPT_SMALL_FULL` destination 크기 profile.
   Source buffer와 physical producer 수는 유지한 채 layer의 화면 footprint만 바꿉니다.
+- 실제 primary source buffer를 Display/1K(1024×576)/2K·1080p/4K/8K로 선택하고,
+  base projection을 종횡비 보존 `FIT` 또는 centered `1:1 crop`으로 구분합니다.
+  0°/90° 고정 orientation은 motion과 별도로 적용되며 projection·rotation은 full source
+  allocation, graphics budget이나 예상 full-buffer traffic을 줄이지 않습니다.
 - layer별 scroll, zoom, pan, 임의 회전, parallax, alpha overlap, View/client Z-order
   swap proxy(physical HWC Z-order 변경의 증거는 아님)
 - producer 30~120 fps 및 display 60/90/120 Hz 요청·실제 Hz 동시 기록
@@ -87,6 +91,8 @@ Soong module/APK 통합 이름 `DpuLayerLab`은 이름을 바꾸지 않는 호�
   focus 손실은 측정 오염으로 즉시 중단
 - 실행 중 좌측 상단 build version, layer/DPU/CPU/GPU 숫자·점유율·60-sample 그래프
   (`observed/—P`는 topology commit 대기, `observed/expected P`는 commit 완료).
+  같은 HUD에서 요청 시간 배율 `TIME n×`와 `BUFFER · 1K/2K/4K/8K · FIT/1:1 · 0°/90°`를
+  현재 phase 기준으로 확인할 수 있습니다.
   각 gauge는 source/quality를 함께 표시하고 provenance 변경이나 unavailable 구간에서는
   선을 연결하지 않습니다.
 - 실행 HUD의 destination screen-equivalent footprint. 일반 phase는
@@ -100,10 +106,11 @@ Soong module/APK 통합 이름 `DpuLayerLab`은 이름을 바꾸지 않는 호�
 - HWC DEVICE/CLIENT layer 파싱(`DUMP` 권한이 있을 때)
 - exact underrun counter와 frame-deadline proxy를 분리한 판정
 - thermal·low-memory·graphics-memory budget 기반 런타임 안전 정책
-- `테스트 선택 → 순서·반복 → 확인 후 실행`의 두 단계 시나리오 설정, 선택 단계 고정
+- `테스트 선택 → 순서·반복·시간 → 확인 후 실행`의 두 단계 시나리오 설정, 선택 단계 고정
   요약 dock, 접을 수 있는 세부 조건·scenario 상세, 세로 queue 편집
 - 카테고리·변화 파형·예상 강도·부하/조건을 조합하는 필터와 순서·중복이 보존되는
-  queue, plan 반복 및 실행/결과 진행률. 필터·단계·각 목록 위치는 탭 왕복/회전 후 보존
+  queue, 전체 queue loop 반복, 1×/2×/5×/10×/50×/100× phase 시간 배율 및
+  실행/결과 진행률. 필터·단계·각 목록 위치는 탭 왕복/회전 후 보존
 - 목적 중심 빠른 선택(`급격한 DPU 부하`, `DEVICE 후보 유지`, `CLIENT 전환 목표`)과
   small/mixed/full size A/B, 점진 확대, 급격 toggle, size+layer+FPS burst preset
 - phase/event/telemetry를 포함한 로컬 JSON 결과와 명시적 공유
@@ -211,6 +218,13 @@ Provider는 client Binder death, lease expiry 또는 명시적 `END`에서 **BEG
 불명확하면 다음 plan으로 넘어가지 않습니다. Broker가 없더라도 Battery Saver가 이미
 꺼져 있으면 app-only monitoring으로 실행할 수 있지만, 켜져 있거나 remote mutation
 가능성이 남은 모호한 응답이면 producer를 시작하지 않습니다.
+이때 오류 snackbar의 `설정 열기`를 누르면 필요한 실행 정리·원상복구·Window 복구가
+끝난 직후 Android 배터리 절약 설정으로 이동합니다. 시작 전 거부처럼 정리가 이미 끝난
+경우에는 즉시 이동하고, 전용 화면을 처리할 수 없는 기기에서는 일반 Android 설정으로
+fallback합니다.
+Background 전환 중에는 요청을 보존하고, 정리 대기 timeout이나 설정 Activity 실행 실패
+때는 `설정 열기`를 다시 제공합니다. 앱이 설정을 대신 변경하지는 않으며, 사용자가 끈 뒤
+새 plan에서 상태를 다시 검증합니다.
 Timeout 뒤 같은 session에 더 높은 version의 `END`만 재시도된 경우에는 이미 실행
 중이던 이전 `END`의 exact acknowledgment도 복구 증거로 사용할 수 있습니다. 단,
 process restore latch가 비었고 renewal Job이 실제 종료됐으며, 직접 읽은
@@ -459,6 +473,8 @@ Plan-wide Battery Saver `END`는 scenario의 terminal counter/producer teardown 
 판정을 성공으로 덮지 않습니다. Plan-wide 복원이 확인되지 않으면 이미 완료된 앞
 scenario도 안전한 plan 종료를 증명할 수 없으므로 결과를 `ABORTED`로 바꾸고 기존
 report 경로를 철회하며, managed JSON은 best-effort로 삭제합니다.
+마지막 report 교체는 새 파일 publish → 이전 managed 파일 삭제 확인 → 400개 retention
+순서로 직렬화해 최대 400-run plan의 첫 report가 교체 중 먼저 잘리지 않게 합니다.
 Renewal/health/service-session integrity가 한 번 깨진 경우에는 나중에 exact
 Battery Saver 복원만 성공해도 같은 process의 새 plan을 허용하지 않습니다. Restore
 결과 JSON 재발행이 실패한 경우도 메모리의 summary를 `ABORTED`로 고정해 finalizer가
@@ -473,18 +489,18 @@ Battery Saver exact restore 순서를 조합해 확인합니다. Host 검증은 
 
 ## 시나리오
 
-현재 source candidate catalog에는 다음 **32개 preset**이 있습니다. Custom은 catalog
+현재 source candidate catalog에는 다음 **36개 preset**이 있습니다. Custom은 catalog
 preset 수에 포함하지 않습니다.
 
 | 카테고리 | 대표 테스트 |
 |---|---|
 | Layer / HWC | HWC Plane Staircase, backend만 바꾸는 HWC ↔ GPU Composition Pivot, 4L DEVICE Candidate Burst, 20L CLIENT Fallback Candidate |
 | Layer size | Small-layer Density, Small/Mixed/Full Matrix, Gradual Expansion, Abrupt Toggle, Size+Layer+FPS Burst, Sized DEVICE/CLIENT |
-| Transform | 12-layer Transform Storm |
-| Video / Format | 4K YUV + RGB Overlay, 8K30 YUV / 8K60 P010 Decoder Pressure, Linear ↔ SBWC |
+| Transform | 12-layer Transform Storm, 2K/4K/8K 90° FIT Matrix, 8K FIT ↔ 1:1 Crop A/B/A |
+| Video / Format | Resolution-only 1K ↔ 8K, 4K YUV + RGB Overlay, 8K30 YUV / 8K60 P010 Decoder Pressure, Linear ↔ SBWC |
 | Refresh | 60 → 90 → 120 Hz baseline, mixed producer pacing |
 | Resource | Fixed-topology Resource Pulse, NPU Cross-load |
-| Load Transition | DPU-only Repeated Step Shock, Instant Isolated Contention, Instant Step & Burst, Topology + Load Combined Ramp, Continuous Fixed-topology Cross-load Ramp, Triangle Wave & Soak Recovery |
+| Load Transition | DPU-only Repeated Step Shock, Instant Isolated Contention, Instant Step & Burst, Topology + Load Combined Ramp, Continuous Fixed-topology Cross-load Ramp, 1K → 8K → 1K Load Sweep, Triangle Wave & Soak Recovery |
 | Mixed | 사용자 custom 단일 phase |
 | DVFS / Adaptive | Low-clock Single-layer Wake, Idle → Composition/4K Shock, Paired Mid-load Perturbation Matrix, Multidimensional Adaptive Underrun Hunt |
 | Soak | mixed load/thermal regression cycle |
@@ -533,6 +549,15 @@ zero-load settle을 기다리지 않습니다. 이때 one-shot은 terminal `UNAV
 8K60 preset은 decoder primary 한 장, RGB overlay 6장과 GL tail 한 장으로 총 8개의
 physical layer를 구성합니다. 8K30 preset과 분리되어 있으므로 8K30-only 장치가 8K60
 capability 때문에 불필요하게 거부되지 않습니다.
+
+해상도와 투영을 검증하는 네 preset은 서로 다른 질문을 분리합니다.
+`Resolution-only 1K / 2K / 4K / 8K A/B`는 1L/30fps/60Hz/FIT/0°/정적/zero-load를
+고정해 source 해상도만 왕복하고, `1K → 8K → 1K Load Sweep`은 해상도와 교차 부하를
+함께 올렸다가 낮춥니다. `90° Fit 2K / 4K / 8K Matrix`는 2K/4K/8K를 모두 고정 90°로
+회전해 FIT하며 8K 정적·parallax·bounded zoom을 포함합니다.
+`8K FIT ↔ 1:1 Crop A/B/A`는 같은 8K allocation에서 projection만 바꿔 전체 보기와
+centered 원본 픽셀 crop을 비교합니다. `1:1 crop`에는 `FULL_SCREEN`과 non-scaling
+motion만 허용되고 `CAPACITY_TILES`는 FIT/0°만 허용됩니다.
 
 원인을 분리해 비교할 때는 topology/FPS/Hz/motion/alpha를 고정한
 `Fixed-topology Resource Pulse`와 `Instant Isolated Contention`을 사용합니다. 전자는
@@ -593,8 +618,14 @@ DVFS preset의 settle 구간은 작은 layer/FPS/Hz 부하를 유지해 governor
    필터 결과를 기존 queue 뒤에 **결과 추가**하거나 **결과로 교체**할 수 있고, 개별
    항목은 중복 추가·`←`/`→` 이동·`×` 제거가 가능합니다. 저장 상태에 더 이상 catalog에
    없는 ID가 있으면 복원 시 제거합니다.
-5. 전체 queue 반복 횟수를 1~10회에서 선택합니다. queue × repeat로 확장한 총 run은
-   40회를 넘을 수 없으며 UI가 허용 가능한 반복 상한을 함께 제한합니다.
+5. 전체 queue 반복 횟수를 1~10회에서 선택합니다. `N`회는 전체 queue를 처음부터 끝까지
+   `N`번 실행하며, `N > 1`이면 회차 경계에서 마지막 scenario 다음에 첫 scenario로
+   돌아갑니다. 1회는 전체 queue를 한 번 실행합니다. 앱 UI queue는 최대 40개,
+   확장 run은 `40 × 10 = 400`회까지이며, 외부 Intent automation은 기존 40-run 상한을
+   유지합니다. 같은 실행 직전 화면에서 1×/2×/5×/10×/50×/100× 시간 배율도 고릅니다.
+   배율은 각 phase duration과 transition window/cycle에 정확히 한 번 함께 적용됩니다.
+   이후 기존 phase 10분/scenario 30분 안전 상한이 명시적으로 조정하거나 거부할 수
+   있으며, 예상 시간에는 preflight·warm-up·cooldown·report I/O가 포함되지 않습니다.
    같은 화면의 **실행 보호 정책**에서 선택형 SEVERE 앱 감속 상태를 확인합니다.
    기본 OFF는 SEVERE에서 요청 부하를 유지한다는 뜻이며, CRITICAL/low-memory 등의
    필수 중단을 끄는 설정은 아닙니다.
@@ -648,7 +679,7 @@ Cold start START는 Activity decor attach와 첫 root Insets acknowledgment까�
 startup queue에서 기다린 뒤 fullscreen isolation을 시작합니다. STOP은 이 readiness를
 기다리지 않고 미실행 START를 폐기해 즉시 안전 중단 경로로 들어갑니다.
 
-순서 보존 plan, repeat/40-run cap, SHOW/STOP ordering, release permission과 오류 의미는
+외부 순서 보존 plan, repeat/40-run cap, SHOW/STOP ordering, release permission과 오류 의미는
 [Intent automation guide](docs/AUTOMATION.md), 변하지 않는 이름·타입은
 [External compatibility contracts](docs/EXTERNAL_CONTRACTS.md)를 참고하세요.
 
@@ -801,7 +832,7 @@ descriptor의 B/px가 유한한 양수가 아니거나 16 B/px를 넘으면 무�
 4 B/px로 계산합니다. YUV/P010/SBWC decoder phase는 선택 media가 없으면 실행되지
 않으므로 RGBA proxy traffic을 표시하지 않습니다. mixed backend의 TextureView 여러 장은
 한 개의 display-sized RGBA client target read로, flattened backend는 논리 layer 수와
-별개로 한 개의 RGBA producer로 계산합니다. explicit 4K/8K 크기는 현재 renderer와
+별개로 한 개의 RGBA producer로 계산합니다. explicit 1K/2K/4K/8K 크기는 현재 renderer와
 같이 primary producer에 적용합니다. HUD/control layer와 시스템 UI traffic은 제외합니다.
 
 이 값은 capacity 또는 실제 bus counter가 아닙니다. 다음 항목은 포함하지 않습니다.
@@ -935,14 +966,14 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 - debug: `app/build/outputs/apk/debug/app-debug.apk`
 - release: `app/build/outputs/apk/release/app-release-unsigned.apk`
 
-### `20260725_170750` 릴리스 산출물의 의미
+### `20260725_232013` 릴리스 산출물의 의미
 
-- release tag는 `v20260725_170750`입니다.
-- `DPULayerTest-20260725_170750-debug.apk`는 Android debug key로 서명되어 바로 설치 가능한
+- release tag는 `v20260725_232013`입니다.
+- `DPULayerTest-20260725_232013-debug.apk`는 Android debug key로 서명되어 바로 설치 가능한
   **전용 lab/개발용** APK입니다. Explicit automation alias에는 debug manifest에서
   `CONTROL_TESTS` permission이 제거되어 있으므로 ADB 사용이 쉽지만, 신뢰 경계가 열린
   이 동작을 제품 release 보안으로 간주하거나 일반 사용자 단말에 배포하면 안 됩니다.
-- `DPULayerTest-20260725_170750-release-unsigned.apk`는 제품 빌드/서명 파이프라인
+- `DPULayerTest-20260725_232013-release-unsigned.apk`는 제품 빌드/서명 파이프라인
   입력을 위한 **서명되지 않은 통합 산출물**입니다. 그대로 설치 가능한 최종 제품
   APK가 아닙니다.
 - 실제 제품 APK는 secure product build 환경에서 platform/product key로 서명하고
@@ -1009,7 +1040,7 @@ private platform/vendor key 자체를 저장소나 Release에 넣어서는 안 �
   rule에서 internal/external files, database, shared preferences, device-protected
   storage를 포함한 앱 데이터 전체를 명시적으로 제외합니다. 다른 제품으로 복원된
   stale `probe_paths.conf`가 exact counter provenance를 오염시키지 않습니다.
-- 앱이 `dpu-layer-lab-` prefix로 발행한 완료 `.json` 보고서는 최근 200개를
+- 앱이 `dpu-layer-lab-` prefix로 발행한 완료 `.json` 보고서는 최근 400개를
   보존합니다. 새 보고서를 fsync/rename으로 발행한 뒤 best-effort로 오래된 앱 보고서만
   정리하므로, retention 실패가 방금 생성한 보고서를 실패로 바꾸지 않습니다. 발행
   중이거나 crash 흔적인 `.part` 파일과 `reports/` 안의 unrelated `.json`은 자동 정리

@@ -39,6 +39,10 @@ stateDiagram-v2
 - `runJob`이 존재하는 동안 새 START를 허용하지 않는다. `isRunning`만으로 판단하지 않는다.
 - finalizer는 identity가 같은 자기 owner만 `runJob`에서 제거한다.
 - queue 순서와 중복은 immutable plan snapshot에 보존한다.
+- runner는 queue index를 끝까지 증가시킨 뒤에만 repeat index를 올리고 queue index 0으로
+  돌아간다. 따라서 repeat는 개별 scenario 반복이 아니라 전체 queue nested loop다.
+- duration multiplier는 runner 진입 전에 immutable phase/transition copy에 한 번
+  materialize되며 active loop 안에서 다시 곱하지 않는다.
 
 ## Process-session HWC capacity
 

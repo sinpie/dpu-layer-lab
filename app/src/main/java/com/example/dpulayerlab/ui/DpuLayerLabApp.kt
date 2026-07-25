@@ -61,6 +61,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -103,14 +104,17 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.example.dpulayerlab.BuildConfig
 import com.example.dpulayerlab.engine.LabController
+import com.example.dpulayerlab.engine.ErrorRecoveryAction
 import com.example.dpulayerlab.engine.ScenarioCatalog
 import com.example.dpulayerlab.engine.GaugePeak
 import com.example.dpulayerlab.engine.consistentGaugePeak
 import com.example.dpulayerlab.model.BufferSize
+import com.example.dpulayerlab.model.BufferPresentation
 import com.example.dpulayerlab.model.DecoderLinearReference
 import com.example.dpulayerlab.model.Gauge
 import com.example.dpulayerlab.model.HwcCompositionExpectation
 import com.example.dpulayerlab.model.LayerBackend
+import com.example.dpulayerlab.model.LayerOrientation
 import com.example.dpulayerlab.model.LayerSizeProfile
 import com.example.dpulayerlab.model.LayerTrafficEstimate
 import com.example.dpulayerlab.model.LayerTrafficEstimator
@@ -258,7 +262,10 @@ internal enum class RawHwcExpectationState(val label: String) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DpuLayerLabApp(controller: LabController) {
+fun DpuLayerLabApp(
+    controller: LabController,
+    onOpenBatterySaverSettings: () -> Unit,
+) {
     var lastUserSectionKey by rememberSaveable {
         mutableStateOf(AppSection.DASHBOARD.name)
     }
@@ -293,6 +300,7 @@ fun DpuLayerLabApp(controller: LabController) {
         mutableStateOf<List<String>>(arrayListOf())
     }
     var planRepeatCount by rememberSaveable { mutableIntStateOf(1) }
+    var planDurationMultiplier by rememberSaveable { mutableIntStateOf(1) }
     val knownScenarioIds = remember {
         ScenarioCatalog.presets.mapTo(LinkedHashSet()) { it.id }
     }
@@ -305,8 +313,13 @@ fun DpuLayerLabApp(controller: LabController) {
             requested = planRepeatCount,
         )
     }
+    val validatedDurationMultiplier = remember(planDurationMultiplier) {
+        planDurationMultiplier.takeIf {
+            it in ScenarioPlanPolicy.DURATION_MULTIPLIERS
+        } ?: 1
+    }
     val snackbar = remember { SnackbarHostState() }
-    val error = controller.errorMessage
+    val errorNotice = controller.errorNotice
     val mediaPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let(controller::setMediaUri)
     }
@@ -318,10 +331,23 @@ fun DpuLayerLabApp(controller: LabController) {
             planState = planProgress.state,
         )
     }
-    LaunchedEffect(error) {
-        if (error != null) {
-            snackbar.showSnackbar(error)
-            controller.clearError()
+    LaunchedEffect(errorNotice?.id) {
+        if (errorNotice != null) {
+            val recoveryAction = errorNotice.recoveryAction
+            val result = snackbar.showSnackbar(
+                message = errorNotice.message,
+                actionLabel = when (recoveryAction) {
+                    ErrorRecoveryAction.OPEN_BATTERY_SAVER_SETTINGS -> "설정 열기"
+                    null -> null
+                },
+            )
+            if (
+                result == SnackbarResult.ActionPerformed &&
+                recoveryAction == ErrorRecoveryAction.OPEN_BATTERY_SAVER_SETTINGS
+            ) {
+                onOpenBatterySaverSettings()
+            }
+            controller.clearError(errorNotice.id)
         }
     }
     LaunchedEffect(
@@ -329,12 +355,17 @@ fun DpuLayerLabApp(controller: LabController) {
         selectedScenarioIds,
         validatedRepeatCount,
         planRepeatCount,
+        validatedDurationMultiplier,
+        planDurationMultiplier,
     ) {
         if (validatedScenarioIds != selectedScenarioIds) {
             selectedScenarioIds = validatedScenarioIds
         }
         if (planRepeatCount != validatedRepeatCount) {
             planRepeatCount = validatedRepeatCount
+        }
+        if (planDurationMultiplier != validatedDurationMultiplier) {
+            planDurationMultiplier = validatedDurationMultiplier
         }
     }
 
@@ -427,6 +458,7 @@ fun DpuLayerLabApp(controller: LabController) {
                     selectMedia = { mediaPicker.launch(arrayOf("video/*")) },
                     selectedScenarioIds = validatedScenarioIds,
                     repeatCount = validatedRepeatCount,
+                    durationMultiplier = validatedDurationMultiplier,
                 addScenario = { scenarioId ->
                     val currentQueue =
                         ScenarioQueueEditor.retainKnown(selectedScenarioIds, knownScenarioIds)
@@ -515,6 +547,7 @@ fun DpuLayerLabApp(controller: LabController) {
                 clearSelection = {
                     selectedScenarioIds = arrayListOf()
                     planRepeatCount = 1
+                    planDurationMultiplier = 1
                 },
                 resetOrder = {
                     val currentQueue =
@@ -536,15 +569,22 @@ fun DpuLayerLabApp(controller: LabController) {
                         maximumPlanRepeats(currentQueue.size),
                     )
                     },
+                    selectDurationMultiplier = { requested ->
+                        if (requested in ScenarioPlanPolicy.DURATION_MULTIPLIERS) {
+                            planDurationMultiplier = requested
+                        }
+                    },
                     runSelection = {
                         val freshPlan = catalogRunPlanSnapshot(
                             rawQueueIds = selectedScenarioIds,
                             knownScenarioIds = knownScenarioIds,
                             requestedRepeat = planRepeatCount,
+                            requestedDurationMultiplier = planDurationMultiplier,
                         )
                         selectedScenarioIds =
                             freshPlan?.scenarios?.map(ScenarioSpec::id).orEmpty()
                         planRepeatCount = freshPlan?.repeatCount ?: 1
+                        planDurationMultiplier = freshPlan?.durationMultiplier ?: 1
                         val freshMediaReady = freshPlan == null ||
                             !scenariosRequireSelectedMedia(freshPlan.scenarios) ||
                             controller.selectedMediaUri != null
@@ -886,6 +926,7 @@ private fun CatalogScreen(
     selectMedia: () -> Unit,
     selectedScenarioIds: List<String>,
     repeatCount: Int,
+    durationMultiplier: Int,
     addScenario: (String) -> Unit,
     removeScenario: (String) -> Unit,
     removeQueueAt: (List<String>, Int) -> Unit,
@@ -896,6 +937,7 @@ private fun CatalogScreen(
     clearSelection: () -> Unit,
     resetOrder: () -> Unit,
     adjustRepeatCount: (Int) -> Unit,
+    selectDurationMultiplier: (Int) -> Unit,
     runSelection: () -> Unit,
 ) {
     var setupStepKey by rememberSaveable {
@@ -1182,9 +1224,11 @@ private fun CatalogScreen(
                     QueuePlanCard(
                         selectedScenarios = selectedScenarios,
                         repeatCount = repeatCount,
+                        durationMultiplier = durationMultiplier,
                         maximumRepeatCount = maximumPlanRepeats(selectedScenarios.size),
                         running = controller.isRunning,
                         adjustRepeatCount = adjustRepeatCount,
+                        selectDurationMultiplier = selectDurationMultiplier,
                         selectAll = selectAll,
                         clearSelection = clearSelection,
                         resetOrder = resetOrder,
@@ -1206,6 +1250,7 @@ private fun CatalogScreen(
                     PlanLaunchCard(
                         selectedScenarios = selectedScenarios,
                         repeatCount = repeatCount,
+                        durationMultiplier = durationMultiplier,
                         running = controller.isRunning,
                         mediaRequired = selectedNeedsMedia,
                         mediaSelected = controller.selectedMediaUri != null,
@@ -1218,6 +1263,7 @@ private fun CatalogScreen(
             SelectionPlanDock(
                 selectedScenarios = selectedScenarios,
                 repeatCount = repeatCount,
+                durationMultiplier = durationMultiplier,
                 openPlan = { setupStepKey = CatalogSetupStep.PLAN.name },
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -1619,13 +1665,15 @@ private fun CatalogBulkSelectionCard(
 private fun SelectionPlanDock(
     selectedScenarios: List<ScenarioSpec>,
     repeatCount: Int,
+    durationMultiplier: Int,
     openPlan: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val plan = remember(selectedScenarios, repeatCount) {
+    val plan = remember(selectedScenarios, repeatCount, durationMultiplier) {
         ScenarioRunPlan(
             scenarios = selectedScenarios,
             repeatCount = repeatCount,
+            durationMultiplier = durationMultiplier,
             source = PlanSource.USER_SELECTION,
         )
     }
@@ -1658,7 +1706,8 @@ private fun SelectionPlanDock(
                     if (selectedScenarios.isEmpty()) {
                         "목적 전체 선택 또는 개별 추가가 가능합니다."
                     } else {
-                        "현재 ${repeatCount}회 반복 · 약 ${formatDuration(plan.estimatedDurationMs)}" +
+                        "전체 LOOP ${repeatCount}회 · 시간 ${durationMultiplier}× · " +
+                            "요청 예상 ${formatDuration(plan.estimatedDurationMs)}" +
                             if (mediaRequired) " · 영상 필요" else ""
                     },
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1669,7 +1718,7 @@ private fun SelectionPlanDock(
                 onClick = openPlan,
                 enabled = selectedScenarios.isNotEmpty(),
             ) {
-                Text("순서·반복")
+                Text("순서·반복·시간")
             }
         }
     }
@@ -1714,9 +1763,11 @@ private fun FacetFilterRow(
 private fun QueuePlanCard(
     selectedScenarios: List<ScenarioSpec>,
     repeatCount: Int,
+    durationMultiplier: Int,
     maximumRepeatCount: Int,
     running: Boolean,
     adjustRepeatCount: (Int) -> Unit,
+    selectDurationMultiplier: (Int) -> Unit,
     selectAll: () -> Unit,
     clearSelection: () -> Unit,
     resetOrder: () -> Unit,
@@ -1729,17 +1780,19 @@ private fun QueuePlanCard(
     val expandedQueueMaxHeight = (
         LocalConfiguration.current.screenHeightDp * 0.55f
         ).roundToInt().coerceIn(220, 420).dp
-    val oneLoopDurationMs = remember(selectedScenarios) {
+    val oneLoopDurationMs = remember(selectedScenarios, durationMultiplier) {
         ScenarioRunPlan(
             scenarios = selectedScenarios,
             repeatCount = 1,
+            durationMultiplier = durationMultiplier,
             source = PlanSource.USER_SELECTION,
         ).estimatedDurationMs
     }
-    val previewPlan = remember(selectedScenarios, repeatCount) {
+    val previewPlan = remember(selectedScenarios, repeatCount, durationMultiplier) {
         ScenarioRunPlan(
             scenarios = selectedScenarios,
             repeatCount = repeatCount,
+            durationMultiplier = durationMultiplier,
             source = PlanSource.USER_SELECTION,
         )
     }
@@ -1824,7 +1877,7 @@ private fun QueuePlanCard(
                     modifier = Modifier.weight(1f),
                 )
                 ScenarioAttribute(
-                    label = "총 예상",
+                    label = "요청 예상",
                     value = formatDuration(totalDurationMs),
                     modifier = Modifier.weight(1f),
                 )
@@ -1941,12 +1994,34 @@ private fun QueuePlanCard(
             }
             Text(
                 "반복 최대 ${ScenarioPlanPolicy.MAX_REPEAT_COUNT}회 · 전체 실행 최대 " +
-                    "${ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS}회 · 현재 ${totalRuns}회",
+                    "${ScenarioPlanPolicy.MAX_USER_TOTAL_PLAN_RUNS}회 · 현재 ${totalRuns}회",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.labelMedium,
             )
             Text(
-                "예상 시간은 scenario phase 합계이며 precheck·warm-up·cooldown·report I/O는 제외합니다.",
+                "한 LOOP는 위 queue 전체를 끝까지 실행한 뒤 첫 항목으로 돌아갑니다.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelSmall,
+            )
+            Text("테스트 시간 배율", style = MaterialTheme.typography.titleMedium)
+            Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(7.dp),
+            ) {
+                ScenarioPlanPolicy.DURATION_MULTIPLIERS.forEach { multiplier ->
+                    FilterChip(
+                        selected = durationMultiplier == multiplier,
+                        onClick = { selectDurationMultiplier(multiplier) },
+                        enabled = !running,
+                        label = { Text("${multiplier}×") },
+                    )
+                }
+            }
+            Text(
+                "배율은 모든 phase와 transition window/cycle에 동일 적용됩니다. 기기 안전 " +
+                    "상한을 넘는 시간은 시작 전 policy가 명시적으로 조정합니다. 위 값은 " +
+                    "policy 적용 전 요청 예상이며 " +
+                    "precheck·warm-up·cooldown·report I/O가 제외됩니다.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.labelSmall,
             )
@@ -2154,22 +2229,24 @@ private fun MediaSourceCard(uri: android.net.Uri?, selectMedia: () -> Unit, clea
 private fun PlanLaunchCard(
     selectedScenarios: List<ScenarioSpec>,
     repeatCount: Int,
+    durationMultiplier: Int,
     running: Boolean,
     mediaRequired: Boolean,
     mediaSelected: Boolean,
     runSelection: () -> Unit,
 ) {
-    val plan = remember(selectedScenarios, repeatCount) {
+    val plan = remember(selectedScenarios, repeatCount, durationMultiplier) {
         ScenarioRunPlan(
             scenarios = selectedScenarios,
             repeatCount = repeatCount,
+            durationMultiplier = durationMultiplier,
             source = PlanSource.USER_SELECTION,
         )
     }
     val mediaReady = !mediaRequired || mediaSelected
     val runnable =
         selectedScenarios.isNotEmpty() &&
-            plan.totalRuns in 1..ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS &&
+            plan.totalRuns in 1..ScenarioPlanPolicy.MAX_USER_TOTAL_PLAN_RUNS &&
             mediaReady &&
             !running
     Card(
@@ -2185,7 +2262,8 @@ private fun PlanLaunchCard(
             Text("3. 확인 후 실행", style = MaterialTheme.typography.titleLarge)
             Text(
                 "${selectedScenarios.size}개 테스트 × ${repeatCount}회 반복 = " +
-                    "총 ${plan.totalRuns}회 · 약 ${formatDuration(plan.estimatedDurationMs)}",
+                    "총 ${plan.totalRuns}회 · 시간 ${durationMultiplier}× · " +
+                    "요청 예상 ${formatDuration(plan.estimatedDurationMs)}",
                 color = MaterialTheme.colorScheme.onPrimaryContainer,
             )
             if (!mediaReady) {
@@ -2617,6 +2695,12 @@ private fun BuilderScreen(controller: LabController, modifier: Modifier) {
     var backend by rememberSaveable { mutableStateOf(LayerBackend.MIXED_SURFACE_TEXTURE) }
     var route by rememberSaveable { mutableStateOf(PixelRoute.RGB_8888) }
     var size by rememberSaveable { mutableStateOf(BufferSize.DISPLAY) }
+    var bufferPresentation by rememberSaveable {
+        mutableStateOf(BufferPresentation.FIT)
+    }
+    var layerOrientation by rememberSaveable {
+        mutableStateOf(LayerOrientation.ROTATION_0)
+    }
     var layerSizeProfile by rememberSaveable {
         mutableStateOf(LayerSizeProfile.FULL_SCREEN)
     }
@@ -2656,9 +2740,45 @@ private fun BuilderScreen(controller: LabController, modifier: Modifier) {
                 EnumSelector("Pixel route", route, PixelRoute.entries) { route = it }
                 EnumSelector("Buffer size", size, BufferSize.entries) { size = it }
                 EnumSelector(
+                    "Buffer 표시",
+                    bufferPresentation,
+                    BufferPresentation.entries,
+                ) {
+                    bufferPresentation = it
+                    if (it == BufferPresentation.PIXEL_1_TO_1_CROP) {
+                        layerSizeProfile = LayerSizeProfile.FULL_SCREEN
+                        if (
+                            motion == MotionProfile.ZOOM_PAN ||
+                            motion == MotionProfile.TRANSFORM_STORM
+                        ) {
+                            motion = MotionProfile.STATIC
+                        }
+                    }
+                }
+                EnumSelector(
+                    "고정 방향",
+                    layerOrientation,
+                    LayerOrientation.entries,
+                ) { layerOrientation = it }
+                Text(
+                    when (bufferPresentation) {
+                        BufferPresentation.FIT ->
+                            "motion 적용 전 원본 종횡비를 보존해 전체 buffer를 화면 안에 맞춥니다."
+                        BufferPresentation.PIXEL_1_TO_1_CROP ->
+                            "source pixel과 display pixel을 1:1로 두고 화면 밖 영역을 중앙 " +
+                                "크롭합니다. 실제 buffer allocation은 바뀌지 않습니다."
+                    },
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelMedium,
+                )
+                EnumSelector(
                     "Layer 표시 크기",
                     layerSizeProfile,
-                    LayerSizeProfile.entries,
+                    if (bufferPresentation == BufferPresentation.PIXEL_1_TO_1_CROP) {
+                        listOf(LayerSizeProfile.FULL_SCREEN)
+                    } else {
+                        LayerSizeProfile.entries
+                    },
                 ) { layerSizeProfile = it }
                 Text(
                     when {
@@ -2680,7 +2800,15 @@ private fun BuilderScreen(controller: LabController, modifier: Modifier) {
                     "Motion",
                     motion,
                     MotionProfile.entries.filterNot {
-                        it == MotionProfile.CAPACITY_TILES
+                        it == MotionProfile.CAPACITY_TILES ||
+                            (
+                                bufferPresentation ==
+                                    BufferPresentation.PIXEL_1_TO_1_CROP &&
+                                    (
+                                        it == MotionProfile.ZOOM_PAN ||
+                                            it == MotionProfile.TRANSFORM_STORM
+                                        )
+                                )
                     },
                 ) { motion = it }
                 if (motion == MotionProfile.Z_ORDER_SWAP) {
@@ -2820,6 +2948,8 @@ private fun BuilderScreen(controller: LabController, modifier: Modifier) {
                 backend = backend,
                 pixelRoute = route,
                 bufferSize = size,
+                bufferPresentation = bufferPresentation,
+                layerOrientation = layerOrientation,
                 motion = motion,
                 layerSizeProfile = layerSizeProfile,
                 loads = LoadSetpoints(cpu, memory, gpu, npu, shape),
@@ -2908,6 +3038,8 @@ private fun enumLabel(value: Any?): String = when (value) {
     is LayerBackend -> value.label
     is PixelRoute -> value.label
     is BufferSize -> value.label
+    is BufferPresentation -> value.label
+    is LayerOrientation -> value.label
     is LayerSizeProfile -> layerSizeProfileUiLabel(value)
     is MotionProfile -> value.label
     is LoadShape -> value.label
@@ -3287,7 +3419,9 @@ private fun RunningHud(
                         Text(
                             "QUEUE ${planProgress.currentQueuePosition}/" +
                                 "${planProgress.queueSize} · LOOP ${planProgress.currentRepeat}/" +
-                                "${planProgress.repeatCount} · ${progress.stage.displayLabel()}",
+                                "${planProgress.repeatCount} · TIME " +
+                                "${planProgress.durationMultiplier}× · " +
+                                progress.stage.displayLabel(),
                             color = Color(0xFFB8CBC5),
                             style = MaterialTheme.typography.labelMedium,
                             maxLines = 1,
@@ -3300,6 +3434,17 @@ private fun RunningHud(
                                         layerSizeProfileUiLabel(it, compact = true)
                                     } ?: "준비 중"
                                     ),
+                            color = Color(0xFF8FA9A1),
+                            fontSize = 8.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            phase?.let {
+                                "BUFFER · ${it.bufferSize.label} · " +
+                                    "${it.bufferPresentation.label} · " +
+                                    it.layerOrientation.label
+                            } ?: "BUFFER · 준비 중",
                             color = Color(0xFF8FA9A1),
                             fontSize = 8.sp,
                             maxLines = 1,
@@ -4965,6 +5110,7 @@ internal fun catalogRunPlanSnapshot(
     rawQueueIds: List<String>,
     knownScenarioIds: Set<String>,
     requestedRepeat: Int,
+    requestedDurationMultiplier: Int = 1,
 ): ScenarioRunPlan? {
     val retainedIds = ScenarioQueueEditor.retainKnown(rawQueueIds, knownScenarioIds)
     val scenarios = retainedIds.mapNotNull(ScenarioCatalog::byId)
@@ -4972,6 +5118,9 @@ internal fun catalogRunPlanSnapshot(
     return ScenarioRunPlan(
         scenarios = scenarios,
         repeatCount = normalizedCatalogRepeatCount(scenarios.size, requestedRepeat),
+        durationMultiplier = requestedDurationMultiplier.takeIf {
+            it in ScenarioPlanPolicy.DURATION_MULTIPLIERS
+        } ?: 1,
         source = PlanSource.USER_SELECTION,
     )
 }
@@ -5475,9 +5624,17 @@ private fun List<Int>.positionSummary(): String {
     return if (size > 2) "$visible +${size - 2}" else visible
 }
 
-private fun formatDuration(ms: Long): String {
+internal fun formatDuration(ms: Long): String {
     val seconds = (ms / 1_000).coerceAtLeast(0)
-    return if (seconds >= 60) "${seconds / 60}m ${seconds % 60}s" else "${seconds}s"
+    val minutes = seconds / 60
+    val hours = minutes / 60
+    val days = hours / 24
+    return when {
+        days > 0 -> "${days}d ${hours % 24}h"
+        hours > 0 -> "${hours}h ${minutes % 60}m"
+        minutes > 0 -> "${minutes}m ${seconds % 60}s"
+        else -> "${seconds}s"
+    }
 }
 
 private fun yesNo(value: Boolean) = if (value) "✓" else "–"

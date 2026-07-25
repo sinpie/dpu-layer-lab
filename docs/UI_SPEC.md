@@ -11,7 +11,7 @@
 UI의 목표는 시험자가 다음 네 질문에 한 화면 흐름으로 답할 수 있게 하는 것이다.
 
 1. 무엇을 시험할 것인가?
-2. 어떤 순서와 반복으로 실행할 것인가?
+2. 어떤 순서·전체 반복·시간 배율로 실행할 것인가?
 3. 지금 실제로 무엇이 실행되고 있는가?
 4. 결과와 증거 source가 무엇인가?
 
@@ -20,7 +20,7 @@ UI의 목표는 시험자가 다음 네 질문에 한 화면 흐름으로 답할
 | Section | 목적 | 실행 중 노출 |
 |---|---|---|
 | 대시보드 | device 상태, 주요 목적 quick start, 최근 결과 | 실행 전 |
-| 시나리오 | 목적/facet 필터, preset 상세, queue/repeat | 실행 전 |
+| 시나리오 | 목적/facet 필터, preset 상세, queue/repeat/time multiplier | 실행 전 |
 | 커스텀 | bounded custom phase 조합 | 실행 전 |
 | 시스템 | capability, permission, display/codec/sensor | 실행 전 |
 | 실행 | fullscreen renderer와 HUD | active run에서 자동 전환 |
@@ -47,7 +47,7 @@ flowchart LR
     D["Dashboard"] --> SEL["1. 테스트 선택"]
     SEL --> P["목적 선택"]
     P --> C["선택형 세부 조건"]
-    C --> Q["2. 순서·중복·repeat"]
+    C --> Q["2. 순서·중복·repeat·시간 배율"]
     Q --> M["필요할 때만 Decoder media"]
     M --> V["3. 확인 후 실행"]
     V --> R["Running fullscreen + HUD"]
@@ -78,10 +78,10 @@ Metric value가 unavailable이면 0 대신 N/A를 표시한다.
 
 ## Catalog
 
-Catalog는 한 개의 긴 설정 form 대신 `테스트 선택`과 `순서·반복` 두 단계로 나눈다.
-상단 step control로 되돌아갈 수 있고, 선택 단계 하단에는 queue 수·repeat·예상 시간을
+Catalog는 한 개의 긴 설정 form 대신 `테스트 선택`과 `순서·반복·시간` 두 단계로 나눈다.
+상단 step control로 되돌아갈 수 있고, 선택 단계 하단에는 queue 수·repeat·요청 예상 시간을
 보이는 고정 dock을 유지한다. Catalog의 step, filter, 펼침 상태와 각 단계 scroll은
-탭 왕복과 configuration 재생성 뒤에도 보존한다. `순서·반복` 단계의 Android Back은
+탭 왕복과 configuration 재생성 뒤에도 보존한다. `순서·반복·시간` 단계의 Android Back은
 Activity를 닫지 않고 먼저 `테스트 선택` 단계로 돌아간다.
 
 ### 목적 중심 선택
@@ -121,14 +121,16 @@ Filtered result는 catalog 원래 순서를 유지한다. 일괄 `queue 교체`�
 - position action은 render 시 queue snapshot과 event 시 최신 queue가 다르면 적용하지
   않아 연속 입력이 다른 occurrence를 수정하지 않음
 - catalog 순서로 reset
-- repeat count와 expanded run 수
-- 현재 예상 duration
+- repeat count와 expanded run 수. `N`회는 전체 queue를 N번 실행하고 `N > 1`인 회차
+  경계에서만 마지막 항목 다음에 첫 항목으로 돌아간다. 1회는 전체 queue 한 번이다.
+- 앱 UI는 40-entry × 10 loop = 400 run, 외부 Intent는 기존 40 run
+- 1×/2×/5×/10×/50×/100× phase/transition 시간 배율
+- policy 적용 전 요청 예상 duration과 phase 10분/scenario 30분 safety cap 안내
 - unknown restored ID 자동 제거
-- 40-run cap 안에서 repeat 조정
 - queue가 비면 숨은 repeat를 항상 1로 canonicalize
 
 실행 전 preview는 접을 수 있으며 input change, composition target, verification을
-요약한다. Queue mutation과 repeat 증감, START는 event 시점의 최신 state를 다시 읽어
+요약한다. Queue mutation, repeat/시간 선택과 START는 event 시점의 최신 state를 다시 읽어
 빠른 연속 입력이 이전 snapshot을 덮어쓰거나 제거한 scenario를 실행하지 않게 한다.
 
 ## Custom builder
@@ -136,13 +138,15 @@ Filtered result는 catalog 원래 순서를 유지한다. 일괄 `queue 교체`�
 Custom UI는 hard cap 안에서 다음을 구성한다.
 
 - layer 수, producer FPS, requested Hz
-- backend, pixel route, buffer size
-- motion과 layer size profile
+- backend, pixel route, Display/1K/2K/4K/8K buffer size
+- FIT/1:1 crop projection, 고정 0°/90° orientation, motion과 layer size profile
 - alpha/GL
 - CPU/memory/GPU/NPU setpoint와 shape
 - transition mode/duration/cycle/step/duty/floor
 
 `CAPACITY_TILES`는 internal calibration용 motion이므로 일반 custom selector에서 제외한다.
+1:1 crop을 고르면 `FULL_SCREEN`과 non-scaling motion만 남기고, FIT은 motion 전
+aspect-preserving base projection임을 설명한다.
 Selected-media가 필요한 route는 media와 codec preflight 없이 실행하지 않는다.
 
 ## Running screen
@@ -151,8 +155,8 @@ Selected-media가 필요한 route는 media와 codec preflight 없이 실행하�
 
 ```text
 ┌────────────────────────────────────────────┐
-│ Scenario · QUEUE x/y · LOOP x/y · STAGE   │
-│ Layer size · BUILD version        [STOP]   │
+│ Scenario · QUEUE x/y · LOOP x/y · TIME n× │
+│ Buffer·FIT/crop·0°/90° · BUILD    [STOP]   │
 │ Plan / phase progress                       │
 │ PHYSICAL observed/expected + committed graph │
 │ LOGICAL requested/active count (별도 label)  │
@@ -206,6 +210,7 @@ Producer count 표기:
 ### Progress와 상태
 
 - queue/repeat/current/next scenario
+- 선택한 duration multiplier와 effective phase elapsed/duration
 - phase index, elapsed/duration
 - current→target layer/FPS/size/workload
 - transition mode/segment/fraction
@@ -268,6 +273,7 @@ Unavailable 기능에 “활성” toggle을 제공하지 않는다.
 | queue 비어 있음 | 실행 disabled + 추가 안내 |
 | media 필요/미선택 | requirement와 선택 action |
 | plan rejected | 현재 화면 유지 + snackbar/terminal reason |
+| Battery Saver active | `설정 열기`; cleanup/원상복구와 Window restore 뒤 전용 Saver 설정, 처리 불가 시 일반 설정. Background에서는 pending 요청을 보존하고 defer/launch 실패 시 action 재제공 |
 | topology pending | `—P`, phase clock 시작 전 준비 상태 |
 | cleanup sticky | process restart 필요 reason |
 | report 없음 | share disabled |
@@ -284,7 +290,7 @@ Unavailable 기능에 “활성” toggle을 제공하지 않는다.
 - 숫자에 unit 포함
 - N/A, pending, proxy, exact 표현을 일관되게 사용
 - destructive/reset action과 run action을 시각적으로 구분
-- 목적/개별 선택 → 순서·반복 → run → result의 두 단계 설정 흐름
+- 목적/개별 선택 → 순서·반복·시간 → run → result의 두 단계 설정 흐름
 - queue 이동/삭제는 기호만 쓰지 않고 text label과 occurrence 기반 TalkBack 설명 제공
 - 두 step control은 button 색뿐 아니라 tab role과 selected semantics를 제공
 - 선택 화면의 고정 dock은 실제 측정 높이로 bottom padding을 갱신해 큰 글꼴에서도 마지막
@@ -308,4 +314,5 @@ Unavailable 기능에 “활성” toggle을 제공하지 않는다.
 
 변경 뒤 compact/landscape STOP, graph provenance gap, `—P`, requested/actual calibration,
 queue duplicate/order, 선택/plan별 scroll·filter 복원, 연속 add/repeat 입력,
-Window hide/restore acknowledgment와 result-old-state 분리를 반드시 재검토한다.
+시간 배율 복원, Battery Saver 설정 이동의 cleanup defer/fallback, Window hide/restore
+acknowledgment와 result-old-state 분리를 반드시 재검토한다.

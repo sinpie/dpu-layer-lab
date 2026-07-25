@@ -32,6 +32,8 @@ DPULayerTest는 Android AP의 display pipeline에 제어 가능한 physical prod
 | FR-DISPLAY-002 | independent, mixed, flattened GPU composition topology를 구분해야 한다. | `LabModels.kt`, `LayerStageView.kt` | `LabModelsTest`, `ScenarioCatalogTest` |
 | FR-DISPLAY-003 | scroll, zoom, rotation, pan, parallax, alpha와 client Z-order proxy를 제공해야 한다. | `LayerStageView.kt`, `SCENARIOS.md` | `LayerStageViewMathTest`, catalog tests |
 | FR-SIZE-001 | full, small, mixed, gradual, abrupt layer destination 크기를 지원해야 한다. | `LabModels.kt`, `LayerStageView.kt` | `LayerStageViewMathTest`, `LayerTrafficEstimatorTest` |
+| FR-SIZE-002 | 실제 primary producer 버퍼는 1K, 2K/1080p, 4K, 8K 선택을 제공하고, 해상도·교차 부하를 함께 올리고 내리는 catalog sweep을 제공해야 한다. 각 단계는 graphics-memory safety budget을 통과해야 하며 더 작은 해상도로 조용히 대체하지 않는다. | `LabModels.kt`, `ScenarioCatalog.kt`, `ScenarioSafetyPolicy.kt` | `ScenarioCatalogTest`, `ScenarioSafetyPolicyTest` |
+| FR-SIZE-003 | source buffer를 종횡비 보존 FIT 또는 centered 1:1 crop으로 투영하고 motion과 별도인 고정 0°/90° orientation을 지원해야 한다. 2K/4K/8K의 90° FIT와 8K FIT/1:1을 비교할 수 있어야 하며 projection은 full allocation/budget/traffic을 줄이지 않는다. | `LabModels.kt`, `LayerStageView.kt`, `ScenarioSafetyPolicy.kt` | `LayerStageViewMathTest`, `ScenarioSafetyPolicyTest` |
 | FR-FORMAT-001 | RGB8888/565와 검증된 decoder-to-Surface YUV/P010/SBWC route를 구분해야 한다. | `VideoDecoderSelection.kt`, `LabController.kt` | `VideoDecoderSelectionTest`, controller tests |
 | FR-MEDIA-001 | 선택한 4K/8K media의 MIME, dimensions, FPS, profile, codec binding을 fail-closed 검증해야 한다. | `VideoDecoderSelection.kt`, `LabController.kt` | `VideoDecoderSelectionTest`, `LabControllerMathTest` |
 | FR-PACING-001 | producer FPS와 requested/actual display Hz를 독립적으로 제어·기록해야 한다. | `LabModels.kt`, `LabController.kt`, `FrameTracker.kt` | model/controller/frame tests |
@@ -42,12 +44,15 @@ DPULayerTest는 Android AP의 display pipeline에 제어 가능한 physical prod
 | FR-HWC-001 | DEVICE/CLIENT 기대 조건과 실제 fresh evidence를 분리해 판정해야 한다. | `LabController.kt`, `SystemMonitor.kt` | controller/system monitor tests |
 | FR-HWC-002 | process-session의 최초 승인된 START에서 첫 scenario 전에 20-layer candidate를 한 번만 관측하고 terminal 결과를 재사용해야 한다. | `HwcCapacityCalibrationSession.kt`, `LabController.kt` | `HwcCapacityCalibrationSessionTest`, controller tests |
 | FR-SCENARIO-001 | baseline, burst, gradual, DEVICE 후보, CLIENT 목표, video/format, resource 조합 preset을 제공해야 한다. | `ScenarioCatalog.kt` | `ScenarioCatalogTest` |
-| FR-PLAN-001 | 사용자가 선택한 순서와 중복을 보존하고 scenario/repeat 진행을 loop할 수 있어야 한다. | `ScenarioQueueEditor.kt`, `LabController.kt` | queue/plan/controller tests |
-| FR-UI-001 | 목적 중심 선택, 세부 facet, queue 구성, 현재/다음 항목, 중지와 결과를 직관적으로 보여야 한다. | `ui/DpuLayerLabApp.kt` | `DpuLayerLabAppMathTest` |
+| FR-SCENARIO-002 | 해상도 외 축을 고정한 1K↔8K resolution-only A/B와 동일 8K allocation에서 FIT↔1:1만 바꾸는 presentation-only A/B/A를 제공해 결합 sweep 결과를 분리 검증할 수 있어야 한다. | `ScenarioCatalog.kt` | `ScenarioCatalogTest` |
+| FR-PLAN-001 | 사용자가 선택한 순서와 중복을 보존하고 queue 전체가 끝난 뒤 첫 scenario로 돌아가는 repeat loop를 1~10회 실행할 수 있어야 한다. 앱 UI는 40-entry×10=400 run을 허용하되 외부 Intent는 기존 40-run 상한을 유지한다. | `ScenarioQueueEditor.kt`, `LabController.kt` | queue/plan/controller tests |
+| FR-PLAN-002 | 실행 직전 1×/2×/5×/10×/50×/100× 시간 배율을 선택하고 각 phase duration·transition window·cycle에 정확히 한 번 적용해야 한다. 기존 phase/scenario safety cap과 예상 시간 제외 범위를 명시해야 하며 외부 Intent로 우회하지 않는다. | `LabModels.kt`, `LabController.kt`, `ui/DpuLayerLabApp.kt` | `ScenarioPlanPolicyTest`, `DpuLayerLabAppMathTest` |
+| FR-UI-001 | 목적 중심 선택, 세부 facet, queue 구성, 실행 직전 전체-loop 반복·시간 배율 review, 현재/다음 항목, 중지와 결과를 직관적으로 보여야 한다. | `ui/DpuLayerLabApp.kt` | `DpuLayerLabAppMathTest` |
 | FR-UI-002 | 실행 중 좌측 상단 HUD에 version, layer, DPU, CPU, GPU와 예상 traffic을 provenance와 함께 표시해야 한다. | `DpuLayerLabApp.kt`, `LayerTrafficEstimator.kt` | UI/traffic tests |
 | FR-UI-003 | Dashboard에서 AP/app CPU, system memory·available memory, measured memory bus, generated traffic, producer FPS와 display 상태를 N/A와 구분해 확인할 수 있어야 한다. | `DpuLayerLabApp.kt`, `SystemMonitor.kt` | UI/system monitor tests |
 | FR-WINDOW-001 | test Window는 status/navigation bar hidden acknowledgment 뒤에만 producer를 시작하고, STOP·실패·Activity 재생성에서도 시작 전 visibility를 실제 Insets로 확인해 복구해야 한다. | `TestWindowIsolation.kt`, `MainActivity.kt` | isolation/activity tests |
 | FR-PERF-001 | 실행 중 Battery Saver만 typed API v3 bounded lease로 임시 해제할 수 있고, broker가 없으면 Saver가 이미 OFF인 경우에만 app-only monitoring으로 실행해야 한다. 원래 상태, lease/renewal과 exact restore acknowledgment를 확인하며 복구 실패는 후속 START를 차단해야 한다. | `PerformanceEnvironment.kt`, `VendorBridge.kt` | performance/vendor tests |
+| FR-UI-004 | Battery Saver가 켜져 테스트를 시작할 수 없으면 명시적 설정 action을 제공하되 cleanup·performance 원상복구·Window 복구 전 navigation을 defer해야 한다. 전용 Battery Saver 설정을 먼저 열고 처리할 수 없으면 일반 설정으로 fallback하며, 앱이 설정을 직접 변경하거나 typed broker 계약을 우회하지 않는다. Background 전환 중 pending 요청을 보존하고 defer/launch 실패에는 action을 다시 제공한다. 복귀 후 새 plan에서 상태를 다시 검증하고 stale snackbar consume이 새 notice를 지우지 않아야 한다. | `LabController.kt`, `DpuLayerLabApp.kt`, `MainActivity.kt` | controller/UI/activity tests |
 | FR-PERF-002 | 앱의 선제 thermal SEVERE derating은 plan-start immutable 선택값이며 기본 OFF여야 한다. OFF에서는 app setpoint를 유지하고 Android/kernel throttling에 맡기며, Intent로 값을 우회하지 못한다. CRITICAL·low-memory abort는 항상 유지해야 한다. | `PerformanceEnvironment.kt`, `LabController.kt` | controller/performance tests |
 | FR-AUTO-001 | explicit Intent로 SHOW, START, STOP, scenario ID 목록과 반복 횟수를 제어해야 한다. | `AutomationIntentContract.kt`, manifest | automation/main activity tests |
 | FR-REPORT-001 | phase/event/sample/verdict와 provenance를 schema v2 JSON으로 원자 발행·공유해야 한다. | `ReportWriter.kt`, `METRICS.md` | `ReportWriterMathTest` |
@@ -57,7 +62,7 @@ DPULayerTest는 Android AP의 display pipeline에 제어 가능한 physical prod
 
 | ID | 요구사항 | 검증·근거 |
 |---|---|---|
-| NFR-SAFETY-001 | layer, FPS, Hz, duration, memory와 plan 반복은 hard cap을 넘지 않아야 한다. | `AGENTS.md`, `ScenarioSafetyPolicyTest` |
+| NFR-SAFETY-001 | layer, FPS, Hz, duration, memory와 source별 plan 반복/run 상한은 hard cap을 넘지 않아야 한다. | `AGENTS.md`, `ScenarioSafetyPolicyTest`, `ScenarioPlanPolicyTest` |
 | NFR-SAFETY-002 | thermal CRITICAL, low-memory, safety envelope 변경은 active run을 중단해야 한다. | controller/safety tests |
 | NFR-EFFICIENCY-001 | 의도한 load 외의 allocation, polling, Binder/dumpsys와 worker backlog를 최소화해야 한다. | fixed-period/latest-wins 설계와 lifecycle tests |
 | NFR-LIFECYCLE-001 | 모든 producer/codec/EGL/worker/vendor state에는 bounded cancel·teardown과 sticky failure가 있어야 한다. | `STATE_MACHINES.md`, cleanup/recovery tests |

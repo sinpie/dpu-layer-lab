@@ -26,8 +26,8 @@ class DpuLayerLabAppMathTest {
     @Test
     fun visibleVersionKeepsSourceCandidateTimestampAndVariantSuffix() {
         assertEquals(
-            "BUILD 20260725_170750-debug",
-            visibleAppVersion("20260725_170750-debug"),
+            "BUILD 20991231_235959-debug",
+            visibleAppVersion("20991231_235959-debug"),
         )
     }
 
@@ -390,7 +390,7 @@ class DpuLayerLabAppMathTest {
         assertEquals(1, normalizedCatalogRepeatCount(queueSize = 0, requested = 10))
         assertEquals(1, normalizedCatalogRepeatCount(queueSize = -1, requested = 4))
         assertEquals(4, normalizedCatalogRepeatCount(queueSize = 2, requested = 4))
-        assertEquals(2, normalizedCatalogRepeatCount(queueSize = 20, requested = 10))
+        assertEquals(10, normalizedCatalogRepeatCount(queueSize = 20, requested = 10))
     }
 
     @Test
@@ -430,7 +430,7 @@ class DpuLayerLabAppMathTest {
     }
 
     @Test
-    fun startSnapshotUsesLatestKnownQueueAndReappliesExpandedRunCap() {
+    fun startSnapshotUsesLatestKnownQueueAndPreservesWholeQueueLoop() {
         val scenario = checkNotNull(ScenarioCatalog.byId("baseline-display-modes"))
         val knownIds = ScenarioCatalog.presets.mapTo(LinkedHashSet()) { it.id }
         val plan = checkNotNull(
@@ -438,12 +438,14 @@ class DpuLayerLabAppMathTest {
                 rawQueueIds = listOf("unknown") + List(5) { scenario.id },
                 knownScenarioIds = knownIds,
                 requestedRepeat = 10,
+                requestedDurationMultiplier = 100,
             ),
         )
 
         assertEquals(List(5) { scenario.id }, plan.scenarios.map { it.id })
-        assertEquals(8, plan.repeatCount)
-        assertEquals(40, plan.totalRuns)
+        assertEquals(10, plan.repeatCount)
+        assertEquals(50, plan.totalRuns)
+        assertEquals(100, plan.durationMultiplier)
         assertEquals(
             null,
             catalogRunPlanSnapshot(
@@ -452,6 +454,44 @@ class DpuLayerLabAppMathTest {
                 requestedRepeat = 10,
             ),
         )
+    }
+
+    @Test
+    fun allCatalogScenariosCanRepeatAsOneWholeQueue() {
+        val knownIds = ScenarioCatalog.presets.mapTo(LinkedHashSet()) { it.id }
+        val plan = checkNotNull(
+            catalogRunPlanSnapshot(
+                rawQueueIds = ScenarioCatalog.presets.map { it.id },
+                knownScenarioIds = knownIds,
+                requestedRepeat = 10,
+                requestedDurationMultiplier = 10,
+            ),
+        )
+
+        assertEquals(ScenarioCatalog.presets.size, plan.scenarios.size)
+        assertEquals(10, plan.repeatCount)
+        assertEquals(360, plan.totalRuns)
+        assertEquals(10, plan.durationMultiplier)
+        assertEquals(null, ScenarioPlanPolicy.validate(plan))
+        assertEquals(
+            1,
+            checkNotNull(
+                catalogRunPlanSnapshot(
+                    rawQueueIds = listOf(ScenarioCatalog.presets.first().id),
+                    knownScenarioIds = knownIds,
+                    requestedRepeat = 1,
+                    requestedDurationMultiplier = 3,
+                ),
+            ).durationMultiplier,
+        )
+    }
+
+    @Test
+    fun durationFormattingStaysReadableForLongPlans() {
+        assertEquals("59s", formatDuration(59_000L))
+        assertEquals("1m 1s", formatDuration(61_000L))
+        assertEquals("2h 5m", formatDuration(7_500_000L))
+        assertEquals("2d 3h", formatDuration(183_600_000L))
     }
 
     @Test

@@ -82,7 +82,7 @@ command를 혼동하지 않는다.
 - 해당 경로는 현재 controller의 `lastReportFile` 또는 현 plan result history에 publish된
   report와 canonical-equal해야 한다.
 - traversal, foreign JSON, missing file과 `.part` 공유를 거부한다.
-- 최신 200개 managed completed report만 best-effort 보존한다.
+- 최신 400개 managed completed report만 best-effort 보존한다.
 - app data는 cloud backup, device transfer와 legacy backup에서 전부 제외한다.
 
 Schema v2의 field·type·nullability는 [Report schema](REPORT_SCHEMA.md), 값의 물리적

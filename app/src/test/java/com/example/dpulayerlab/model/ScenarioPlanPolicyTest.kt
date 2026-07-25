@@ -10,8 +10,16 @@ class ScenarioPlanPolicyTest {
     fun restoredRepeatCountIsAlwaysNormalizedToBothLimits() {
         assertEquals(10, ScenarioPlanPolicy.normalizeRepeatCount(queueSize = 0, requested = 99))
         assertEquals(10, ScenarioPlanPolicy.normalizeRepeatCount(queueSize = 1, requested = 11))
-        assertEquals(4, ScenarioPlanPolicy.normalizeRepeatCount(queueSize = 10, requested = 10))
+        assertEquals(10, ScenarioPlanPolicy.normalizeRepeatCount(queueSize = 10, requested = 10))
         assertEquals(1, ScenarioPlanPolicy.normalizeRepeatCount(queueSize = 40, requested = 0))
+        assertEquals(
+            4,
+            ScenarioPlanPolicy.normalizeRepeatCount(
+                queueSize = 10,
+                requested = 10,
+                source = PlanSource.EXTERNAL_INTENT,
+            ),
+        )
     }
 
     @Test
@@ -49,21 +57,160 @@ class ScenarioPlanPolicyTest {
 
     @Test
     fun expandedRunCountIsBoundedWithoutIntegerOverflow() {
-        val acceptedQueue = List(4) { scenario("same") }
+        val acceptedQueue = List(ScenarioPlanPolicy.MAX_QUEUE_ENTRIES) { scenario("same") }
         val accepted = ScenarioRunPlan(
             acceptedQueue,
             repeatCount = ScenarioPlanPolicy.MAX_REPEAT_COUNT,
+            source = PlanSource.USER_SELECTION,
         )
-        assertEquals(ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS, accepted.totalRuns)
+        assertEquals(ScenarioPlanPolicy.MAX_USER_TOTAL_PLAN_RUNS, accepted.totalRuns)
         assertNull(ScenarioPlanPolicy.validate(accepted))
 
         val rejected = ScenarioRunPlan(
-            acceptedQueue + scenario("extra"),
+            List(5) { scenario("external") },
             repeatCount = ScenarioPlanPolicy.MAX_REPEAT_COUNT,
+            source = PlanSource.EXTERNAL_INTENT,
         )
         assertTrue(
             ScenarioPlanPolicy.validate(rejected)
                 ?.contains("maximum") == true,
+        )
+    }
+
+    @Test
+    fun durationMultiplierScalesEveryPhaseAndTransitionWindowOnce() {
+        val base = scenario().copy(
+            phases = listOf(
+                scenario().phases.single().copy(
+                    durationMs = 2_000L,
+                    transition = TransitionSpec(
+                        mode = TransitionMode.TRIANGLE_WAVE,
+                        transitionDurationMs = 500L,
+                        cycleMs = 1_000L,
+                    ),
+                ),
+            ),
+        )
+        val requested = ScenarioRunPlan(
+            scenarios = listOf(base),
+            repeatCount = 2,
+            durationMultiplier = 10,
+        )
+        assertNull(ScenarioPlanPolicy.validate(requested))
+        assertEquals(40_000L, requested.estimatedDurationMs)
+
+        val materialized = requested.materializeDurationMultiplier()
+        val phase = materialized.scenarios.single().phases.single()
+        assertEquals(20_000L, phase.durationMs)
+        assertEquals(5_000L, phase.transition.transitionDurationMs)
+        assertEquals(10_000L, phase.transition.cycleMs)
+        assertEquals(1, materialized.durationMultiplier)
+        assertEquals(2_000L, base.phases.single().durationMs)
+        assertEquals(500L, base.phases.single().transition.transitionDurationMs)
+        assertEquals(1_000L, base.phases.single().transition.cycleMs)
+        assertTrue(materialized.scenarios.single() !== base)
+        assertTrue(materialized.scenarios.single().phases.single() !== base.phases.single())
+    }
+
+    @Test
+    fun hundredTimesMaterializationStillPassesThroughExistingDurationSafetyCaps() {
+        val base = scenario(durationMs = 20_000L).copy(
+            phases = listOf(
+                scenario(durationMs = 20_000L).phases.single().copy(
+                    transition = TransitionSpec(
+                        mode = TransitionMode.LINEAR_RAMP,
+                        transitionDurationMs = 4_000L,
+                        cycleMs = 1_000L,
+                    ),
+                ),
+            ),
+        )
+        val materialized = ScenarioRunPlan(
+            scenarios = listOf(base),
+            durationMultiplier = 100,
+        ).materializeDurationMultiplier()
+        val decision = ScenarioSafetyPolicy.evaluate(
+            materialized.scenarios.single(),
+            RenderSafetyLimits(
+                displayWidthPx = 1_920,
+                displayHeightPx = 1_080,
+                maxLayers = 20,
+                maxProducerFps = 120f,
+                maxPhaseDurationMs = 600_000L,
+                maxScenarioDurationMs = 1_800_000L,
+                maxGraphicsBytes = Long.MAX_VALUE,
+                maxCpuLoad = 1f,
+                maxMemoryLoad = 1f,
+                maxGpuLoad = 1f,
+                maxNpuLoad = 1f,
+            ),
+        )
+
+        assertNull(decision.rejectionReason)
+        val effective = requireNotNull(decision.effectiveScenario).phases.single()
+        assertEquals(600_000L, effective.durationMs)
+        assertEquals(120_000L, effective.transition.transitionDurationMs)
+        assertEquals(100_000L, effective.transition.cycleMs)
+        assertTrue(decision.adjustments.any { it.contains("duration") })
+    }
+
+    @Test
+    fun cyclicDurationSafetyCapScalesTheMaterializedCycle() {
+        val base = scenario(durationMs = 20_000L).copy(
+            phases = listOf(
+                scenario(durationMs = 20_000L).phases.single().copy(
+                    transition = TransitionSpec(
+                        mode = TransitionMode.TRIANGLE_WAVE,
+                        cycleMs = 1_000L,
+                    ),
+                ),
+            ),
+        )
+        val materialized = ScenarioRunPlan(
+            scenarios = listOf(base),
+            durationMultiplier = 100,
+        ).materializeDurationMultiplier()
+        val decision = ScenarioSafetyPolicy.evaluate(
+            materialized.scenarios.single(),
+            RenderSafetyLimits(
+                displayWidthPx = 1_920,
+                displayHeightPx = 1_080,
+                maxLayers = 20,
+                maxProducerFps = 120f,
+                maxPhaseDurationMs = 600_000L,
+                maxScenarioDurationMs = 1_800_000L,
+                maxGraphicsBytes = Long.MAX_VALUE,
+                maxCpuLoad = 1f,
+                maxMemoryLoad = 1f,
+                maxGpuLoad = 1f,
+                maxNpuLoad = 1f,
+            ),
+        )
+
+        assertNull(decision.rejectionReason)
+        val effective = requireNotNull(decision.effectiveScenario).phases.single()
+        assertEquals(600_000L, effective.durationMs)
+        assertEquals(30_000L, effective.transition.cycleMs)
+    }
+
+    @Test
+    fun durationMultiplierRejectsUnsupportedAndOverflowingValues() {
+        assertTrue(
+            ScenarioPlanPolicy.validate(
+                ScenarioRunPlan(listOf(scenario()), durationMultiplier = 3),
+            )?.contains("duration multiplier") == true,
+        )
+        val hostile = scenario().copy(
+            phases = listOf(
+                scenario().phases.single().copy(
+                    transition = TransitionSpec(cycleMs = Long.MAX_VALUE),
+                ),
+            ),
+        )
+        assertTrue(
+            ScenarioPlanPolicy.validate(
+                ScenarioRunPlan(listOf(hostile), durationMultiplier = 100),
+            )?.contains("safely scale") == true,
         )
     }
 

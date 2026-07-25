@@ -149,10 +149,15 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
 15. **실험 선택은 직교 facet과 ordered queue다.** Catalog의 카테고리·변화 파형·예상
     강도·부하/조건은 같은 facet 안에서 OR, facet 사이에서 AND로 결합한다. Filter
     결과는 catalog 순서로 queue에 append/replace하고, queue는 중복과 명시적 이동을
-    보존하되 복원된 unknown ID는 실행 index를 만들기 전에 제거한다. Repeat는 1~10,
-    expanded plan은 40 run 상한이다. DPU 저→고 burst와 HWC DEVICE/CLIENT 목적도
+    보존하되 복원된 unknown ID는 실행 index를 만들기 전에 제거한다. 앱 UI repeat
+    `N`은 전체 queue를 N회 실행하며, `N > 1`인 회차 경계에서만 마지막 scenario 다음에
+    첫 scenario로 돌아간다. 1은 전체 queue 한 번이고 40-entry queue × 10회 = 400 run
+    상한이다. 외부 Intent는 기존 expanded 40-run 상한을 유지한다.
+    실행 직전의 1/2/5/10/50/100× 시간 배율은 immutable plan copy의 phase duration과
+    transition window/cycle에 정확히 한 번 적용한 뒤 기존 duration safety cap을
+    통과한다. DPU 저→고 burst와 HWC DEVICE/CLIENT 목적도
     phase의 typed control/expectation으로 분류하며 이름이나 tag에서 실행 의미를
-    추론하지 않는다. UI는 기본 정보를 `테스트 선택`과 `순서·반복` 두 단계로 분리하고
+    추론하지 않는다. UI는 기본 정보를 `테스트 선택`과 `순서·반복·시간` 두 단계로 분리하고
     목적 선택과 일괄 queue mutation을 중복 배치하지 않는다. Catalog subtree는
     saveable-state holder로 step/filter/펼침/scroll을 보존한다. Queue/facet/repeat
     action은 event 시점의 최신 state를 다시 sanitize/reduce해 빠른 연속 입력의
@@ -167,7 +172,9 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
     있었다면 임시 해제 중에도 power-save safety envelope를 유지한다. Broker가 없고
     Saver가 이미 꺼진 경우만 app-only monitor로 실행한다. Thermal/low-memory 보호는
     비활성화하지 않고, Doze/device-idle은 강제 해제하지 않으며, DVFS/governor/frequency
-    write나 lock은 하지 않는다.
+    write나 lock은 하지 않는다. Saver가 켜져 시작이 거부되면 UI는 전용 Battery Saver
+    설정, 일반 설정 순서의 명시적 navigation action만 제공하고 앱이 정책을 직접
+    변경하지 않는다. 복귀 뒤에는 새 plan이 상태를 처음부터 다시 검증한다.
 17. **장기 자원에는 명시적 owner와 cleanup 증거가 필요하다.** Activity보다 오래 살 수
     있는 monitor/vendor/load cleanup은 application context 또는 Activity-free callback만
     보유한다. Renderer container, receiver, coroutine, worker, codec/EGL/Surface,
@@ -226,6 +233,13 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
     `LAYER_SIZE_COVERAGE_MISSING`/`INCONCLUSIVE`, 충족되면 `LAYER_SIZE_COVERAGE`를
     남긴다. Narrow stage horizontal stagger는 scale-aware bound로 최소 1 px visibility를
     유지한다.
+19. **Source buffer projection은 allocation과 분리한다.** `BufferPresentation.FIT`은
+    고정 0°/90° orientation을 반영해 motion 전 전체 source를 aspect-preserving
+    letterbox하고, `PIXEL_1_TO_1_CROP`은 source 1 px와 display 1 px를 맞춘 centered
+    overflow crop이다. 고정 orientation은 motion과 별도다. 1:1은 `FULL_SCREEN`과
+    non-scaling motion만, `CAPACITY_TILES`는 FIT/0°만 허용한다. 이 projection·rotation은
+    full source graphics budget과 linear traffic estimate를 줄이지 않으며 discrete
+    변경은 fresh generation/readiness/evidence를 다시 요구한다.
 
 ## 반드시 유지할 불변식
 
@@ -242,7 +256,7 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
   phase가 1 layer로 clamp될 때는 GL-only로 바뀌지 않도록 primary를 보존한다. GL
   color와 보수적 depth attachment는 각각 triple-buffered budget에 포함한다.
 - `FLATTENED_TEXTURE`는 logical layer 수와 무관한 display-sized RGBA 단일 physical
-  producer이며 decoder route 또는 explicit 4K/8K buffer라고 보고하지 않는다. Custom
+  producer이며 decoder route 또는 explicit non-DISPLAY buffer라고 보고하지 않는다. Custom
   입력의 incompatible route/size는 UI label/tag와 함께 DISPLAY/RGB로 정규화한다.
 - Flattened 1-layer의 GPU intensity도 실제 hardware-canvas work를 바꿔야 한다. 0은
   기본 pass, policy를 통과한 `0.001` 초과 값은 intensity에 따라 bounded 1~8 extra
@@ -577,19 +591,21 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
 
 ## 현재 구현
 
-- DPULayerTest release `20260725_170750` / `20260725_170750-debug`(`versionCode 6`)
+- DPULayerTest release `20260725_232013` / `20260725_232013-debug`(`versionCode 7`)
   launcher/Gradle project, 화면/HUD/report build version과 stable
   `com.example.dpulayerlab`/`DpuLayerLab` 제품 통합 identifier
 - Compose 기반 scenario browser, system dashboard, running HUD, result 화면. 실행
   header의 STOP은 compact/landscape에서도 상단에 유지한다.
-- 32개 catalog preset 및 custom phase. 4L DEVICE candidate/CLIENT plane-overflow의 typed
+- 36개 catalog preset 및 custom phase. 1K↔8K load/resolution sweep, 2K/4K/8K
+  90° FIT matrix, 8K FIT↔1:1 A/B/A와 4L DEVICE candidate/CLIENT plane-overflow의 typed
   HWC 관측 probe와 cross-load 없는 repeated DPU step shock, fixed-topology resource isolation,
   instant isolated contention, continuous cross-load ramp, paired mid-load reference,
   backend-only composition pivot과 다변수 adaptive hunt의 용도를 구분한다.
 - Typed DPU burst/DEVICE-only/CLIENT-required 목적 quick filter와 접힌 고급
   카테고리/변화 파형/예상 강도/부하·조건 filter. 같은 행 OR, 목적을 포함한 서로 다른
   행 AND를 유지하며 filtered append/replace, 중복·이동이 가능한 ordered queue,
-  restored unknown-ID sanitize, repeat 1~10과 expanded 40-run cap을 적용한다.
+  restored unknown-ID sanitize, UI whole-queue repeat 1~10/expanded 400-run cap과
+  1/2/5/10/50/100× 시간 배율을 적용한다. 외부 automation은 40-run cap을 유지한다.
 - 독립 Surface, mixed Surface/Texture, flattened RGBA, app-owned EGL stress layer
 - scroll/zoom/pan/rotate/parallax/storm과 physical HWC 변경으로 오해하지 않는
   View/client Z-order proxy animation
@@ -699,7 +715,7 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
   Saver-off인 상태를 감시할 뿐이다. Doze/device-idle을 강제로 해제하는 typed 계약도
   현재 없다.
 - report에 build fingerprint와 선택 media의 이름/metadata가 포함될 수 있다.
-- `dpu-layer-lab-` prefix와 앱 파일명 형식이 확인된 완료 report만 최근 200개로
+- `dpu-layer-lab-` prefix와 앱 파일명 형식이 확인된 완료 report만 최근 400개로
   process-serialized best-effort retention한다. 방금 발행한 파일은 보호하고 `.part`와
   unrelated `.json`은 건드리지 않으며, 사용자 설정형 만료 정책은 아직 없다.
 - vendor service는 샘플 계약만 있고 reference provider 구현은 이 저장소에 없다.

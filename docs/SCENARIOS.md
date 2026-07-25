@@ -33,6 +33,8 @@
 | `backend` | independent, mixed Surface/Texture, flattened GPU 경로 |
 | `pixelRoute` | RGB/YUV/P010/SBWC 입력 계약 |
 | `bufferSize` | primary source/allocation 검증 크기 |
+| `bufferPresentation` | source를 stage에 투영하는 base `FIT`/`PIXEL_1_TO_1_CROP` 계약 |
+| `layerOrientation` | motion과 별도인 고정 0°/90° base orientation |
 | `motion` | scroll/zoom/rotate/parallax 등의 View transform |
 | `layerSizeProfile` | physical child의 destination footprint |
 | `workloads` | CPU, memory, GPU, NPU normalized setpoint |
@@ -50,7 +52,17 @@ cooldown, report I/O는 포함하지 않는다.
 ### Plan
 
 `ScenarioRunPlan`은 queue 순서와 repeat를 보존한다. 같은 scenario를 여러 번 넣는 것은
-A/B/A 실험을 위해 허용된다. repeat는 최대 10회, queue×repeat는 최대 40 run이다.
+A/B/A 실험을 위해 허용된다. `repeatCount=N`은 전체 queue를 처음부터 끝까지 N회
+실행한다. `N > 1`이면 각 회차 경계에서 마지막 scenario 다음에 첫 scenario로 돌아가며,
+1은 전체 queue 한 번이다. 앱 UI는 최대 40-entry queue × 10 loop = 400 run이다.
+외부 Intent automation은 기존 expanded 40-run 상한을 유지한다.
+
+`durationMultiplier`는 실행 직전 `1×, 2×, 5×, 10×, 50×, 100×` 중 하나를 고른다.
+각 phase의 duration, transition window와 cycle에 immutable execution snapshot을 만들 때
+정확히 한 번 함께 적용해 ramp/soak/cyclic 의미를 보존한다. 그 뒤 기존 phase 10분,
+scenario 30분 safety cap이 명시적 adjustment 또는 reject를 수행할 수 있다. 예상 시간은
+phase 합계이며 preflight, warm-up, cooldown, report I/O를 포함하지 않는다. 이 옵션은
+외부 Intent extra로 노출하지 않는다.
 
 ## Backend와 physical producer
 
@@ -66,6 +78,31 @@ primary media 또는 explicit buffer와 GL tail이 모두 필요한 1L 요청은
 승격될 수 있다.
 
 ## LayerSizeProfile
+
+### 1K~8K 실제 버퍼 sweep
+
+`resolution-load-sweep` preset은 destination footprint와 별도로 primary producer의 실제
+`BufferSize`를 `1K → 2K/1080p → 4K → 8K → 4K → 2K/1080p → 1K` 순서로 바꾼다.
+상승 구간에서는 memory/CPU 교차 부하를 단계적으로 높이고 하강 구간에서는 낮춰,
+해상도와 부하 증가·복구의 결합을 한 plan에서 관찰한다. 8K peak는 한 physical
+producer로 제한하며 각 phase는 기존 triple-buffer graphics-memory budget을 그대로
+통과해야 한다. Budget을 넘으면 해상도를 축소하지 않고 plan을 거부한다.
+
+### Source buffer projection과 고정 orientation
+
+`BufferSize`는 `DISPLAY`, `HD_1K`(1024×576), `FHD`(2K/1080p, 1920×1080),
+`UHD_4K`, `UHD_8K`를 제공한다. `BufferPresentation.FIT`은 고정 0°/90° orientation을
+먼저 반영한 source aspect ratio를 보존해 motion 전 전체 source가 stage 안에
+letterbox되게 한다. `PIXEL_1_TO_1_CROP`은 source 1 px를 display 1 px로 두고 stage 밖
+overflow를 중앙 crop한다.
+
+고정 `LayerOrientation`은 motion과 별도인 base transform이다. 1:1 의미를 흐리지 않도록
+`PIXEL_1_TO_1_CROP`은 `FULL_SCREEN`과 non-scaling motion만 허용하며, capacity calibration의
+`CAPACITY_TILES`는 FIT/0°만 허용한다. Projection·orientation·crop은 full source
+allocation, conservative graphics-memory budget이나 full-buffer traffic estimate를
+줄이지 않는다. 일반 FIT 뒤 motion은 추가 transform일 수 있지만
+`rotated-resolution-fit-matrix`의 90° parallax/zoom은 현재 letterbox slack과 1.0 이하
+zoom으로 제한해 전체 buffer가 계속 보이게 한다.
 
 `LayerSizeProfile`은 source buffer 크기나 producer 수가 아니라 destination footprint를
 선택한다. `MotionProfile`과 독립적이므로 small layer도 scroll/zoom/rotate할 수 있다.
@@ -202,7 +239,7 @@ reject한다.
 
 ## Catalog 목적별 지도
 
-현재 source candidate의 catalog는 32개 preset이며 Custom은 이 수에 포함하지 않는다.
+현재 source candidate의 catalog는 36개 preset이며 Custom은 이 수에 포함하지 않는다.
 
 ### Baseline, DVFS와 DPU burst
 
@@ -244,6 +281,8 @@ phase evidence를 바꾸지 않는다.
 | `composition-pivot` | content와 pacing을 고정하고 independent→mixed→flattened backend 전환 |
 | `transform-storm` | 12L zoom/scroll/rotate/parallax와 View/client Z proxy |
 | `mid-load-perturbation` | 4~8L, 60~90fps의 A/B/A 중간 부하 matrix |
+| `rotated-resolution-fit-matrix` | 2K/4K/8K 고정 90° FIT; 8K static/parallax/bounded zoom |
+| `8k-presentation-fit-crop-aba` | 같은 8K allocation에서 FIT→1:1 crop→FIT projection-only A/B/A |
 
 ### Video, format와 compression
 
@@ -254,6 +293,7 @@ phase evidence를 바꾸지 않는다.
 | `8k-decoder-pressure` | 8K30 metadata와 size/rate를 지원하는 hardware decoder |
 | `8k60-p010-pressure` | 8K60 10-bit P010 fingerprint와 hardware decoder |
 | `sbwc-matrix` | 동일 decoder content와 vendor SBWC route acknowledgment |
+| `resolution-only-sweep` | 1L/30fps/60Hz/FIT/0°/static/zero-load 고정, 1K→8K→1K resolution-only A/B |
 
 YUV/P010/SBWC phase는 procedural RGBA로 대체하지 않는다. selected media의 URI,
 descriptor, dimensions, FPS, MIME, profile, codec name과 P010 fingerprint를 preflight와
@@ -269,6 +309,7 @@ renderer에서 재검증한다.
 | `instant-burst-transitions` | layer/FPS STEP 뒤 contention duty cycle |
 | `gradual-load-transitions` | topology와 cross-load의 combined ramp/staircase |
 | `continuous-crossload-ramp` | 고정 8L topology에서 cross-load 0→high→hold→0 |
+| `resolution-load-sweep` | 1K→2K→4K→8K→4K→2K→1K와 cross-load 상승·감소 |
 | `wave-soak-recovery` | triangle 반복과 attack/hold/release |
 | `npu-cross-load` | vendor NPU + memory/GPU; adapter 없으면 `UNSUPPORTED` |
 | `adaptive-underrun-hunt` | layer/backend/alpha/memory 다축 staircase |
@@ -285,7 +326,8 @@ facet은 같은 행의 여러 값이 OR, 서로 다른 행이 AND다.
 - Pattern: 순간 STEP, 느린 점진, 반복/펄스, 고정 유지
 - Estimated load band: 낮음, 보통, 높음, 매우 높음
 - Condition: display-only, multi-layer, CPU/memory/GPU/NPU, video/format,
-  transform/high refresh/DVFS, DPU burst, DEVICE/CLIENT 목표, layer size
+  1K/2K/4K/8K, 1:1 crop, 고정 90°, transform/high refresh/DVFS, DPU burst,
+  DEVICE/CLIENT 목표, layer size
 
 intensity score는 catalog 비교와 UI 탐색용 추정치다. 실제 HW capacity 또는 위험 판정이
 아니다. layer-size score도 visible-area heuristic이며 safety memory budget을 줄이지 않는다.
@@ -315,6 +357,8 @@ Custom builder도 catalog와 같은 `ScenarioSafetyPolicy`를 통과한다.
 - positive GPU load에는 실제 GPU-backed producer 필요
 - decoder route에는 선택·검증된 media와 concrete codec binding 필요
 - graphics budget이 맞지 않으면 silent clamp 대신 reject될 수 있음
+- buffer projection은 FIT/1:1 crop, 고정 orientation은 0°/90° 중 선택
+- 1:1 crop은 `FULL_SCREEN`과 non-scaling motion만 허용
 
 Custom ID는 process 내에서 고유하게 생성되며 외부 Intent automation에서는 허용되지 않는다.
 
