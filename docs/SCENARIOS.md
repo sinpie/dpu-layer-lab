@@ -4,8 +4,10 @@
 > **Audience:** 시험 설계자, 앱 개발자, scenario reviewer, automation 작성자
 > **Update when:** catalog ID·phase·요구사항, scenario model, classifier/facet 또는 custom builder가 바뀔 때
 > **Does not own:** hard safety invariant, metric 판정, BSP probe 구현, 현재 작업 우선순위
-> **Related:** [README.md](../README.md), [ARCHITECTURE.md](../ARCHITECTURE.md),
+> **Related:** [Documentation index](INDEX.md), [README.md](../README.md), [ARCHITECTURE.md](../ARCHITECTURE.md),
 > [AGENTS.md](../AGENTS.md), [METRICS.md](METRICS.md),
+> [REQUIREMENTS.md](REQUIREMENTS.md), [UI_SPEC.md](UI_SPEC.md),
+> [HWC_CAPACITY_CALIBRATION.md](HWC_CAPACITY_CALIBRATION.md),
 > [TESTING.md](TESTING.md), [SYSTEM_INTEGRATION.md](SYSTEM_INTEGRATION.md)
 
 코드 authority는
@@ -142,7 +144,7 @@ off-screen loss를 포함하지 않는다.
 - `STATIC`: 추가 View transform 없음
 - `SCROLL`, `ZOOM_PAN`, `ROTATE`, `PARALLAX`, `TRANSFORM_STORM`: app View transform
 - `Z_ORDER_SWAP`: `translationZ` 기반 client ordering proxy
-- `CAPACITY_TILES`: plan-start HWC capacity candidate 전용 non-overlap crop
+- `CAPACITY_TILES`: process-session HWC capacity one-shot candidate 전용 non-overlap crop
 
 `Z_ORDER_SWAP`은 physical HWC plane Z-order가 바뀌었다는 증거가 아니다. report의
 `physicalHwcZOrderChange`는 계속 `false`다.
@@ -205,8 +207,11 @@ reject한다.
 | `dpu-client-fallback-burst` | 1L/30fps→20L mixed/alpha/GL 120fps | CLIENT fallback candidate |
 | `dpu-only-repeat-shock` | cross-load 0, 1L/30fps↔12L/120fps 반복 | display-only 급변 |
 
-4L이나 20L은 제품의 보편적 HWC 한계가 아니다. plan-start capacity calibration 결과도
-matching topology의 advisory boundary일 뿐이다.
+4L이나 20L은 제품의 보편적 HWC 한계가 아니다. Process-session capacity calibration은
+20L를 요청하지만 safety/graphics budget이 actual candidate를 줄일 수 있다. 최초
+terminal 결과를 이후 scenario/repeat/START가 재사용하더라도 matching opaque RGB
+DISPLAY tile topology의 advisory boundary일 뿐이며 catalog target, safety cap 또는 typed
+phase evidence를 바꾸지 않는다.
 
 ### Layer size profile
 

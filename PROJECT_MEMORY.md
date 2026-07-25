@@ -1,44 +1,29 @@
 # Project Memory
 
-이 문서는 DPULayerTest의 장기 설계 맥락을 보존하는 canonical project memory입니다.
-구현을 바꾸면 코드, test, `README.md`, 이 문서를 함께 갱신합니다.
+> **Authority:** 장기간 유지할 설계 결정, 선택 이유, trade-off와 알려진 한계
+> **Audience:** maintainer, reviewer, 제품 owner, source 복구 담당자
+> **Update when:** 장기 architecture 결정이나 전제·한계·rationale가 바뀔 때
+> **Does not own:** 현재 작업, 파일 위치, safety 규칙 원문, version/tag, 검증 명령
+> **Related:** [Documentation index](docs/INDEX.md), [Requirements](docs/REQUIREMENTS.md),
+> [ARCHITECTURE.md](ARCHITECTURE.md), [PLAN.md](PLAN.md),
+> [Repository map](docs/REPOSITORY_MAP.md)
 
-현재 미배포 source candidate는 `20260725_095708`(`versionCode 5`), debug version은
-`20260725_095708-debug`이다. 최신 공개 release는
-`20260725_090252`(`versionCode 4`), tag는 `v20260725_090252`이다.
-`yyyyMMdd_HHmmss`는 KST build 시각이며 Launcher와 Gradle project 표시 이름은
-`DPULayerTest`다. Canonical GitHub
-저장소는 `sinpie/dpu-layer-lab`이며, 기존 제품 통합과 report consumer를 위해 package
-`com.example.dpulayerlab`, automation action/component, `dpu-layer-lab-` report prefix,
-Soong module/APK 이름 `DpuLayerLab`은 stable compatibility identifier로 유지한다.
-Release asset 이름은 `DPULayerTest-20260725_090252-debug.apk`,
-`DPULayerTest-20260725_090252-release-unsigned.apk`, `SHA256SUMS.txt`다. Unsigned
-release는 secure product signing pipeline 입력이며 최종 설치 APK가 아니고 platform
-key/certificate/keystore/token은 저장소나 release에 두지 않는다.
-Android Studio project는 Gradle wrapper를 authority로 사용한다. AGP 8.12.2 때문에
-Narwhal Feature Drop 2025.1.2 이상 또는 AGP 8.12 지원 후속 Studio가 필요하다.
-VCS-shared configuration은 `DPULayerTest - Debug APK`(`:app:assembleDebug`)와
-`DPULayerTest - Release APK (unsigned)`(`:app:assembleRelease`)이며 사용자별
-`.idea`/SDK/JDK 경로는 추적하지 않는다. Release configuration은 secure product
-signing과 분리된 unsigned 산출물만 만든다.
+이 문서는 DPULayerTest의 장기 설계 맥락을 보존하는 canonical project memory입니다.
+구현을 바꿀 때는 [Documentation index](docs/INDEX.md)의 변경 유형별 갱신표를 따릅니다.
+
+표시 이름은 `DPULayerTest`지만 기존 제품 통합과 report consumer를 위해 package,
+automation action/component, report prefix와 Soong module은 안정적인 외부 계약으로
+분리했다. 이 결정의 현재 값과 migration 규칙은
+[External contracts](docs/EXTERNAL_CONTRACTS.md), 변동하는 source/release version은
+[Release](docs/RELEASE.md)가 소유한다. Build toolchain과 Android Studio configuration은
+[Testing](docs/TESTING.md)이 소유하며 개인 SDK/JDK 경로와 signing material은 추적하지
+않는다.
 
 ## 문서 authority
 
-| 문서 | 장기 역할 |
-|---|---|
-| `AGENTS.md` | 규범적 수정 규칙, 안전 불변식과 완료 정의 |
-| `PLAN.md` | 현재·다음 작업의 상태; 완료된 설계 사실의 authority가 아님 |
-| `ARCHITECTURE.md` | 현재 component, 실행 흐름과 resource ownership |
-| `PROJECT_MEMORY.md` | 장기간 유지할 결정, 이유와 알려진 한계 |
-| `docs/SCENARIOS.md` | scenario/phase/catalog 의미 |
-| `docs/METRICS.md` | metric provenance, exact/proxy, verdict와 report |
-| `docs/TESTING.md` | 검증 명령과 test-to-contract map |
-| `docs/RELEASE.md` | version, artifact, signing과 publish 절차 |
-| `docs/RECONSTRUCTION.md` | source 유실 시 dependency별 복구 절차 |
-| `docs/SYSTEM_INTEGRATION.md` | product/BSP/AIDL/SELinux 계약 |
-
-한 사실은 해당 authority 문서 한 곳에서 상세히 설명하고 다른 문서는 요약과 링크만
-유지한다. `PLAN.md`가 기존 안전·제품·계측 계약을 덮어쓰지 않는다.
+문서별 단일 책임과 역할별 읽기 순서는 [Documentation index](docs/INDEX.md)가
+authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존하며 현재 작업은
+`PLAN.md`, 파일 위치는 `docs/REPOSITORY_MAP.md`, 안전 규범은 `AGENTS.md`를 따른다.
 
 ## 목적
 
@@ -434,8 +419,11 @@ signing과 분리된 unsigned 산출물만 만든다.
   unavailable로 둔다.
 - HWC DEVICE/CLIENT는 같은 vendor snapshot 또는 같은 SurfaceFlinger dump의 완전한
   원자 쌍으로만 투영한다. Fresh vendor 쌍을 우선하고, 한쪽이라도 없거나 invalid이면
-  SurfaceFlinger fallback은 Dashboard/idle `PERIODIC` 또는 plan-start
-  `CALIBRATION_ONESHOT` policy에서만 허용한다. Active run에서는 서로 다른
+  SurfaceFlinger fallback은 Dashboard/idle `PERIODIC` 또는 process-session
+  `CALIBRATION_ONESHOT` policy에서만 허용한다. Session one-shot은 vendor snapshot을
+  먼저 한 번만 prefetch하고 같은 service session의 nonnegative 원자 쌍이면 SF child를
+  생략한다. Pair가 불완전할 때만 SF fallback을 한 번 수행하며 같은 calibration sample에서
+  vendor를 다시 호출하지 않는다. Active run에서는 서로 다른
   source/boundary의 한쪽씩을 합치거나 SurfaceFlinger로 fallback하지 않는다. 선택 쌍의
   completion timestamp/age를 sample/report에 보존하며 2.5초를 넘으면 두 값 모두
   unavailable이다. Typed HWC expectation phase는 STEP만 허용하고 target topology와
@@ -461,15 +449,17 @@ signing과 분리된 unsigned 산출물만 만든다.
   Forced sample은 전체 safety/exact telemetry sample이므로 이 구간의 continuity를
   대체한다. 모든 terminal/cancel/error/phase-finally 경로는 identity-matched priority
   owner를 해제한다.
-- START plan은 첫 scenario 전에 전체 queue/repeat가 공유하는 HWC capacity 관측을 한
-  번만 수행한다. Safety-approved 최대 20L/30fps opaque RGB tile topology의 모든 first
-  buffer를 확인하고 100ms 안정화한 뒤 fresh DEVICE/CLIENT 원자 쌍을 한 번 읽는다.
-  불완전하면 retry 없이 N/A다. Producer/load zero, teardown, 3초 settle 뒤 기존 1L
-  scenario warm-up과 fresh baseline을 시작해 관측 traffic/frame/counter를 run evidence에서
-  제외한다. 결과는 matching topology의 advisory boundary일 뿐 universal maximum 또는
-  ScenarioSafetyPolicy cap이 아니다. logcat/임의 sysfs·debugfs plane 탐색은 금지한다.
+- HWC capacity 관측은 “각 scenario마다 미리 plane 수를 찾는 탐색”이 아니다. 계측 자체의
+  20-layer 부하가 뒤의 실험을 방해하지 않도록 process-session의 최초 승인된 START에서
+  한 번만 시도하고, 성공·실패·취소를 모두 terminal 결과로 재사용한다. Process memory에만
+  두는 이유는 Activity 재생성·후속 START에는 재측정 부하를 만들지 않으면서 다른
+  process/device 환경에는 오래된 경계를 적용하지 않기 위해서다. 결과는 matching opaque
+  RGB topology의 advisory이며 universal maximum, safety cap 또는 typed phase evidence가
+  아니다. 요청 topology, deadline, display scope, telemetry serialization과 cleanup의
+  현재 계약은
+  [HWC capacity calibration](docs/HWC_CAPACITY_CALIBRATION.md)이 authority다.
 - Active phase는 SurfaceFlinger child를 생성하지 않는다. Typed boundary도 fresh vendor
-  pair만 사용하고 없으면 INCONCLUSIVE다. Plan calibration의 SF cache를 phase evidence로
+  pair만 사용하고 없으면 INCONCLUSIVE다. Session calibration의 SF cache를 phase evidence로
   재사용하지 않으며 untyped active sweep도 vendor pair가 없으면 N/A를 보존한다.
 - 실행 HUD의 typed HWC 상태는 동일 source·quality·timestamp이고 2.5초 freshness를
   만족한 현재 pair만 `RAW MATCH/WAIT`로 표시하며 그 밖은 `RAW N/A`다. 이는 target
@@ -643,9 +633,10 @@ signing과 분리된 unsigned 산출물만 만든다.
   unrelated `.json`은 건드리지 않으며, 사용자 설정형 만료 정책은 아직 없다.
 - vendor service는 샘플 계약만 있고 reference provider 구현은 이 저장소에 없다.
 
-## 다음 작업
+## 장기 후속 고려사항
 
-우선순위가 높은 후속 작업:
+현재·다음 작업의 상태와 우선순위는 [PLAN.md](PLAN.md)가 유일한 원장이다. 아래는 아직
+승인된 작업으로 간주하지 않는 장기 제품 방향이다.
 
 1. 실제 target BSP에서 platform-signed release 및 privapp permission 검증
 2. API v3의 system-wide Battery Saver arbitration과 exact prior-state restore를 포함한
@@ -658,120 +649,11 @@ signing과 분리된 unsigned 산출물만 만든다.
 7. report 목록/삭제 UI와 사용자 설정 가능한 retention/만료 정책
 8. schema v2 consumer/migration test와 장기 report 호환성 정책
 
-## 검증 명령
+## 검증과 파일 위치
 
-PowerShell:
+Host 명령, boundary/fault invariant map과 승인된 실기기 절차는
+[Testing](docs/TESTING.md)이 authority다. Release별 고정 test 수와 artifact evidence는
+[Release](docs/RELEASE.md)에만 기록한다. 연결된 실기기 stress는 사용자가 대상 실험기와
+실행 범위를 명시한 경우에만 수행한다.
 
-```powershell
-$env:JAVA_HOME='<JDK_17_HOME>'
-$env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
-
-.\gradlew.bat testDebugUnitTest
-.\gradlew.bat lintDebug
-.\gradlew.bat assembleDebug
-.\gradlew.bat assembleRelease
-```
-
-`20260725_090252`은 41개 suite의 host unit test 575개를 실패·오류·skip 없이
-통과했고, `lintDebug` error 0개(버전/도구 업데이트 알림 warning 6개),
-`assembleDebug`, `assembleRelease`를 통과했습니다. 이번 release에서는
-emulator/실기기 stress를 자동 실행하지 않았습니다. Exact DPU/SBWC/HWC/NPU 판정은
-host 회귀에 포함되지 않으며 platform-signed target BSP에서 별도로 검증해야 합니다.
-
-안전 정책 또는 renderer를 바꿨다면 최소한 다음을 추가 확인합니다.
-
-- 음수/0/NaN/무한대, cap 직전/직후 값의 unit test
-- 1개 8K producer가 budget을 넘는 경우 reject
-- scenario 전체 duration cap이 모든 phase에 비례 배분되고 transition/cycle도 함께
-  축소되며 100 ms cadence의 실제 window에서 의미를 유지할 수 없는 짧은
-  transition은 reject되는지
-- STEP이 fresh baseline/origin buffer 뒤 measured tick에서 target을 적용하고 그 tick을
-  실행할 시간이 없으면 `INCONCLUSIVE`인지, noncyclic transition의 floor가 0인지
-- absolute-deadline fixed-period loop가 늦은 tick을 busy catch-up하지 않고, runtime
-  coverage가 ramp 중간값/staircase 전 level/pulse ON·OFF/triangle 상승·하강/soak
-  attack·hold·recovery 중 누락을 `INCONCLUSIVE`로 만드는지
-- custom flattened 입력이 DISPLAY/RGB 단일 producer로 표시되고, non-zero GPU 요청의
-  GL producer가 보존되거나 budget 부족으로 명시적으로 reject되는지, flattened
-  1-layer intensity가 bounded extra draw pass를 실제로 바꾸는지
-- 모든 workload의 `0 < load <= 0.001`이 reject되고, GPU load가 허용되면 실제
-  GPU-backed producer가 끝까지 유지되는지
-- layer clamp 시 logical/producer count와 report event 일치
-- low-RAM, power-save, `MemoryInfo.lowMemory`, thermal SEVERE/CRITICAL state transition
-- Battery Saver original ON/OFF 각각의 BEGIN/renew/death/expiry/END와 exact restore,
-  stale command/late BEGIN, service replacement, renewal timeout, overlapping client의
-  global arbitration. 원래 ON 상태가 임시 해제돼도 power-save cap이 유지되는지
-- Broker가 없을 때 Saver OFF만 monitor-only로 허용되고 Saver ON, Doze/device-idle,
-  non-interactive는 producer 전에 거부되는지
-- 앱 선제 thermal SEVERE derating이 plan-start immutable 옵션/기본 OFF인지. OFF에서는
-  앱 setpoint를 유지하고 Android/kernel mitigation을 방해하지 않으며, ON에서만 시작 전
-  SEVERE 거부와 ordered zero → reduced workload acknowledgment → display
-  acknowledgment를 적용하고 하나라도 실패하면 중단하는지
-- thermal CRITICAL, low-memory, local-worker failure와 power/display/SystemUI 격리
-  무결성 fail-safe가 옵션과 무관하게 항상 중단하는지
-- phase 전환, 사용자 stop, exception, Activity destroy 뒤 worker/codec/NPU 해제
-- 함수 단위로 invalid/경계 입력, state transition, idempotent close와 owner token을
-  검증한 뒤 전체 흐름의 partial start·STOP/cancel·Activity 재생성·receiver unregister
-  실패·Job/thread 종료 지연이 Activity를 보존하거나 다음 run과 겹치지 않는지
-- 양의 NPU command ticket/acknowledgment와 active health loss가 fail-closed event를
-  만들고 측정 성공으로 남지 않는지
-- local worker Throwable/active interrupt가 first-wins latch와
-  `LOCAL_WORKER_FAILURE`/`ABORTED`를 만들고 같은 process의 후속 plan을 차단하는지
-- partial worker start 실패가 기존 worker 종료 전 same-owner retry/overlap을 막는지
-- memory workload prewarm이 모든 worker의 allocation/page touch를 baseline 전에
-  확인하고 byte counter를 reset하는지, allocation/ack timeout이 plan을 중단하는지
-- compression adapter 거부/timeout/연결 상실과 linear reset 실패가 plan을 fail-closed
-  중단하고 각 route 결과 event를 남기는지, physical producer teardown 뒤에만
-  compression reset하는지
-- producer generation 변경 전 frame이 다음 phase startup guard를 만족하지 않는지
-- 선택 media 없는 YUV/P010/SBWC decoder가 procedural proxy 없이 reject되는지,
-  실제 video track MIME, encoded/visible dimensions, FPS/profile/codecs/P010
-  fingerprint가 runtime에도 일치하고, horizontal/vertical crop pair를 독립 검증하며,
-  source `KEY_MAX_*`가 absent/exact pair인지 확인한 뒤 configure 전에 제거하는지,
-  codec rate가 source/phase/reachable transition FPS 최댓값을 만족하고 output
-  crop/dynamic resolution/64 px graphics/output allocation ceiling을 fail-closed하는지
-- provider open/parser timeout·cancel 뒤 daemon의 실제 `finally`까지 process-wide
-  refcount lease가 다음 plan을 막고 pinned AFD가 seekable인지
-- GL color와 보수적 depth를 각각 triple buffering한 budget 경계
-- aggregate physical actual/expected가 30 frame 이상에서 70% 미만일 때 event와
-  exact-positive 우선/그 외 `INCONCLUSIVE` 판정, flattened physical count 1
-- unpublished/pending/process-lease HUD가 fake expected `1P` 대신 `—P`인지
-- compact/landscape 실행 화면에서도 상단 STOP과 layer/DPU/CPU/GPU 그래프 및 예상
-  traffic, build version이 보이고 provenance 변경/unavailable 구간이 graph gap으로
-  유지되는지
-- Adaptive Hunt boundary가 `STEADY` memory plateau를 유지하는지
-- exact counter의 post-warmup baseline, source/quality 변화, reset/regress, 0-delta
-  continuity, post-teardown terminal sample, telemetry gap과 invalid delta provenance,
-  stable-source peak 및 report schema v2 직렬화
-- `AutomationActivity` explicit 호출만 허용되고 direct `MainActivity` START와 implicit
-  resolution이 거부되며 plan/repeat 상한을 유지하는지
-- catalog facet의 OR-within/AND-across 의미, filtered append/replace 순서와 cap,
-  queue move/duplicate 및 restored unknown-ID sanitize가 일치하는지
-- report 공유가 canonical internal managed completed file만 허용하고 traversal,
-  foreign/missing JSON을 거부하는지
-- vendor source가 없을 때 DPU/GPU/bus가 `N/A`이고 proxy verdict만 생성되는지
-
-실기기 stress test는 사용자가 대상 실험기와 실행 범위를 명시한 경우에만 수행합니다.
-
-## 파일 지도
-
-| 역할 | 경로 |
-|---|---|
-| Activity / display mode | `app/src/main/java/com/example/dpulayerlab/MainActivity.kt` |
-| Compose UI / HUD | `app/src/main/java/com/example/dpulayerlab/ui/DpuLayerLabApp.kt` |
-| 실행 상태와 안전 제어 | `app/src/main/java/com/example/dpulayerlab/engine/LabController.kt` |
-| 입력 검증 / graphics budget | `app/src/main/java/com/example/dpulayerlab/model/ScenarioSafetyPolicy.kt` |
-| device 안전 envelope | `app/src/main/java/com/example/dpulayerlab/engine/DeviceRenderSafety.kt` |
-| scenario catalog | `app/src/main/java/com/example/dpulayerlab/engine/ScenarioCatalog.kt` |
-| CPU/memory/NPU 부하 | `app/src/main/java/com/example/dpulayerlab/engine/LoadGenerators.kt` |
-| report | `app/src/main/java/com/example/dpulayerlab/engine/ReportWriter.kt` |
-| model / telemetry | `app/src/main/java/com/example/dpulayerlab/model/LabModels.kt` |
-| traffic estimate | `app/src/main/java/com/example/dpulayerlab/model/LayerTrafficEstimator.kt` |
-| BufferQueue / codec | `app/src/main/java/com/example/dpulayerlab/render/LayerStageView.kt` |
-| GLES stress | `app/src/main/java/com/example/dpulayerlab/render/StressGlSurfaceView.kt` |
-| system monitor | `app/src/main/java/com/example/dpulayerlab/monitor/SystemMonitor.kt` |
-| kernel probes | `app/src/main/java/com/example/dpulayerlab/monitor/KernelSensorProvider.kt` |
-| SurfaceFlinger parser | `app/src/main/java/com/example/dpulayerlab/monitor/SurfaceFlingerProbe.kt` |
-| vendor Binder client | `app/src/main/java/com/example/dpulayerlab/vendor/VendorBridge.kt` |
-| AIDL contract | `app/src/main/aidl/com/example/dpulayerlab/vendor/IDpuLabVendorService.aidl` |
-| product integration | `system_integration/`, `docs/SYSTEM_INTEGRATION.md` |
-| contributor rules | `AGENTS.md` |
+현재 tracked file과 package 책임은 [Repository map](docs/REPOSITORY_MAP.md)을 사용한다.

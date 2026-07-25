@@ -302,7 +302,7 @@ class ScenarioCatalogTest {
     }
 
     @Test
-    fun planeStaircaseIsBoundedRequestSweepSeparateFromPlanCalibration() {
+    fun planeStaircaseIsBoundedRequestSweepSeparateFromSessionCalibration() {
         val staircase = checkNotNull(ScenarioCatalog.byId("plane-staircase"))
 
         assertEquals(
@@ -310,7 +310,7 @@ class ScenarioCatalogTest {
             staircase.phases.map(PhaseSpec::activeLayers),
         )
         assertTrue(staircase.phases.none { it.activeLayers == 20 })
-        assertTrue(staircase.description.contains("Plan-start 1회 capacity 관측과 별개"))
+        assertTrue(staircase.description.contains("process-session 최초 1회 capacity 관측과 별개"))
         assertTrue(staircase.description.contains("최대 plane 수로 간주하지 않"))
         assertTrue(staircase.description.contains("N/A"))
     }

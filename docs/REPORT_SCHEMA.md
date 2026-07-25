@@ -1,0 +1,300 @@
+# Report schema v2
+
+> **Authority:** JSON report의 field 이름, type, nullability, 단위, provenance와 consumer 규칙
+> **Audience:** report consumer, data analyst, app maintainer, source 복구 담당자
+> **Update when:** `ReportWriter`, `RunSummary`, `TelemetrySnapshot`, filename/retention 또는 schema version이 바뀔 때
+> **Does not own:** metric의 물리적 해석, verdict algorithm, FileProvider 제품 배치
+> **Related:** [Documentation index](INDEX.md), [METRICS.md](METRICS.md),
+> [EXTERNAL_CONTRACTS.md](EXTERNAL_CONTRACTS.md), [TESTING.md](TESTING.md),
+> [RECONSTRUCTION.md](RECONSTRUCTION.md)
+
+Machine authority는
+`app/src/main/java/com/example/dpulayerlab/engine/ReportWriter.kt`다. 이 문서는 source
+유실 시 consumer 호환 구조를 재생성하기 위한 schema 설명이다.
+
+## 파일과 발행
+
+Filename:
+
+```text
+dpu-layer-lab-yyyyMMdd-HHmmss-SSS-<safeScenarioId>[-<collision>].json
+```
+
+- UTF-8 JSON
+- internal `files/reports`
+- `.json.part` write/flush/fsync 뒤 rename
+- scenario ID는 `[A-Za-z0-9._-]`, 최대 80자
+- collision suffix는 1~999
+- newest 200 managed completed report 보존
+- FileProvider 공유는 canonical internal completed file이면서 현재 controller의
+  `lastReportFile` 또는 plan result history에 publish된 경로만 허용
+
+## 공통 type 규칙
+
+- timestamp `*EpochMs`: Unix epoch milliseconds
+- timestamp `tMs`, `*MonotonicMs`: run 시작 monotonic 원점을 뺀 signed milliseconds
+- duration/age `*Ms`: milliseconds
+- utilization/CPU/memory `*Percent`, `cpu`, `gpuBusy`, `busBusy`, `dpuBusy`: percent
+- frequency `*Mhz`: MHz
+- `generatedBandwidthGbps`: decimal gigabits/second
+- memory `*Mb`: MiB로 계산한 표시값
+- count/delta: integer
+- unavailable numeric과 non-finite float: JSON `null`
+- unavailable source: empty string
+- unavailable quality: `"UNAVAILABLE"`
+- enum: Kotlin enum의 stable uppercase `name`
+
+모든 gauge는 value와 함께 `Quality`와 `Source`를 보존한다. Value가 null/non-finite,
+source가 비었거나 quality가 unavailable이면 report quality도 `UNAVAILABLE`이다.
+
+Report의 event, sample과 evidence timestamp는 하나의 run-relative 축을 사용한다.
+Run 시작 전에 수집됐지만 freshness가 유효한 cached HWC/SF evidence는
+`*EvidenceMonotonicMs`가 음수일 수 있다. 유효 evidence의 age는
+`sample.tMs - evidenceMonotonicMs == evidenceAgeMs` 관계를 유지한다.
+
+## Top-level
+
+| Field | Type | Null | 의미 |
+|---|---|---|---|
+| `schemaVersion` | integer | no | 현재 `2` |
+| `appVersion` | string | no | 실제 `BuildConfig.VERSION_NAME` |
+| `scenarioId` | string | no | 실행한 effective scenario ID |
+| `scenarioName` | string | no | 사용자 표시 이름 |
+| `verdict` | enum string | no | `RunVerdict.name` |
+| `startedEpochMs` | integer | no | run 시작 wall clock |
+| `finishedEpochMs` | integer | no | run 종료 wall clock |
+| `controlLayerIncluded` | boolean | no | 항상 true, app control layer가 display에 존재 |
+| `device` | object | no | build/device identity |
+| `exactUnderrunDelta` | integer | yes | verified exact delta |
+| `exactUnderrunSource` | string | no | unavailable이면 empty |
+| `exactUnderrunQuality` | enum string | no | unavailable이면 `UNAVAILABLE` |
+| `suspectedUnderrunDelta` | integer | no | proxy delta |
+| `telemetrySources` | object | no | 마지막 sample의 source/quality |
+| `peaks` | object | no | stable-source aggregate peak |
+| `phases` | array | no | effective phase contract |
+| `events` | array | no | ordered event |
+| `samples` | array | no | ordered telemetry sample |
+
+### `device`
+
+| Field | Type |
+|---|---|
+| `manufacturer`, `model`, `device`, `release`, `fingerprint` | string |
+| `sdk` | integer |
+
+Fingerprint는 privacy-sensitive device identity다. Report를 저장소에 commit하거나
+자동 upload하지 않는다.
+
+## `telemetrySources`
+
+각 entry는 다음 object다.
+
+```json
+{"quality":"MEASURED","source":"example"}
+```
+
+Key:
+
+- `exactUnderrun`
+- `cpu`, `appCpu`
+- `memoryUsed`, `memoryAvailable`, `appPss`
+- `display`, `producedFps`
+- `suspectedUnderrun`
+- `gpu`, `gpuFrequency`
+- `memoryBus`
+- `dpu`, `dpuFrequency`
+- `hwcDeviceLayers`, `hwcClientLayers`
+- `surfaceFlingerMiss`
+- `generatedBandwidth`
+
+이 object는 값 자체를 반복하지 않는다. 마지막 sample의 provenance 요약이다.
+
+## `peaks`
+
+| Field | Type | 단위 |
+|---|---|---|
+| `cpuPercent` | number/null | % |
+| `memoryUsedPercent` | number/null | % |
+| `generatedBandwidthGbps` | number/null | Gbps |
+
+다른 peak가 필요하면 consumer가 `samples`에서 source/quality 연속성을 확인해 계산한다.
+서로 다른 provenance segment의 max를 조용히 합치지 않는다.
+
+## `phases[]`
+
+| Field | Type | 의미 |
+|---|---|---|
+| `id` | string | phase ID |
+| `durationMs` | integer | effective duration |
+| `layers` | integer | active logical layer |
+| `producerFps` | number/null | requested producer pacing |
+| `requestedDisplayHz` | number/null | requested display pacing |
+| `backend` | enum string | `LayerBackend` |
+| `pixelRoute` | enum string | `PixelRoute` |
+| `bufferSize` | enum string | `BufferSize` |
+| `motion` | enum string | `MotionProfile` |
+| `layerSizeProfile` | enum string | `LayerSizeProfile` |
+| `motionSemantics` | enum string | typed motion semantics |
+| `physicalHwcZOrderChange` | boolean | 현재 View swap은 false |
+| `alphaOverlap` | boolean | overlap/alpha pressure |
+| `includeGlLayer` | boolean | GL producer/tail |
+| `hwcCompositionExpectation` | enum string | none/device/client contract |
+| `workloads` | object | CPU/MEM/GPU/NPU/shape |
+| `transition` | object | transition envelope |
+
+`workloads`:
+
+- `cpu`, `memory`, `gpu`, `npu`: normalized 0~1 number
+- `shape`: `LoadShape.name`
+
+`transition`:
+
+- `mode`: `TransitionMode.name`
+- `durationMs`, `cycleMs`, `stepCount`
+- `dutyCycle`, `floor`
+
+## `events[]`
+
+| Field | Type | 의미 |
+|---|---|---|
+| `tMs` | integer | run-relative event timestamp |
+| `type` | string | stable event type |
+| `message` | string | bounded human-readable detail |
+
+Consumer는 모르는 event type을 무시할 수 있어야 하며 known event의 의미를 문자열
+pattern만으로 추론하지 않는다.
+
+## `samples[]`
+
+### Core/system
+
+| Value field | Type | 단위 | 동반 field |
+|---|---|---|---|
+| `tMs` | integer | run-relative ms | 없음 |
+| `cpu` | number/null | % | `cpuQuality`, `cpuSource` |
+| `appCpu` | number/null | % | `appCpuQuality`, `appCpuSource` |
+| `memoryUsed` | number/null | % | `memoryUsedQuality`, `memoryUsedSource` |
+| `memoryAvailableMb` | number/null | MiB | `memoryAvailableQuality`, `memoryAvailableSource` |
+| `appPssMb` | number/null | MiB | `appPssQuality`, `appPssSource` |
+| `displayHz` | number/null | Hz | `displayHzQuality`, `displayHzSource` |
+| `producedFps` | number/null | fps | `producedFpsQuality`, `producedFpsSource` |
+
+### Underrun과 frame proxy
+
+| Field | Type | 의미 |
+|---|---|---|
+| `missedFrames` | integer | app/frame proxy cumulative |
+| `missedFramesQuality`, `missedFramesSource` | enum/string | proxy provenance |
+| `suspectedUnderruns` | integer | suspected proxy cumulative |
+| `suspectedUnderrunQuality`, `suspectedUnderrunSource` | enum/string | proxy provenance |
+| `exactUnderruns` | integer/null | hardware/kernel exact cumulative |
+| `exactUnderrunQuality`, `exactUnderrunSource` | enum/string | exact provenance |
+
+### GPU, bus와 DPU
+
+| Value field | 단위 | 동반 field |
+|---|---|---|
+| `gpuBusy` | % | `gpuBusyQuality`, `gpuBusySource` |
+| `gpuFrequencyMhz` | MHz | `gpuFrequencyQuality`, `gpuFrequencySource` |
+| `busBusy` | % | `busBusyQuality`, `busBusySource` |
+| `dpuBusy` | % | `dpuBusyQuality`, `dpuBusySource` |
+| `dpuFrequencyMhz` | MHz | `dpuFrequencyQuality`, `dpuFrequencySource` |
+
+모든 value는 number/null이다.
+
+### HWC composition
+
+| Field | Type | 의미 |
+|---|---|---|
+| `hwcDeviceLayers`, `hwcClientLayers` | integer/null | same-snapshot pair |
+| `hwcDeviceLayersQuality`, `hwcClientLayersQuality` | enum | pair quality |
+| `hwcDeviceLayersSource`, `hwcClientLayersSource` | string | pair source |
+| `hwcCompositionEvidenceMonotonicMs` | integer/null | run-relative pair completion; 음수 가능 |
+| `hwcCompositionEvidenceAgeMs` | integer/null | sample 시점 age |
+| `surfaceFlingerHwcMissed`, `surfaceFlingerGpuMissed` | integer/null | SF proxy |
+| `surfaceFlingerMissQuality`, `surfaceFlingerMissSource` | enum/string | proxy provenance |
+| `surfaceFlingerEvidenceMonotonicMs` | integer/null | run-relative SF completion; 음수 가능 |
+| `surfaceFlingerEvidenceAgeMs` | integer/null | sample 시점 age |
+
+DEVICE/CLIENT source와 quality는 서로 같아야 usable pair다. Consumer가 한쪽만 다른
+source와 결합하면 안 된다.
+
+### Generated load와 safety
+
+| Field | Type | 단위/의미 |
+|---|---|---|
+| `generatedBandwidthGbps` | number/null | app memory worker Gbps |
+| `generatedBandwidthQuality`, `generatedBandwidthSource` | enum/string | provenance |
+| `thermalStatus` | integer | Android thermal status |
+| `thermal` | string | display label |
+| `memoryLow` | boolean | system/app allocation low-memory |
+| `powerSaveMode` | boolean | sample 시 Battery Saver |
+| `vendorServiceSession` | integer/null | provider registration continuity |
+| `compressionState` | string | sanitized bounded status |
+| `npuState` | string | sanitized bounded status |
+
+## 대표 구조 예
+
+아래는 필드 관계를 보여 주는 축약 예다. 실제 writer는 위 표의 모든 sample field를
+출력한다.
+
+```json
+{
+  "schemaVersion": 2,
+  "appVersion": "yyyyMMdd_HHmmss-debug",
+  "scenarioId": "example",
+  "scenarioName": "Example",
+  "verdict": "INCONCLUSIVE",
+  "startedEpochMs": 0,
+  "finishedEpochMs": 1,
+  "controlLayerIncluded": true,
+  "device": {
+    "manufacturer": "",
+    "model": "",
+    "device": "",
+    "sdk": 36,
+    "release": "",
+    "fingerprint": ""
+  },
+  "exactUnderrunDelta": null,
+  "exactUnderrunSource": "",
+  "exactUnderrunQuality": "UNAVAILABLE",
+  "suspectedUnderrunDelta": 0,
+  "telemetrySources": {},
+  "peaks": {
+    "cpuPercent": null,
+    "memoryUsedPercent": null,
+    "generatedBandwidthGbps": null
+  },
+  "phases": [],
+  "events": [],
+  "samples": []
+}
+```
+
+`telemetrySources`는 실제 report에서 빈 object가 아니라 정의된 모든 provenance key를
+포함한다. 현재 저장소에는 versioned golden JSON fixture가 없다. Fixture를 추가할 때는
+실제 `ReportWriter` 출력으로 만들고 `ReportWriterMathTest`의 schema assertion과 함께
+검증한다.
+
+## Consumer 규칙
+
+1. `schemaVersion`을 먼저 확인한다.
+2. unknown top-level/event/enum은 원본을 보존하고 fail-open parsing할 수 있지만 known
+   field의 단위나 null 의미를 바꾸지 않는다.
+3. unavailable numeric을 0으로 채우지 않는다.
+4. exact delta가 usable하면 proxy보다 우선한다.
+5. source/quality 변경 전후의 peak·trend를 하나의 연속 segment로 합치지 않는다.
+6. HWC D/C 한쪽만 있는 sample을 완전한 pair로 만들지 않는다.
+7. estimated layer traffic은 현재 schema sample의 measured bus와 합치지 않는다.
+8. fingerprint와 status string을 외부 공유 전에 privacy 검토한다.
+
+## Schema migration
+
+- 기존 field 의미를 바꾸지 않는다.
+- incompatible type/unit/nullability 변경은 `schemaVersion`을 증가시킨다.
+- 새 optional field는 consumer가 무시할 수 있게 추가한다.
+- app writer, unit test, `METRICS.md`, 이 문서와 존재하는 외부 consumer fixture를 같은
+  변경에서 갱신한다.
+- filename/report prefix 변경은 [External contracts](EXTERNAL_CONTRACTS.md)의 migration을
+  따른다.

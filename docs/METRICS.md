@@ -2,11 +2,13 @@
 
 > **Authority:** metric 이름·단위·source·quality, exact/proxy 경계, continuity, HUD/report와 verdict 의미
 > **Audience:** 시험 결과 분석자, telemetry 개발자, BSP integrator, report consumer
-> **Update when:** `TelemetrySnapshot`, probe/source 선택, counter 연속성, verdict 또는 report schema가 바뀔 때
-> **Does not own:** provider의 SELinux/배치 방법, scenario 설계, UI 사용 순서, 릴리스 절차
-> **Related:** [README.md](../README.md), [ARCHITECTURE.md](../ARCHITECTURE.md),
+> **Update when:** `TelemetrySnapshot`, probe/source 선택, counter 연속성 또는 verdict가 바뀔 때
+> **Does not own:** JSON field/nullability, provider의 SELinux/배치 방법, scenario 설계, UI 사용 순서, 릴리스 절차
+> **Related:** [Documentation index](INDEX.md), [README.md](../README.md), [ARCHITECTURE.md](../ARCHITECTURE.md),
 > [AGENTS.md](../AGENTS.md), [SCENARIOS.md](SCENARIOS.md),
-> [SYSTEM_INTEGRATION.md](SYSTEM_INTEGRATION.md), [TESTING.md](TESTING.md)
+> [HWC_CAPACITY_CALIBRATION.md](HWC_CAPACITY_CALIBRATION.md),
+> [REPORT_SCHEMA.md](REPORT_SCHEMA.md), [SYSTEM_INTEGRATION.md](SYSTEM_INTEGRATION.md),
+> [TESTING.md](TESTING.md)
 
 코드 authority는 다음과 같다.
 
@@ -166,9 +168,12 @@ HUD의 `RAW MATCH`, `RAW WAIT`, `RAW N/A`는 현재 raw pair의 보조 해석이
 target activation, distinct sample 수, topology revision과 phase coverage를 별도로
 검증한다.
 
-plan-start HWC capacity calibration은 safety-approved opaque RGB non-overlap tile의
-fresh DEVICE/CLIENT snapshot 한 번이다. 실패하면 retry나 0 추정 없이 N/A며, 결과는 해당
-topology의 advisory boundary다.
+Process-session HWC capacity 결과도 위 complete-pair 규칙을 따른다. Requested 20과
+safety-approved actual candidate를 구분하고, source/quality/evidence time이 불완전하면
+0이 아니라 terminal `UNAVAILABLE`을 보존한다. 이 값과 calibration 중 얻은
+SurfaceFlinger cache는 typed phase evidence가 아니며 matching topology의 advisory다.
+상세 topology, deadline, probe serialization, display scope, cleanup과 event는
+[HWC capacity calibration](HWC_CAPACITY_CALIBRATION.md)이 authority다.
 
 ## GPU source와 Xclipse
 
@@ -341,28 +346,9 @@ HUD graph는 다음 경계에 선을 이어 그리지 않는다.
 
 ## Report schema v2
 
-`ReportWriter`는 다음 최상위 필드를 쓴다.
-
-- `schemaVersion`, `appVersion`
-- `scenarioId`, `scenarioName`, `verdict`
-- `startedEpochMs`, `finishedEpochMs`
-- `controlLayerIncluded`
-- `device`
-- exact/proxy delta와 exact provenance
-- `telemetrySources`
-- `peaks`
-- `phases`
-- `events`
-- `samples`
-
-각 sample은 값과 source/quality를 함께 가진다. HWC pair에는 evidence completion time과
-age가 포함된다. phase에는 backend, pixel route, buffer size, motion semantics,
-workload, transition과 HWC expectation이 포함된다. `LayerSizeProfile`을 runtime/report
-contract에 포함하며 phase JSON의 `layerSizeProfile`에 같은 enum 이름을 기록한다.
-Schema compatibility test가 이 typed field를 검증한다.
-
-JSON publication은 temp write, flush/fsync, rename 순서다. managed filename은
-`dpu-layer-lab-` prefix이며 completed JSON만 최신 200개를 best-effort 보존한다.
+값의 source/quality와 exact/proxy 해석은 이 문서가 소유한다. JSON의 모든 field,
+type, nullability, enum, 단위, publication과 consumer 규칙은
+[Report schema v2](REPORT_SCHEMA.md)가 authority다.
 
 ## 분석 checklist
 

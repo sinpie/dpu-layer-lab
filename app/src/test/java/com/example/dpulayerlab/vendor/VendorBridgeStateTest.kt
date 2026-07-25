@@ -270,6 +270,18 @@ class VendorBridgeStateTest {
         assertFalse(supportsVendorTelemetryV2(1))
         assertTrue(supportsVendorTelemetryV2(VENDOR_TELEMETRY_API_V2))
         assertTrue(supportsVendorTelemetryV2(Int.MAX_VALUE))
+        assertFalse(
+            shouldReadVendorTelemetryV2(
+                apiVersion = VENDOR_TELEMETRY_API_V2,
+                includeExtendedTelemetry = false,
+            ),
+        )
+        assertTrue(
+            shouldReadVendorTelemetryV2(
+                apiVersion = VENDOR_TELEMETRY_API_V2,
+                includeExtendedTelemetry = true,
+            ),
+        )
     }
 
     @Test
@@ -398,6 +410,79 @@ class VendorBridgeStateTest {
             release.countDown()
             executor.shutdownNow()
             assertTrue(executor.awaitTermination(2L, TimeUnit.SECONDS))
+        }
+    }
+
+    @Test
+    fun calibrationTelemetryBarrierRequiresBothVendorLanesToBecomeIdle() {
+        val started = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val v2Started = CountDownLatch(1)
+        val v2Release = CountDownLatch(1)
+        val v1 = newNoBacklogRemoteExecutor("VendorCalibrationBarrier-v1")
+        val v2 = newNoBacklogRemoteExecutor("VendorCalibrationBarrier-v2")
+        try {
+            v1.execute {
+                started.countDown()
+                while (release.count > 0L) {
+                    try {
+                        release.await()
+                    } catch (_: InterruptedException) {
+                        // Model a provider Binder transaction that ignores cancellation.
+                    }
+                }
+            }
+            assertTrue(started.await(1L, TimeUnit.SECONDS))
+            assertFalse(
+                awaitVendorTelemetryLanesIdle(
+                    executors = listOf(v1, v2),
+                    timeoutMs = 20L,
+                    maxTimeoutMs = 1_000L,
+                ),
+            )
+
+            release.countDown()
+            assertTrue(
+                awaitVendorTelemetryLanesIdle(
+                    executors = listOf(v1, v2),
+                    timeoutMs = 1_000L,
+                    maxTimeoutMs = 1_000L,
+                ),
+            )
+
+            v2.execute {
+                v2Started.countDown()
+                while (v2Release.count > 0L) {
+                    try {
+                        v2Release.await()
+                    } catch (_: InterruptedException) {
+                        // The no-backlog lane must still reject the sentinel until this exits.
+                    }
+                }
+            }
+            assertTrue(v2Started.await(1L, TimeUnit.SECONDS))
+            assertFalse(
+                awaitVendorTelemetryLanesIdle(
+                    executors = listOf(v1, v2),
+                    timeoutMs = 20L,
+                    maxTimeoutMs = 1_000L,
+                ),
+            )
+            v2Release.countDown()
+            assertTrue(
+                awaitVendorTelemetryLanesIdle(
+                    executors = listOf(v1, v2),
+                    timeoutMs = 1_000L,
+                    maxTimeoutMs = 1_000L,
+                ),
+            )
+        } finally {
+            release.countDown()
+            v2Release.countDown()
+            v1.shutdownNow()
+            v2.shutdownNow()
+            assertTrue(v1.awaitTermination(2L, TimeUnit.SECONDS))
+            assertTrue(v2.awaitTermination(2L, TimeUnit.SECONDS))
         }
     }
 

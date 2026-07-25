@@ -258,6 +258,36 @@ class SurfaceFlingerProbeTest {
     }
 
     @Test
+    fun inputLaneCallerDeadlineCanShortenButNotExtendTheHardTimeout() {
+        val started = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val invocations = AtomicInteger()
+        val lane = SingleFlightInputProbeLane<Int, String>(
+            threadName = "SurfaceFlingerProbeTest-caller-deadline",
+            timeoutMs = 2_000L,
+            shutdownTimeoutMs = 500L,
+        ) { _, cancellation ->
+            invocations.incrementAndGet()
+            cancellation.registerCleanup(release::countDown)
+            started.countDown()
+            release.await()
+            "done"
+        }
+
+        val startedNanos = System.nanoTime()
+        assertEquals(ProbeLaneResult.TimedOut, lane.execute(1, callerTimeoutMs = 40L))
+        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos)
+        assertTrue("caller timeout took ${elapsedMs}ms", elapsedMs < 1_000L)
+        assertTrue(started.await(1, TimeUnit.SECONDS))
+        assertTrue(waitUntil(1_000L) { !lane.isActive() })
+        assertEquals(1, invocations.get())
+
+        assertEquals(ProbeLaneResult.TimedOut, lane.execute(2, callerTimeoutMs = 0L))
+        assertEquals(1, invocations.get())
+        assertTrue(lane.closeWithResult())
+    }
+
+    @Test
     fun timeoutKeepsGateClosedUntilWorkerActuallyExits() {
         val release = CountDownLatch(1)
         val invocations = AtomicInteger()
@@ -287,6 +317,34 @@ class SurfaceFlingerProbeTest {
         release.countDown()
         assertTrue(waitUntil(1_000L) { !lane.isActive() })
         assertEquals(ProbeLaneResult.Completed("done-2"), lane.execute())
+        assertTrue(lane.closeWithResult())
+    }
+
+    @Test
+    fun nonClosingIdleBarrierWaitsForTheTimedOutWorkersActualFinally() {
+        val release = CountDownLatch(1)
+        val lane = SingleFlightInputProbeLane<Int, String>(
+            threadName = "SurfaceFlingerProbeTest-idle-barrier",
+            timeoutMs = 25L,
+            shutdownTimeoutMs = 200L,
+        ) { input, _ ->
+            while (release.count > 0L) {
+                try {
+                    release.await()
+                } catch (_: InterruptedException) {
+                    // Model a Binder/native operation which ignores Future cancellation.
+                }
+            }
+            "done-$input"
+        }
+
+        assertEquals(ProbeLaneResult.TimedOut, lane.execute(1))
+        assertFalse(lane.awaitIdle(20L))
+        assertEquals(ProbeLaneResult.Busy, lane.execute(2))
+
+        release.countDown()
+        assertTrue(lane.awaitIdle(1_000L))
+        assertEquals(ProbeLaneResult.Completed("done-3"), lane.execute(3))
         assertTrue(lane.closeWithResult())
     }
 

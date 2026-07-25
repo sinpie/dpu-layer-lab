@@ -2,6 +2,13 @@
 
 ![DPULayerTest icon](docs/assets/dpu-layer-lab-icon.png)
 
+> **Authority:** 시험자 관점의 기능, UI, 빠른 시작, 결과 해석과 알려진 제한
+> **Audience:** lab operator, QA, 새 사용자, 제품 평가 담당자
+> **Update when:** 사용자-visible 기능, 화면 흐름, 실행 절차 또는 제한이 바뀔 때
+> **Does not own:** 수정 금지선, 내부 상태 전이, JSON field, BSP 배치와 release 절차
+> **Related:** [Documentation index](docs/INDEX.md), [Requirements](docs/REQUIREMENTS.md),
+> [UI spec](docs/UI_SPEC.md), [Troubleshooting](docs/TROUBLESHOOTING.md)
+
 Android AP의 DPU underrun 재현·검출과 Hardware Composer 합성 한계 탐색을 위한
 실험용 앱입니다. 독립 BufferQueue layer, 화면 변환, 고해상도 영상, CPU·메모리·GPU·NPU
 교차 부하를 단계적으로 올리고 내리면서 계측값과 판정 근거를 JSON 보고서로 남깁니다.
@@ -31,6 +38,9 @@ Soong module/APK 통합 이름 `DpuLayerLab`은 이름을 바꾸지 않는 호�
 
 ## 문서 지도
 
+전체 읽기 순서와 문서별 단일 책임은 [Documentation index](docs/INDEX.md)를 기준으로
+합니다.
+
 | 문서 | Authority |
 |---|---|
 | [README.md](README.md) | 시험자 관점의 기능, UI, 빠른 시작과 제한 |
@@ -38,8 +48,15 @@ Soong module/APK 통합 이름 `DpuLayerLab`은 이름을 바꾸지 않는 호�
 | [PLAN.md](PLAN.md) | 현재·다음 작업의 상태와 acceptance criteria |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | component, 실행 흐름, 상태와 resource ownership |
 | [PROJECT_MEMORY.md](PROJECT_MEMORY.md) | 장기 설계 결정과 이유 |
+| [Requirements](docs/REQUIREMENTS.md) | 사용자 목적과 구현·검증 traceability |
+| [Repository map](docs/REPOSITORY_MAP.md) | 파일·package 책임과 변경 영향 |
+| [State machines](docs/STATE_MACHINES.md) | 실행·telemetry·cleanup 상태 전이 |
+| [UI spec](docs/UI_SPEC.md) | 화면 정보 구조와 실행 HUD |
 | [Scenario 계약](docs/SCENARIOS.md) | catalog, phase, transition, facet와 custom test |
-| [Metric 계약](docs/METRICS.md) | source/quality, exact/proxy, verdict와 report schema |
+| [Metric 계약](docs/METRICS.md) | source/quality, exact/proxy와 verdict |
+| [HWC 최초 1회 계측](docs/HWC_CAPACITY_CALIBRATION.md) | 20L candidate 관측과 process-session 재사용 |
+| [Intent 자동화](docs/AUTOMATION.md) | ADB 호출, ordering, cap과 오류 |
+| [Report schema](docs/REPORT_SCHEMA.md) | schema v2 field, type, nullability와 consumer 규칙 |
 | [Build와 검증](docs/TESTING.md) | host/device gate와 test-to-contract 지도 |
 | [Release 절차](docs/RELEASE.md) | version, artifact, signing과 publish |
 | [Repository 복구](docs/RECONSTRUCTION.md) | 코드 유실 시 dependency별 재구축 순서 |
@@ -470,21 +487,18 @@ fresh producer topology를 다시 확인하므로 periodic sample이 두 probe �
 1L/30fps/60Hz ↔ 12L/120fps/120Hz를 세 번 왕복해 DPU 요청 부하의 상승과 회복만
 비교합니다.
 
-사용자가 START한 plan은 첫 scenario 전에 전체 queue/repeat가 공유하는 HWC capacity
-관측을 정확히 한 번 수행합니다. Runtime safety/graphics budget이 허용하는 범위에서 최대
-20개의 30fps RGB 독립 Surface를 불투명 non-overlap tile로 준비하고, 모든 first
-buffer와 topology publish를 확인한 뒤 100ms 안정화하고 fresh DEVICE/CLIENT snapshot을
-한 번만 수집합니다. 준비 또는 원자 쌍이 불완전하면 재시도 부하를 만들지 않고 `N/A`로
-남깁니다. 이어서 producer와 cross-load zero를 확인하고 teardown 뒤 3초 settle한 다음
-각 scenario의 기존 1L warm-up과 fresh exact baseline을 시작하므로 calibration의 frame,
-traffic, counter delta는 scenario evidence에 섞이지 않습니다.
+앱 process-session의 최초 승인된 START는 첫 scenario 전에 20L/30fps/60Hz independent
+opaque RGB candidate 관측을 정확히 한 번 시도합니다. Runtime safety가 실제 candidate를
+줄일 수 있으므로 requested `20L`과 actual candidate를 분리해 표시합니다. 성공뿐 아니라
+timeout·취소·실패도 terminal 결과로 저장하며 같은 process의 scenario/repeat/후속 START와
+Activity 재생성에서는 그 결과만 재사용해 두 번째 calibration burst를 만들지 않습니다.
 
-이 값은 해당 opaque RGB/display/system-surface 조합의 “candidate에서 관측된 D/C”이지
-보편적인 hardware maximum이 아닙니다. 같은 topology를 해석할 때 DEVICE/CLIENT 경계
-참고값으로만 queue/repeat에 재사용하며 safety hard cap을 바꾸지 않습니다. format,
-scale, transform, alpha 또는 display mode가 바뀐 typed phase는 fresh vendor evidence로
-다시 판정합니다. `HWC Plane Staircase`도 1→2→4→6→8→12→8→4→1L의 별도 bounded
-request sweep입니다.
+이 값은 해당 topology에서 관측한 DEVICE/CLIENT 참고값이지 보편적인 HWC plane maximum,
+safety cap 또는 typed phase evidence가 아닙니다. Display ID나 정규화 physical dimensions가
+바뀌면 같은 process에서는 `N/A`로 투영하며 다시 측정하려면 process를 재시작해야 합니다.
+정확한 topology, 6000ms producer-active deadline, telemetry priority/drain, cleanup과
+event 계약은 [Process-session HWC capacity calibration](docs/HWC_CAPACITY_CALIBRATION.md)을
+참고하세요.
 8K60 preset은 decoder primary 한 장, RGB overlay 6장과 GL tail 한 장으로 총 8개의
 physical layer를 구성합니다. 8K30 preset과 분리되어 있으므로 8K30-only 장치가 8K60
 capability 때문에 불필요하게 거부되지 않습니다.
@@ -583,64 +597,25 @@ preflight에서 거부합니다. SBWC `REQUIRED`와 NPU 시나리오는 실제 v
 
 ### ADB / 외부 Intent 자동화
 
-외부 harness는 반드시 explicit component(`-n`)로 전용 `AutomationActivity` alias를
-호출합니다. Launcher인 `MainActivity`에 `START`를 직접 보내면 의도적으로 무시됩니다.
-Alias의 intent-filter에는 `CATEGORY_DEFAULT`가 없으므로 일반 implicit activity
-resolution으로 실행할 수 없습니다. 대상 activity는 `singleTask`이므로 실행 중인
-instance에는 `onNewIntent`로 명령이 전달됩니다. Debug APK의 정확한 component 예시는
-다음과 같습니다.
+외부 harness는 explicit component(`-n`)로 전용 `AutomationActivity` alias를 호출합니다.
+Launcher `MainActivity`의 직접 START와 implicit Intent는 처리하지 않습니다. 아래는
+debug APK의 최소 예입니다.
 
 ```powershell
-# catalog preset 한 개를 2회 실행
 adb shell am start -n `
   com.example.dpulayerlab.debug/com.example.dpulayerlab.AutomationActivity `
   -a com.example.dpulayerlab.action.START `
   --es scenario_id baseline-display-modes `
   --ei repeat_count 2
 
-# 순서를 보존한 preset plan
-adb shell am start -n `
-  com.example.dpulayerlab.debug/com.example.dpulayerlab.AutomationActivity `
-  -a com.example.dpulayerlab.action.START `
-  --es scenario_ids "instant-isolated-contention,continuous-crossload-ramp" `
-  --ei repeat_count 2
-
-# 현재 전체 plan 중단 / UI만 표시
 adb shell am start -n `
   com.example.dpulayerlab.debug/com.example.dpulayerlab.AutomationActivity `
   -a com.example.dpulayerlab.action.STOP
-adb shell am start -n `
-  com.example.dpulayerlab.debug/com.example.dpulayerlab.AutomationActivity `
-  -a com.example.dpulayerlab.action.SHOW
 ```
 
-Release component는
-`com.example.dpulayerlab/com.example.dpulayerlab.AutomationActivity`입니다. Release
-alias에는 `com.example.dpulayerlab.permission.CONTROL_TESTS`
-(`signature|privileged`)가 걸립니다. 신뢰된 제품 harness는 이 permission을
-`uses-permission`으로 요청하고 같은 signing trust 또는 제품의 privileged allowlist
-정책을 충족해야 합니다. Debug manifest만 ADB lab 자동화를 위해 alias의 permission을
-제거하며, release 보안 계약으로 간주하면 안 됩니다.
-
-`scenario_ids`는 comma-separated 문자열 외에도 string array/list extra를 허용하며 입력
-순서와 중복을 보존합니다.
-8K preset은 독립 실행됩니다. 기존 catalog ID `8k-decoder-pressure`는 호환을 위해
-유지하지만 이제 독립 8K30 YUV preset을 뜻하고, 8K60 10-bit P010은
-`8k60-p010-pressure`를 사용합니다. 따라서 8K30-only harness는 기존 ID만 보내면
-8K60 capability를 요구하지 않습니다.
-`repeat_count`는 1~10, expanded plan은 최대 40회입니다. Catalog에 등록된 preset ID만
-허용하므로 Intent로 custom workload나 safety cap을 주입할 수 없습니다. 요청은
-`onStart` 이후에만 소비되고, 실행 중 추가 `START`는 기존 run을 교체하지 않고
-사용자 오류로 거부됩니다. `STOP`은 현재 scenario만이 아니라 남은 plan 전체를
-중단합니다. Activity가 아직 시작되지 않아 명령이 대기 중이어도 가장 최근 `STOP`이
-모든 미실행 `START`를 폐기하므로 오래된 `STOP`과의 중복 제거 때문에 재시작되지 않습니다.
-Extra는 `START`에서만 읽으므로 잘못 직렬화된 START payload가 뒤의 명시적 `STOP`
-처리를 막지 않습니다.
-
-앱 표시 이름이 DPULayerTest로 바뀌어도 위 component와
-`com.example.dpulayerlab.action.START`, `.STOP`, `.SHOW` action 문자열은 버전과
-무관하게 그대로입니다. 제품 harness는 launcher label을 파싱하지 말고 이 stable contract를
-사용해야 합니다.
+순서 보존 plan, repeat/40-run cap, SHOW/STOP ordering, release permission과 오류 의미는
+[Intent automation guide](docs/AUTOMATION.md), 변하지 않는 이름·타입은
+[External compatibility contracts](docs/EXTERNAL_CONTRACTS.md)를 참고하세요.
 
 Cold start에서 신뢰된 vendor broker가 아직 bind/capability 조회 중이면 최대 2초 동안
 비차단 대기합니다. 그때도 조회가 진행 중이면 adapter가 없다고 단정하지 않고 해당
@@ -745,16 +720,15 @@ SurfaceFlinger 쌍을 사용합니다. 둘 다 불완전하거나 2.5초 freshne
 
 SurfaceFlinger text dump 형식은 Android 및 BSP 버전에 따라 달라질 수 있습니다. 이
 dump는 전체 telemetry sample과 별도 completion 시각과 age를 가집니다. Dashboard/idle
-일반 모니터링은 3개 telemetry snapshot cadence로 bounded 재수집할 수 있고, plan-start
-capacity 관측은 준비가 끝난 뒤 cache를 우회해 정확히 한 번 fresh fallback을 허용합니다.
-Dump child는 800ms, 전체 telemetry는 4초로 제한됩니다. 같은 snapshot의 vendor 원자
-쌍이 있으면 그것이 우선합니다.
+일반 모니터링은 3개 telemetry snapshot cadence로 bounded 재수집할 수 있습니다.
+Process-session capacity의 vendor/SF 선택과 deadline은
+[HWC capacity calibration](docs/HWC_CAPACITY_CALIBRATION.md)을 따릅니다.
 
 실제 scenario active load에서는 periodic뿐 아니라 typed boundary도 SurfaceFlinger
 child를 만들지 않고 현재 vendor service session의 fresh 원자 쌍만 사용합니다. 따라서
-관측 프로세스가 target load를 교란하거나 calibration cache가 phase evidence로 재사용되지
+관측 프로세스가 target load를 교란하거나 session calibration cache가 phase evidence로 재사용되지
 않습니다. Vendor pair가 없으면 typed 판정과 untyped `HWC Plane Staircase`의 단계별
-DEVICE/CLIENT는 `N/A`/`INCONCLUSIVE`이며, plan-start 참고값으로 채우지 않습니다.
+DEVICE/CLIENT는 `N/A`/`INCONCLUSIVE`이며, session 참고값으로 채우지 않습니다.
 
 HWC composition count를 위해 logcat을 읽거나 임의 sysfs/debugfs를 탐색하지 않습니다.
 Portable 경로는 `dumpsys SurfaceFlinger --hwclayers`, 제품 경로는
@@ -1024,21 +998,10 @@ MainActivity
       └─ ReportWriter
 ```
 
-주요 파일:
-
-- 시나리오: `app/src/main/java/com/example/dpulayerlab/engine/ScenarioCatalog.kt`
-- 실행/안전: `app/src/main/java/com/example/dpulayerlab/engine/LabController.kt`
-- 입력 검증/budget: `app/src/main/java/com/example/dpulayerlab/model/ScenarioSafetyPolicy.kt`
-- device 안전 envelope: `app/src/main/java/com/example/dpulayerlab/engine/DeviceRenderSafety.kt`
-- 부하 발생기: `app/src/main/java/com/example/dpulayerlab/engine/LoadGenerators.kt`
-- multi-layer/codec: `app/src/main/java/com/example/dpulayerlab/render/LayerStageView.kt`
-- traffic 모델: `app/src/main/java/com/example/dpulayerlab/model/LayerTrafficEstimator.kt`
-- portable/vendor 계측: `app/src/main/java/com/example/dpulayerlab/monitor/`
-- vendor client: `app/src/main/java/com/example/dpulayerlab/vendor/VendorBridge.kt`
-- AIDL 계약: `app/src/main/aidl/com/example/dpulayerlab/vendor/IDpuLabVendorService.aidl`
-
-장기 설계 메모는 [PROJECT_MEMORY.md](PROJECT_MEMORY.md), 기여 및 agent 작업 규칙은
-[AGENTS.md](AGENTS.md)를 참고하세요.
+Component 관계는 [ARCHITECTURE.md](ARCHITECTURE.md), 실제 파일 위치와 변경 영향은
+[Repository map](docs/REPOSITORY_MAP.md), 장기 결정은
+[PROJECT_MEMORY.md](PROJECT_MEMORY.md), 수정 규칙은 [AGENTS.md](AGENTS.md)를
+참고하세요.
 
 ## 알려진 한계
 
@@ -1049,10 +1012,13 @@ MainActivity
 - SBWC 선택·검증은 vendor gralloc/codec adapter가 필요합니다.
 - NPU는 vendor service 또는 실제 accelerator adapter가 필요합니다. CPU fallback을
   NPU로 표시하지 않습니다.
-- 20 layer는 앱의 hard cap이지 SoC의 overlay plane 수가 아닙니다. Plan-start 1회
-  관측도 safety-approved candidate topology의 D/C 결과일 뿐이고 실제 배치는 HWC 정책,
-  format, transform, alpha, scale, secure/HDR 조건에 따라 달라집니다.
-- Plan-start 관측은 보편적인 maximum을 계산하거나 후속 safety cap을 변경하지 않습니다.
+- 20 layer는 앱의 hard cap이지 SoC의 overlay plane 수가 아닙니다. Process-session 최초
+  1회 관측도 requested 20에서 safety-approved actual candidate로 실행한 topology의 D/C
+  결과일 뿐이고 실제 배치는 HWC 정책, format, transform, alpha, scale, secure/HDR
+  조건에 따라 달라집니다.
+- Session 관측은 보편적인 maximum을 계산하거나 후속 safety cap을 변경하지 않습니다.
+  실패·취소도 같은 process에서 terminal N/A로 재사용되며 새 display를 측정하려면 앱
+  process를 재시작해야 합니다.
   Active load에서는 SurfaceFlinger dump를 억제하므로 fresh vendor snapshot이 없는 typed/
   untyped phase의 HWC count는 `N/A`일 수 있습니다.
 - View/client Z-order swap은 앱 content의 client-side ordering proxy이며 physical HWC

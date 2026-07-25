@@ -15,6 +15,7 @@ import android.os.Looper
 import com.example.dpulayerlab.model.LoadShape
 import com.example.dpulayerlab.model.PixelRoute
 import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.SynchronousQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
@@ -721,7 +722,7 @@ class VendorBridge private constructor(
     fun pendingPerformanceRestoreTicket(): VendorPerformanceSessionTicket? =
         processPerformanceRestoreLatch.snapshot()
 
-    fun snapshot(): VendorSnapshot? {
+    fun snapshot(includeExtendedTelemetry: Boolean = true): VendorSnapshot? {
         val deadlineNanos =
             System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(SNAPSHOT_TIMEOUT_MS)
         val baseSnapshot = callRemote<VendorSnapshot?>(
@@ -748,7 +749,12 @@ class VendorBridge private constructor(
         }
         baseSnapshot ?: return null
 
-        val extendedSnapshot = if (supportsVendorTelemetryV2(baseSnapshot.apiVersion)) {
+        val extendedSnapshot = if (
+            shouldReadVendorTelemetryV2(
+                apiVersion = baseSnapshot.apiVersion,
+                includeExtendedTelemetry = includeExtendedTelemetry,
+            )
+        ) {
             val remainingTimeoutMs = remainingVendorTelemetryTimeoutMs(
                 deadlineNanos = deadlineNanos,
                 nowNanos = System.nanoTime(),
@@ -781,6 +787,20 @@ class VendorBridge private constructor(
             currentServiceSession() == baseSnapshot.serviceSession
         }
     }
+
+    /**
+     * Non-closing barrier for the process-session calibration boundary.
+     *
+     * The caller must first suppress new SystemMonitor samples. A timed-out Binder transaction
+     * may ignore Future cancellation, so an empty caller/sample lane is not enough proof that the
+     * v1/v2 telemetry workers stopped touching the vendor service.
+     */
+    internal fun awaitTelemetryQuiescent(timeoutMs: Long): Boolean =
+        awaitVendorTelemetryLanesIdle(
+            executors = listOf(telemetryExecutor, telemetryV2Executor),
+            timeoutMs = timeoutMs,
+            maxTimeoutMs = MAX_CALIBRATION_TELEMETRY_QUIESCE_TIMEOUT_MS,
+        )
 
     private fun endPerformanceAfterFailedCommand(
         ticket: VendorPerformanceSessionTicket,
@@ -2133,6 +2153,7 @@ class VendorBridge private constructor(
         private const val PERFORMANCE_SESSION_REMOTE_RESTORED = 0
         private const val PERFORMANCE_SESSION_REMOTE_ACTIVE = 1
         const val MAX_RESTART_SAFE_WAIT_MS = 5_000L
+        const val MAX_CALIBRATION_TELEMETRY_QUIESCE_TIMEOUT_MS = 5_000L
         private const val RESTART_SAFE_POLL_NANOS = 5_000_000L
 
         private fun newRemoteExecutor(threadName: String) = ThreadPoolExecutor(
@@ -2289,6 +2310,13 @@ private val processPerformanceRestoreLatch = VendorPerformanceRestoreLatch()
 internal fun supportsVendorTelemetryV2(apiVersion: Int): Boolean =
     apiVersion >= VENDOR_TELEMETRY_API_V2
 
+internal fun shouldReadVendorTelemetryV2(
+    apiVersion: Int,
+    includeExtendedTelemetry: Boolean,
+): Boolean =
+    includeExtendedTelemetry &&
+        supportsVendorTelemetryV2(apiVersion)
+
 internal fun supportsVendorPerformanceSession(apiVersion: Int): Boolean =
     apiVersion >= VENDOR_PERFORMANCE_API_V3
 
@@ -2363,6 +2391,78 @@ internal fun awaitBoundedCondition(
             return false
         }
         if (condition()) return true
+    }
+}
+
+private const val VENDOR_TELEMETRY_IDLE_POLL_NANOS = 1_000_000L
+
+internal fun awaitVendorTelemetryLanesIdle(
+    executors: List<ThreadPoolExecutor>,
+    timeoutMs: Long,
+    maxTimeoutMs: Long,
+): Boolean {
+    require(executors.isNotEmpty())
+    require(maxTimeoutMs >= 0L)
+    val boundedTimeoutMs = timeoutMs.coerceIn(0L, maxTimeoutMs)
+    val deadlineNanos = monotonicDeadlineAfter(
+        System.nanoTime(),
+        TimeUnit.MILLISECONDS.toNanos(boundedTimeoutMs),
+    )
+    for (executor in executors) {
+        if (!awaitExecutorSentinel(executor, deadlineNanos)) return false
+    }
+    return true
+}
+
+/**
+ * A completed sentinel is an exact FIFO proof for every task accepted before it. Retrying submit
+ * also handles the v2 SynchronousQueue without relying on ThreadPoolExecutor.activeCount, which is
+ * explicitly approximate.
+ */
+private fun awaitExecutorSentinel(
+    executor: ThreadPoolExecutor,
+    deadlineNanos: Long,
+): Boolean {
+    while (true) {
+        if (executor.isShutdown) return false
+        val sentinel = try {
+            executor.submit<Boolean> { true }
+        } catch (_: RejectedExecutionException) {
+            null
+        }
+        if (sentinel == null) {
+            val remainingNanos = deadlineNanos - System.nanoTime()
+            if (remainingNanos <= 0L) return false
+            LockSupport.parkNanos(
+                remainingNanos.coerceAtMost(VENDOR_TELEMETRY_IDLE_POLL_NANOS),
+            )
+            if (Thread.interrupted()) {
+                Thread.currentThread().interrupt()
+                return false
+            }
+            continue
+        }
+        val remainingNanos = deadlineNanos - System.nanoTime()
+        if (remainingNanos <= 0L) {
+            sentinel.cancel(true)
+            (sentinel as? Runnable)?.let(executor::remove)
+            executor.purge()
+            return false
+        }
+        return try {
+            sentinel.get(remainingNanos, TimeUnit.NANOSECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            sentinel.cancel(true)
+            (sentinel as? Runnable)?.let(executor::remove)
+            executor.purge()
+            false
+        } catch (_: Exception) {
+            sentinel.cancel(true)
+            (sentinel as? Runnable)?.let(executor::remove)
+            executor.purge()
+            false
+        }
     }
 }
 

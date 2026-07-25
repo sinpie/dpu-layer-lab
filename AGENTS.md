@@ -2,10 +2,13 @@
 
 이 파일은 사람과 coding agent가 DPULayerTest를 수정할 때 따르는 canonical repository
 instruction입니다. 장기 설계 맥락은 `PROJECT_MEMORY.md`, 사용자-facing 설명은
-`README.md`를 먼저 확인합니다. 현재 구조와 실행 흐름은 `ARCHITECTURE.md`, 작업
-상태는 `PLAN.md`, 복구 순서는 `docs/RECONSTRUCTION.md`, scenario/metric/test/release
-계약은 각각 `docs/SCENARIOS.md`, `docs/METRICS.md`, `docs/TESTING.md`,
-`docs/RELEASE.md`가 authority다.
+`README.md`를 먼저 확인합니다. 전체 문서 읽기 순서와 단일 책임은 `docs/INDEX.md`,
+사용자 요구 추적은 `docs/REQUIREMENTS.md`가 authority다. 현재 component/data flow는
+`ARCHITECTURE.md`, 허용 상태 전이는 `docs/STATE_MACHINES.md`, 파일 위치는
+`docs/REPOSITORY_MAP.md`, 작업 상태는 `PLAN.md`, 복구 순서는
+`docs/RECONSTRUCTION.md`를 사용한다. Scenario/metric/report/test/release 계약은 각각
+`docs/SCENARIOS.md`, `docs/METRICS.md`, `docs/REPORT_SCHEMA.md`,
+`docs/TESTING.md`, `docs/RELEASE.md`가 authority다.
 
 Launcher와 Gradle project의 표시 이름은 `DPULayerTest`이고 canonical remote는
 `https://github.com/sinpie/dpu-layer-lab`이다. 제품 호환성 계약인 package
@@ -244,15 +247,40 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   count와 topology revision을 재검증한다. Forced full telemetry가 safety/exact
   continuity를 갱신하며 모든 terminal/cancel/error/phase-finally는 identity-matched
   priority owner를 해제한다.
-- START plan은 첫 scenario 전에 전체 queue/repeat가 공유하는 HWC capacity 관측을 정확히
-  한 번 수행한다. Safety-approved 최대 20L/30fps opaque RGB non-overlap tile의 모든
-  first buffer를 확인하고 100ms 안정화한 뒤 fresh DEVICE/CLIENT snapshot을 한 번만
-  수집한다. 실패는 retry/0 추정 없이 N/A다. Producer/load zero, teardown, 3초 settle 뒤
-  기존 1L scenario warm-up과 fresh baseline을 시작한다. 이 결과는 matching topology의
-  advisory boundary일 뿐 universal maximum이나 renderer safety cap이 아니다.
+- 앱 process session의 최초 승인된 START는 첫 scenario 전에 HWC capacity 관측을
+  정확히 한 번 시도한다. 요청 topology는 20L/30fps/60Hz independent opaque RGB DISPLAY
+  `CAPACITY_TILES`이며 runtime safety/graphics budget이 실제 candidate를 줄일 수 있으므로
+  requested=20과 actual candidate를 UI/event/report에서 구분한다. 모든 first buffer 뒤
+  100ms 안정화와 single fresh DEVICE/CLIENT sample까지 producer-active 전체 구간은 하나의
+  absolute 6000ms deadline 안에 있어야 한다. 모든 terminal path에서 producer/generated
+  load zero, teardown과 counter drain을 확인한다. Cleanup-confirmed non-cancelled
+  경로만 deadline 밖의 3초 settle과 direct safety recheck 뒤 기존 1L scenario
+  warm-up/fresh baseline을 시작한다. Renderer target handoff 전에 실패하면 actual
+  candidate는 N/A다.
+  계측 priority를 먼저 획득해 periodic telemetry를 drop하고 기존 local sample,
+  SurfaceFlinger child와 vendor v1/v2 lane을 실제 completion까지 drain한다. Sample 뒤
+  동일 generation의 topology/geometry revision, discontinuity serial과 fresh heartbeat를
+  재검증하고 teardown 뒤에도 같은 quiescence barrier를 통과해야 한다. Barrier 실패는
+  process-sticky telemetry lifecycle failure다. 격리 중 watchdog timestamp를 성공으로
+  갱신하지 말고 pause/resume grace를 분리한다. Vendor/SF 없는 direct
+  thermal/power/low-memory 검사는 producer readiness 대기에서 control cadence로
+  유지하며 pre-drain 또는 composition sample에 별도 병렬 poll을 추가하지 않는다.
+  Calibration vendor snapshot은 v1 한 번만 사용하고 optional v2는 생략한다. V1 원자
+  D/C가 없을 때는 actual vendor worker quiescence를 bounded 확인한 뒤에만 SF fallback을
+  시작하며, 미확인이면 두 probe를 겹치지 않고 N/A로 끝낸다.
+  성공 `OBSERVED_AT_CANDIDATE`와 실패·timeout·취소의 terminal `UNAVAILABLE`은 같은 process의
+  이후 scenario/repeat/START와 Activity 재생성에서 재사용하며, 반복 20-layer burst를
+  만들지 않는다. SharedPreferences/disk에 저장하지 않는다. Display ID 또는 정규화한
+  physical dimensions가 바뀌면 projection을 N/A로 무효화하되 같은 process에서 다시
+  측정하지 않고 process 재시작을 요구한다. 단순 width/height 축 교환은 재사용한다.
+  결과는 matching topology의 advisory boundary일 뿐 universal maximum, renderer safety
+  cap 또는 typed phase evidence가 아니다.
 - Active run은 periodic/typed 모두 SurfaceFlinger child process를 만들지 않는다. Typed
   boundary는 같은 현재 vendor session의 fresh 원자 쌍만 사용하고 없으면 INCONCLUSIVE다.
-  Plan calibration SF cache를 phase evidence로 재사용하지 않는다. HWC count를 logcat이나
+  Session calibration의 `CALIBRATION_ONESHOT`은 vendor snapshot을 최대 한 번 prefetch하고
+  같은 session의 nonnegative DEVICE/CLIENT 원자 쌍이면 SurfaceFlinger를 생략한다. 그렇지
+  않을 때만 SF fallback을 한 번 허용하며 vendor snapshot을 두 번 호출하지 않는다.
+  Session calibration cache를 phase evidence로 재사용하지 않는다. HWC count를 logcat이나
   임의 sysfs/debugfs plane 탐색으로 추론하지 않는다.
 - HUD의 typed HWC `RAW MATCH/WAIT/N/A`는 2.5초 이내 동일 source·quality·timestamp
   DEVICE/CLIENT pair의 보조 해석일 뿐이다. Target readiness, distinct sample 수와
@@ -466,9 +494,12 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
     BEGIN/renew/health/END, stale/late command, death/expiry, exact restore와
     system-wide overlapping-client arbitration을 함수 단위와 전체 run/cancel/Activity
     재생성 흐름에서 검증했다.
-11. tracked 파일에 secret, APK, report, local path가 없다.
-12. 보고서는 internal `files/reports`만 사용하고 FileProvider로만 공유한다. 공유할
+11. HWC capacity session 변경은 one-shot claim/terminal reuse, requested/actual,
+    6000ms total producer deadline, vendor-prefetch/SF-fallback, Activity 재생성과
+    display-scope projection을 test하고 `SESSION_HWC_CAPACITY_*` event를 검증했다.
+12. tracked 파일에 secret, APK, report, local path가 없다.
+13. 보고서는 internal `files/reports`만 사용하고 FileProvider로만 공유한다. 공유할
     파일은 canonical internal directory 안에 실제 존재하며 managed completed
     `dpu-layer-lab-…json` 이름을 통과해야 한다. Traversal, foreign/missing file은
     거부한다.
-13. cloud backup/device-to-device/legacy rule에서 모든 app data domain이 제외된다.
+14. cloud backup/device-to-device/legacy rule에서 모든 app data domain이 제외된다.

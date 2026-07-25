@@ -352,12 +352,14 @@ class ProducerGenerationGateTest {
         assertTrue(pending.topologyPending)
         assertEquals(0, pending.expectedCount)
         assertFalse(pending.topologyMissed)
+        assertEquals(1L, pending.topologyDiscontinuitySerial)
         assertFalse(gate.activate(generation, nowMs = 4_000L))
 
         assertTrue(gate.expect(generation, setOf(11L, 12L), nowMs = 4_100L))
         val published = gate.readiness(generation, nowMs = 4_101L)
         assertTrue(published.topologyPublished)
         assertFalse(published.topologyPending)
+        assertEquals(1L, published.topologyDiscontinuitySerial)
         assertTrue(published.topologyPublishedAtMs == 4_100L)
         assertTrue(gate.activate(generation, nowMs = 4_200L))
     }
@@ -398,11 +400,17 @@ class ProducerGenerationGateTest {
         assertTrue(gate.accept(generation, 1L, nowMs = 30L))
         assertTrue(gate.accept(generation, 2L, nowMs = 30L))
         assertTrue(gate.readiness(generation, nowMs = 40L).ready)
+        val beforeRestartSerial =
+            gate.readiness(generation, nowMs = 40L).topologyDiscontinuitySerial
 
         assertTrue(gate.restartObservation(generation, nowMs = 2_500L))
         val restarted = gate.readiness(generation, nowMs = 2_501L)
         assertFalse(restarted.ready)
         assertTrue(restarted.topologyPublishedAtMs == 10L)
+        assertEquals(
+            beforeRestartSerial + 1L,
+            restarted.topologyDiscontinuitySerial,
+        )
         assertTrue(gate.accept(generation, 1L, nowMs = 2_510L))
         assertTrue(gate.accept(generation, 2L, nowMs = 2_520L))
         assertTrue(gate.readiness(generation, nowMs = 2_521L).ready)

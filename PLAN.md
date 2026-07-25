@@ -4,8 +4,10 @@
 > **Audience:** 프로젝트 owner, maintainer, coding agent, reviewer
 > **Update when:** 작업이 추가·분할·완료·차단되거나 acceptance criteria가 바뀔 때
 > **Does not own:** 안전 불변식, 현재 구현 구조, 계측 의미, 릴리스 절차, 과거 설계 결정
-> **Related:** [AGENTS.md](AGENTS.md), [ARCHITECTURE.md](ARCHITECTURE.md),
+> **Related:** [Documentation index](docs/INDEX.md), [Requirements](docs/REQUIREMENTS.md),
+> [AGENTS.md](AGENTS.md), [ARCHITECTURE.md](ARCHITECTURE.md),
 > [PROJECT_MEMORY.md](PROJECT_MEMORY.md), [docs/TESTING.md](docs/TESTING.md),
+> [docs/HWC_CAPACITY_CALIBRATION.md](docs/HWC_CAPACITY_CALIBRATION.md),
 > [docs/RELEASE.md](docs/RELEASE.md)
 
 이 문서는 앞으로 할 일을 기록한다. 구현된 사실은
@@ -39,6 +41,8 @@ DEVICE→CLIENT 전환, layer 크기 변화와 교차 자원 경합을 선택하
   `CLIENT_REQUIRED`는 fresh DEVICE/CLIENT evidence를 요구하는 관측 계약이다.
 - layer 표시 면적을 줄여도 physical producer 수, buffer allocation과 graphics
   safety budget을 축소했다고 가정하지 않는다.
+- HWC capacity candidate는 process session에서 한 번만 시도하고 terminal 결과를
+  재사용해 scenario별 또는 START별 calibration burst를 만들지 않는다.
 - exact DPU underrun counter가 없으면 proxy를 exact 결과로 승격하지 않는다.
 - 테스트 종료·중단·오류에서 producer, load worker, NPU/SBWC 상태, Battery Saver,
   display request와 system bar 상태 복구를 확인한다.
@@ -119,9 +123,21 @@ DEVICE→CLIENT 전환, layer 크기 변화와 교차 자원 경합을 선택하
 
 - **상태:** `DONE`
 - **완료 근거:** 신규·기존 문서의 authority를 분리하고 링크·제한된 inline path·
-  code-fence·버전·preset 정합 검사와 `git diff --check`를 통과했다.
+  code-fence·버전·preset 정합 검사와 `git diff --check`를 통과했다. 전체 host gate는
+  42개 suite/629개 test(실패·오류·skip 0), lint error 0,
+  `assembleDebug` 성공으로 확인했다.
 - **목표:** 사용법·안전·구조·시나리오·계측·검증·릴리스·복구의 authority를 분리한다.
 - **산출물:**
+  - `docs/INDEX.md`
+  - `docs/REQUIREMENTS.md`
+  - `docs/REPOSITORY_MAP.md`
+  - `docs/STATE_MACHINES.md`
+  - `docs/EXTERNAL_CONTRACTS.md`
+  - `docs/AUTOMATION.md`
+  - `docs/HWC_CAPACITY_CALIBRATION.md`
+  - `docs/REPORT_SCHEMA.md`
+  - `docs/UI_SPEC.md`
+  - `docs/TROUBLESHOOTING.md`
   - `PLAN.md`
   - `ARCHITECTURE.md`
   - `docs/SCENARIOS.md`
@@ -135,9 +151,49 @@ DEVICE→CLIENT 전환, layer 크기 변화와 교차 자원 경합을 선택하
   - 모든 상대 링크와 언급한 저장소 경로가 존재한다.
   - `git diff --check`가 통과한다.
 
+### P-005 Process-session HWC capacity one-shot
+
+- **상태:** `DONE`
+- **현재 근거:** process-local session store, controller deadline, vendor-prefetch/SF
+  fallback 분기와 관련 boundary test가 구현됐고 전체 host gate가 통과했다.
+- **목표:** 첫 START의 첫 scenario 전에만 bounded capacity candidate를 계측하고 같은 앱
+  process의 모든 후속 실행에서 terminal 결과를 재사용한다.
+- **계약:**
+  - requested topology는 20L/30fps/60Hz independent opaque RGB DISPLAY
+    `CAPACITY_TILES`
+  - safety/graphics budget이 actual candidate를 줄일 수 있으며 requested/actual을 구분
+  - topology readiness, 100ms stabilize와 single sample을 absolute 6000ms
+    producer-active deadline으로 제한
+  - success뿐 아니라 timeout/cancel/failure도 terminal N/A이며 같은 process에서 재시도
+    burst 금지
+  - scenario/repeat/후속 START와 Activity 재생성에서 in-memory reuse, disk persistence
+    금지
+  - orientation-only 축 교환은 reuse, display ID/normalized-size 변경은 N/A projection 후
+    process restart 요구
+  - vendor snapshot 한 번의 current-session atomic pair가 있으면 SF 생략, 없으면 SF
+    fallback 한 번
+  - optional vendor v2는 생략하고 v1 실패 뒤 actual worker quiescence가 확인된 경우에만
+    SF fallback 시작; 미확인은 probe overlap 없이 N/A
+  - periodic priority 획득 뒤 local/SF/vendor lane을 pre-drain하고 teardown 뒤 실제
+    completion을 다시 확인하며 미확인은 process-sticky failure
+  - sample 전후 topology/geometry revision, discontinuity serial과 fresh heartbeat 유지
+  - watchdog pause/resume grace는 success timestamp와 분리하고 direct safety recheck를
+    producer readiness cadence에 유지
+  - load zero와 renderer teardown은 모든 terminal path에서 확인하고, cleanup-confirmed
+    경로의 3초 settle은 producer deadline 밖에서 수행
+  - final producer teardown 뒤 calibration frame/generated-traffic counter를 drain해
+    첫 scenario evidence와 분리
+  - result는 advisory-only이며 safety cap/catalog target/typed phase evidence가 아님
+- **Acceptance:**
+  - `HwcCapacityCalibrationSessionTest`, `LabControllerMathTest`,
+    `SystemMonitorMathTest`의 one-shot/deadline/source/display boundary가 통과한다.
+  - report event가 `SESSION_HWC_CAPACITY_CALIBRATION`과
+    `SESSION_HWC_CAPACITY_REUSE_GUIDANCE`다.
+  - 전체 host gate와 Markdown 검사가 통과한다.
+
 ## Next
 
-### P-005 수동 device validation matrix
+### P-006 수동 device validation matrix
 
 - **상태:** `BLOCKED`
 - **차단 조건:** 대상 실험기, BSP probe/provider 구성, 허용된 시나리오 범위가 지정되지 않음
@@ -173,7 +229,7 @@ DEVICE→CLIENT 전환, layer 크기 변화와 교차 자원 경합을 선택하
 정확한 명령과 산출물은 [docs/TESTING.md](docs/TESTING.md), publish 절차는
 [docs/RELEASE.md](docs/RELEASE.md)를 따른다.
 
-이번 완료 상태의 host evidence는 41개 suite, 610개 unit test
-(`failures=0`, `errors=0`, `skipped=0`), `lintDebug`, `assembleDebug`,
-`assembleRelease` 성공이다. 연결된 실기기 stress validation은 P-005의 입력이 없어
-실행하지 않았다.
+이번 완료 상태의 host evidence는 42개 suite, 629개 unit test
+(`failures=0`, `errors=0`, `skipped=0`), `lintDebug`, `assembleDebug` 성공이다.
+이번 요청에는 release build가 포함되지 않아 `assembleRelease`는 다시 실행하지 않았다.
+연결된 실기기 stress validation은 P-006의 입력이 없어 실행하지 않았다.

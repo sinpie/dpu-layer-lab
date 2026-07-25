@@ -4,7 +4,7 @@
 > **Audience:** recovery maintainer, 미래 coding agent, repository owner
 > **Update when:** repository skeleton, module dependency, bootstrap 순서, irreducible contract 또는 checkpoint가 바뀔 때
 > **Does not own:** 정상 기능 개발 계획, 안전 규칙 원문, architecture rationale, secret/asset 보관
-> **Related:** [AGENTS.md](../AGENTS.md), [ARCHITECTURE.md](../ARCHITECTURE.md),
+> **Related:** [Documentation index](INDEX.md), [AGENTS.md](../AGENTS.md), [ARCHITECTURE.md](../ARCHITECTURE.md),
 > [PROJECT_MEMORY.md](../PROJECT_MEMORY.md), [PLAN.md](../PLAN.md),
 > [SCENARIOS.md](SCENARIOS.md), [METRICS.md](METRICS.md),
 > [TESTING.md](TESTING.md), [SYSTEM_INTEGRATION.md](SYSTEM_INTEGRATION.md),
@@ -16,15 +16,17 @@
 
 ## Authority 읽기 순서
 
-1. `AGENTS.md`: 수정 금지선, cap, cleanup과 exact/proxy 불변식
+1. `README.md`: 제품 목적과 사용자-visible 동작
 2. `PROJECT_MEMORY.md`: 장기간 유지할 결정과 이유
-3. `ARCHITECTURE.md`: 현재 component와 runtime flow
-4. `docs/SCENARIOS.md`: scenario/phase/catalog 계약
-5. `docs/METRICS.md`: telemetry/verdict/report 계약
-6. `docs/SYSTEM_INTEGRATION.md`: product/BSP/AIDL 계약
-7. `docs/TESTING.md`: acceptance gate
-8. `docs/RELEASE.md`: version과 공개 artifact
-9. `PLAN.md`: 아직 완료되지 않은 작업
+3. `AGENTS.md`: 수정 금지선, cap, cleanup과 exact/proxy 불변식
+4. `docs/INDEX.md`: 문서별 authority와 역할별 route
+5. `docs/REQUIREMENTS.md`: 잃으면 안 되는 요구사항 traceability
+6. `docs/REPOSITORY_MAP.md`: tracked file과 dependency 위치
+7. `ARCHITECTURE.md`와 `docs/STATE_MACHINES.md`: component/flow와 허용 전이
+8. `docs/EXTERNAL_CONTRACTS.md`: 외부 identifier와 wire compatibility
+9. `docs/SCENARIOS.md`, `docs/METRICS.md`, `docs/REPORT_SCHEMA.md`: 도메인 계약
+10. `docs/SYSTEM_INTEGRATION.md`, `docs/TESTING.md`, `docs/RELEASE.md`
+11. `PLAN.md`: 아직 완료되지 않은 작업
 
 `PLAN.md`에만 있는 미래 의도를 현재 구현으로 복구하지 않는다. 문서와 남은 source/test가
 충돌하면 safety는 `AGENTS.md`, product interface는 `SYSTEM_INTEGRATION.md`, 실행 가능한
@@ -453,7 +455,7 @@ dependency를 조율한다.
 2. immutable plan snapshot과 start gate
 3. Window isolation owner
 4. Battery Saver performance session
-5. plan-start HWC capacity calibration
+5. process-local HWC capacity session store와 one-shot claim/projection
 6. scenario media/vendor preflight
 7. warm-up, memory prewarm와 exact baseline
 8. phase transaction과 transition coverage
@@ -464,14 +466,46 @@ dependency를 조율한다.
 STOP은 phase/target null과 load/display safe setpoint를 먼저 적용하고 lazy run job의
 identity-matched NonCancellable finalizer가 ownership을 해제할 때까지 새 START를 막는다.
 
+`engine/HwcCapacityCalibrationSession.kt`를 controller보다 먼저 복구한다. Store는
+process당 하나의 claim/result만 소유하고 disk persistence를 사용하지 않는다. 최초
+controller만 requested 20L/30fps/60Hz independent opaque RGB DISPLAY
+`CAPACITY_TILES` 측정 claim을 얻는다. Safety-approved actual candidate, terminal
+`OBSERVED_AT_CANDIDATE` 또는 `UNAVAILABLE`, display ID와 normalized physical
+short/long edge를 result에 보존한다. 취소·timeout·failure도 terminal N/A로 complete해
+후속 START와 Activity 재생성이 두 번째 producer burst를 만들지 않게 한다.
+
+Scope 비교는 width/height 축 순서를 무시하므로 orientation-only swap은 reuse한다.
+Display ID 또는 normalized dimensions가 바뀌면 projection을 N/A로 바꾸되 새 claim을
+발급하지 않는다. 새 display 측정은 process restart 뒤에만 가능하다. Controller의
+one-shot owner는 topology+100ms stabilization+single sample을 absolute 6000ms
+producer-active deadline으로 묶는다. 모든 terminal path에서 load zero, renderer
+teardown과 calibration frame/generated-traffic counter drain을 확인하고,
+cleanup-confirmed non-cancelled path만 3000ms settle 뒤 scenario로 진행한다.
+Calibration telemetry는 vendor snapshot을 최대 한 번
+prefetch하고 완전한 current-session D/C이면 SF를 생략하며, 아니라면 SF fallback을 한
+번만 사용한다. Optional v2는 생략하고, v1 실패 뒤 actual vendor-worker completion을
+bounded 확인하지 못하면 SF를 시작하지 않고 N/A로 닫는다. Producer 시작 전 periodic
+priority를 획득하고 기존 local/SF/vendor
+작업을 drain한다. Sample 전후 topology/geometry revision과 discontinuity serial을
+비교하고 teardown 뒤 실제 worker completion을 다시 확인한다. Watchdog pause/grace는
+success timestamp와 분리하며, direct safety check는 producer readiness cadence에서
+유지한다.
+
 Checkpoint:
 
 ```powershell
-.\gradlew.bat testDebugUnitTest --tests "com.example.dpulayerlab.engine.LabControllerMathTest"
+.\gradlew.bat testDebugUnitTest `
+    --tests "com.example.dpulayerlab.engine.HwcCapacityCalibrationSessionTest" `
+    --tests "com.example.dpulayerlab.engine.LabControllerMathTest" `
+    --tests "com.example.dpulayerlab.monitor.ProducerGenerationGateTest" `
+    --tests "com.example.dpulayerlab.monitor.SurfaceFlingerProbeTest" `
+    --tests "com.example.dpulayerlab.monitor.SystemMonitorMathTest" `
+    --tests "com.example.dpulayerlab.vendor.VendorBridgeStateTest"
 ```
 
 이 checkpoint는 cancellation, exact continuity, typed HWC coverage, producer fidelity,
-duration cap, media fingerprint, cleanup과 performance restore fault를 포함해야 한다.
+session one-shot/reuse/display projection, vendor-prefetch/SF-fallback, duration cap, media
+fingerprint, cleanup과 performance restore fault를 포함해야 한다.
 
 ## 8단계: Activity와 UI
 
@@ -479,6 +513,7 @@ duration cap, media fingerprint, cleanup과 performance restore fault를 포함�
 
 - `engine/TestWindowIsolation.kt`
 - `MainActivity.kt`
+- `util/DisplayCompat.kt`
 - `ui/theme/Theme.kt`
 - `ui/DpuLayerLabApp.kt`
 

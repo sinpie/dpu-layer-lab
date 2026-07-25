@@ -23,6 +23,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runInterruptible
 import java.io.File
 import java.util.ArrayDeque
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 enum class CompressionControlResult {
@@ -55,7 +56,7 @@ internal enum class SurfaceFlingerProbePolicy {
     /** An active typed target accepts a fresh vendor pair but never starts another dump process. */
     TYPED_BOUNDARY,
 
-    /** The single plan-start candidate topology may use one SurfaceFlinger fallback snapshot. */
+    /** The process-session one-shot candidate may use one SurfaceFlinger fallback snapshot. */
     CALIBRATION_ONESHOT,
 
     /** Never spawn a diagnostic process in an untyped active load interval. */
@@ -192,7 +193,11 @@ class SystemMonitor private constructor(
         display: Display?,
         surfaceFlingerProbePolicy: SurfaceFlingerProbePolicy =
             SurfaceFlingerProbePolicy.PERIODIC,
+        sampleTimeoutMs: Long = SYSTEM_MONITOR_SAMPLE_TIMEOUT_MS,
     ): TelemetrySnapshot {
+        require(sampleTimeoutMs > 0L)
+        val boundedSampleTimeoutMs =
+            minOf(sampleTimeoutMs, SYSTEM_MONITOR_SAMPLE_TIMEOUT_MS)
         // Capture only immutable scalar input before handing work to the process-owned lane. A
         // timed-out worker therefore cannot retain an Activity, Window, or Display object.
         val request = SystemMonitorSampleRequest(
@@ -203,7 +208,7 @@ class SystemMonitor private constructor(
         )
         val result = try {
             runInterruptible(ioDispatcher) {
-                sampleLane.execute(request)
+                sampleLane.execute(request, boundedSampleTimeoutMs)
             }
         } catch (cancelled: CancellationException) {
             sampleContinuityLost.set(true)
@@ -223,7 +228,30 @@ class SystemMonitor private constructor(
             ProbeLaneResult.Cancelled -> sampleFailure("telemetry sample was cancelled")
             ProbeLaneResult.Interrupted -> sampleFailure("telemetry sample was interrupted")
             ProbeLaneResult.TimedOut -> sampleFailure(
-                "telemetry sample exceeded ${SYSTEM_MONITOR_SAMPLE_TIMEOUT_MS}ms",
+                "telemetry sample exceeded ${boundedSampleTimeoutMs}ms",
+            )
+        }
+    }
+
+    /**
+     * Non-closing actual-completion barrier used around the one-shot 20-layer calibration.
+     *
+     * Order matters: once the outer sample lane is idle it can no longer start a nested vendor or
+     * SurfaceFlinger operation, so the two inner process lanes can then be drained without a
+     * submit-after-check race.
+     */
+    internal suspend fun awaitCalibrationSampleQuiescent(
+        timeoutMs: Long = SYSTEM_MONITOR_CALIBRATION_QUIESCE_TIMEOUT_MS,
+    ): Boolean {
+        require(timeoutMs >= 0L)
+        val boundedTimeoutMs =
+            minOf(timeoutMs, SYSTEM_MONITOR_CALIBRATION_QUIESCE_TIMEOUT_MS)
+        return runInterruptible(ioDispatcher) {
+            awaitCalibrationQuiescenceStages(
+                timeoutMs = boundedTimeoutMs,
+                awaitLocalSampleLane = sampleLane::awaitIdle,
+                awaitSurfaceFlinger = surfaceFlinger::awaitQuiescent,
+                awaitVendorTelemetry = vendorBridge::awaitTelemetryQuiescent,
             )
         }
     }
@@ -285,12 +313,42 @@ class SystemMonitor private constructor(
         hz?.let(frameTracker::updateExpectedRefresh)
 
         val compositionDecisionMonotonicMs = SystemClock.elapsedRealtime()
+        val calibrationVendorPrefetched =
+            request.surfaceFlingerProbePolicy == SurfaceFlingerProbePolicy.CALIBRATION_ONESHOT
+        // Calibration is the only active-load policy allowed to spawn a SurfaceFlinger child.
+        // Read the current vendor transaction first so a complete atomic pair can avoid that
+        // perturbation. Keep this exact snapshot for the remainder of the sample; a null/partial
+        // result must fall back to SurfaceFlinger, not trigger a second vendor request.
+        val prefetchedCalibrationVendor =
+            if (calibrationVendorPrefetched) {
+                // Capacity needs only the atomic v1 D/C pair. Avoid the optional v2 transaction so
+                // GPU/frequency telemetry cannot add another Binder worker under the 20L burst.
+                vendorBridge.snapshot(includeExtendedTelemetry = false)
+            } else {
+                null
+            }
+        val prefetchedCalibrationVendorCompletedMonotonicMs =
+            prefetchedCalibrationVendor?.let {
+                completedEvidenceMonotonicMs(
+                    sampleStartedMs = cpuIntervalStartedMs,
+                    evidenceCompletedMs = SystemClock.elapsedRealtime(),
+                )
+            }
+        ensureSampleActive(cancellation)
         val vendorSessionBeforeCompositionProbe = vendorBridge.currentServiceSession()
+        val freshCalibrationVendorPairAvailable =
+            calibrationVendorPrefetched &&
+                nextVerifiedVendorCompositionSession(
+                    snapshotServiceSession = prefetchedCalibrationVendor?.serviceSession,
+                    currentServiceSession = vendorSessionBeforeCompositionProbe,
+                    deviceLayers = prefetchedCalibrationVendor?.deviceLayers,
+                    clientLayers = prefetchedCalibrationVendor?.clientLayers,
+                ) != null
         val vendorCompositionPathReady = vendorCompositionPathCanReplaceSurfaceFlinger(
             verifiedVendorCompositionSession = verifiedVendorCompositionSession,
             currentVendorServiceSession = vendorSessionBeforeCompositionProbe,
         )
-        if (
+        val surfaceFlingerProbeRequested =
             shouldRunSurfaceFlingerCompositionProbe(
                 policy = request.surfaceFlingerProbePolicy,
                 samplesUntilProbe = compositionSamplesUntilProbe,
@@ -298,6 +356,28 @@ class SystemMonitor private constructor(
                 observedMonotonicMs = compositionDecisionMonotonicMs,
                 maxAgeMs = SURFACE_FLINGER_EVIDENCE_MAX_AGE_MS,
                 vendorCompositionPathReady = vendorCompositionPathReady,
+                freshCalibrationVendorPairAvailable = freshCalibrationVendorPairAvailable,
+            )
+        val vendorTelemetryQuiescentForFallback =
+            if (
+                surfaceFlingerProbeRequested &&
+                request.surfaceFlingerProbePolicy ==
+                    SurfaceFlingerProbePolicy.CALIBRATION_ONESHOT
+            ) {
+                // A timed-out Binder Future may keep running after snapshot() returns null.
+                // Never overlap that worker with a dumpsys child under the 20-layer candidate.
+                vendorBridge.awaitTelemetryQuiescent(
+                    CALIBRATION_VENDOR_FALLBACK_QUIESCE_TIMEOUT_MS,
+                )
+            } else {
+                true
+            }
+        ensureSampleActive(cancellation)
+        if (
+            surfaceFlingerProbeRequested &&
+            surfaceFlingerFallbackMayStart(
+                policy = request.surfaceFlingerProbePolicy,
+                vendorTelemetryQuiescent = vendorTelemetryQuiescentForFallback,
             )
         ) {
             val composition = surfaceFlinger.sample()
@@ -306,6 +386,16 @@ class SystemMonitor private constructor(
                 completedMonotonicMs = SystemClock.elapsedRealtime(),
             )
             compositionSamplesUntilProbe = SURFACE_FLINGER_SAMPLE_EVERY_N_SNAPSHOTS - 1
+        } else if (surfaceFlingerProbeRequested) {
+            lastCompositionEvidence = CompositionEvidence(
+                snapshot = CompositionSnapshot(
+                    detail =
+                        "SurfaceFlinger fallback suppressed because vendor telemetry " +
+                            "worker completion was not confirmed",
+                ),
+                completedMonotonicMs = SystemClock.elapsedRealtime(),
+            )
+            compositionSamplesUntilProbe = 0
         } else if (
             shouldDiscardCachedSurfaceFlingerEvidence(
                 request.surfaceFlingerProbePolicy,
@@ -316,7 +406,10 @@ class SystemMonitor private constructor(
             // an explicit typed-boundary dump exists.
             lastCompositionEvidence = null
             compositionSamplesUntilProbe = 0
-        } else if (vendorCompositionPathReady) {
+        } else if (
+            vendorCompositionPathReady ||
+            freshCalibrationVendorPairAvailable
+        ) {
             // Keep the fallback due. If the vendor pair disappears, or the active run ends, the
             // next eligible sample probes immediately instead of inheriting a hidden cadence.
             compositionSamplesUntilProbe = 0
@@ -324,16 +417,27 @@ class SystemMonitor private constructor(
             compositionSamplesUntilProbe -= 1
         }
         ensureSampleActive(cancellation)
-        // Exact counters are intentionally sampled after a SurfaceFlinger probe. A caller waiting
-        // for a pre-phase baseline can then start immediately after this sample. At a typed active
-        // boundary the same ordering deliberately charges the bounded probe to that target phase.
-        val vendor = vendorBridge.snapshot()
-        val vendorEvidenceCompletedMonotonicMs = vendor?.let {
-            completedEvidenceMonotonicMs(
-                sampleStartedMs = cpuIntervalStartedMs,
-                evidenceCompletedMs = SystemClock.elapsedRealtime(),
-            )
-        }
+        // Non-calibration exact counters are intentionally sampled after a SurfaceFlinger probe.
+        // A caller waiting for a pre-phase baseline can then start immediately after this sample.
+        // Calibration already captured its one vendor transaction above so it can decide whether
+        // the lower-overhead atomic pair makes a SurfaceFlinger child unnecessary.
+        val vendor =
+            if (calibrationVendorPrefetched) {
+                prefetchedCalibrationVendor
+            } else {
+                vendorBridge.snapshot()
+            }
+        val vendorEvidenceCompletedMonotonicMs =
+            if (calibrationVendorPrefetched) {
+                prefetchedCalibrationVendorCompletedMonotonicMs
+            } else {
+                vendor?.let {
+                    completedEvidenceMonotonicMs(
+                        sampleStartedMs = cpuIntervalStartedMs,
+                        evidenceCompletedMs = SystemClock.elapsedRealtime(),
+                    )
+                }
+            }
         ensureSampleActive(cancellation)
         // Registration continuity is local state and must remain observable when the remote
         // metrics call times out under load. Only a real disconnect/reconnect changes this ID.
@@ -391,6 +495,12 @@ class SystemMonitor private constructor(
             vendorClientLayers = vendor?.clientLayers,
             vendorSource = vendorSource,
             vendorCompletedMonotonicMs = vendorEvidenceCompletedMonotonicMs,
+            vendorSessionVerified =
+                vendorCompositionPathCanReplaceSurfaceFlinger(
+                    verifiedVendorCompositionSession =
+                        verifiedVendorCompositionSession,
+                    currentVendorServiceSession = currentVendorServiceSession,
+                ),
             surfaceFlinger = compositionEvidence,
             observedMonotonicMs = evidenceMonotonicMs,
             maxAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
@@ -918,11 +1028,13 @@ internal fun shouldRunSurfaceFlingerCompositionProbe(
     observedMonotonicMs: Long,
     maxAgeMs: Long,
     vendorCompositionPathReady: Boolean,
+    freshCalibrationVendorPairAvailable: Boolean,
 ): Boolean {
     require(observedMonotonicMs >= 0L)
     require(maxAgeMs >= 0L)
-    // Capacity evidence must be correlated with the just-published candidate topology. Never let
-    // an earlier vendor-capability cache suppress this one fresh fallback snapshot.
+    // Capacity evidence must be correlated with the just-published candidate topology. An earlier
+    // vendor-capability cache cannot suppress the fallback; only the complete current-sample pair
+    // captured immediately before this decision can do so.
     if (
         policy != SurfaceFlingerProbePolicy.CALIBRATION_ONESHOT &&
         vendorCompositionPathReady
@@ -930,9 +1042,10 @@ internal fun shouldRunSurfaceFlingerCompositionProbe(
         return false
     }
     return when (policy) {
-        SurfaceFlingerProbePolicy.CALIBRATION_ONESHOT -> true
+        SurfaceFlingerProbePolicy.CALIBRATION_ONESHOT ->
+            !freshCalibrationVendorPairAvailable
         // Active typed phases may still obtain a fresh vendor snapshot later in this telemetry
-        // transaction, but never spawn a second SurfaceFlinger process after plan calibration.
+        // transaction, but never spawn a SurfaceFlinger process after session calibration.
         SurfaceFlingerProbePolicy.TYPED_BOUNDARY -> false
         SurfaceFlingerProbePolicy.SUPPRESS_DURING_LOAD -> false
         SurfaceFlingerProbePolicy.PERIODIC ->
@@ -945,6 +1058,18 @@ internal fun shouldRunSurfaceFlingerCompositionProbe(
             )
     }
 }
+
+/**
+ * Calibration may start dumpsys only after every timed-out vendor Future has actually completed.
+ * Other policies collect vendor state after (or instead of) SurfaceFlinger and do not need this
+ * ordering gate.
+ */
+internal fun surfaceFlingerFallbackMayStart(
+    policy: SurfaceFlingerProbePolicy,
+    vendorTelemetryQuiescent: Boolean,
+): Boolean =
+    policy != SurfaceFlingerProbePolicy.CALIBRATION_ONESHOT ||
+        vendorTelemetryQuiescent
 
 internal fun shouldDiscardCachedSurfaceFlingerEvidence(
     policy: SurfaceFlingerProbePolicy,
@@ -1025,6 +1150,7 @@ internal fun selectHwcCompositionEvidence(
     vendorClientLayers: Int?,
     vendorSource: String?,
     vendorCompletedMonotonicMs: Long?,
+    vendorSessionVerified: Boolean,
     surfaceFlinger: CompositionEvidenceProjection,
     observedMonotonicMs: Long,
     maxAgeMs: Long,
@@ -1058,13 +1184,18 @@ internal fun selectHwcCompositionEvidence(
         )
     }
 
-    return completePair(
-        deviceLayers = vendorDeviceLayers,
-        clientLayers = vendorClientLayers,
-        source = vendorSource,
-        quality = MetricQuality.HARDWARE_COUNTER,
-        completedMonotonicMs = vendorCompletedMonotonicMs,
-    ) ?: completePair(
+    val verifiedVendorPair = if (vendorSessionVerified) {
+        completePair(
+            deviceLayers = vendorDeviceLayers,
+            clientLayers = vendorClientLayers,
+            source = vendorSource,
+            quality = MetricQuality.HARDWARE_COUNTER,
+            completedMonotonicMs = vendorCompletedMonotonicMs,
+        )
+    } else {
+        null
+    }
+    return verifiedVendorPair ?: completePair(
         deviceLayers = surfaceFlinger.snapshot.deviceLayers,
         clientLayers = surfaceFlinger.snapshot.clientLayers,
         source = surfaceFlinger.snapshot.source,
@@ -1142,12 +1273,34 @@ private const val BYTES_PER_MEBIBYTE = 1_048_576.0
 private const val KIBIBYTES_PER_MEBIBYTE = 1_024.0
 private const val HZ_PER_MHZ = 1_000_000.0
 internal const val SYSTEM_MONITOR_SAMPLE_TIMEOUT_MS = 4_000L
+internal const val SYSTEM_MONITOR_CALIBRATION_QUIESCE_TIMEOUT_MS = 3_000L
+internal const val CALIBRATION_VENDOR_FALLBACK_QUIESCE_TIMEOUT_MS = 500L
 internal const val HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS = 2_500L
 internal const val SURFACE_FLINGER_EVIDENCE_MAX_AGE_MS =
     HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS
 private const val SURFACE_FLINGER_SAMPLE_EVERY_N_SNAPSHOTS = 3
 private const val SAMPLE_SHUTDOWN_TIMEOUT_MS = 1_500L
 private const val MAX_CONSTRUCTION_ROLLBACK_ACTIONS = 8
+
+internal fun awaitCalibrationQuiescenceStages(
+    timeoutMs: Long,
+    monotonicNowNanos: () -> Long = System::nanoTime,
+    awaitLocalSampleLane: (Long) -> Boolean,
+    awaitSurfaceFlinger: (Long) -> Boolean,
+    awaitVendorTelemetry: (Long) -> Boolean,
+): Boolean {
+    require(timeoutMs >= 0L)
+    val deadlineNanos =
+        monotonicNowNanos() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+    fun remainingMs(): Long =
+        (deadlineNanos - monotonicNowNanos())
+            .takeIf { it > 0L }
+            ?.let { TimeUnit.NANOSECONDS.toMillis(it) }
+            ?: 0L
+    return awaitLocalSampleLane(remainingMs()) &&
+        awaitSurfaceFlinger(remainingMs()) &&
+        awaitVendorTelemetry(remainingMs())
+}
 
 internal fun completedEvidenceMonotonicMs(
     sampleStartedMs: Long,

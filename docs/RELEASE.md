@@ -4,8 +4,9 @@
 > **Audience:** release engineer, repository maintainer, product integration 담당자
 > **Update when:** version 규칙, build type, asset allowlist, signing 또는 publish 절차가 바뀔 때
 > **Does not own:** 구현 architecture, safety invariant, 테스트 의미, BSP provider 계약
-> **Related:** [README.md](../README.md), [AGENTS.md](../AGENTS.md),
+> **Related:** [Documentation index](INDEX.md), [README.md](../README.md), [AGENTS.md](../AGENTS.md),
 > [PROJECT_MEMORY.md](../PROJECT_MEMORY.md), [TESTING.md](TESTING.md),
+> [EXTERNAL_CONTRACTS.md](EXTERNAL_CONTRACTS.md), [REPORT_SCHEMA.md](REPORT_SCHEMA.md),
 > [SYSTEM_INTEGRATION.md](SYSTEM_INTEGRATION.md)
 
 Canonical remote:

@@ -64,8 +64,10 @@ import com.example.dpulayerlab.monitor.FrameTracker
 import com.example.dpulayerlab.monitor.CapabilityScanner
 import com.example.dpulayerlab.monitor.CompressionControlResult
 import com.example.dpulayerlab.monitor.HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS
+import com.example.dpulayerlab.monitor.ProducerReadiness
 import com.example.dpulayerlab.monitor.SystemMonitor
 import com.example.dpulayerlab.monitor.SurfaceFlingerProbePolicy
+import com.example.dpulayerlab.monitor.SYSTEM_MONITOR_CALIBRATION_QUIESCE_TIMEOUT_MS
 import com.example.dpulayerlab.monitor.SYSTEM_MONITOR_SAMPLE_TIMEOUT_MS
 import com.example.dpulayerlab.render.RendererSafetyState
 import com.example.dpulayerlab.render.MAX_BOUND_COMPRESSED_SAMPLE_BYTES
@@ -138,6 +140,37 @@ enum class HwcCapacityCalibrationStatus {
     UNAVAILABLE,
 }
 
+internal const val HWC_CAPACITY_CALIBRATION_REQUESTED_LAYERS = 20
+internal const val HWC_CAPACITY_CALIBRATION_TOTAL_TIMEOUT_MS = 6_000L
+internal const val HWC_CAPACITY_CALIBRATION_PRODUCER_FPS = 30f
+internal const val HWC_CAPACITY_CALIBRATION_DISPLAY_HZ = 60f
+
+/**
+ * Fixed, display-only topology used for the process-session one-shot observation.
+ *
+ * Keep this construction pure so the exact 20-layer contract cannot silently inherit workloads,
+ * alpha, GL, decoder, or transition state from the first queued scenario.
+ */
+internal fun processSessionHwcCapacityCalibrationPhase(): PhaseSpec =
+    PhaseSpec(
+        id = "session-hwc-capacity-calibration",
+        label = "App session HWC capacity one-shot",
+        durationMs = HWC_CAPACITY_CALIBRATION_TOTAL_TIMEOUT_MS,
+        activeLayers = HWC_CAPACITY_CALIBRATION_REQUESTED_LAYERS,
+        producerFps = HWC_CAPACITY_CALIBRATION_PRODUCER_FPS,
+        requestedDisplayHz = HWC_CAPACITY_CALIBRATION_DISPLAY_HZ,
+        backend = LayerBackend.INDEPENDENT_SURFACES,
+        pixelRoute = PixelRoute.RGB_8888,
+        bufferSize = BufferSize.DISPLAY,
+        motion = MotionProfile.CAPACITY_TILES,
+        layerSizeProfile = LayerSizeProfile.FULL_SCREEN,
+        workloads = LoadSetpoints(),
+        alphaOverlap = false,
+        includeGlLayer = false,
+        transition = TransitionSpec(),
+        hwcCompositionExpectation = HwcCompositionExpectation.NONE,
+    )
+
 data class HwcCapacityCalibrationResult(
     val status: HwcCapacityCalibrationStatus,
     val candidateLayers: Int? = null,
@@ -146,27 +179,37 @@ data class HwcCapacityCalibrationResult(
     val source: String = "",
     val quality: MetricQuality = MetricQuality.UNAVAILABLE,
     val evidenceMonotonicMs: Long? = null,
+    val calibrationDisplayId: Int? = null,
+    val calibrationDisplayShortEdgePx: Int? = null,
+    val calibrationDisplayLongEdgePx: Int? = null,
     val detail: String = "",
 ) {
     fun eventDetail(): String =
-        "status=${status.name}; candidate=${candidateLayers ?: "N/A"}; " +
+        "status=${status.name}; requested=$HWC_CAPACITY_CALIBRATION_REQUESTED_LAYERS; " +
+            "candidate=${candidateLayers ?: "N/A"}; " +
             "device=${observedDeviceLayers ?: "N/A"}; " +
             "client=${observedClientLayers ?: "N/A"}; " +
             "quality=${quality.name}; source=${source.ifBlank { "N/A" }}; " +
             "evidenceMs=${evidenceMonotonicMs ?: "N/A"}; " +
+            "calibrationDisplay=${calibrationDisplayId ?: "unknown"}:" +
+            "${calibrationDisplayShortEdgePx ?: "N/A"}x" +
+            "${calibrationDisplayLongEdgePx ?: "N/A"}; " +
+            "lifetime=process-session; " +
             "scope=observed-at-candidate-not-universal-max; detail=${detail.ifBlank { "N/A" }}"
 
     fun uiSummary(): String =
         when (status) {
             HwcCapacityCalibrationStatus.PENDING ->
-                "HWC capacity · plan 1회 측정 대기"
+                "HWC capacity · 앱 session 최초 1회 · 요청 20L · 측정 대기"
             HwcCapacityCalibrationStatus.OBSERVED_AT_CANDIDATE ->
-                "HWC capacity · ${candidateLayers ?: "N/A"}L 후보에서 " +
+                "HWC capacity · session 1회 · 요청 20L · " +
+                    "실제 후보 ${candidateLayers ?: "N/A"}L에서 " +
                     "D${observedDeviceLayers ?: "N/A"}/C${observedClientLayers ?: "N/A"} · " +
                     "${quality.name}@${source.ifBlank { "N/A" }} · " +
                     capacityReuseGuidance(this).uiSummary()
             HwcCapacityCalibrationStatus.UNAVAILABLE ->
-                "HWC capacity · N/A · 후보 ${candidateLayers ?: "N/A"}L · " +
+                "HWC capacity · session 1회 N/A · 요청 20L · " +
+                    "실제 후보 ${candidateLayers ?: "N/A"}L · " +
                     "${quality.name}@${source.ifBlank { "N/A" }} · " +
                     detail.ifBlank { "fresh pair unavailable" }
         }
@@ -286,6 +329,29 @@ internal fun createLabController(
     }
 }
 
+/**
+ * Uses physical mode dimensions when available and normalizes axis order. This is evaluated again
+ * at each START so a fold/external-display transition cannot reuse an observation from another
+ * display envelope.
+ */
+internal fun currentHwcCapacityCalibrationScope(
+    activity: Activity,
+): HwcCapacityCalibrationScope {
+    val display = activity.currentDisplayCompat()
+    val mode = runCatching { display?.mode }.getOrNull()
+    val widthPx = mode?.physicalWidth
+        ?.takeIf { it > 0 }
+        ?: activity.resources.displayMetrics.widthPixels.coerceAtLeast(1)
+    val heightPx = mode?.physicalHeight
+        ?.takeIf { it > 0 }
+        ?: activity.resources.displayMetrics.heightPixels.coerceAtLeast(1)
+    return HwcCapacityCalibrationScope.normalized(
+        displayId = display?.displayId,
+        widthPx = widthPx,
+        heightPx = heightPx,
+    )
+}
+
 class LabController internal constructor(
     private val activity: Activity,
     private val requestDisplayMode: (Float) -> Boolean,
@@ -377,6 +443,7 @@ class LabController internal constructor(
      */
     private val hwcCompositionProbePriorityGate =
         HwcCompositionProbePriorityGate()
+    private val hwcCapacityCalibrationProbeOwner = Any()
     private var thermalReduced = false
     private var severeThermalPolicyObservationRecorded = false
     private var activeRuntimeProtectionPolicy = RuntimeProtectionPolicy()
@@ -417,6 +484,10 @@ class LabController internal constructor(
     @Volatile
     private var telemetrySampleInFlightDeadlineMs: Long? = null
     @Volatile
+    private var telemetryWatchdogCalibrationPaused = false
+    @Volatile
+    private var telemetryWatchdogResumeGraceDeadlineMs: Long? = null
+    @Volatile
     private var activeTestWindowIsolationToken: Long? = null
     private var isolationReleaseToken: Long? = null
     private var isolationReleaseDeferred: Deferred<Boolean>? = null
@@ -448,7 +519,9 @@ class LabController internal constructor(
     var performanceIsolationStatus by mutableStateOf("대기")
         private set
     var hwcCapacityCalibration by mutableStateOf(
-        HwcCapacityCalibrationResult(HwcCapacityCalibrationStatus.PENDING),
+        ProcessHwcCapacityCalibrationSession.snapshot(
+            currentHwcCapacityCalibrationScope(activity),
+        ) ?: HwcCapacityCalibrationResult(HwcCapacityCalibrationStatus.PENDING),
     )
         private set
     var errorMessage by mutableStateOf<String?>(null)
@@ -475,6 +548,14 @@ class LabController internal constructor(
     val hasDumpPermission: Boolean get() = systemMonitor.hasDumpPermission()
     val hasNpuAdapter: Boolean get() = systemMonitor.hasNpuAdapter()
     val hasSbwcAdapter: Boolean get() = systemMonitor.hasSbwcAdapter()
+
+    fun refreshHwcCapacityCalibrationDisplayProjection() {
+        if (closed) return
+        hwcCapacityCalibration =
+            ProcessHwcCapacityCalibrationSession.snapshot(
+                currentHwcCapacityCalibrationScope(activity),
+            ) ?: HwcCapacityCalibrationResult(HwcCapacityCalibrationStatus.PENDING)
+    }
 
     fun start() {
         if (closed) return
@@ -518,6 +599,8 @@ class LabController internal constructor(
         }
         frameTracker.start()
         lastSuccessfulSampleMs = SystemClock.elapsedRealtime()
+        telemetryWatchdogCalibrationPaused = false
+        telemetryWatchdogResumeGraceDeadlineMs = null
         val monitorCompletion = backendUseCompletionGroup.registerStart()
         val watchdogCompletion = backendUseCompletionGroup.registerStart()
         if (monitorCompletion == null || watchdogCompletion == null) {
@@ -576,6 +659,9 @@ class LabController internal constructor(
                             lastSuccessfulSampleMs = lastSuccessfulSampleMs,
                             staleTimeoutMs = MONITOR_STALE_TIMEOUT_MS,
                             inFlightDeadlineMs = telemetrySampleInFlightDeadlineMs,
+                            intentionallyPaused = telemetryWatchdogCalibrationPaused,
+                            resumeGraceDeadlineMs =
+                                telemetryWatchdogResumeGraceDeadlineMs,
                         ) &&
                         cancellationReason == null
                     ) {
@@ -1139,7 +1225,7 @@ class LabController internal constructor(
                 }
                 acquirePerformanceIsolationForPlan()
                 startPerformanceSessionRenewal(launchedJob)
-                calibrateHwcCapacityOnceForPlan(firstScenario)
+                ensureProcessSessionHwcCapacityCalibration(firstScenario)
                 repeat(plan.repeatCount) { repeatIndex ->
                     plan.scenarios.forEachIndexed { queueIndex, scenario ->
                         currentCoroutineContext().ensureActive()
@@ -2591,7 +2677,9 @@ class LabController internal constructor(
         loadManager.clearMemoryAllocationFailure()
         mutablePlanResultHistory.clear()
         hwcCapacityCalibration =
-            HwcCapacityCalibrationResult(HwcCapacityCalibrationStatus.PENDING)
+            ProcessHwcCapacityCalibrationSession.snapshot(
+                currentHwcCapacityCalibrationScope(activity),
+            ) ?: HwcCapacityCalibrationResult(HwcCapacityCalibrationStatus.PENDING)
         thermalReduced = false
         cancellationReason = null
         errorMessage = null
@@ -2629,9 +2717,198 @@ class LabController internal constructor(
         producerRecoveryPaused = false
     }
 
-    private suspend fun calibrateHwcCapacityOnceForPlan(firstScenario: ScenarioSpec) {
+    private suspend fun ensureProcessSessionHwcCapacityCalibration(
+        firstScenario: ScenarioSpec,
+    ) {
+        val calibrationScope = currentHwcCapacityCalibrationScope(activity)
+        when (
+            val acquisition =
+                ProcessHwcCapacityCalibrationSession.acquire(calibrationScope)
+        ) {
+            is HwcCapacityCalibrationAcquisition.Reuse -> {
+                hwcCapacityCalibration = acquisition.result
+                return
+            }
+            is HwcCapacityCalibrationAcquisition.Busy -> {
+                throw PlanAbortException(
+                    "다른 controller가 HWC capacity session 계측을 완료하지 못했습니다 " +
+                        "(${acquisition.activeScope.label()}). 중복 20-layer 부하를 막기 위해 " +
+                        "현재 plan을 시작하지 않습니다.",
+                )
+            }
+            is HwcCapacityCalibrationAcquisition.Measure -> {
+                var published = false
+                var calibrationPriorityAcquired = false
+                var priorityReleaseFailure: String? = null
+                try {
+                    if (calibrationScope.displayId == null) {
+                        hwcCapacityCalibration = HwcCapacityCalibrationResult(
+                            status = HwcCapacityCalibrationStatus.UNAVAILABLE,
+                            detail =
+                                "current physical display identity unavailable; " +
+                                    "20-layer one-shot was not started",
+                        )
+                    } else {
+                        if (
+                            !hwcCompositionProbePriorityGate.acquire(
+                                hwcCapacityCalibrationProbeOwner,
+                            )
+                        ) {
+                            throw PlanAbortException(
+                                "다른 typed HWC 계측이 아직 활성 상태여서 process-session " +
+                                    "20-layer 계측을 시작하지 않았습니다.",
+                            )
+                        }
+                        calibrationPriorityAcquired = true
+                        telemetryWatchdogResumeGraceDeadlineMs = null
+                        telemetryWatchdogCalibrationPaused = true
+                        if (!awaitCalibrationTelemetryIsolation()) {
+                            failCalibrationTelemetryLifecycle(
+                                "HWC capacity 계측 전 기존 telemetry/vendor/SF worker " +
+                                    "종료를 확인하지 못했습니다.",
+                            )
+                        }
+                        performProcessSessionHwcCapacityCalibration(
+                            firstScenario = firstScenario,
+                            claim = acquisition.claim,
+                        )
+                    }
+                    val completedScope =
+                        currentHwcCapacityCalibrationScope(activity)
+                    if (completedScope != calibrationScope) {
+                        throw PlanAbortException(
+                            "HWC capacity session 계측 중 display envelope가 변경되어 " +
+                                "결과를 재사용할 수 없습니다.",
+                        )
+                    }
+                    check(
+                        hwcCapacityCalibration.status !=
+                            HwcCapacityCalibrationStatus.PENDING,
+                    ) {
+                        "HWC capacity session calibration returned without a terminal result"
+                    }
+                    if (
+                        !ProcessHwcCapacityCalibrationSession.complete(
+                            claim = acquisition.claim,
+                            result = hwcCapacityCalibration,
+                        )
+                    ) {
+                        throw PlanAbortException(
+                            "HWC capacity session 계측 owner가 변경되어 결과를 게시하지 " +
+                                "못했습니다.",
+                        )
+                    }
+                    hwcCapacityCalibration = checkNotNull(
+                        ProcessHwcCapacityCalibrationSession.snapshot(calibrationScope),
+                    ) {
+                        "Completed HWC capacity session result was not reusable"
+                    }
+                    published = true
+                } finally {
+                    if (calibrationPriorityAcquired) {
+                        // Cancellation can arrive while the initial isolation barrier is waiting.
+                        // Keep priority ownership until an uncancellable second barrier proves that
+                        // no old local/SF/vendor task can escape into a later scenario.
+                        val finalIsolationConfirmed = try {
+                            withContext(NonCancellable) {
+                                awaitCalibrationTelemetryIsolation()
+                            }
+                        } catch (error: Exception) {
+                            false
+                        }
+                        if (!finalIsolationConfirmed) {
+                            val failure =
+                                "HWC capacity telemetry final isolation을 확인하지 못해 " +
+                                    "process 재시작 전 후속 시나리오를 차단합니다."
+                            telemetryLifecycleIntegrityConfirmed.set(false)
+                            cancellationReason = cancellationReason ?: failure
+                            errorMessage = failure
+                            priorityReleaseFailure = priorityReleaseFailure ?: failure
+                        }
+                        telemetryWatchdogResumeGraceDeadlineMs =
+                            saturatingAddNonNegative(
+                                SystemClock.elapsedRealtime(),
+                                MONITOR_STALE_TIMEOUT_MS,
+                            )
+                        telemetryWatchdogCalibrationPaused = false
+                        if (
+                            !hwcCompositionProbePriorityGate.release(
+                                hwcCapacityCalibrationProbeOwner,
+                            )
+                        ) {
+                            priorityReleaseFailure = priorityReleaseFailure ?:
+                                "HWC capacity telemetry priority owner 해제를 확인하지 못했습니다."
+                            telemetryLifecycleIntegrityConfirmed.set(false)
+                            cancellationReason =
+                                cancellationReason ?: priorityReleaseFailure
+                        }
+                    }
+                    if (!published) {
+                        ProcessHwcCapacityCalibrationSession.abandon(
+                            claim = acquisition.claim,
+                            reason = cancellationReason
+                                ?: "measurement, teardown, or settle did not complete",
+                        )
+                        hwcCapacityCalibration =
+                            ProcessHwcCapacityCalibrationSession.snapshot(
+                                currentHwcCapacityCalibrationScope(activity),
+                            )
+                                ?: HwcCapacityCalibrationResult(
+                                    status = HwcCapacityCalibrationStatus.UNAVAILABLE,
+                                    detail =
+                                        "process-session one-shot ended without a reusable result",
+                                )
+                    }
+                }
+                priorityReleaseFailure?.let { failure ->
+                    throw PlanAbortException(failure)
+                }
+            }
+        }
+    }
+
+    private suspend fun awaitCalibrationTelemetryIsolation(): Boolean {
+        val startedMs = SystemClock.elapsedRealtime()
+        return withTimeoutOrNull(
+            HWC_CAPACITY_CALIBRATION_TELEMETRY_DRAIN_TIMEOUT_MS,
+        ) {
+            telemetrySampleMutex.withLock {
+                val elapsedMs =
+                    (SystemClock.elapsedRealtime() - startedMs).coerceAtLeast(0L)
+                val remainingMs =
+                    (HWC_CAPACITY_CALIBRATION_TELEMETRY_DRAIN_TIMEOUT_MS - elapsedMs)
+                        .coerceAtLeast(0L)
+                remainingMs > 0L &&
+                    systemMonitor.awaitCalibrationSampleQuiescent(
+                        minOf(
+                            remainingMs,
+                            SYSTEM_MONITOR_CALIBRATION_QUIESCE_TIMEOUT_MS,
+                        ),
+                    )
+            }
+        } == true
+    }
+
+    private fun failCalibrationTelemetryLifecycle(reason: String): Nothing {
+        val boundedReason = reason.take(MAX_EVENT_MESSAGE_CHARS)
+        telemetryLifecycleIntegrityConfirmed.set(false)
+        cancellationReason = cancellationReason ?: boundedReason
+        errorMessage = boundedReason
+        throw PlanAbortException(boundedReason)
+    }
+
+    private suspend fun performProcessSessionHwcCapacityCalibration(
+        firstScenario: ScenarioSpec,
+        claim: HwcCapacityCalibrationClaim,
+    ) {
         check(hwcCapacityCalibration.status == HwcCapacityCalibrationStatus.PENDING) {
-            "Plan HWC capacity calibration must execute at most once"
+            "Process-session HWC capacity calibration must execute at most once"
+        }
+        check(
+            HWC_CAPACITY_CALIBRATION_REQUESTED_LAYERS <=
+                ScenarioSafetyPolicy.HARD_MAX_LAYERS,
+        ) {
+            "HWC capacity calibration candidate exceeds renderer hard cap"
         }
         ensurePlanMemoryAvailable()
         verifyPerformanceEnvironmentBeforeProducer()
@@ -2639,21 +2916,10 @@ class LabController internal constructor(
             activity = activity,
             originalPowerSaveMode = performanceBaselinePowerSaveMode == true,
         )
-        val requestedPhase = PhaseSpec(
-            id = "plan-hwc-capacity-calibration",
-            label = "Plan HWC capacity one-shot",
-            durationMs = HWC_CAPACITY_CALIBRATION_PHASE_BUDGET_MS,
-            activeLayers = ScenarioSafetyPolicy.HARD_MAX_LAYERS,
-            producerFps = HWC_CAPACITY_CALIBRATION_PRODUCER_FPS,
-            requestedDisplayHz = 60f,
-            backend = LayerBackend.INDEPENDENT_SURFACES,
-            pixelRoute = PixelRoute.RGB_8888,
-            bufferSize = BufferSize.DISPLAY,
-            motion = MotionProfile.CAPACITY_TILES,
-        )
+        val requestedPhase = processSessionHwcCapacityCalibrationPhase()
         val calibrationScenario = firstScenario.copy(
-            id = "plan-hwc-capacity-calibration",
-            name = "Plan HWC capacity one-shot",
+            id = "session-hwc-capacity-calibration",
+            name = "App session HWC capacity one-shot",
             description =
                 "Safety-approved RGB candidate topology for one fresh composition snapshot",
             tags = emptySet(),
@@ -2675,35 +2941,60 @@ class LabController internal constructor(
             )
             return
         }
-
         if (!confirmGeneratedLoadQuiesce()) {
             throw PlanAbortException(
-                "HWC capacity calibration 전 generated/NPU load zero를 확인하지 못했습니다.",
+                "HWC capacity session 계측 전 generated/NPU load zero를 확인하지 못했습니다.",
             )
         }
-        requestDisplayModeOrAbort(60f, "plan HWC capacity calibration")
+        requestDisplayModeOrAbort(
+            HWC_CAPACITY_CALIBRATION_DISPLAY_HZ,
+            "app-session HWC capacity calibration",
+        )
+        val deadlineMs = saturatingAdd(
+            SystemClock.elapsedRealtime(),
+            HWC_CAPACITY_CALIBRATION_TOTAL_TIMEOUT_MS,
+        )
         val generation = beginTrackedProducerGeneration()
+        if (
+            !ProcessHwcCapacityCalibrationSession.recordCandidate(
+                claim = claim,
+                candidateLayers = candidatePhase.activeLayers,
+            )
+        ) {
+            throw PlanAbortException(
+                "HWC capacity session owner가 변경되어 physical candidate를 " +
+                    "기록하지 못했습니다.",
+            )
+        }
         progress = RunProgress(
             stage = RunnerStage.WARMUP,
             scenario = firstScenario,
             phase = candidatePhase,
             targetPhase = candidatePhase,
             statusText =
-                "Plan 1회 HWC capacity 관측 · ${candidatePhase.activeLayers}L 후보 준비",
+                "앱 session 최초 1회 HWC capacity 관측 · " +
+                    "${candidatePhase.activeLayers}L/20L 후보 준비",
             producerGeneration = generation,
         )
-        val deadlineMs = saturatingAdd(
-            SystemClock.elapsedRealtime(),
-            HWC_CAPACITY_CALIBRATION_TOPOLOGY_TIMEOUT_MS,
-        )
-        var readinessAtSnapshot: com.example.dpulayerlab.monitor.ProducerReadiness? = null
+        var readinessAtSnapshot: ProducerReadiness? = null
         var unavailableReason: String? = null
         var generationActivated = false
         var teardownConfirmed: Boolean
+        var nextDirectSafetyCheckMs = SystemClock.elapsedRealtime()
         try {
             while (readinessAtSnapshot == null && unavailableReason == null) {
                 currentCoroutineContext().ensureActive()
                 val nowMs = SystemClock.elapsedRealtime()
+                if (nowMs >= nextDirectSafetyCheckMs) {
+                    // Periodic vendor/SF/counter telemetry is intentionally isolated here, but
+                    // critical thermal, power-envelope and low-memory safety remain live.
+                    ensurePlanMemoryAvailable()
+                    verifyPerformanceEnvironmentBeforeProducer(
+                        recordSuccessfulObservation = false,
+                    )
+                    nextDirectSafetyCheckMs =
+                        saturatingAdd(nowMs, LOAD_CONTROL_CADENCE_MS)
+                }
                 val readiness = frameTracker.producerReadiness(generation)
                 val rendererCleanupPending = RendererSafetyState.hasUnconfirmedTeardown()
                 readiness.runtimeFailureReason?.let { failure ->
@@ -2736,15 +3027,13 @@ class LabController internal constructor(
                 }
                 if (
                     generationActivated &&
-                    readiness.ready &&
-                    readiness.topologyPublished &&
-                    !readiness.topologyPending &&
-                    readiness.geometryReady &&
-                    readiness.geometryAppliedProfileOrdinal ==
-                    candidatePhase.layerSizeProfile.ordinal &&
-                    !rendererCleanupPending &&
-                    readiness.expectedCount == candidatePhase.activeLayers &&
-                    readiness.observedCount == candidatePhase.activeLayers
+                    hwcCapacityCalibrationTopologyReady(
+                        readiness = readiness,
+                        candidateLayers = candidatePhase.activeLayers,
+                        expectedProfileOrdinal =
+                            candidatePhase.layerSizeProfile.ordinal,
+                        rendererCleanupPending = rendererCleanupPending,
+                    )
                 ) {
                     readinessAtSnapshot = readiness
                     break
@@ -2797,17 +3086,14 @@ class LabController internal constructor(
                     }
                     val stabilized = frameTracker.producerReadiness(generation)
                     val topologyStillReady =
-                        stabilized.ready &&
-                            stabilized.topologyPublished &&
-                            !stabilized.topologyPending &&
-                            stabilized.geometryReady &&
-                            stabilized.geometryAppliedProfileOrdinal ==
-                            candidatePhase.layerSizeProfile.ordinal &&
-                            !stabilized.teardownFailed &&
-                            stabilized.runtimeFailureReason == null &&
-                            !RendererSafetyState.hasUnconfirmedTeardown() &&
-                            stabilized.expectedCount == candidatePhase.activeLayers &&
-                            stabilized.observedCount == candidatePhase.activeLayers
+                        hwcCapacityCalibrationTopologyReady(
+                            readiness = stabilized,
+                            candidateLayers = candidatePhase.activeLayers,
+                            expectedProfileOrdinal =
+                                candidatePhase.layerSizeProfile.ordinal,
+                            rendererCleanupPending =
+                                RendererSafetyState.hasUnconfirmedTeardown(),
+                        )
                     readinessAtSnapshot = stabilized.takeIf { topologyStillReady }
                     if (!topologyStillReady) {
                         unavailableReason =
@@ -2830,45 +3116,146 @@ class LabController internal constructor(
                 )
             } else {
                 val calibrationSampleStartedMs = SystemClock.elapsedRealtime()
-                val snapshot = try {
-                    collectPlanHwcCapacityCalibrationSample()
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (error: Exception) {
-                    null.also {
-                        unavailableReason =
-                            "single fresh composition snapshot failed: " +
-                                error.javaClass.simpleName
+                val sampleBudgetMs = remainingHwcCapacityCalibrationBudgetMs(
+                    deadlineMs = deadlineMs,
+                    nowMs = calibrationSampleStartedMs,
+                )
+                var sampleFailure: String? = null
+                val snapshot = if (sampleBudgetMs <= 0L) {
+                    null
+                } else {
+                    withTimeoutOrNull(sampleBudgetMs) {
+                        try {
+                            collectPlanHwcCapacityCalibrationSample(deadlineMs)
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (error: Exception) {
+                            sampleFailure =
+                                "single fresh composition snapshot failed: " +
+                                    error.javaClass.simpleName
+                            null
+                        }
                     }
                 }
-                hwcCapacityCalibration = if (snapshot == null) {
+                currentCoroutineContext().ensureActive()
+                val postSampleIsolationToken = activeTestWindowIsolationToken
+                val postSampleIsolationConfirmed =
+                    postSampleIsolationToken != null &&
+                        testWindowIsolation.isConfirmed(postSampleIsolationToken)
+                val postSampleReadiness =
+                    frameTracker.producerReadiness(generation)
+                // The snapshot is complete. Stop publishing the 20-layer target before any
+                // potentially slower validation so the absolute producer-active deadline is
+                // enforced even at its boundary.
+                progress = progress.copy(
+                    phase = null,
+                    targetPhase = null,
+                    transitionFraction = 0f,
+                    statusText = "HWC capacity snapshot 검증/teardown",
+                )
+                ensurePlanMemoryAvailable()
+                verifyPerformanceEnvironmentBeforeProducer()
+                if (!postSampleIsolationConfirmed) {
+                    throw PlanAbortException(
+                        "HWC capacity snapshot 중 SystemUI 격리가 해제되었습니다.",
+                    )
+                }
+                val completedWithinDeadline =
+                    remainingHwcCapacityCalibrationBudgetMs(
+                        deadlineMs = deadlineMs,
+                        nowMs = SystemClock.elapsedRealtime(),
+                    ) > 0L
+                val postSampleTopologyReady =
+                    hwcCapacityCalibrationTopologyUnchanged(
+                        before = ready,
+                        after = postSampleReadiness,
+                        candidateLayers = candidatePhase.activeLayers,
+                        expectedProfileOrdinal =
+                            candidatePhase.layerSizeProfile.ordinal,
+                        rendererCleanupPending =
+                            RendererSafetyState.hasUnconfirmedTeardown(),
+                    )
+                hwcCapacityCalibration = if (!completedWithinDeadline) {
                     HwcCapacityCalibrationResult(
                         status = HwcCapacityCalibrationStatus.UNAVAILABLE,
                         candidateLayers = candidatePhase.activeLayers,
-                        detail = unavailableReason.orEmpty(),
+                        detail =
+                            "single fresh composition snapshot/validation exceeded the " +
+                                "${HWC_CAPACITY_CALIBRATION_TOTAL_TIMEOUT_MS}ms " +
+                                "total producer-active deadline",
+                    )
+                } else if (!postSampleTopologyReady) {
+                    HwcCapacityCalibrationResult(
+                        status = HwcCapacityCalibrationStatus.UNAVAILABLE,
+                        candidateLayers = candidatePhase.activeLayers,
+                        detail =
+                            "candidate topology changed during composition snapshot; " +
+                                "expected=${candidatePhase.activeLayers}, " +
+                                "published=${postSampleReadiness.expectedCount}, " +
+                                "observed=${postSampleReadiness.observedCount}, " +
+                                "ready=${postSampleReadiness.ready}, " +
+                                "pending=${postSampleReadiness.topologyPending}, " +
+                                "missed=${postSampleReadiness.topologyMissed}, " +
+                                "teardown=${postSampleReadiness.teardownCompleted}/" +
+                                "${postSampleReadiness.teardownFailed}",
+                    )
+                } else if (snapshot == null) {
+                    HwcCapacityCalibrationResult(
+                        status = HwcCapacityCalibrationStatus.UNAVAILABLE,
+                        candidateLayers = candidatePhase.activeLayers,
+                        detail = sampleFailure
+                            ?: "single fresh composition snapshot exceeded the " +
+                                "${HWC_CAPACITY_CALIBRATION_TOTAL_TIMEOUT_MS}ms " +
+                                "total producer-active deadline",
                     )
                 } else {
                     hwcCapacityCalibrationResult(
                         candidateLayers = candidatePhase.activeLayers,
-                        expectedProducerCount = ready.expectedCount,
-                        observedProducerCount = ready.observedCount,
+                        expectedProducerCount = postSampleReadiness.expectedCount,
+                        observedProducerCount = postSampleReadiness.observedCount,
                         sampleStartedMonotonicMs = calibrationSampleStartedMs,
                         snapshot = snapshot,
                     )
                 }
             }
         } finally {
-            progress = progress.copy(
-                phase = null,
-                targetPhase = null,
-                transitionFraction = 0f,
-                statusText = "HWC capacity calibration teardown/zero-load settle",
-            )
-            val loadsZero = confirmGeneratedLoadQuiesce()
-            val rendererReleased = awaitRendererTeardownBarrier()
-            teardownConfirmed = loadsZero && rendererReleased
-            if (teardownConfirmed) {
-                delay(HWC_CAPACITY_CALIBRATION_SETTLE_MS)
+            teardownConfirmed = withContext(NonCancellable) {
+                progress = progress.copy(
+                    phase = null,
+                    targetPhase = null,
+                    transitionFraction = 0f,
+                    statusText = "HWC capacity calibration teardown/zero-load settle",
+                )
+                val loadsZero = confirmGeneratedLoadQuiesce()
+                val rendererReleased = awaitRendererTeardownBarrier()
+                if (rendererReleased) {
+                    // Calibration is not a scenario sample. Consume every producer/generated
+                    // traffic counter only after final producer teardown so its tail cannot leak
+                    // into the first scenario's warm-up baseline or peaks.
+                    frameTracker.sampleProducedFrames()
+                    loadManager.sampleAndResetBandwidthBytes()
+                }
+                val telemetryQuiescent = awaitCalibrationTelemetryIsolation()
+                if (!telemetryQuiescent) {
+                    val reason =
+                        "HWC capacity 계측 telemetry/vendor/SF worker 종료를 확인하지 " +
+                            "못해 process 재시작 전 후속 시나리오를 차단합니다."
+                    telemetryLifecycleIntegrityConfirmed.set(false)
+                    cancellationReason = cancellationReason ?: reason
+                    errorMessage = reason
+                }
+                val confirmed =
+                    telemetryQuiescent && loadsZero && rendererReleased
+                if (confirmed) {
+                    delay(HWC_CAPACITY_CALIBRATION_SETTLE_MS)
+                    if (cancellationReason == null) {
+                        ensurePlanMemoryAvailable()
+                        verifyPerformanceEnvironmentBeforeProducer(
+                            recordSuccessfulObservation = false,
+                        )
+                    }
+                }
+                confirmed
             }
         }
         if (!teardownConfirmed) {
@@ -2885,11 +3272,11 @@ class LabController internal constructor(
         val pendingMediaSource = AtomicReference<PinnedMediaSource?>()
         try {
             runEvents += event(
-                "PLAN_HWC_CAPACITY_CALIBRATION",
+                "SESSION_HWC_CAPACITY_CALIBRATION",
                 hwcCapacityCalibration.eventDetail(),
             )
             runEvents += event(
-                "PLAN_HWC_CAPACITY_REUSE_GUIDANCE",
+                "SESSION_HWC_CAPACITY_REUSE_GUIDANCE",
                 capacityReuseGuidance(hwcCapacityCalibration).let { guidance ->
                     "deviceCandidateCeiling=" +
                         "${guidance.deviceCandidateCeiling ?: "N/A"}; " +
@@ -3339,12 +3726,28 @@ class LabController internal constructor(
             collectTelemetrySampleLocked(forceCompositionProbe)
         }
 
-    private suspend fun collectPlanHwcCapacityCalibrationSample(): TelemetrySnapshot =
+    private suspend fun collectPlanHwcCapacityCalibrationSample(
+        deadlineMs: Long,
+    ): TelemetrySnapshot =
         telemetrySampleMutex.withLock {
+            val remainingMs = remainingHwcCapacityCalibrationBudgetMs(
+                deadlineMs = deadlineMs,
+                nowMs = SystemClock.elapsedRealtime(),
+            )
+            val laneTimeoutMs = hwcCapacityCalibrationSampleLaneTimeoutMs(
+                remainingMs = remainingMs,
+                hardTimeoutMs = SYSTEM_MONITOR_SAMPLE_TIMEOUT_MS,
+                completionReserveMs =
+                    HWC_CAPACITY_CALIBRATION_SAMPLE_RESERVE_MS,
+            )
+            check(laneTimeoutMs != null) {
+                "HWC capacity sample has no remaining lane deadline"
+            }
             collectTelemetrySampleLocked(
                 forceCompositionProbe = false,
                 surfaceFlingerProbePolicyOverride =
                     SurfaceFlingerProbePolicy.CALIBRATION_ONESHOT,
+                systemMonitorSampleTimeoutMs = laneTimeoutMs,
             )
         }
 
@@ -3378,12 +3781,16 @@ class LabController internal constructor(
     private suspend fun collectTelemetrySampleLocked(
         forceCompositionProbe: Boolean,
         surfaceFlingerProbePolicyOverride: SurfaceFlingerProbePolicy? = null,
+        systemMonitorSampleTimeoutMs: Long = SYSTEM_MONITOR_SAMPLE_TIMEOUT_MS,
     ): TelemetrySnapshot {
+        require(
+            systemMonitorSampleTimeoutMs in 1L..SYSTEM_MONITOR_SAMPLE_TIMEOUT_MS,
+        )
         val generation = telemetrySampleGate.issue()
         val sampleStartedMs = SystemClock.elapsedRealtime()
         telemetrySampleInFlightDeadlineMs = telemetrySampleDeadlineMs(
             sampleStartedMs = sampleStartedMs,
-            sampleTimeoutMs = SYSTEM_MONITOR_SAMPLE_TIMEOUT_MS,
+            sampleTimeoutMs = systemMonitorSampleTimeoutMs,
             completionGraceMs = WATCHDOG_INTERVAL_MS,
         )
         val snapshot = try {
@@ -3397,11 +3804,13 @@ class LabController internal constructor(
                         forceCompositionProbe = forceCompositionProbe,
                         activeRun = isRunning,
                     ),
+                sampleTimeoutMs = systemMonitorSampleTimeoutMs,
             )
         } finally {
             telemetrySampleInFlightDeadlineMs = null
         }
         lastSuccessfulSampleMs = SystemClock.elapsedRealtime()
+        telemetryWatchdogResumeGraceDeadlineMs = null
         acceptSnapshot(
             generation = generation,
             snapshot = snapshot,
@@ -5272,7 +5681,9 @@ class LabController internal constructor(
         throw PlanAbortException(reason)
     }
 
-    private fun verifyPerformanceEnvironmentBeforeProducer() {
+    private fun verifyPerformanceEnvironmentBeforeProducer(
+        recordSuccessfulObservation: Boolean = true,
+    ) {
         val environment = runCatching {
             PerformanceEnvironment(
                 powerSaveMode = powerManager.isPowerSaveMode,
@@ -5300,12 +5711,14 @@ class LabController internal constructor(
             )
             throw InconclusiveRunException(reason)
         }
-        runEvents += event(
-            "PERFORMANCE_PREFLIGHT",
-            "Battery Saver=off; interactive=true; deviceIdle=false; " +
-                "thermal=${environment.thermalStatus}; " +
-                runtimeProtectionPolicyDescription(activeRuntimeProtectionPolicy),
-        )
+        if (recordSuccessfulObservation) {
+            runEvents += event(
+                "PERFORMANCE_PREFLIGHT",
+                "Battery Saver=off; interactive=true; deviceIdle=false; " +
+                    "thermal=${environment.thermalStatus}; " +
+                    runtimeProtectionPolicyDescription(activeRuntimeProtectionPolicy),
+            )
+        }
         recordUnmitigatedSevereThermalObservation(environment.thermalStatus)
     }
 
@@ -7074,11 +7487,10 @@ class LabController internal constructor(
         const val MONITOR_STALE_TIMEOUT_MS = 5_000L
         const val PRECHECK_DELAY_MS = 700L
         const val WARMUP_DELAY_MS = 1_200L
-        const val HWC_CAPACITY_CALIBRATION_PHASE_BUDGET_MS = 5_000L
-        const val HWC_CAPACITY_CALIBRATION_TOPOLOGY_TIMEOUT_MS = 5_000L
         const val HWC_CAPACITY_CALIBRATION_STABILIZE_MS = 100L
+        const val HWC_CAPACITY_CALIBRATION_SAMPLE_RESERVE_MS = 50L
         const val HWC_CAPACITY_CALIBRATION_SETTLE_MS = 3_000L
-        const val HWC_CAPACITY_CALIBRATION_PRODUCER_FPS = 30f
+        const val HWC_CAPACITY_CALIBRATION_TELEMETRY_DRAIN_TIMEOUT_MS = 7_500L
         const val SYSTEM_UI_ISOLATION_TIMEOUT_MS = 3_000L
         const val SYSTEM_UI_ISOLATION_POLL_MS = 16L
         const val SYSTEM_UI_RESTORE_TIMEOUT_MS = 3_000L
@@ -8391,6 +8803,31 @@ internal enum class HwcCapacityGenerationAction {
     OBSERVE,
 }
 
+internal fun remainingHwcCapacityCalibrationBudgetMs(
+    deadlineMs: Long,
+    nowMs: Long,
+): Long {
+    if (deadlineMs < 0L || nowMs < 0L || nowMs >= deadlineMs) return 0L
+    return deadlineMs - nowMs
+}
+
+internal fun hwcCapacityCalibrationSampleLaneTimeoutMs(
+    remainingMs: Long,
+    hardTimeoutMs: Long,
+    completionReserveMs: Long,
+): Long? {
+    if (
+        remainingMs <= 0L ||
+        hardTimeoutMs <= 0L ||
+        completionReserveMs < 0L ||
+        remainingMs <= completionReserveMs
+    ) {
+        return null
+    }
+    return min(hardTimeoutMs, remainingMs - completionReserveMs)
+        .takeIf { it > 0L }
+}
+
 /**
  * Keeps calibration activation behind the same committed-topology and cleanup barriers as a
  * measured phase. A failed ACTIVATE attempt remains WAIT/ACTIVATE eligible until the caller's
@@ -8412,6 +8849,59 @@ internal fun hwcCapacityGenerationAction(
         rendererCleanupPending -> HwcCapacityGenerationAction.WAIT
     else -> HwcCapacityGenerationAction.ACTIVATE
 }
+
+internal fun hwcCapacityCalibrationTopologyReady(
+    readiness: ProducerReadiness,
+    candidateLayers: Int,
+    expectedProfileOrdinal: Int,
+    rendererCleanupPending: Boolean,
+): Boolean =
+    candidateLayers > 0 &&
+        expectedProfileOrdinal >= 0 &&
+        readiness.ready &&
+        readiness.topologyPublished &&
+        readiness.topologyPublishedAtMs != null &&
+        readiness.topologyRevision > 0L &&
+        !readiness.topologyPending &&
+        !readiness.topologyMissed &&
+        !readiness.teardownFailed &&
+        !readiness.teardownCompleted &&
+        readiness.runtimeFailureReason == null &&
+        readiness.geometryReady &&
+        readiness.geometryRequestedRevision > 0L &&
+        readiness.geometryAppliedRevision ==
+            readiness.geometryRequestedRevision &&
+        readiness.geometryRequestedProfileOrdinal == expectedProfileOrdinal &&
+        readiness.geometryAppliedProfileOrdinal == expectedProfileOrdinal &&
+        readiness.expectedCount == candidateLayers &&
+        readiness.observedCount == candidateLayers &&
+        !rendererCleanupPending
+
+internal fun hwcCapacityCalibrationTopologyUnchanged(
+    before: ProducerReadiness,
+    after: ProducerReadiness,
+    candidateLayers: Int,
+    expectedProfileOrdinal: Int,
+    rendererCleanupPending: Boolean,
+): Boolean =
+    hwcCapacityCalibrationTopologyReady(
+        readiness = before,
+        candidateLayers = candidateLayers,
+        expectedProfileOrdinal = expectedProfileOrdinal,
+        rendererCleanupPending = false,
+    ) &&
+        hwcCapacityCalibrationTopologyReady(
+            readiness = after,
+            candidateLayers = candidateLayers,
+            expectedProfileOrdinal = expectedProfileOrdinal,
+            rendererCleanupPending = rendererCleanupPending,
+        ) &&
+        after.topologyRevision == before.topologyRevision &&
+        after.topologyDiscontinuitySerial ==
+            before.topologyDiscontinuitySerial &&
+        after.topologyPublishedAtMs == before.topologyPublishedAtMs &&
+        after.geometryRequestedRevision == before.geometryRequestedRevision &&
+        after.geometryAppliedRevision == before.geometryAppliedRevision
 
 internal fun hwcCapacityCalibrationResult(
     candidateLayers: Int,
@@ -8459,7 +8949,7 @@ internal fun hwcCapacityCalibrationResult(
             quality = quality,
             evidenceMonotonicMs = evidenceMs,
             detail =
-                "one fresh plan-start snapshot; physical topology fully ready; " +
+                "one fresh process-session snapshot; physical topology fully ready; " +
                     "not a universal hardware maximum",
         )
     } else {
@@ -9483,11 +9973,16 @@ internal fun shouldAbortTelemetryWatchdog(
     lastSuccessfulSampleMs: Long,
     staleTimeoutMs: Long,
     inFlightDeadlineMs: Long?,
+    intentionallyPaused: Boolean = false,
+    resumeGraceDeadlineMs: Long? = null,
 ): Boolean {
     require(nowMs >= 0L)
     require(lastSuccessfulSampleMs >= 0L)
     require(staleTimeoutMs > 0L)
     require(inFlightDeadlineMs == null || inFlightDeadlineMs >= 0L)
+    require(resumeGraceDeadlineMs == null || resumeGraceDeadlineMs >= 0L)
+    if (intentionallyPaused) return false
+    if (resumeGraceDeadlineMs != null && nowMs <= resumeGraceDeadlineMs) return false
     val staleDeadline = saturatingAddNonNegative(
         lastSuccessfulSampleMs,
         staleTimeoutMs,

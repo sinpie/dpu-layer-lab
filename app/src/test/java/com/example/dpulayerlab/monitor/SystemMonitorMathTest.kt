@@ -11,6 +11,62 @@ import org.junit.Test
 
 class SystemMonitorMathTest {
     @Test
+    fun calibrationQuiescenceUsesOneDeadlineAndStrictOuterToInnerOrder() {
+        var nowNanos = 0L
+        val calls = mutableListOf<String>()
+
+        assertTrue(
+            awaitCalibrationQuiescenceStages(
+                timeoutMs = 3_000L,
+                monotonicNowNanos = { nowNanos },
+                awaitLocalSampleLane = { remainingMs ->
+                    calls += "local:$remainingMs"
+                    nowNanos += 500_000_000L
+                    true
+                },
+                awaitSurfaceFlinger = { remainingMs ->
+                    calls += "sf:$remainingMs"
+                    nowNanos += 500_000_000L
+                    true
+                },
+                awaitVendorTelemetry = { remainingMs ->
+                    calls += "vendor:$remainingMs"
+                    true
+                },
+            ),
+        )
+        assertEquals(
+            listOf("local:3000", "sf:2500", "vendor:2000"),
+            calls,
+        )
+    }
+
+    @Test
+    fun calibrationQuiescenceStopsAtTheFirstUnconfirmedStage() {
+        val calls = mutableListOf<String>()
+
+        assertFalse(
+            awaitCalibrationQuiescenceStages(
+                timeoutMs = 3_000L,
+                monotonicNowNanos = { 0L },
+                awaitLocalSampleLane = {
+                    calls += "local"
+                    false
+                },
+                awaitSurfaceFlinger = {
+                    calls += "sf"
+                    true
+                },
+                awaitVendorTelemetry = {
+                    calls += "vendor"
+                    true
+                },
+            ),
+        )
+        assertEquals(listOf("local"), calls)
+    }
+
+    @Test
     fun forcedCompositionProbeBypassesFreshCacheAndCadence() {
         val evidence = CompositionEvidence(
             snapshot = CompositionSnapshot(
@@ -51,7 +107,7 @@ class SystemMonitorMathTest {
     }
 
     @Test
-    fun activeSurfaceFlingerIsSuppressedExceptForPlanCalibrationOneShot() {
+    fun activeSurfaceFlingerIsSuppressedExceptForProcessSessionCalibrationOneShot() {
         val staleEvidence = CompositionEvidence(
             snapshot = CompositionSnapshot(
                 deviceLayers = 1,
@@ -69,6 +125,7 @@ class SystemMonitorMathTest {
                 observedMonotonicMs = 10_000L,
                 maxAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
                 vendorCompositionPathReady = false,
+                freshCalibrationVendorPairAvailable = false,
             ),
         )
         assertFalse(
@@ -79,6 +136,7 @@ class SystemMonitorMathTest {
                 observedMonotonicMs = 10_000L,
                 maxAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
                 vendorCompositionPathReady = false,
+                freshCalibrationVendorPairAvailable = false,
             ),
         )
         assertTrue(
@@ -89,6 +147,7 @@ class SystemMonitorMathTest {
                 observedMonotonicMs = 10_000L,
                 maxAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
                 vendorCompositionPathReady = false,
+                freshCalibrationVendorPairAvailable = false,
             ),
         )
         assertTrue(
@@ -109,6 +168,29 @@ class SystemMonitorMathTest {
     }
 
     @Test
+    fun calibrationFallbackCannotOverlapAnUnfinishedVendorTelemetryWorker() {
+        assertFalse(
+            surfaceFlingerFallbackMayStart(
+                policy = SurfaceFlingerProbePolicy.CALIBRATION_ONESHOT,
+                vendorTelemetryQuiescent = false,
+            ),
+        )
+        assertTrue(
+            surfaceFlingerFallbackMayStart(
+                policy = SurfaceFlingerProbePolicy.CALIBRATION_ONESHOT,
+                vendorTelemetryQuiescent = true,
+            ),
+        )
+        assertTrue(
+            surfaceFlingerFallbackMayStart(
+                policy = SurfaceFlingerProbePolicy.PERIODIC,
+                vendorTelemetryQuiescent = false,
+            ),
+        )
+        assertEquals(500L, CALIBRATION_VENDOR_FALLBACK_QUIESCE_TIMEOUT_MS)
+    }
+
+    @Test
     fun verifiedCurrentVendorCompositionAvoidsRedundantSurfaceFlingerProbe() {
         assertTrue(
             vendorCompositionPathCanReplaceSurfaceFlinger(
@@ -124,6 +206,7 @@ class SystemMonitorMathTest {
                 observedMonotonicMs = 1_000L,
                 maxAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
                 vendorCompositionPathReady = true,
+                freshCalibrationVendorPairAvailable = false,
             ),
         )
         assertTrue(
@@ -134,6 +217,7 @@ class SystemMonitorMathTest {
                 observedMonotonicMs = 1_000L,
                 maxAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
                 vendorCompositionPathReady = true,
+                freshCalibrationVendorPairAvailable = false,
             ),
         )
         assertFalse(
@@ -183,6 +267,52 @@ class SystemMonitorMathTest {
                 observedMonotonicMs = -1L,
                 maxAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
                 vendorCompositionPathReady = true,
+                freshCalibrationVendorPairAvailable = false,
+            )
+        }
+    }
+
+    @Test
+    fun calibrationSkipsSurfaceFlingerOnlyForFreshCurrentSampleVendorPair() {
+        val currentPairAvailable =
+            nextVerifiedVendorCompositionSession(
+                snapshotServiceSession = 12L,
+                currentServiceSession = 12L,
+                deviceLayers = 7,
+                clientLayers = 13,
+            ) != null
+        assertFalse(
+            shouldRunSurfaceFlingerCompositionProbe(
+                policy = SurfaceFlingerProbePolicy.CALIBRATION_ONESHOT,
+                samplesUntilProbe = 2,
+                evidence = null,
+                observedMonotonicMs = 2_000L,
+                maxAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
+                // A previous sample's verified cache is deliberately not enough.
+                vendorCompositionPathReady = false,
+                freshCalibrationVendorPairAvailable = currentPairAvailable,
+            ),
+        )
+
+        val unusableCurrentPairs = listOf(
+            nextVerifiedVendorCompositionSession(12L, 13L, 7, 13),
+            nextVerifiedVendorCompositionSession(12L, 12L, null, 13),
+            nextVerifiedVendorCompositionSession(12L, 12L, 7, null),
+            nextVerifiedVendorCompositionSession(12L, 12L, -1, 13),
+        )
+        unusableCurrentPairs.forEach { session ->
+            assertNull(session)
+            assertTrue(
+                shouldRunSurfaceFlingerCompositionProbe(
+                    policy = SurfaceFlingerProbePolicy.CALIBRATION_ONESHOT,
+                    samplesUntilProbe = 2,
+                    evidence = null,
+                    observedMonotonicMs = 2_000L,
+                    maxAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
+                    // Even a previous current-session capability must not hide this fallback.
+                    vendorCompositionPathReady = true,
+                    freshCalibrationVendorPairAvailable = false,
+                ),
             )
         }
     }
@@ -204,6 +334,7 @@ class SystemMonitorMathTest {
             vendorClientLayers = 0,
             vendorSource = "vendor session=7",
             vendorCompletedMonotonicMs = 950L,
+            vendorSessionVerified = true,
             surfaceFlinger = surface,
             observedMonotonicMs = 1_000L,
             maxAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
@@ -240,6 +371,7 @@ class SystemMonitorMathTest {
                 vendorClientLayers = vendorClient,
                 vendorSource = "vendor",
                 vendorCompletedMonotonicMs = 950L,
+                vendorSessionVerified = true,
                 surfaceFlinger = surface,
                 observedMonotonicMs = 1_000L,
                 maxAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
@@ -276,6 +408,7 @@ class SystemMonitorMathTest {
                 vendorClientLayers = 0,
                 vendorSource = vendorSource,
                 vendorCompletedMonotonicMs = vendorCompletedMs,
+                vendorSessionVerified = true,
                 surfaceFlinger = surface,
                 observedMonotonicMs = 4_000L,
                 maxAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
@@ -306,6 +439,7 @@ class SystemMonitorMathTest {
             vendorClientLayers = null,
             vendorSource = "vendor",
             vendorCompletedMonotonicMs = 950L,
+            vendorSessionVerified = true,
             surfaceFlinger = partialSurface,
             observedMonotonicMs = 1_000L,
             maxAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
@@ -323,12 +457,42 @@ class SystemMonitorMathTest {
             vendorClientLayers = 0,
             vendorSource = "vendor",
             vendorCompletedMonotonicMs = 1_000L,
+            vendorSessionVerified = true,
             surfaceFlinger = partialSurface,
             observedMonotonicMs = 4_000L,
             maxAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
         )
         assertNull(stale.deviceLayers)
         assertNull(stale.clientLayers)
+    }
+
+    @Test
+    fun vendorCompositionFromAReplacedServiceSessionIsNeverPublished() {
+        val surface = CompositionEvidenceProjection(
+            snapshot = CompositionSnapshot(
+                deviceLayers = 3,
+                clientLayers = 2,
+                source = "SurfaceFlinger",
+            ),
+            completedMonotonicMs = 950L,
+            ageMs = 50L,
+        )
+
+        val selected = selectHwcCompositionEvidence(
+            vendorDeviceLayers = 20,
+            vendorClientLayers = 0,
+            vendorSource = "vendor stale session=7",
+            vendorCompletedMonotonicMs = 990L,
+            vendorSessionVerified = false,
+            surfaceFlinger = surface,
+            observedMonotonicMs = 1_000L,
+            maxAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
+        )
+
+        assertEquals(3, selected.deviceLayers)
+        assertEquals(2, selected.clientLayers)
+        assertEquals(MetricQuality.SYSTEM_SERVICE, selected.quality)
+        assertEquals("SurfaceFlinger", selected.source)
     }
 
     @Test

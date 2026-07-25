@@ -13,6 +13,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.locks.LockSupport
 
 data class CompositionSnapshot(
     val deviceLayers: Int? = null,
@@ -53,6 +54,34 @@ class SurfaceFlingerProbe(context: Context) : AutoCloseable {
                 CompositionSnapshot(
                     detail = "SurfaceFlinger probe 실패: ${result.error.javaClass.simpleName}",
                 )
+        }
+    }
+
+    /**
+     * Waits without closing the shared lane. This is used after a bounded sample timeout so the
+     * first scenario cannot overlap either the old worker or its dumpsys child.
+     */
+    internal fun awaitQuiescent(timeoutMs: Long): Boolean {
+        if (timeoutMs < 0L) return false
+        val startedNanos = System.nanoTime()
+        val timeoutNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        val deadlineNanos = startedNanos + timeoutNanos
+        val laneWaitMs = (deadlineNanos - System.nanoTime())
+            .takeIf { it > 0L }
+            ?.let { remaining -> TimeUnit.NANOSECONDS.toMillis(remaining) }
+            ?: 0L
+        if (!laneLease.awaitIdle(laneWaitMs)) return false
+        while (true) {
+            if (processChildren.isRestartSafe()) return true
+            val remainingNanos = deadlineNanos - System.nanoTime()
+            if (remainingNanos <= 0L) return processChildren.isRestartSafe()
+            LockSupport.parkNanos(
+                minOf(remainingNanos, QUIESCENCE_POLL_NANOS),
+            )
+            if (Thread.interrupted()) {
+                Thread.currentThread().interrupt()
+                return false
+            }
         }
     }
 
@@ -125,6 +154,7 @@ class SurfaceFlingerProbe(context: Context) : AutoCloseable {
         const val PROBE_TIMEOUT_MS = 800L
         const val PROCESS_CLEANUP_WAIT_MS = 100L
         const val PROBE_SHUTDOWN_MARGIN_MS = 300L
+        const val QUIESCENCE_POLL_NANOS = 1_000_000L
         val PROBE_SHUTDOWN_TIMEOUT_MS = surfaceFlingerProbeShutdownBudgetMs(
             processCleanupWaitMs = PROCESS_CLEANUP_WAIT_MS,
             completionMarginMs = PROBE_SHUTDOWN_MARGIN_MS,
@@ -200,6 +230,8 @@ internal class SingleFlightProbeLane<T>(
 
     internal fun isActive(): Boolean = delegate.isActive()
 
+    internal fun awaitIdle(timeoutMs: Long): Boolean = delegate.awaitIdle(timeoutMs)
+
     internal fun isRestartSafeAfterClose(): Boolean = delegate.isRestartSafeAfterClose()
 
     internal fun closeWithResult(): Boolean = delegate.closeWithResult()
@@ -241,7 +273,18 @@ internal class SingleFlightInputProbeLane<I : Any, T>(
         require(shutdownTimeoutMs >= 0L)
     }
 
-    fun execute(input: I): ProbeLaneResult<T> {
+    fun execute(input: I): ProbeLaneResult<T> = execute(input, timeoutMs)
+
+    /**
+     * Allows a caller with a tighter absolute deadline to shorten, but never extend, this lane's
+     * process-wide hard timeout.
+     */
+    fun execute(
+        input: I,
+        callerTimeoutMs: Long,
+    ): ProbeLaneResult<T> {
+        if (callerTimeoutMs <= 0L) return ProbeLaneResult.TimedOut
+        val effectiveTimeoutMs = minOf(timeoutMs, callerTimeoutMs)
         if (closed.get()) return ProbeLaneResult.Closed
         if (!active.compareAndSet(false, true)) return ProbeLaneResult.Busy
         val task = synchronized(handoffLock) {
@@ -278,7 +321,7 @@ internal class SingleFlightInputProbeLane<I : Any, T>(
         }
 
         return try {
-            task.result.get(timeoutMs, TimeUnit.MILLISECONDS)
+            task.result.get(effectiveTimeoutMs, TimeUnit.MILLISECONDS)
         } catch (_: TimeoutException) {
             task.cancel()
             ProbeLaneResult.TimedOut
@@ -292,6 +335,29 @@ internal class SingleFlightInputProbeLane<I : Any, T>(
     }
 
     internal fun isActive(): Boolean = active.get()
+
+    /**
+     * Non-closing barrier used between an abandoned diagnostic sample and measured work. It never
+     * opens a queue slot or clears [active]; only the worker's actual `finally` can do that.
+     */
+    internal fun awaitIdle(timeoutMs: Long): Boolean {
+        if (timeoutMs < 0L) return false
+        val timeoutNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        val startedNanos = System.nanoTime()
+        val deadlineNanos = startedNanos + timeoutNanos
+        while (true) {
+            val task = synchronized(handoffLock) { activeTask.get() }
+            if (task != null) return task.awaitActualCompletion(deadlineNanos)
+            if (!active.get()) return true
+            val remainingNanos = deadlineNanos - System.nanoTime()
+            if (remainingNanos <= 0L) return false
+            LockSupport.parkNanos(minOf(remainingNanos, IDLE_HANDOFF_POLL_NANOS))
+            if (Thread.interrupted()) {
+                Thread.currentThread().interrupt()
+                return false
+            }
+        }
+    }
 
     internal fun isRestartSafeAfterClose(): Boolean =
         closed.get() && !active.get() && executor.isTerminated
@@ -405,6 +471,10 @@ internal class SingleFlightInputProbeLane<I : Any, T>(
             actualCompletion.countDown()
         }
     }
+
+    private companion object {
+        const val IDLE_HANDOFF_POLL_NANOS = 1_000_000L
+    }
 }
 
 /**
@@ -473,6 +543,9 @@ internal class SharedProbeLaneRegistry<T>(
 
         fun execute(): ProbeLaneResult<T> =
             if (releaseStarted.get()) ProbeLaneResult.Closed else lane.execute()
+
+        internal fun awaitIdle(timeoutMs: Long): Boolean =
+            if (releaseStarted.get()) false else lane.awaitIdle(timeoutMs)
 
         @Synchronized
         fun closeWithResult(): Boolean {

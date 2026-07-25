@@ -1,12 +1,14 @@
 # DPULayerTest Architecture
 
-> **Authority:** 현재 코드의 component 경계, runtime/data flow, 상태 기계와 resource ownership
+> **Authority:** 현재 코드의 component 경계, runtime/data flow와 resource ownership
 > **Audience:** maintainer, reviewer, 기능 확장 담당자, 코드 복구 담당자
-> **Update when:** package 책임, 실행 순서, 상태 전이, concurrency 또는 cleanup ownership이 바뀔 때
-> **Does not own:** 작업 우선순위, 안전 규칙의 규범적 원문, metric 세부 의미, BSP 구현 방법
-> **Related:** [AGENTS.md](AGENTS.md), [PLAN.md](PLAN.md),
+> **Update when:** component 책임, 상위 실행 흐름, dependency 또는 resource ownership이 바뀔 때
+> **Does not own:** 파일 목록, 허용 상태 전이, 작업 우선순위, 안전 규칙 원문, metric 세부 의미, BSP 구현 방법
+> **Related:** [Documentation index](docs/INDEX.md), [AGENTS.md](AGENTS.md), [PLAN.md](PLAN.md),
 > [PROJECT_MEMORY.md](PROJECT_MEMORY.md), [docs/SCENARIOS.md](docs/SCENARIOS.md),
-> [docs/METRICS.md](docs/METRICS.md),
+> [docs/METRICS.md](docs/METRICS.md), [docs/REPOSITORY_MAP.md](docs/REPOSITORY_MAP.md),
+> [docs/STATE_MACHINES.md](docs/STATE_MACHINES.md),
+> [docs/HWC_CAPACITY_CALIBRATION.md](docs/HWC_CAPACITY_CALIBRATION.md),
 > [docs/SYSTEM_INTEGRATION.md](docs/SYSTEM_INTEGRATION.md),
 > [docs/RECONSTRUCTION.md](docs/RECONSTRUCTION.md)
 
@@ -34,36 +36,20 @@ portable app이 보장하지 않는 범위는 다음과 같다.
 따라서 `HwcCompositionExpectation`은 실행 의도와 관측 계약이며 강제 API가 아니다.
 metric의 exact/proxy 경계는 [docs/METRICS.md](docs/METRICS.md)가 authority다.
 
-## 저장소와 package 지도
+## Component 경계
 
-| 경로 | 책임 |
-|---|---|
-| `app/build.gradle.kts` | Android application, SDK/toolchain, build type, version |
-| `app/src/main/AndroidManifest.xml` | launcher, protected automation alias, permission, FileProvider |
-| `app/src/main/java/com/example/dpulayerlab/MainActivity.kt` | Activity lifecycle, automation intake, display envelope, Window isolation |
-| `app/src/main/java/com/example/dpulayerlab/ui/DpuLayerLabApp.kt` | Compose dashboard/catalog/builder/run/result/system UI와 HUD |
-| `app/src/main/java/com/example/dpulayerlab/model/LabModels.kt` | scenario, plan, progress, metric, result value model |
-| `app/src/main/java/com/example/dpulayerlab/model/ScenarioSafetyPolicy.kt` | hostile input validation, clamp/reject, duration·memory budget |
-| `app/src/main/java/com/example/dpulayerlab/model/ScenarioClassifier.kt` | catalog facet와 비교용 intensity |
-| `app/src/main/java/com/example/dpulayerlab/model/LayerTrafficEstimator.kt` | linear producer/DPU traffic estimate |
-| `app/src/main/java/com/example/dpulayerlab/engine/ScenarioCatalog.kt` | immutable catalog preset와 custom scenario construction |
-| `app/src/main/java/com/example/dpulayerlab/engine/LabController.kt` | plan orchestration, evidence, safety, verdict, finalization |
-| `app/src/main/java/com/example/dpulayerlab/engine/LoadGenerators.kt` | bounded CPU/memory workers와 NPU control |
-| `app/src/main/java/com/example/dpulayerlab/engine/TestWindowIsolation.kt` | tokenized process-wide Window isolation state |
-| `app/src/main/java/com/example/dpulayerlab/engine/PerformanceEnvironment.kt` | Battery Saver performance-session 판단 |
-| `app/src/main/java/com/example/dpulayerlab/engine/ControllerBackendCleanupCoordinator.kt` | Activity-free backend cleanup gate |
-| `app/src/main/java/com/example/dpulayerlab/render/LayerStageView.kt` | physical producer topology와 child transform |
-| `app/src/main/java/com/example/dpulayerlab/render/StressGlSurfaceView.kt` | bounded GL draw producer |
-| `app/src/main/java/com/example/dpulayerlab/render/VideoDecoderSelection.kt` | immutable decoder/media capability binding |
-| `app/src/main/java/com/example/dpulayerlab/render/RendererSafetyState.kt` | process-wide producer teardown latch |
-| `app/src/main/java/com/example/dpulayerlab/monitor/SystemMonitor.kt` | serialized telemetry transaction과 source merge |
-| `app/src/main/java/com/example/dpulayerlab/monitor/FrameTracker.kt` | generation별 producer readiness·rate·proxy frame evidence |
-| `app/src/main/java/com/example/dpulayerlab/monitor/KernelSensorProvider.kt` | allowlisted read-only kernel probe adapter |
-| `app/src/main/java/com/example/dpulayerlab/monitor/SurfaceFlingerProbe.kt` | bounded diagnostic composition snapshot |
-| `app/src/main/java/com/example/dpulayerlab/vendor/VendorBridge.kt` | versioned Binder telemetry/control session과 bounded lanes |
-| `app/src/main/java/com/example/dpulayerlab/engine/ReportWriter.kt` | schema v2 JSON의 atomic publication·retention |
-| `app/src/main/aidl/com/example/dpulayerlab/vendor/IDpuLabVendorService.aidl` | stable vendor integration interface |
-| `system_integration/` | product Soong, privapp permission, probe config example |
+- Activity/Compose는 입력, Window isolation과 표시를 소유하지만 plan 실행 권한은
+  controller에 위임한다.
+- Pure model/policy는 scenario 값, transition, safety budget과 traffic 계산을 Android
+  lifecycle에서 분리한다.
+- Controller는 plan/phase transaction, evidence, verdict와 cleanup owner를 하나로 묶는다.
+- Renderer와 load subsystem은 실제 producer/worker를 만들고 generation/ticket
+  acknowledgment로 controller에 상태를 돌려준다.
+- Monitor/vendor adapter는 source·quality가 결속된 telemetry transaction만 게시한다.
+- Report writer는 immutable run summary를 schema v2 completed JSON으로 발행한다.
+
+현재 package와 tracked file의 정확한 위치는
+[Repository map](docs/REPOSITORY_MAP.md)이 authority다.
 
 ## 상위 실행 흐름
 
@@ -76,7 +62,7 @@ ScenarioPlanPolicy + DeviceRenderSafety + ScenarioSafetyPolicy
     ↓
 MainActivity Window isolation + LabController plan owner
     ↓
-plan-start HWC capacity advisory calibration (정확히 한 번)
+process-session HWC capacity advisory attempt/reuse
     ↓
 scenario preflight → media/vendor capability → warm-up → exact baseline
     ↓
@@ -199,41 +185,18 @@ screen-equivalent와 physical producer당 평균 `%`로 별도 표시한다. `CA
 geometry estimate이며 conservative
 full-buffer read/write traffic이나 measured bus를 대체하지 않는다.
 
-## Plan과 scenario 상태
+## Runtime orchestration summary
 
-`PlanState`:
+Plan owner publication, runner stage, producer generation, telemetry priority, workload
+ticket과 terminal cleanup의 허용 전이는
+[Runtime state machines](docs/STATE_MACHINES.md)가 authority다. Producer는 test Window의
+status/navigation bar hidden acknowledgment 뒤에만 시작한다.
 
-```text
-IDLE → RUNNING → COMPLETE
-               ↘ ABORTED
-IDLE/RUNNING → REJECTED (새 실행 요청 자체가 유효하지 않을 때)
-```
-
-`RunnerStage`:
-
-```text
-IDLE
-  → PRECHECK
-  → WARMUP
-  → RUNNING
-  → COOLDOWN
-  → COMPLETE
-    ↘ UNSUPPORTED
-    ↘ ABORTED
-```
-
-`startPlan()`은 다음을 먼저 확인한다.
-
-1. controller와 telemetry monitor/watchdog pair의 lifecycle integrity
-2. 이전 Window, renderer, NPU, pinned media와 performance-session cleanup latch
-3. queue/repeat policy와 runtime protection immutable snapshot
-4. local load worker transactional start
-5. wake flag와 test Window isolation token
-6. lazy run job의 owner publication
-
-producer는 status/navigation bar가 hidden으로 acknowledgment된 뒤에만 시작한다.
-첫 scenario 전에 plan-wide HWC capacity candidate를 정확히 한 번 관측하고, teardown과
-settle 뒤 일반 1-layer warm-up/baseline으로 들어간다.
+Process-session 최초 1회 HWC candidate의 topology, display scope, deadline, probe
+serialization과 cleanup 조건은
+[HWC capacity calibration](docs/HWC_CAPACITY_CALIBRATION.md)에 정의한다. Architecture
+관점에서 이 calibration은 첫 scenario의 warm-up/baseline보다 앞에 있는 advisory
+sub-transaction이며 이후 plan execution과 evidence budget을 오염시키지 않아야 한다.
 
 ## Phase transaction
 
@@ -314,7 +277,10 @@ vendor hardware counter가 유효하면 kernel fallback보다 우선한다. sour
 [docs/METRICS.md](docs/METRICS.md)에 있다.
 
 active run은 periodic/typed path에서 새 SurfaceFlinger child process를 만들지 않는다.
-예외는 plan-start one-shot capacity calibration의 제한된 fallback뿐이다.
+예외는 process-session one-shot capacity calibration의 제한된 fallback뿐이다. 이
+one-shot은 같은 telemetry transaction에서 vendor snapshot을 한 번 prefetch하고,
+current-session nonnegative DEVICE/CLIENT 원자 쌍이면 SF를 생략한다. Pair가 없을 때만
+SF fallback을 한 번 실행하며 vendor를 다시 읽지 않는다.
 
 ## Vendor와 BSP 경계
 

@@ -85,7 +85,9 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         activityStarted = true
-        lastDisplayEnvelopeIdentity = currentDisplayEnvelopeIdentity()
+        // Compare before overwriting: a fold/external-display move can happen while the Activity
+        // is stopped without producing an in-process configuration callback.
+        validateCurrentDisplayEnvelope()
         testWindowIsolation.reconcileWithLifecycle()
         controller?.let { activeController ->
             activeController.start()
@@ -163,14 +165,14 @@ class MainActivity : ComponentActivity() {
         val previous = lastDisplayEnvelopeIdentity
         val current = currentDisplayEnvelopeIdentity()
         lastDisplayEnvelopeIdentity = current
-        if (
-            controller?.isRunning == true &&
-            displaySafetyEnvelopeChanged(previous, current)
-        ) {
-            controller?.invalidateSafetyEnvelope(
-                "실행 중 display identity/physical size가 " +
-                    "${previous?.summary() ?: "unknown"} → ${current.summary()}로 변경됨",
-            )
+        if (displaySafetyEnvelopeChanged(previous, current)) {
+            controller?.refreshHwcCapacityCalibrationDisplayProjection()
+            if (controller?.isRunning == true) {
+                controller?.invalidateSafetyEnvelope(
+                    "실행 중 display identity/physical size가 " +
+                        "${previous?.summary() ?: "unknown"} → ${current.summary()}로 변경됨",
+                )
+            }
         }
     }
 

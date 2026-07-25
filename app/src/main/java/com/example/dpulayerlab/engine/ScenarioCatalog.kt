@@ -965,13 +965,14 @@ object ScenarioCatalog {
         name = "HWC Plane Staircase",
         description =
             "불투명 독립 Surface demand를 1→2→4→6→8→12L로 올렸다가 줄입니다. " +
-                "Plan-start 1회 capacity 관측과 별개인 bounded sweep이며 이 sweep의 " +
+                "앱 process-session 최초 1회 capacity 관측과 별개인 bounded sweep이며 " +
+                "이 sweep의 " +
                 "최대값도 제품 HWC 최대 plane 수로 간주하지 않습니다. Active load를 " +
                 "교란하지 않도록 SurfaceFlinger dump는 중지하고, fresh vendor composition " +
                 "snapshot이 없으면 단계별 DEVICE/CLIENT 결과는 N/A일 수 있습니다.",
         category = ScenarioCategory.LAYER_HWC,
         risk = RiskLevel.MEDIUM,
-        tags = setOf("HWC", "plane", "bounded sweep", "plan calibration separate"),
+        tags = setOf("HWC", "plane", "bounded sweep", "session calibration separate"),
         requirements = setOf(
             "저교란 단계별 HWC 관측에는 vendor composition snapshot 권장",
             "Active 단계는 SurfaceFlinger fallback 없이 vendor snapshot만 사용",

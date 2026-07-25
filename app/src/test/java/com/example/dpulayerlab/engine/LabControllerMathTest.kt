@@ -28,6 +28,7 @@ import com.example.dpulayerlab.model.TransitionSpec
 import com.example.dpulayerlab.model.requiredCoverageMask
 import com.example.dpulayerlab.model.terminalReason
 import com.example.dpulayerlab.monitor.CompressionControlResult
+import com.example.dpulayerlab.monitor.ProducerReadiness
 import com.example.dpulayerlab.monitor.SurfaceFlingerProbePolicy
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.cancelAndJoin
@@ -45,7 +46,28 @@ import org.junit.Test
 
 class LabControllerMathTest {
     @Test
-    fun scenarioWarmupRemainsOneLayerAfterSeparatePlanCalibration() {
+    fun processSessionCalibrationTopologyIsExactlyTwentyDisplayOnlyLayers() {
+        val phase = processSessionHwcCapacityCalibrationPhase()
+
+        assertEquals("session-hwc-capacity-calibration", phase.id)
+        assertEquals(HWC_CAPACITY_CALIBRATION_TOTAL_TIMEOUT_MS, phase.durationMs)
+        assertEquals(HWC_CAPACITY_CALIBRATION_REQUESTED_LAYERS, phase.activeLayers)
+        assertEquals(HWC_CAPACITY_CALIBRATION_PRODUCER_FPS, phase.producerFps)
+        assertEquals(HWC_CAPACITY_CALIBRATION_DISPLAY_HZ, phase.requestedDisplayHz)
+        assertEquals(LayerBackend.INDEPENDENT_SURFACES, phase.backend)
+        assertEquals(PixelRoute.RGB_8888, phase.pixelRoute)
+        assertEquals(BufferSize.DISPLAY, phase.bufferSize)
+        assertEquals(MotionProfile.CAPACITY_TILES, phase.motion)
+        assertEquals(LayerSizeProfile.FULL_SCREEN, phase.layerSizeProfile)
+        assertEquals(LoadSetpoints(), phase.workloads)
+        assertFalse(phase.alphaOverlap)
+        assertFalse(phase.includeGlLayer)
+        assertEquals(TransitionSpec(), phase.transition)
+        assertEquals(HwcCompositionExpectation.NONE, phase.hwcCompositionExpectation)
+    }
+
+    @Test
+    fun scenarioWarmupRemainsOneLayerAfterSeparateSessionCalibration() {
         val target = PhaseSpec(
             id = "maximum-client-target",
             label = "Maximum client target",
@@ -75,6 +97,75 @@ class LabControllerMathTest {
         assertFalse(warmup.alphaOverlap)
         assertFalse(warmup.includeGlLayer)
         assertEquals(HwcCompositionExpectation.NONE, warmup.hwcCompositionExpectation)
+    }
+
+    @Test
+    fun capacityCalibrationUsesOneAbsoluteProducerActiveDeadline() {
+        assertEquals(
+            6_000L,
+            remainingHwcCapacityCalibrationBudgetMs(
+                deadlineMs = 10_000L,
+                nowMs = 4_000L,
+            ),
+        )
+        assertEquals(
+            1L,
+            remainingHwcCapacityCalibrationBudgetMs(
+                deadlineMs = 10_000L,
+                nowMs = 9_999L,
+            ),
+        )
+        assertEquals(
+            0L,
+            remainingHwcCapacityCalibrationBudgetMs(
+                deadlineMs = 10_000L,
+                nowMs = 10_000L,
+            ),
+        )
+        assertEquals(
+            0L,
+            remainingHwcCapacityCalibrationBudgetMs(
+                deadlineMs = Long.MAX_VALUE,
+                nowMs = Long.MAX_VALUE,
+            ),
+        )
+        assertEquals(
+            0L,
+            remainingHwcCapacityCalibrationBudgetMs(
+                deadlineMs = -1L,
+                nowMs = 0L,
+            ),
+        )
+        assertEquals(
+            4_000L,
+            hwcCapacityCalibrationSampleLaneTimeoutMs(
+                remainingMs = 6_000L,
+                hardTimeoutMs = 4_000L,
+                completionReserveMs = 50L,
+            ),
+        )
+        assertEquals(
+            950L,
+            hwcCapacityCalibrationSampleLaneTimeoutMs(
+                remainingMs = 1_000L,
+                hardTimeoutMs = 4_000L,
+                completionReserveMs = 50L,
+            ),
+        )
+        assertNull(
+            hwcCapacityCalibrationSampleLaneTimeoutMs(
+                remainingMs = 50L,
+                hardTimeoutMs = 4_000L,
+                completionReserveMs = 50L,
+            ),
+        )
+        assertNull(
+            hwcCapacityCalibrationSampleLaneTimeoutMs(
+                remainingMs = Long.MAX_VALUE,
+                hardTimeoutMs = 0L,
+                completionReserveMs = 50L,
+            ),
+        )
     }
 
     @Test
@@ -186,6 +277,104 @@ class LabControllerMathTest {
     }
 
     @Test
+    fun capacitySnapshotRequiresTheSameHealthyTopologyAfterSampling() {
+        val profile = LayerSizeProfile.FULL_SCREEN.ordinal
+        val ready = ProducerReadiness(
+            expectedCount = 20,
+            observedCount = 20,
+            everObservedCount = 20,
+            ready = true,
+            topologyPublished = true,
+            topologyPending = false,
+            topologyPublishedAtMs = 10L,
+            topologyRevision = 1L,
+            geometryRequestedRevision = 4L,
+            geometryAppliedRevision = 4L,
+            geometryRequestedProfileOrdinal = profile,
+            geometryAppliedProfileOrdinal = profile,
+            geometryReady = true,
+        )
+
+        assertTrue(
+            hwcCapacityCalibrationTopologyReady(
+                readiness = ready,
+                candidateLayers = 20,
+                expectedProfileOrdinal = profile,
+                rendererCleanupPending = false,
+            ),
+        )
+        listOf(
+            ready.copy(observedCount = 19),
+            ready.copy(topologyPending = true),
+            ready.copy(topologyMissed = true),
+            ready.copy(teardownCompleted = true),
+            ready.copy(teardownFailed = true),
+            ready.copy(runtimeFailureReason = "producer failed"),
+            ready.copy(geometryAppliedRevision = 3L),
+            ready.copy(geometryAppliedProfileOrdinal = profile + 1),
+        ).forEach { invalid ->
+            assertFalse(
+                hwcCapacityCalibrationTopologyReady(
+                    readiness = invalid,
+                    candidateLayers = 20,
+                    expectedProfileOrdinal = profile,
+                    rendererCleanupPending = false,
+                ),
+            )
+        }
+        assertFalse(
+            hwcCapacityCalibrationTopologyReady(
+                readiness = ready,
+                candidateLayers = 20,
+                expectedProfileOrdinal = profile,
+                rendererCleanupPending = true,
+            ),
+        )
+        assertTrue(
+            hwcCapacityCalibrationTopologyUnchanged(
+                before = ready,
+                after = ready,
+                candidateLayers = 20,
+                expectedProfileOrdinal = profile,
+                rendererCleanupPending = false,
+            ),
+        )
+        assertFalse(
+            hwcCapacityCalibrationTopologyUnchanged(
+                before = ready,
+                after = ready.copy(topologyRevision = ready.topologyRevision + 1L),
+                candidateLayers = 20,
+                expectedProfileOrdinal = profile,
+                rendererCleanupPending = false,
+            ),
+        )
+        assertFalse(
+            hwcCapacityCalibrationTopologyUnchanged(
+                before = ready,
+                after = ready.copy(
+                    topologyDiscontinuitySerial =
+                        ready.topologyDiscontinuitySerial + 1L,
+                ),
+                candidateLayers = 20,
+                expectedProfileOrdinal = profile,
+                rendererCleanupPending = false,
+            ),
+        )
+        assertFalse(
+            hwcCapacityCalibrationTopologyUnchanged(
+                before = ready,
+                after = ready.copy(
+                    geometryRequestedRevision = 5L,
+                    geometryAppliedRevision = 5L,
+                ),
+                candidateLayers = 20,
+                expectedProfileOrdinal = profile,
+                rendererCleanupPending = false,
+            ),
+        )
+    }
+
+    @Test
     fun capacityCalibrationRequiresReadyCandidateAndFreshAtomicPair() {
         val valid = hwcCapacityCalibrationResult(
             candidateLayers = 20,
@@ -276,6 +465,8 @@ class LabControllerMathTest {
         assertEquals(9, guidance.clientPressureCandidate)
         assertTrue(guidance.detail.contains("advisory only"))
         assertTrue(observed.uiSummary().contains("HARDWARE_COUNTER@vendor:test"))
+        assertTrue(observed.eventDetail().contains("requested=20; candidate=20"))
+        assertTrue(observed.eventDetail().contains("lifetime=process-session"))
 
         val unavailable = capacityReuseGuidance(
             HwcCapacityCalibrationResult(
@@ -2129,6 +2320,40 @@ class LabControllerMathTest {
                 sampleStartedMs = Long.MAX_VALUE - 1L,
                 sampleTimeoutMs = 4_000L,
                 completionGraceMs = 500L,
+            ),
+        )
+    }
+
+    @Test
+    fun telemetryWatchdogPauseAndResumeGraceDoNotFabricateASuccessTimestamp() {
+        assertFalse(
+            shouldAbortTelemetryWatchdog(
+                nowMs = 20_000L,
+                lastSuccessfulSampleMs = 1_000L,
+                staleTimeoutMs = 5_000L,
+                inFlightDeadlineMs = null,
+                intentionallyPaused = true,
+                resumeGraceDeadlineMs = null,
+            ),
+        )
+        assertFalse(
+            shouldAbortTelemetryWatchdog(
+                nowMs = 25_000L,
+                lastSuccessfulSampleMs = 1_000L,
+                staleTimeoutMs = 5_000L,
+                inFlightDeadlineMs = null,
+                intentionallyPaused = false,
+                resumeGraceDeadlineMs = 25_000L,
+            ),
+        )
+        assertTrue(
+            shouldAbortTelemetryWatchdog(
+                nowMs = 25_001L,
+                lastSuccessfulSampleMs = 1_000L,
+                staleTimeoutMs = 5_000L,
+                inFlightDeadlineMs = null,
+                intentionallyPaused = false,
+                resumeGraceDeadlineMs = 25_000L,
             ),
         )
     }

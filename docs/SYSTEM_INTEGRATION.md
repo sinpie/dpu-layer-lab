@@ -1,21 +1,24 @@
 # System / BSP 통합
 
-사용자에게 보이는 launcher/Gradle project 이름은 **DPULayerTest**입니다. 저장소의
-미배포 source candidate는 `20260725_095708`(`versionCode 5`), debug version은
-`20260725_095708-debug`입니다. 최신 공개 release는
-`20260725_090252`(`versionCode 4`), tag는 `v20260725_090252`입니다.
-`yyyyMMdd_HHmmss`는 KST build 시각이며 앱 상단·실행 HUD·보고서에는 실제 build
-version이 표시됩니다. Canonical source remote는 `sinpie/dpu-layer-lab`입니다.
-아래 `DpuLayerLab` directory/Soong module,
-package `com.example.dpulayerlab`, automation action/component, vendor action/AIDL과
+> **Authority:** product/BSP 배치, permission, SELinux, vendor provider와 probe 구현 계약
+> **Audience:** BSP integrator, system image owner, vendor service 개발자, security reviewer
+> **Update when:** Soong/product 배치, AIDL provider, permission/SELinux 또는 probe ABI가 바뀔 때
+> **Does not own:** app 내부 상태 전이, scenario/metric 의미, version/tag, report JSON field
+> **Related:** [Documentation index](INDEX.md), [External contracts](EXTERNAL_CONTRACTS.md),
+> [ARCHITECTURE.md](../ARCHITECTURE.md), [METRICS.md](METRICS.md),
+> [HWC capacity calibration](HWC_CAPACITY_CALIBRATION.md), [TESTING.md](TESTING.md),
+> [RELEASE.md](RELEASE.md)
+
+사용자에게 보이는 launcher/Gradle project 이름은 **DPULayerTest**입니다. Canonical source
+remote는 `sinpie/dpu-layer-lab`입니다. 현재 source/release version은
+[Release](RELEASE.md)를 확인합니다. 아래 `DpuLayerLab` directory/Soong module, package
+`com.example.dpulayerlab`, automation action/component, vendor action/AIDL과
 `dpu-layer-lab-` report prefix는 기존 제품 이미지·harness·consumer 호환성을 위한 stable
 identifier입니다. 표시 이름에 맞춰 이 계약들을 일괄 rename하지 마세요.
 
 앱 구조와 runtime ownership은 [ARCHITECTURE.md](../ARCHITECTURE.md), scenario 의미는
 [SCENARIOS.md](SCENARIOS.md), metric의 app-side source/quality/verdict 의미는
-[METRICS.md](METRICS.md), host 검증과 release 절차는 각각
-[TESTING.md](TESTING.md), [RELEASE.md](RELEASE.md)를 참고하세요. 이 문서는
-provider/BSP 측 deployment, AIDL, permission과 SELinux 계약만 소유합니다.
+[METRICS.md](METRICS.md)를 참고하세요.
 
 ## 권장 배치
 
@@ -596,26 +599,27 @@ origin/mid/end 또는 abrupt 8 step
 applied coverage가 빠지면 `LAYER_SIZE_COVERAGE_MISSING`과 `INCONCLUSIVE`이며,
 충족되면 `LAYER_SIZE_COVERAGE` event를 남깁니다.
 
-START plan은 첫 scenario 전에 전체 queue/repeat가 공유하는 capacity 관측을 한 번
-수행합니다. Safety/graphics budget이 승인한 최대 20개의 30fps opaque RGB Surface를
-non-overlap tile로 배치하고 모든 first buffer/topology publish 뒤 100ms 안정화한 다음
-fresh composition 원자 쌍을 한 번만 읽습니다. 준비/쌍 실패는 retry나 0으로 바꾸지 않고
-N/A입니다. 이어서 load zero, renderer teardown과 3초 settle을 확인한 뒤 기존 1L
-scenario warm-up/fresh baseline을 시작하므로 calibration traffic/frame/counter는
-scenario evidence에 포함되지 않습니다.
-
-관측값은 해당 candidate topology의 D/C일 뿐 maximum plane 수가 아닙니다. matching
-opaque RGB topology의 DEVICE/CLIENT boundary 참고로만 queue/repeat에서 공유하고
-ScenarioSafetyPolicy hard cap은 변경하지 않습니다. Format, transform, alpha, scaling,
-display 또는 system surface가 바뀌면 fresh vendor evidence가 필요합니다.
+Process-session 최초 1회 20L candidate 관측의 app-side topology, deadline, process
+lifetime과 cleanup은
+[HWC capacity calibration](HWC_CAPACITY_CALIBRATION.md)이 authority입니다. BSP
+provider 관점에서는 API v1 `compositionLayerCounts`가 같은 service session의
+nonnegative DEVICE/CLIENT 원자 쌍을 반환하고, bounded cancellation과 실제 worker
+completion을 제공해야 합니다. Optional v2 frequency getter는 이 calibration의 필수
+transaction이 아닙니다. Provider pair가 불완전하면 앱이 worker quiescence를 확인한
+뒤에만 SurfaceFlinger fallback을 시작하므로 timeout 뒤 Binder work를 계속 남기지
+마세요. 이 advisory 결과로 HWC maximum이나 app safety cap을 바꾸지 않습니다.
 
 Composition source는 API v1 `compositionLayerCounts`의 같은-snapshot 원자 쌍을
 우선합니다. Dashboard/idle은 3-sample cadence의 bounded `dumpsys SurfaceFlinger
---hwclayers`를 사용할 수 있고 plan-start capacity 관측은 cache를 우회한 fresh fallback
-한 번을 허용합니다(child 800ms/전체 sample 4초 상한). Active scenario에서는 periodic과
-typed target boundary 모두 dump를 억제하며 fresh vendor 원자 쌍만 인정합니다. 따라서
-capacity cache가 phase 증거가 되지 않고 vendor pair가 없으면 N/A/INCONCLUSIVE가
-올바른 결과입니다. HWC count를 logcat 또는 임의 sysfs/debugfs path에서 추론하지 마세요.
+--hwclayers`를 사용할 수 있습니다. Session capacity 관측은 vendor snapshot을 먼저 한
+번만 읽고 같은 current service session의 nonnegative DEVICE/CLIENT 원자 쌍이면
+SurfaceFlinger를 생략합니다. Pair가 null/partial/invalid/session-mismatch일 때만 cache를
+우회한 SF fallback을 한 번 허용하며 fallback 뒤 vendor snapshot을 다시 호출하지
+않습니다. SF child 800ms/telemetry sample 4초 상한은 전체 6000ms producer-active
+deadline 안에 포함됩니다. Active scenario에서는 periodic과 typed target boundary 모두
+dump를 억제하며 fresh vendor 원자 쌍만 인정합니다. 따라서 session capacity cache가 phase
+증거가 되지 않고 vendor pair가 없으면 N/A/INCONCLUSIVE가 올바른 결과입니다. HWC count를
+logcat 또는 임의 sysfs/debugfs path에서 추론하지 마세요.
 
 Transition controller는 absolute-deadline 100 ms fixed period를 사용하고 늦은 tick을
 busy catch-up하지 않습니다. Preflight window 검증과 별도로 runtime coverage가 ramp
@@ -723,6 +727,15 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 
 - release alias만 `CONTROL_TESTS`로 보호되고 implicit resolution/direct Main control이
   거부되는지
+- process-session capacity가 requested 20L와 safety-approved actual candidate를
+  구분하고, 성공/실패/취소 terminal result를 queue/repeat/후속 START/Activity 재생성에서
+  재사용해 두 번째 burst를 만들지 않는지
+- capacity topology+100ms stabilize+single sample이 absolute 6000ms producer-active
+  deadline 안이고, 모든 terminal path의 load zero/teardown/counter drain과
+  cleanup-confirmed non-cancelled path의 3초 settle이 구분되는지
+- current-session vendor D/C 원자 쌍이면 SF child가 없고 incomplete pair일 때만 SF
+  fallback 한 번인지. Orientation 축 교환은 reuse하고 display ID/normalized-size 변경은
+  N/A projection+process restart 요구인지
 - exact counter의 post-warmup baseline, post-teardown terminal sample, telemetry gap,
   source/quality 변화, reset/wrap, invalid-delta provenance와 stable-source peak
 - SBWC route 거부/timeout/provider death와 linear reset 실패가 fail-closed이고 모든

@@ -4,9 +4,11 @@
 > **Audience:** 개발자, reviewer, CI maintainer, BSP validation 담당자
 > **Update when:** toolchain, test suite, acceptance gate, device 검증 protocol 또는 산출물 경로가 바뀔 때
 > **Does not own:** 안전 불변식의 원문, 릴리스 게시, scenario·metric 의미, BSP provider 구현
-> **Related:** [AGENTS.md](../AGENTS.md), [PLAN.md](../PLAN.md),
+> **Related:** [Documentation index](INDEX.md), [AGENTS.md](../AGENTS.md), [PLAN.md](../PLAN.md),
 > [ARCHITECTURE.md](../ARCHITECTURE.md), [SCENARIOS.md](SCENARIOS.md),
-> [METRICS.md](METRICS.md), [RELEASE.md](RELEASE.md),
+> [METRICS.md](METRICS.md), [REPORT_SCHEMA.md](REPORT_SCHEMA.md),
+> [HWC_CAPACITY_CALIBRATION.md](HWC_CAPACITY_CALIBRATION.md),
+> [AUTOMATION.md](AUTOMATION.md), [UI_SPEC.md](UI_SPEC.md), [RELEASE.md](RELEASE.md),
 > [SYSTEM_INTEGRATION.md](SYSTEM_INTEGRATION.md)
 
 테스트 개수는 변동 값이므로 이 문서에 고정하지 않는다. 현재 suite는 source와 Gradle
@@ -20,9 +22,8 @@ Get-ChildItem app/src/test -Recurse -Filter *Test.kt |
 Get-ChildItem app/build/test-results/testDebugUnitTest -Filter *.xml -ErrorAction SilentlyContinue
 ```
 
-릴리스 시점의 검증 수치가 필요한 경우 해당 release evidence를
-[README.md](../README.md), [PROJECT_MEMORY.md](../PROJECT_MEMORY.md)와
-[RELEASE.md](RELEASE.md)에 기록한다.
+릴리스 시점의 고정 검증 수치는 [RELEASE.md](RELEASE.md)의 해당 release evidence에만
+기록한다.
 
 ## 기준 환경
 
@@ -104,7 +105,8 @@ release configuration에 local keystore, platform key 경로나 credential을 �
 | Test | 계약 |
 |---|---|
 | `engine/ScenarioCatalogTest.kt` | preset uniqueness, phase validity, catalog semantics |
-| `engine/LabControllerMathTest.kt` | verdict, telemetry/HWC coverage, size-profile arm·coverage, preparation/recovery timing, cleanup decisions |
+| `engine/LabControllerMathTest.kt` | verdict, telemetry/HWC coverage, session-calibration deadline, size-profile arm·coverage, preparation/recovery timing, cleanup decisions |
+| `engine/HwcCapacityCalibrationSessionTest.kt` | process one-shot claim/reuse, terminal N/A, Activity recreation scope와 display projection invalidation |
 | `engine/DeviceRenderSafetyTest.kt` | RAM/power-save/low-RAM envelope |
 | `engine/AutomationIntentContractTest.kt` | explicit action, malformed extras, STOP ordering |
 | `engine/TestWindowIsolationTest.kt` | token/state/focus/restore |
@@ -139,7 +141,7 @@ release configuration에 local keystore, platform key 경로나 credential을 �
 
 | Test | 계약 |
 |---|---|
-| `monitor/SystemMonitorMathTest.kt` | source merge, interval, HWC evidence |
+| `monitor/SystemMonitorMathTest.kt` | source merge, interval, HWC evidence와 one-shot vendor-prefetch/SF-fallback 선택 |
 | `monitor/SystemMonitorConstructionTest.kt` | transactional construction rollback |
 | `monitor/KernelSensorProviderTest.kt` | typed ABI parse, Xclipse/KGSL/GED, units |
 | `monitor/SurfaceFlingerProbeTest.kt` | bounded dump parse와 lifecycle |
@@ -156,6 +158,51 @@ release configuration에 local keystore, platform key 경로나 credential을 �
 | `MainActivityMathTest.kt` | display/window/automation helper |
 | `engine/ReportWriterMathTest.kt` | schema/provenance/retention/atomic naming helper |
 | `AppVersionTest.kt` | versionName/versionCode 계약 |
+
+## Process-session HWC capacity 검증
+
+Capacity 변경은 다음 경계를 별도로 검증해야 한다.
+
+- 최초 START만 measurement claim을 얻고 같은 process의 이후 scenario/repeat/START는
+  terminal result를 재사용
+- Activity 재생성 뒤 새 controller도 같은 in-memory result를 재사용
+- 성공뿐 아니라 timeout, 취소, topology/sample 실패도 terminal `UNAVAILABLE`이며 두
+  번째 20-layer burst를 만들지 않음
+- SharedPreferences, file/report 또는 다른 disk state에서 calibration을 복원하지 않음
+- requested topology가 20L/30fps/60Hz independent opaque RGB DISPLAY
+  `CAPACITY_TILES`이고 actual candidate가 safety/graphics budget에 따라 줄 수 있음
+- UI/event/report가 requested 20과 actual candidate를 혼동하지 않음
+- safety clamp 뒤 renderer target handoff 이후 취소는 실제 candidate를 유지하고 그 전
+  실패는 candidate N/A
+- topology readiness, 100ms stabilization과 single sample 전체가 하나의 absolute
+  6000ms producer-active deadline을 공유
+- sample 전후 topology/geometry revision과 discontinuity serial이 같고 모든 producer
+  heartbeat가 fresh일 때만 observation 수락
+- 모든 terminal path에서 load zero, renderer teardown과 counter drain을 확인하고
+  cleanup-confirmed non-cancelled 경로에서만 3000ms settle 뒤 scenario로 진행
+- final producer teardown 뒤 calibration frame/generated-traffic counter를 drain해 첫
+  scenario baseline/peak와 분리
+- priority 획득 뒤 기존 periodic local sample, SurfaceFlinger worker/child, vendor v1/v2
+  lane을 drain한 후 producer 시작
+- timeout/STOP 뒤 post-sample worker quiescence가 확인되기 전 priority/첫 scenario를
+  해제하지 않고, 미확인은 process-sticky lifecycle failure
+- watchdog pause가 last-success timestamp를 변경하지 않으며 resume grace 안 실제
+  telemetry가 없으면 stale abort
+- producer readiness 대기에서 direct thermal/power/low-memory check가 100ms cadence로
+  유지되고 pre-drain/composition sample에는 별도 병렬 poll을 만들지 않음
+- calibration sample은 vendor snapshot을 최대 한 번만 prefetch하고 current-session
+  nonnegative atomic D/C pair이면 SurfaceFlinger를 실행하지 않음
+- calibration은 optional vendor v2 transaction을 생략하고, v1 실패/partial 뒤 actual
+  vendor-worker quiescence가 확인되지 않으면 SF fallback을 시작하지 않음
+- vendor pair null/partial/negative/session mismatch에서만 SurfaceFlinger fallback 한 번,
+  fallback 뒤 vendor snapshot 재호출 없음
+- display ID 또는 normalized physical short/long edge 변경은 projection을 N/A로 만들고
+  같은 process에서 새 claim을 발급하지 않음
+- width/height만 바뀐 orientation swap은 같은 normalized scope로 재사용
+- result가 advisory-only이며 ScenarioSafetyPolicy cap, catalog target, typed phase
+  evidence로 사용되지 않음
+- 각 scenario report event가 `SESSION_HWC_CAPACITY_CALIBRATION`과
+  `SESSION_HWC_CAPACITY_REUSE_GUIDANCE` 이름을 사용
 
 ## LayerSizeProfile 검증
 
@@ -234,6 +281,7 @@ release configuration에 local keystore, platform key 경로나 credential을 �
 - source/quality change
 - cumulative counter reset/regress/wrap/read gap
 - stale/partial DEVICE/CLIENT pair
+- session calibration vendor prefetch complete/partial/session-change와 SF fallback
 - vendor v2 timeout while v1 remains valid
 - SurfaceFlinger lane timeout·late completion
 - final post-teardown sample failure
@@ -241,6 +289,8 @@ release configuration에 local keystore, platform key 경로나 credential을 �
 ### Lifecycle
 
 - Activity recreation and close during active producer
+- HWC capacity claim owner 취소/실패/재생성과 같은 process 후속 START의 terminal N/A 재사용
+- orientation-only display swap과 display ID/normalized-size 변경 projection
 - STOP during warm-up, phase, report publication과 cleanup
 - topology miss/teardown failure/completed teardown 뒤 stale producer·geometry·typed HWC
   evidence 재사용과 incomplete reattach
@@ -379,6 +429,10 @@ if ($missing.Count -gt 0) {
 - HUD 값에 source/quality 표시
 - expected/observed producer와 frame fidelity 충족
 - typed phase의 fresh HWC pair coverage
+- 첫 process-session HWC capacity attempt 뒤 같은 process의 queue/repeat/새 START에서
+  동일 terminal result가 재사용되고 두 번째 calibration producer burst가 없는지
+- requested 20L와 safety-approved actual candidate, calibration display scope가 HUD와
+  `SESSION_HWC_CAPACITY_*` report event에 구분되어 남는지
 - exact baseline과 post-teardown terminal sample continuity
 - STOP/완료 뒤 thread, Surface, codec, NPU/SBWC, wake/display와 system bar 복구
 - 새 plan 시작 전에 sticky cleanup latch 없음

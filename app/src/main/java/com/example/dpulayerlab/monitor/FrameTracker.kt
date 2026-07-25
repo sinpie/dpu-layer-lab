@@ -208,6 +208,7 @@ internal class ProducerGenerationGate {
     private var activated = false
     private var topologyPublishedMs = -1L
     private var topologyRevision = 0L
+    private var topologyDiscontinuitySerial = 0L
     private var geometryRequestedRevision = 0L
     private var geometryAppliedRevision = 0L
     private var geometryRequestedProfileOrdinal = -1
@@ -231,6 +232,7 @@ internal class ProducerGenerationGate {
         activated = false
         topologyPublishedMs = -1L
         topologyRevision = 0L
+        topologyDiscontinuitySerial = 0L
         geometryRequestedRevision = 0L
         geometryAppliedRevision = 0L
         geometryRequestedProfileOrdinal = -1
@@ -377,6 +379,7 @@ internal class ProducerGenerationGate {
     @Synchronized
     fun markTopologyPending(candidate: Long): Boolean {
         if (candidate != generation) return false
+        if (!topologyPending) advanceTopologyDiscontinuitySerial()
         topologyPending = true
         teardownCompleted = false
         return true
@@ -417,6 +420,7 @@ internal class ProducerGenerationGate {
         ) {
             return false
         }
+        advanceTopologyDiscontinuitySerial()
         resetObservationWindow(nowMs)
         return true
     }
@@ -446,6 +450,7 @@ internal class ProducerGenerationGate {
     @Synchronized
     fun markTeardownFailure(candidate: Long): Boolean {
         if (candidate != generation) return false
+        if (!teardownFailed) advanceTopologyDiscontinuitySerial()
         teardownFailed = true
         activated = false
         invalidateGeometryEvidence()
@@ -455,6 +460,7 @@ internal class ProducerGenerationGate {
     @Synchronized
     fun markTeardownComplete(candidate: Long): Boolean {
         if (candidate != generation) return false
+        if (!teardownCompleted) advanceTopologyDiscontinuitySerial()
         teardownCompleted = true
         activated = false
         invalidateGeometryEvidence()
@@ -524,6 +530,7 @@ internal class ProducerGenerationGate {
             topologyPending = topologyPending,
             topologyPublishedAtMs = topologyPublishedMs.takeIf { it >= 0L },
             topologyRevision = topologyRevision,
+            topologyDiscontinuitySerial = topologyDiscontinuitySerial,
             geometryRequestedRevision = geometryRequestedRevision,
             geometryAppliedRevision = geometryAppliedRevision,
             geometryRequestedProfileOrdinal = geometryRequestedProfileOrdinal,
@@ -555,6 +562,15 @@ internal class ProducerGenerationGate {
             teardownCompleted = teardownCompleted,
             runtimeFailureReason = runtimeFailureReason,
         )
+    }
+
+    private fun advanceTopologyDiscontinuitySerial() {
+        topologyDiscontinuitySerial =
+            if (topologyDiscontinuitySerial == Long.MAX_VALUE) {
+                1L
+            } else {
+                topologyDiscontinuitySerial + 1L
+            }
     }
 
     private fun resetObservationWindow(nowMs: Long) {
@@ -673,6 +689,7 @@ data class ProducerReadiness(
     val topologyPending: Boolean = false,
     val topologyPublishedAtMs: Long? = null,
     val topologyRevision: Long = 0L,
+    val topologyDiscontinuitySerial: Long = 0L,
     val geometryRequestedRevision: Long = 0L,
     val geometryAppliedRevision: Long = 0L,
     val geometryRequestedProfileOrdinal: Int = -1,
