@@ -14,11 +14,11 @@ Launcher와 Gradle project의 표시 이름은 `DPULayerTest`이고 canonical re
 `https://github.com/sinpie/dpu-layer-lab`이다. 제품 호환성 계약인 package
 `com.example.dpulayerlab`, automation component/action, `dpu-layer-lab-` report
 prefix, Soong module/APK 이름 `DpuLayerLab`은 별도 migration 요구 없이 바꾸지 않는다.
-현재 release version은 `20260726_152112`(`versionCode 9`), debug version은
-`20260726_152112-debug`이며 tag는 `v20260726_152112`이다.
+현재 release version은 `20260727_005420`(`versionCode 10`), debug version은
+`20260727_005420-debug`이며 tag는 `v20260727_005420`이다.
 `yyyyMMdd_HHmmss`는 KST build 시각이다. Release asset은
-`DPULayerTest-20260726_152112-debug.apk`,
-`DPULayerTest-20260726_152112-release-unsigned.apk`, `SHA256SUMS.txt` 이름을 사용한다.
+`DPULayerTest-20260727_005420-debug.apk`,
+`DPULayerTest-20260727_005420-release-unsigned.apk`, `SHA256SUMS.txt` 이름을 사용한다.
 
 ## 기본 작업 규칙
 

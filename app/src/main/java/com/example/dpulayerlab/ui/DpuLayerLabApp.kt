@@ -112,6 +112,8 @@ import com.example.dpulayerlab.engine.ErrorRecoveryAction
 import com.example.dpulayerlab.engine.ScenarioCatalog
 import com.example.dpulayerlab.engine.GaugePeak
 import com.example.dpulayerlab.engine.consistentGaugePeak
+import com.example.dpulayerlab.model.AppProducerKind
+import com.example.dpulayerlab.model.AppProducerTopology
 import com.example.dpulayerlab.model.BufferSize
 import com.example.dpulayerlab.model.BufferPresentation
 import com.example.dpulayerlab.model.DecoderLinearReference
@@ -154,9 +156,11 @@ import com.example.dpulayerlab.model.terminalReason
 import com.example.dpulayerlab.model.TransitionMode
 import com.example.dpulayerlab.model.TransitionSpec
 import com.example.dpulayerlab.model.usesSelectedMediaDecoder
+import com.example.dpulayerlab.model.plannedAppProducerKinds
 import com.example.dpulayerlab.monitor.CapabilityScanner
 import com.example.dpulayerlab.monitor.CapabilitySnapshot
 import com.example.dpulayerlab.monitor.HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS
+import com.example.dpulayerlab.monitor.ProducerReadiness
 import com.example.dpulayerlab.render.LayerStageView
 import com.example.dpulayerlab.render.ProducerFrameCallback
 import kotlinx.coroutines.Dispatchers
@@ -203,6 +207,12 @@ private data class NoExtraSurfaceHudState(
     val mediaSelected: Boolean,
     val mediaWidthPx: Int?,
     val mediaHeightPx: Int?,
+    val decoderVisibleWidthPx: Int?,
+    val decoderVisibleHeightPx: Int?,
+    val decoderSourceFps: Float?,
+    val decoderSourceRotationDegrees: Int?,
+    val decoderCodecName: String?,
+    val producerReadiness: ProducerReadiness,
     val decoderLinearReference: DecoderLinearReference?,
     val safetyAdjustments: List<String>,
     val performanceIsolationStatus: String,
@@ -3152,8 +3162,8 @@ private fun RunningScreen(controller: LabController) {
         }
     }
     val expectedProducersCallback = remember(controller) {
-        { generation: Long, producerIds: Set<Long> ->
-            controller.frameTracker.expectProducers(generation, producerIds)
+        { topology: AppProducerTopology ->
+            controller.frameTracker.expectProducerTopology(topology)
         }
     }
     val producerTopologyPendingCallback = remember(controller) {
@@ -3279,6 +3289,23 @@ private fun RunningScreen(controller: LabController) {
     val hudMediaSelected = controller.selectedMediaUri != null
     val hudMediaWidthPx = controller.selectedMediaWidthPx
     val hudMediaHeightPx = controller.selectedMediaHeightPx
+    val selectedDecoder = controller.selectedVideoDecoder
+    val hudDecoderVisibleWidthPx = selectedDecoder?.expectedVisibleWidthPx
+    val hudDecoderVisibleHeightPx = selectedDecoder?.expectedVisibleHeightPx
+    val hudDecoderSourceFps = selectedDecoder?.expectedSourceFps
+    val hudDecoderSourceRotationDegrees = selectedDecoder?.expectedRotationDegrees
+    val hudDecoderCodecName = selectedDecoder?.codecName
+    val hudProducerReadiness = remember(
+        hudRefreshBucket,
+        progress.producerGeneration,
+        progress.expectedProducerCount,
+        progress.observedProducerCount,
+    ) {
+        progress.producerGeneration
+            .takeIf { it > 0L }
+            ?.let(controller.frameTracker::producerReadiness)
+            ?: ProducerReadiness()
+    }
     val hudDecoderLinearReference = controller.selectedMediaLinearReference
     val hudSafetyAdjustments = controller.lastSafetyAdjustments
     val hudPerformanceIsolationStatus = controller.performanceIsolationStatus
@@ -3295,6 +3322,12 @@ private fun RunningScreen(controller: LabController) {
         hudMediaSelected,
         hudMediaWidthPx,
         hudMediaHeightPx,
+        hudDecoderVisibleWidthPx,
+        hudDecoderVisibleHeightPx,
+        hudDecoderSourceFps,
+        hudDecoderSourceRotationDegrees,
+        hudDecoderCodecName,
+        hudProducerReadiness,
         hudDecoderLinearReference,
         hudSafetyAdjustments,
         hudPerformanceIsolationStatus,
@@ -3312,6 +3345,12 @@ private fun RunningScreen(controller: LabController) {
             mediaSelected = hudMediaSelected,
             mediaWidthPx = hudMediaWidthPx,
             mediaHeightPx = hudMediaHeightPx,
+            decoderVisibleWidthPx = hudDecoderVisibleWidthPx,
+            decoderVisibleHeightPx = hudDecoderVisibleHeightPx,
+            decoderSourceFps = hudDecoderSourceFps,
+            decoderSourceRotationDegrees = hudDecoderSourceRotationDegrees,
+            decoderCodecName = hudDecoderCodecName,
+            producerReadiness = hudProducerReadiness,
             decoderLinearReference = hudDecoderLinearReference,
             safetyAdjustments = hudSafetyAdjustments.toList(),
             performanceIsolationStatus = hudPerformanceIsolationStatus,
@@ -3388,6 +3427,12 @@ private fun NoExtraSurfaceRunningHud(
     val mediaSelected = state.mediaSelected
     val mediaWidthPx = state.mediaWidthPx
     val mediaHeightPx = state.mediaHeightPx
+    val decoderVisibleWidthPx = state.decoderVisibleWidthPx
+    val decoderVisibleHeightPx = state.decoderVisibleHeightPx
+    val decoderSourceFps = state.decoderSourceFps
+    val decoderSourceRotationDegrees = state.decoderSourceRotationDegrees
+    val decoderCodecName = state.decoderCodecName
+    val producerReadiness = state.producerReadiness
     val decoderLinearReference = state.decoderLinearReference
     val safetyAdjustments = state.safetyAdjustments
     val performanceIsolationStatus = state.performanceIsolationStatus
@@ -3405,6 +3450,7 @@ private fun NoExtraSurfaceRunningHud(
         configuration.screenHeightDp < 720 -> 132.dp
         else -> 168.dp
     }
+    val topHudScrollState = rememberScrollState()
     val phaseFraction = phase?.let {
         if (it.durationMs > 0L) {
             (progress.phaseElapsedMs.toDouble() / it.durationMs.toDouble())
@@ -3491,219 +3537,322 @@ private fun NoExtraSurfaceRunningHud(
         ),
     )
 
-    Column(
+    Row(
         Modifier
             .fillMaxSize()
             .windowInsetsPadding(WindowInsets.displayCutout)
             .padding(12.dp),
-        verticalArrangement = Arrangement.SpaceBetween,
+        horizontalArrangement = Arrangement.spacedBy(if (compactHud) 6.dp else 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Surface(
+        Column(
             modifier = Modifier
-                .widthIn(max = if (compactHud) 620.dp else 370.dp)
-                .fillMaxWidth(),
-            color = Color(0xD90A1512),
-            shape = RoundedCornerShape(18.dp),
+                .weight(1f)
+                .fillMaxHeight(),
+            verticalArrangement = Arrangement.SpaceBetween,
         ) {
-            Column(
-                Modifier.padding(if (compactHud) 9.dp else 12.dp),
-                verticalArrangement = Arrangement.spacedBy(if (compactHud) 4.dp else 7.dp),
+            Surface(
+                modifier = Modifier
+                    .widthIn(max = if (compactHud) 620.dp else 370.dp)
+                    .fillMaxWidth()
+                    .weight(1f),
+                color = Color(0xD90A1512),
+                shape = RoundedCornerShape(18.dp),
             ) {
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text(
-                            planProgress.currentScenario?.name
-                                ?: progress.scenario?.name
-                                ?: "DPU test 준비",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = Color.White,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        Text(
-                            "항목 ${planProgress.currentQueuePosition}/" +
-                                "${planProgress.queueSize} · LOOP ${planProgress.currentRepeat}/" +
-                                "${planProgress.repeatCount} · TIME " +
-                                "${planProgress.durationMultiplier}× · " +
-                                progress.stage.displayLabel(),
-                            color = Color(0xFFB8CBC5),
-                            style = MaterialTheme.typography.labelMedium,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        Text(
-                            "LAYER SIZE · " +
-                                (
-                                    phase?.layerSizeProfile?.let {
-                                        layerSizeProfileUiLabel(it, compact = true)
-                                    } ?: "준비 중"
-                                    ),
-                            color = Color(0xFF8FA9A1),
-                            fontSize = 8.sp,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        Text(
-                            phase?.let {
-                                "BUFFER · ${it.bufferSize.label} · " +
-                                    "${it.bufferPresentation.label} · " +
-                                    it.layerOrientation.label
-                            } ?: "BUFFER · 준비 중",
-                            color = Color(0xFF8FA9A1),
-                            fontSize = 8.sp,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        Text(
-                            visibleAppVersion(BuildConfig.VERSION_NAME),
-                            color = Color(0xFF8FA9A1),
-                            fontSize = 8.sp,
-                            maxLines = 1,
-                        )
+                Column(
+                    Modifier.padding(if (compactHud) 9.dp else 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(if (compactHud) 4.dp else 7.dp),
+                ) {
+                    // Keep the header and STOP action fixed in every layout. Only the bounded
+                    // diagnostic body below may scroll when height or font scale is tight.
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                planProgress.currentScenario?.name
+                                    ?: progress.scenario?.name
+                                    ?: "DPU test 준비",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = Color.White,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                "항목 ${planProgress.currentQueuePosition}/" +
+                                    "${planProgress.queueSize} · " +
+                                    "LOOP ${planProgress.currentRepeat}/" +
+                                    "${planProgress.repeatCount} · TIME " +
+                                    "${planProgress.durationMultiplier}× · " +
+                                    progress.stage.displayLabel(),
+                                color = Color(0xFFB8CBC5),
+                                style = MaterialTheme.typography.labelMedium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                "LAYER SIZE · " +
+                                    (
+                                        phase?.layerSizeProfile?.let {
+                                            layerSizeProfileUiLabel(it, compact = true)
+                                        } ?: "준비 중"
+                                        ),
+                                color = Color(0xFF8FA9A1),
+                                fontSize = 8.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                phase?.let {
+                                    "BUFFER · ${it.bufferSize.label} · " +
+                                        "${it.bufferPresentation.label} · " +
+                                        it.layerOrientation.label
+                                } ?: "BUFFER · 준비 중",
+                                color = Color(0xFF8FA9A1),
+                                fontSize = 8.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                visibleAppVersion(BuildConfig.VERSION_NAME),
+                                color = Color(0xFF8FA9A1),
+                                fontSize = 8.sp,
+                                maxLines = 1,
+                            )
+                        }
+                        Surface(
+                            color = Color(0xFF0F332C),
+                            shape = RoundedCornerShape(100.dp),
+                        ) {
+                            Text(
+                                progress.stage.name,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                color = Color(0xFF65E6C4),
+                                style = MaterialTheme.typography.labelLarge,
+                            )
+                        }
+                        Spacer(Modifier.width(6.dp))
+                        Button(
+                            onClick = stop,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.error,
+                                contentColor = MaterialTheme.colorScheme.onError,
+                            ),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 7.dp),
+                        ) {
+                            Text("STOP", fontWeight = FontWeight.Bold)
+                        }
                     }
-                    Surface(color = Color(0xFF0F332C), shape = RoundedCornerShape(100.dp)) {
-                        Text(
-                            progress.stage.name,
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-                            color = Color(0xFF65E6C4),
-                            style = MaterialTheme.typography.labelLarge,
-                        )
-                    }
-                    Spacer(Modifier.width(6.dp))
-                    Button(
-                        onClick = stop,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.error,
-                            contentColor = MaterialTheme.colorScheme.onError,
-                        ),
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 7.dp),
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .verticalScroll(topHudScrollState),
+                        verticalArrangement =
+                            Arrangement.spacedBy(if (compactHud) 4.dp else 7.dp),
                     ) {
-                        Text("STOP", fontWeight = FontWeight.Bold)
-                    }
-                }
-                val expectation =
-                    phase?.hwcCompositionExpectation ?: HwcCompositionExpectation.NONE
-                val liveHwcPair = atomicHwcCompositionPair(
-                    telemetry = telemetry,
-                    nowMonotonicMs = nowMonotonicMs,
-                )
-                val rawHwcState = rawHwcExpectationState(
-                    expectation = expectation,
-                    telemetry = telemetry,
-                    nowMonotonicMs = nowMonotonicMs,
-                )
-                Text(
-                    if (expectation == HwcCompositionExpectation.NONE) {
-                        hwcLayerCountLiveSummary(
+                        val expectation =
+                            phase?.hwcCompositionExpectation ?: HwcCompositionExpectation.NONE
+                        val liveHwcPair = atomicHwcCompositionPair(
                             telemetry = telemetry,
                             nowMonotonicMs = nowMonotonicMs,
                         )
-                    } else {
-                        hwcExpectationLiveSummary(
+                        val rawHwcState = rawHwcExpectationState(
                             expectation = expectation,
                             telemetry = telemetry,
                             nowMonotonicMs = nowMonotonicMs,
                         )
-                    },
-                    color = if (
-                        liveHwcPair != null &&
-                        (
-                            expectation == HwcCompositionExpectation.NONE ||
-                                rawHwcState == RawHwcExpectationState.MATCH
-                            )
-                    ) {
-                        Color(0xFFB8CBC5)
-                    } else {
-                        Color(0xFFFFC857)
-                    },
-                    style = MaterialTheme.typography.labelSmall,
-                    fontSize = if (compactHud) 8.sp else 10.sp,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                HudProgressLine(
-                    label = if (compactHud) {
-                        "PLAN ${(planProgress.overallFraction * 100f).roundToInt()}% · " +
-                            "PHASE ${(progress.phaseIndex + 1).coerceAtLeast(1)}/" +
-                            "${progress.scenario?.phases?.size ?: 0} " +
-                            "${(phaseFraction * 100f).roundToInt()}%"
-                    } else {
-                        "DPU PLAN · ${planProgress.completedRuns}/${planProgress.totalRuns} runs"
-                    },
-                    detail = if (compactHud) {
-                        "${planProgress.completedRuns}/${planProgress.totalRuns} runs"
-                    } else {
-                        "현재 scenario ${(planProgress.boundedCurrentRunFraction * 100f).roundToInt()}%"
-                    },
-                    fraction = planProgress.overallFraction,
-                    color = Color(0xFF65E6C4),
-                )
-                if (!compactHud) phase?.let { activePhase ->
-                    HudProgressLine(
-                        label = "PHASE ${(progress.phaseIndex + 1).coerceAtLeast(1)}/" +
-                            "${progress.scenario?.phases?.size ?: 0}",
-                        detail = "${activePhase.label} · " +
-                            "${formatDuration(progress.phaseElapsedMs)} / " +
-                            formatDuration(activePhase.durationMs),
-                        fraction = phaseFraction,
-                        color = Color(0xFFFFC857),
-                    )
-                }
-                if (compactHud) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        liveMetrics.chunked(2).forEach { columnMetrics ->
-                            Column(
-                                modifier = Modifier.weight(1f),
-                                verticalArrangement = Arrangement.spacedBy(5.dp),
-                            ) {
-                                columnMetrics.forEach { metric ->
-                                    LiveHudMetric(
-                                        label = metric.label,
-                                        provenance = metric.provenance,
-                                        value = metric.value,
-                                        valueText = metric.valueText,
-                                        history = metric.history,
-                                        maxValue = metric.maxValue,
-                                        color = metric.color,
+                        Text(
+                            if (expectation == HwcCompositionExpectation.NONE) {
+                                hwcLayerCountLiveSummary(
+                                    telemetry = telemetry,
+                                    nowMonotonicMs = nowMonotonicMs,
+                                )
+                            } else {
+                                hwcExpectationLiveSummary(
+                                    expectation = expectation,
+                                    telemetry = telemetry,
+                                    nowMonotonicMs = nowMonotonicMs,
+                                )
+                            },
+                            color = if (
+                                liveHwcPair != null &&
+                                (
+                                    expectation == HwcCompositionExpectation.NONE ||
+                                        rawHwcState == RawHwcExpectationState.MATCH
                                     )
+                            ) {
+                                Color(0xFFB8CBC5)
+                            } else {
+                                Color(0xFFFFC857)
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            fontSize = if (compactHud) 8.sp else 10.sp,
+                        )
+                        CurrentTestContentHud(
+                            phase = phase,
+                            readiness = producerReadiness,
+                            expectedProducerCount = progress.expectedProducerCount,
+                            mediaWidthPx = mediaWidthPx,
+                            mediaHeightPx = mediaHeightPx,
+                            decoderVisibleWidthPx = decoderVisibleWidthPx,
+                            decoderVisibleHeightPx = decoderVisibleHeightPx,
+                            decoderSourceFps = decoderSourceFps,
+                            decoderSourceRotationDegrees = decoderSourceRotationDegrees,
+                            decoderCodecName = decoderCodecName,
+                            compact = compactHud,
+                        )
+                        HudProgressLine(
+                            label = if (compactHud) {
+                                "PLAN ${(planProgress.overallFraction * 100f).roundToInt()}% · " +
+                                    "PHASE ${(progress.phaseIndex + 1).coerceAtLeast(1)}/" +
+                                    "${progress.scenario?.phases?.size ?: 0} " +
+                                    "${(phaseFraction * 100f).roundToInt()}%"
+                            } else {
+                                "DPU PLAN · " +
+                                    "${planProgress.completedRuns}/${planProgress.totalRuns} runs"
+                            },
+                            detail = if (compactHud) {
+                                "${planProgress.completedRuns}/${planProgress.totalRuns} runs"
+                            } else {
+                                "현재 scenario " +
+                                    "${(planProgress.boundedCurrentRunFraction * 100f).roundToInt()}%"
+                            },
+                            fraction = planProgress.overallFraction,
+                            color = Color(0xFF65E6C4),
+                        )
+                        if (!compactHud) {
+                            phase?.let { activePhase ->
+                                HudProgressLine(
+                                    label =
+                                        "PHASE ${(progress.phaseIndex + 1).coerceAtLeast(1)}/" +
+                                            "${progress.scenario?.phases?.size ?: 0}",
+                                    detail = "${activePhase.label} · " +
+                                        "${formatDuration(progress.phaseElapsedMs)} / " +
+                                        formatDuration(activePhase.durationMs),
+                                    fraction = phaseFraction,
+                                    color = Color(0xFFFFC857),
+                                )
+                            }
+                        }
+                        if (compactHud) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            ) {
+                                liveMetrics.chunked(2).forEach { columnMetrics ->
+                                    Column(
+                                        modifier = Modifier.weight(1f),
+                                        verticalArrangement = Arrangement.spacedBy(5.dp),
+                                    ) {
+                                        columnMetrics.forEach { metric ->
+                                            LiveHudMetric(
+                                                label = metric.label,
+                                                provenance = metric.provenance,
+                                                value = metric.value,
+                                                valueText = metric.valueText,
+                                                history = metric.history,
+                                                maxValue = metric.maxValue,
+                                                color = metric.color,
+                                            )
+                                        }
+                                    }
                                 }
                             }
+                        } else {
+                            liveMetrics.forEach { metric ->
+                                LiveHudMetric(
+                                    label = metric.label,
+                                    provenance = metric.provenance,
+                                    value = metric.value,
+                                    valueText = metric.valueText,
+                                    history = metric.history,
+                                    maxValue = metric.maxValue,
+                                    color = metric.color,
+                                )
+                            }
+                        }
+                        HorizontalDivider(color = Color.White.copy(alpha = 0.13f))
+                        TrafficHud(traffic, compact = compactHud)
+                    }
+                }
+            }
+            Surface(
+                modifier = Modifier
+                    .widthIn(max = if (compactHud) 760.dp else 520.dp)
+                    .fillMaxWidth(),
+                color = Color(0xD90A1512),
+                shape = RoundedCornerShape(18.dp),
+            ) {
+                if (compactHud) {
+                    Row(
+                        Modifier.padding(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Box(Modifier.weight(1f)) {
+                            RunTransitionStatus(
+                                progress = progress,
+                                planProgress = planProgress,
+                                telemetry = telemetry,
+                                safetyAdjustments = safetyAdjustments,
+                                performanceIsolationStatus = performanceIsolationStatus,
+                                capacityCalibrationStatus = capacityCalibrationStatus,
+                                severeThermalDeratingEnabled = severeThermalDeratingEnabled,
+                                compact = true,
+                                modifier = Modifier
+                                    .heightIn(max = detailPanelMaxHeight)
+                                    .verticalScroll(rememberScrollState()),
+                            )
                         }
                     }
                 } else {
-                    liveMetrics.forEach { metric ->
-                        LiveHudMetric(
-                            label = metric.label,
-                            provenance = metric.provenance,
-                            value = metric.value,
-                            valueText = metric.valueText,
-                            history = metric.history,
-                            maxValue = metric.maxValue,
-                            color = metric.color,
-                        )
-                    }
-                }
-                HorizontalDivider(color = Color.White.copy(alpha = 0.13f))
-                TrafficHud(traffic, compact = compactHud)
-            }
-        }
-        Surface(
-            modifier = Modifier
-                .widthIn(max = if (compactHud) 760.dp else 520.dp)
-                .fillMaxWidth(),
-            color = Color(0xD90A1512),
-            shape = RoundedCornerShape(18.dp),
-        ) {
-            if (compactHud) {
-                Row(
-                    Modifier.padding(8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Box(Modifier.weight(1f)) {
+                    Column(
+                        Modifier.padding(13.dp),
+                        verticalArrangement = Arrangement.spacedBy(9.dp),
+                    ) {
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                val coolingDown = progress.stage == RunnerStage.COOLDOWN
+                                val targetPhase =
+                                    if (coolingDown) null else progress.displayedTargetPhase
+                                Text(
+                                    when {
+                                        coolingDown ->
+                                            "Cooldown · 부하 해제 및 counter 안정화"
+                                        progress.phase != null ->
+                                            "현재 LOGICAL ${progress.phase.activeLayers}L / " +
+                                                "PHYSICAL PRODUCER " +
+                                                producerCountDisplay(
+                                                    observed = progress.observedProducerCount,
+                                                    expected = progress.expectedProducerCount,
+                                                ) +
+                                                " / " +
+                                                "${progress.phase.producerFps.toInt()}fps · " +
+                                                "목표 LOGICAL " +
+                                                "${targetPhase?.activeLayers ?: progress.phase.activeLayers}L / " +
+                                                "${(targetPhase?.producerFps ?: progress.phase.producerFps).toInt()}fps"
+                                        else -> "surface 준비"
+                                    },
+                                    color = Color.White,
+                                    style = MaterialTheme.typography.titleMedium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                Text(
+                                    progress.phase?.let {
+                                        "${layerSizeProfileUiLabel(it.layerSizeProfile)} · " +
+                                            "${it.backend.label} · ${it.pixelRoute.label} · " +
+                                            "${it.motion.label} · " +
+                                            "${it.requestedDisplayHz.toInt()}Hz"
+                                    } ?: "부하 없음",
+                                    color = Color(0xFFB8CBC5),
+                                    style = MaterialTheme.typography.labelLarge,
+                                    maxLines = 1,
+                                )
+                            }
+                        }
                         RunTransitionStatus(
                             progress = progress,
                             planProgress = planProgress,
@@ -3712,79 +3861,582 @@ private fun NoExtraSurfaceRunningHud(
                             performanceIsolationStatus = performanceIsolationStatus,
                             capacityCalibrationStatus = capacityCalibrationStatus,
                             severeThermalDeratingEnabled = severeThermalDeratingEnabled,
-                            compact = true,
+                            compact = false,
                             modifier = Modifier
                                 .heightIn(max = detailPanelMaxHeight)
                                 .verticalScroll(rememberScrollState()),
                         )
                     }
                 }
-            } else {
-                Column(
-                    Modifier.padding(13.dp),
-                    verticalArrangement = Arrangement.spacedBy(9.dp),
-                ) {
-                    Row(
-                        Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    ) {
-                        Column(Modifier.weight(1f)) {
-                            val coolingDown = progress.stage == RunnerStage.COOLDOWN
-                            val targetPhase =
-                                if (coolingDown) null else progress.displayedTargetPhase
-                            Text(
-                                when {
-                                    coolingDown -> "Cooldown · 부하 해제 및 counter 안정화"
-                                    progress.phase != null ->
-                                        "현재 LOGICAL ${progress.phase.activeLayers}L / " +
-                                            "PHYSICAL PRODUCER " +
-                                            producerCountDisplay(
-                                                observed = progress.observedProducerCount,
-                                                expected = progress.expectedProducerCount,
-                                            ) +
-                                            " / " +
-                                            "${progress.phase.producerFps.toInt()}fps · " +
-                                            "목표 LOGICAL " +
-                                            "${targetPhase?.activeLayers ?: progress.phase.activeLayers}L / " +
-                                            "${(targetPhase?.producerFps ?: progress.phase.producerFps).toInt()}fps"
-                                    else -> "surface 준비"
-                                },
-                                color = Color.White,
-                                style = MaterialTheme.typography.titleMedium,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            Text(
-                                progress.phase?.let {
-                                    "${layerSizeProfileUiLabel(it.layerSizeProfile)} · " +
-                                        "${it.backend.label} · ${it.pixelRoute.label} · " +
-                                        "${it.motion.label} · ${it.requestedDisplayHz.toInt()}Hz"
-                                } ?: "부하 없음",
-                                color = Color(0xFFB8CBC5),
-                                style = MaterialTheme.typography.labelLarge,
-                                maxLines = 1,
-                            )
-                        }
-                    }
-                    RunTransitionStatus(
-                        progress = progress,
-                        planProgress = planProgress,
-                        telemetry = telemetry,
-                        safetyAdjustments = safetyAdjustments,
-                        performanceIsolationStatus = performanceIsolationStatus,
-                        capacityCalibrationStatus = capacityCalibrationStatus,
-                        severeThermalDeratingEnabled = severeThermalDeratingEnabled,
-                        compact = false,
-                        modifier = Modifier
-                            .heightIn(max = detailPanelMaxHeight)
-                            .verticalScroll(rememberScrollState()),
-                    )
+            }
+        }
+        AppProducerMapPanel(
+            plannedPhase = progress.displayedTargetPhase ?: phase,
+            activePhase = phase,
+            readiness = producerReadiness,
+            expectedProducerCount = progress.expectedProducerCount,
+            observedProducerCount = progress.observedProducerCount,
+            mediaWidthPx = decoderVisibleWidthPx ?: mediaWidthPx,
+            mediaHeightPx = decoderVisibleHeightPx ?: mediaHeightPx,
+            compact = compactHud,
+        )
+    }
+}
+
+@Immutable
+internal data class CurrentTestHudSummary(
+    val source: String,
+    val presentation: String,
+    val rotation: String,
+    val motion: String,
+    val layerSize: String,
+    val producers: String,
+    val load: String,
+)
+
+internal fun currentTestHudRows(summary: CurrentTestHudSummary): List<String> = listOf(
+    summary.source,
+    summary.presentation,
+    summary.rotation,
+    summary.motion,
+    summary.layerSize,
+    summary.producers,
+    summary.load,
+)
+
+internal enum class DecoderHudEvidenceState(val label: String) {
+    NOT_APPLICABLE("N/A"),
+    TOPOLOGY_WAIT("WAIT · topology"),
+    FIRST_FRAME_WAIT("WAIT · first rendered frame"),
+    REVISION_WAIT("REV WAIT"),
+    ACTIVE("ACTIVE"),
+    STALE("STALE"),
+    INVALID("EVIDENCE INVALID"),
+}
+
+@Immutable
+internal data class DecoderHudProjection(
+    val state: DecoderHudEvidenceState,
+    val text: String,
+)
+
+internal fun currentTestHudSummary(
+    phase: PhaseSpec?,
+    decoderVisibleWidthPx: Int?,
+    decoderVisibleHeightPx: Int?,
+    decoderSourceFps: Float?,
+    decoderSourceRotationDegrees: Int?,
+): CurrentTestHudSummary {
+    if (phase == null) {
+        return CurrentTestHudSummary(
+            source = "SOURCE · 준비 중",
+            presentation = "표시 방식 · 준비 중",
+            rotation = "회전 · 준비 중",
+            motion = "이동/확대 · 준비 중",
+            layerSize = "레이어 크기 · 준비 중",
+            producers = "APP PRODUCER · 준비 중",
+            load = "부하 · 준비 중",
+        )
+    }
+    val kinds = plannedAppProducerKinds(phase)
+    val hasDecoder = AppProducerKind.VIDEO_DECODER in kinds
+    val actualWidth = decoderVisibleWidthPx?.takeIf { it > 0 }
+    val actualHeight = decoderVisibleHeightPx?.takeIf { it > 0 }
+    val actualSource = if (actualWidth != null && actualHeight != null) {
+        "${sourceResolutionClass(actualWidth, actualHeight)} " +
+            "${actualWidth}×${actualHeight}"
+    } else {
+        "metadata 대기"
+    }
+    val requestedSource = when (phase.bufferSize) {
+        BufferSize.DISPLAY -> "Display"
+        else -> "${phase.bufferSize.label} 이상"
+    }
+    val source = if (hasDecoder) {
+        val fps = decoderSourceFps
+            ?.takeIf { it.isFinite() && it > 0f }
+            ?.let(::formatHudFps)
+            ?: "FPS 대기"
+        "SOURCE · 영상/MediaCodec · 실제 $actualSource @$fps · 요구 $requestedSource"
+    } else {
+        val primaryBuffer = when (kinds.firstOrNull()) {
+            AppProducerKind.GPU_GL,
+            AppProducerKind.CANVAS_TEXTURE,
+            AppProducerKind.FLATTENED_CANVAS,
+            -> "Display"
+            AppProducerKind.CANVAS_SURFACE -> {
+                if (phase.bufferSize == BufferSize.DISPLAY) {
+                    "Display"
+                } else {
+                    "${phase.bufferSize.label} Canvas primary + Display overlay"
                 }
             }
+            AppProducerKind.VIDEO_DECODER,
+            AppProducerKind.UNKNOWN,
+            null,
+            -> "N/A"
+        }
+        "SOURCE · ${producerNatureSummary(kinds)} · $primaryBuffer"
+    }
+    val presentation = when (phase.bufferPresentation) {
+        BufferPresentation.FIT -> "기본 FIT(동작 전 전체·종횡비 유지)"
+        BufferPresentation.PIXEL_1_TO_1_CROP -> "1:1 원본 픽셀(중앙 crop)"
+    }
+    val sourceRotation = decoderSourceRotationDegrees
+        ?.takeIf { hasDecoder }
+        ?.let { " · 영상 metadata ${it}°" }
+        .orEmpty()
+    return CurrentTestHudSummary(
+        source = source,
+        presentation = "표시 방식 · $presentation",
+        rotation = "회전 · layer ${phase.layerOrientation.label}$sourceRotation",
+        motion = "이동/확대 · ${motionHudLabel(phase)}",
+        layerSize = "레이어 크기 · ${layerSizeHudLabel(phase.layerSizeProfile)}",
+        producers = "APP PRODUCER · ${producerNatureSummary(kinds)} · ${kinds.size}P",
+        load = "부하 · ${phase.workloads.summary()} · ${phase.workloads.shape.label} · " +
+            phase.transition.summary(),
+    )
+}
+
+internal fun decoderHudProjection(
+    phase: PhaseSpec?,
+    readiness: ProducerReadiness,
+    expectedProducerCount: Int,
+): DecoderHudProjection {
+    val decoderPlanned =
+        phase?.let(::plannedAppProducerKinds)?.contains(AppProducerKind.VIDEO_DECODER) == true
+    if (!decoderPlanned) {
+        return DecoderHudProjection(
+            DecoderHudEvidenceState.NOT_APPLICABLE,
+            "VIDEO DECODER · N/A",
+        )
+    }
+    val state = when {
+        readiness.topologyMissed ||
+            readiness.teardownFailed ||
+            readiness.teardownCompleted ||
+            readiness.runtimeFailureReason != null -> DecoderHudEvidenceState.INVALID
+        expectedProducerCount <= 0 ||
+            readiness.topologyPending ||
+            !readiness.topologyPublished -> DecoderHudEvidenceState.TOPOLOGY_WAIT
+        !readiness.decoderExpected -> DecoderHudEvidenceState.INVALID
+        readiness.decoderObservationFrameCount <= 0L ||
+            readiness.decoderLastFrameAgeMs == null -> DecoderHudEvidenceState.FIRST_FRAME_WAIT
+        readiness.decoderLastFrameAgeMs > DECODER_HUD_FRESHNESS_MS ->
+            DecoderHudEvidenceState.STALE
+        readiness.producerControlRequestedRevision > 0L &&
+            !readiness.decoderControlReady -> DecoderHudEvidenceState.REVISION_WAIT
+        else -> DecoderHudEvidenceState.ACTIVE
+    }
+    val age = readiness.decoderLastFrameAgeMs?.let { "${it}ms" } ?: "N/A"
+    val text = when (state) {
+        DecoderHudEvidenceState.TOPOLOGY_WAIT ->
+            "VIDEO DECODER ${state.label} —P"
+        DecoderHudEvidenceState.FIRST_FRAME_WAIT ->
+            "VIDEO DECODER ${state.label}"
+        DecoderHudEvidenceState.INVALID ->
+            "VIDEO DECODER ${state.label}"
+        DecoderHudEvidenceState.REVISION_WAIT,
+        DecoderHudEvidenceState.ACTIVE,
+        DecoderHudEvidenceState.STALE,
+        ->
+            "VIDEO DECODER ${state.label} · current " +
+                "${readiness.decoderObservationFrameCount} rendered · " +
+                "generation ${readiness.decoderGenerationFrameCount} · age $age"
+        DecoderHudEvidenceState.NOT_APPLICABLE -> "VIDEO DECODER · N/A"
+    }
+    return DecoderHudProjection(
+        state = state,
+        text = text,
+    )
+}
+
+@Composable
+private fun CurrentTestContentHud(
+    phase: PhaseSpec?,
+    readiness: ProducerReadiness,
+    expectedProducerCount: Int,
+    mediaWidthPx: Int?,
+    mediaHeightPx: Int?,
+    decoderVisibleWidthPx: Int?,
+    decoderVisibleHeightPx: Int?,
+    decoderSourceFps: Float?,
+    decoderSourceRotationDegrees: Int?,
+    decoderCodecName: String?,
+    compact: Boolean,
+) {
+    val summary = currentTestHudSummary(
+        phase = phase,
+        decoderVisibleWidthPx = decoderVisibleWidthPx ?: mediaWidthPx,
+        decoderVisibleHeightPx = decoderVisibleHeightPx ?: mediaHeightPx,
+        decoderSourceFps = decoderSourceFps,
+        decoderSourceRotationDegrees = decoderSourceRotationDegrees,
+    )
+    val decoder = decoderHudProjection(
+        phase = phase,
+        readiness = readiness,
+        expectedProducerCount = expectedProducerCount,
+    )
+    val fontSize = if (compact) 7.sp else 9.sp
+    val lines = currentTestHudRows(summary)
+    Column(verticalArrangement = Arrangement.spacedBy(if (compact) 1.dp else 2.dp)) {
+        lines.forEach { line ->
+            Text(
+                text = line,
+                color = Color(0xFFD6E6E0),
+                fontSize = fontSize,
+            )
+        }
+        if (decoder.state != DecoderHudEvidenceState.NOT_APPLICABLE) {
+            val codec = decoderCodecName
+                ?.trim()
+                ?.takeIf(String::isNotEmpty)
+                ?.let { " · HW $it" }
+                .orEmpty()
+            Text(
+                text = decoder.text + codec + " · HWC 판정 아님",
+                color = decoderEvidenceColor(decoder.state),
+                fontSize = fontSize,
+            )
         }
     }
 }
+
+@Composable
+private fun AppProducerMapPanel(
+    plannedPhase: PhaseSpec?,
+    activePhase: PhaseSpec?,
+    readiness: ProducerReadiness,
+    expectedProducerCount: Int,
+    observedProducerCount: Int,
+    mediaWidthPx: Int?,
+    mediaHeightPx: Int?,
+    compact: Boolean,
+) {
+    val plannedKinds = plannedPhase?.let(::plannedAppProducerKinds).orEmpty()
+    val committed = readiness.committedTopology?.producers.orEmpty()
+    val committedValid =
+        committed.isNotEmpty() &&
+            expectedProducerCount > 0 &&
+            readiness.expectedCount == expectedProducerCount &&
+            committed.size == expectedProducerCount &&
+            !readiness.topologyPending &&
+            !readiness.topologyMissed &&
+            !readiness.teardownFailed &&
+            !readiness.teardownCompleted
+    val shownKinds = if (committedValid) {
+        committed.map { it.kind }
+    } else {
+        plannedKinds
+    }
+    val observationReady =
+        committedValid &&
+            readiness.ready &&
+            readiness.observedCount == expectedProducerCount &&
+            observedProducerCount >= expectedProducerCount
+    val mapEvidenceInvalid =
+        readiness.topologyMissed ||
+            readiness.teardownFailed ||
+            readiness.runtimeFailureReason != null ||
+            (
+                readiness.committedTopology != null &&
+                    !committedValid &&
+                    !readiness.topologyPending
+                )
+    val mapStatus = when {
+        mapEvidenceInvalid -> "EVIDENCE INVALID"
+        committedValid && observationReady -> "COMMITTED · READY"
+        committedValid -> "COMMITTED · FRAME WAIT"
+        else -> "PLAN · OUTLINE"
+    }
+    val sourcePhase = if (committedValid) {
+        activePhase ?: plannedPhase
+    } else {
+        plannedPhase ?: activePhase
+    }
+    val boxHeight = when {
+        compact && shownKinds.size > 12 -> 11.dp
+        compact -> 13.dp
+        shownKinds.size > 12 -> 13.dp
+        else -> 17.dp
+    }
+    val boxFont = when {
+        compact && shownKinds.size > 12 -> 6.sp
+        compact -> 6.sp
+        shownKinds.size > 12 -> 7.sp
+        else -> 8.sp
+    }
+    Surface(
+        modifier = Modifier
+            .width(if (compact) 84.dp else 96.dp)
+            .fillMaxHeight(),
+        color = Color(0xD90A1512),
+        shape = RoundedCornerShape(14.dp),
+    ) {
+        val mapScrollState = rememberScrollState()
+        Column(
+            Modifier
+                .padding(horizontal = if (compact) 5.dp else 7.dp, vertical = 7.dp)
+                .verticalScroll(mapScrollState),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(if (compact) 1.dp else 2.dp),
+        ) {
+            Text(
+                "APP PRODUCER MAP",
+                color = Color.White,
+                fontWeight = FontWeight.Bold,
+                fontSize = if (compact) 6.sp else 8.sp,
+                maxLines = 1,
+            )
+            Text(
+                "PLAN ${plannedKinds.size} · COMMIT " +
+                    if (expectedProducerCount > 0) "${expectedProducerCount}P" else "—P",
+                color = Color(0xFFB8CBC5),
+                fontSize = if (compact) 5.sp else 7.sp,
+                maxLines = 1,
+            )
+            Text(
+                "OBS ${observedProducerCount.coerceAtLeast(0)}/" +
+                    if (expectedProducerCount > 0) "$expectedProducerCount" else "—",
+                color = when {
+                    mapEvidenceInvalid -> Color(0xFFFF8A80)
+                    observationReady -> Color(0xFF65E6C4)
+                    else -> Color(0xFFFFC857)
+                },
+                fontSize = if (compact) 5.sp else 7.sp,
+                maxLines = 1,
+            )
+            Text(
+                mapStatus,
+                color = when {
+                    mapEvidenceInvalid -> Color(0xFFFF8A80)
+                    observationReady -> Color(0xFF65E6C4)
+                    else -> Color(0xFFFFC857)
+                },
+                fontSize = if (compact) 5.sp else 6.sp,
+                maxLines = 1,
+            )
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(if (compact) 1.dp else 2.dp),
+            ) {
+                shownKinds.forEachIndexed { index, kind ->
+                    val sourceClass = producerSourceClass(
+                        phase = sourcePhase,
+                        layerIndex = index,
+                        kind = kind,
+                        mediaWidthPx = mediaWidthPx,
+                        mediaHeightPx = mediaHeightPx,
+                    )
+                    val color = appProducerKindColor(kind)
+                    val boxModifier = Modifier
+                        .fillMaxWidth()
+                        .height(boxHeight)
+                        .clip(RoundedCornerShape(3.dp))
+                        .semantics {
+                            contentDescription =
+                                "Layer ${index + 1}, ${appProducerKindUiLabel(kind)}, " +
+                                    "$sourceClass, " +
+                                    if (committedValid) "committed" else "planned"
+                        }
+                    Box(
+                        modifier = if (committedValid) {
+                            boxModifier.background(color.copy(alpha = 0.88f))
+                        } else {
+                            boxModifier
+                                .background(Color.Transparent)
+                                .border(1.dp, color, RoundedCornerShape(3.dp))
+                        },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            text = "${(index + 1).toString().padStart(2, '0')} " +
+                                "${kind.shortLabel} $sourceClass",
+                            color = if (committedValid) Color(0xFF07110E) else color,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = boxFont,
+                            maxLines = 1,
+                            overflow = TextOverflow.Clip,
+                        )
+                    }
+                }
+            }
+            HorizontalDivider(color = Color.White.copy(alpha = 0.16f))
+            PRODUCER_LEGEND_KINDS.forEach { kind ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(3.dp),
+                ) {
+                    Box(
+                        Modifier
+                            .size(if (compact) 5.dp else 7.dp)
+                            .background(appProducerKindColor(kind), RoundedCornerShape(2.dp)),
+                    )
+                    Text(
+                        "${kind.shortLabel} ${appProducerKindUiLabel(kind)}",
+                        color = Color(0xFFB8CBC5),
+                        fontSize = if (compact) 5.sp else 6.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            Text(
+                "HWC assignment 아님",
+                color = Color(0xFFFFC857),
+                fontSize = if (compact) 5.sp else 6.sp,
+                textAlign = TextAlign.Center,
+                maxLines = 1,
+            )
+        }
+    }
+}
+
+internal fun sourceResolutionClass(widthPx: Int, heightPx: Int): String {
+    val longEdge = maxOf(widthPx, heightPx).coerceAtLeast(0)
+    val shortEdge = minOf(widthPx, heightPx).coerceAtLeast(0)
+    return when {
+        longEdge >= 7_680 && shortEdge >= 4_320 -> "8K"
+        longEdge >= 3_840 && shortEdge >= 2_160 -> "4K"
+        longEdge >= 1_920 && shortEdge >= 1_080 -> "2K"
+        longEdge >= 1_024 && shortEdge >= 576 -> "1K"
+        longEdge > 0 && shortEdge > 0 -> "${longEdge}p-class"
+        else -> "N/A"
+    }
+}
+
+internal fun motionHudLabel(phase: PhaseSpec): String = when (phase.motion) {
+    MotionProfile.STATIC -> "이동 없음 · 추가 zoom 없음"
+    MotionProfile.CAPACITY_TILES -> "고정 tile · 이동/확대 없음"
+    MotionProfile.SCROLL -> "화면 이동(Scroll)"
+    MotionProfile.ZOOM_PAN -> {
+        val range = if (
+            phase.bufferPresentation == BufferPresentation.FIT &&
+            phase.layerOrientation == LayerOrientation.ROTATION_90
+        ) {
+            "zoom 0.72–1.00×"
+        } else {
+            "zoom 0.72–1.28×"
+        }
+        "$range + 이동(Pan)"
+    }
+    MotionProfile.ROTATE -> "연속 회전 + 이동"
+    MotionProfile.PARALLAX -> if (phase.alphaOverlap) {
+        "레이어별 이동(Parallax) + 회전 진동 ±8°"
+    } else {
+        "레이어별 이동(Parallax) · 추가 회전 없음"
+    }
+    MotionProfile.TRANSFORM_STORM ->
+        "회전 + 비균일 zoom(X 0.58–1.26×/Y 0.68–1.22×) + 이동"
+    MotionProfile.Z_ORDER_SWAP -> "이동·회전 + View Z 교대"
+}
+
+private fun layerSizeHudLabel(profile: LayerSizeProfile): String = when (profile) {
+    LayerSizeProfile.FULL_SCREEN -> "목적지 Full"
+    LayerSizeProfile.SMALL_UNIFORM -> "목적지 Small 30%"
+    LayerSizeProfile.MIXED_SIZES -> "목적지 크기 혼합"
+    LayerSizeProfile.GRADUAL_SMALL_TO_FULL -> "목적지 Small→Full 점진 확대"
+    LayerSizeProfile.ABRUPT_SMALL_FULL -> "목적지 Small↔Full 급변"
+}
+
+private fun producerNatureSummary(kinds: List<AppProducerKind>): String {
+    if (kinds.isEmpty()) return "N/A"
+    return PRODUCER_LEGEND_KINDS.mapNotNull { kind ->
+        kinds.count { it == kind }
+            .takeIf { it > 0 }
+            ?.let { count -> "${producerNatureUiLabel(kind)} ${count}" }
+    }.joinToString(" + ")
+}
+
+private fun producerSourceClass(
+    phase: PhaseSpec?,
+    layerIndex: Int,
+    kind: AppProducerKind,
+    mediaWidthPx: Int?,
+    mediaHeightPx: Int?,
+): String = when (kind) {
+    AppProducerKind.VIDEO_DECODER -> {
+        if (mediaWidthPx != null && mediaHeightPx != null) {
+            sourceResolutionClass(mediaWidthPx, mediaHeightPx)
+        } else {
+            phase?.bufferSize?.mapLabel() ?: "VIDEO"
+        }
+    }
+    AppProducerKind.CANVAS_SURFACE -> {
+        if (layerIndex == 0) phase?.bufferSize?.mapLabel() ?: "DISPLAY" else "DISPLAY"
+    }
+    AppProducerKind.CANVAS_TEXTURE,
+    AppProducerKind.GPU_GL,
+    AppProducerKind.FLATTENED_CANVAS,
+    -> "DISPLAY"
+    AppProducerKind.UNKNOWN -> "N/A"
+}
+
+private fun BufferSize.mapLabel(): String = when (this) {
+    BufferSize.DISPLAY -> "DISPLAY"
+    BufferSize.HD_1K -> "1K"
+    BufferSize.FHD -> "2K"
+    BufferSize.UHD_4K -> "4K"
+    BufferSize.UHD_8K -> "8K"
+}
+
+private fun appProducerKindUiLabel(kind: AppProducerKind): String = when (kind) {
+    AppProducerKind.VIDEO_DECODER -> "VIDEO"
+    AppProducerKind.CANVAS_SURFACE -> "CANVAS"
+    AppProducerKind.CANVAS_TEXTURE -> "TEXTURE"
+    AppProducerKind.GPU_GL -> "GPU GL"
+    AppProducerKind.FLATTENED_CANVAS -> "FLAT"
+    AppProducerKind.UNKNOWN -> "UNKNOWN"
+}
+
+private fun producerNatureUiLabel(kind: AppProducerKind): String = when (kind) {
+    AppProducerKind.VIDEO_DECODER -> "영상(MediaCodec)"
+    AppProducerKind.CANVAS_SURFACE -> "Canvas raster"
+    AppProducerKind.CANVAS_TEXTURE -> "Canvas Texture"
+    AppProducerKind.GPU_GL -> "GPU GL"
+    AppProducerKind.FLATTENED_CANVAS -> "Flattened Canvas"
+    AppProducerKind.UNKNOWN -> "Unknown"
+}
+
+private fun appProducerKindColor(kind: AppProducerKind): Color = when (kind) {
+    AppProducerKind.VIDEO_DECODER -> Color(0xFFFF4D8D)
+    AppProducerKind.CANVAS_SURFACE -> Color(0xFF3DDCFF)
+    AppProducerKind.CANVAS_TEXTURE -> Color(0xFFFFC857)
+    AppProducerKind.GPU_GL -> Color(0xFFB26CFF)
+    AppProducerKind.FLATTENED_CANVAS -> Color(0xFF57E389)
+    AppProducerKind.UNKNOWN -> Color(0xFF9AA8A3)
+}
+
+private fun decoderEvidenceColor(state: DecoderHudEvidenceState): Color = when (state) {
+    DecoderHudEvidenceState.ACTIVE -> Color(0xFF65E6C4)
+    DecoderHudEvidenceState.TOPOLOGY_WAIT,
+    DecoderHudEvidenceState.FIRST_FRAME_WAIT,
+    DecoderHudEvidenceState.REVISION_WAIT,
+    DecoderHudEvidenceState.STALE,
+    -> Color(0xFFFFC857)
+    DecoderHudEvidenceState.INVALID -> Color(0xFFFF8A80)
+    DecoderHudEvidenceState.NOT_APPLICABLE -> Color(0xFF8FA9A1)
+}
+
+private fun formatHudFps(fps: Float): String {
+    val rounded = fps.roundToInt()
+    return if (kotlin.math.abs(fps - rounded.toFloat()) < 0.05f) {
+        "${rounded}fps"
+    } else {
+        String.format(Locale.US, "%.1ffps", fps)
+    }
+}
+
+private val PRODUCER_LEGEND_KINDS = listOf(
+    AppProducerKind.VIDEO_DECODER,
+    AppProducerKind.CANVAS_SURFACE,
+    AppProducerKind.CANVAS_TEXTURE,
+    AppProducerKind.GPU_GL,
+    AppProducerKind.FLATTENED_CANVAS,
+)
+
+private const val DECODER_HUD_FRESHNESS_MS = 3_000L
 
 internal fun visibleAppVersion(versionName: String): String {
     val normalized = versionName.trim().take(MAX_VISIBLE_VERSION_CHARS)

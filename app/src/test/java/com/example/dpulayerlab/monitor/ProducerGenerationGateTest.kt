@@ -1,5 +1,8 @@
 package com.example.dpulayerlab.monitor
 
+import com.example.dpulayerlab.model.AppProducerDescriptor
+import com.example.dpulayerlab.model.AppProducerKind
+import com.example.dpulayerlab.model.AppProducerTopology
 import com.example.dpulayerlab.model.LayerSizeProfile
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertEquals
@@ -540,5 +543,203 @@ class ProducerGenerationGateTest {
 
         val nextGeneration = gate.begin(nowMs = 20L)
         assertNull(gate.readiness(nextGeneration, nowMs = 21L).runtimeFailureReason)
+    }
+
+    @Test
+    fun typedTopologyCountsOnlyMatchingDecoderFramesAndTracksRevisionFreshness() {
+        val gate = ProducerGenerationGate()
+        val generation = gate.begin(nowMs = 100L)
+        val topology = AppProducerTopology(
+            generation = generation,
+            producers = listOf(
+                AppProducerDescriptor(
+                    producerId = 10L,
+                    layerIndex = 0,
+                    kind = AppProducerKind.VIDEO_DECODER,
+                    primary = true,
+                ),
+                AppProducerDescriptor(
+                    producerId = 20L,
+                    layerIndex = 1,
+                    kind = AppProducerKind.CANVAS_SURFACE,
+                    primary = false,
+                ),
+            ),
+        )
+
+        assertTrue(gate.expect(topology, nowMs = 110L))
+        assertTrue(gate.activate(generation, nowMs = 120L))
+        assertFalse(gate.accept(generation, 10L, primary = false, nowMs = 130L))
+        assertTrue(gate.accept(generation, 20L, primary = false, nowMs = 131L))
+        val beforeDecoder = gate.readiness(generation, nowMs = 132L)
+        assertEquals(topology, beforeDecoder.committedTopology)
+        assertTrue(beforeDecoder.decoderExpected)
+        assertEquals(0L, beforeDecoder.decoderGenerationFrameCount)
+        assertEquals(0L, beforeDecoder.decoderObservationFrameCount)
+        assertNull(beforeDecoder.decoderLastFrameAgeMs)
+
+        assertTrue(gate.accept(generation, 10L, primary = true, nowMs = 140L))
+        val firstDecoder = gate.readiness(generation, nowMs = 145L)
+        assertEquals(1L, firstDecoder.decoderGenerationFrameCount)
+        assertEquals(1L, firstDecoder.decoderObservationFrameCount)
+        assertEquals(5L, firstDecoder.decoderLastFrameAgeMs)
+        assertTrue(firstDecoder.decoderControlReady)
+
+        assertTrue(gate.requestProducerControlRevision(generation, 7L, nowMs = 150L))
+        assertTrue(
+            gate.accept(
+                generation,
+                10L,
+                primary = true,
+                nowMs = 160L,
+                controlRevision = 6L,
+            ),
+        )
+        assertFalse(gate.readiness(generation, nowMs = 161L).decoderControlReady)
+        assertTrue(
+            gate.accept(
+                generation,
+                10L,
+                primary = true,
+                nowMs = 170L,
+                controlRevision = 7L,
+            ),
+        )
+        val revisionReady = gate.readiness(generation, nowMs = 171L)
+        assertEquals(3L, revisionReady.decoderGenerationFrameCount)
+        assertEquals(7L, revisionReady.decoderLastControlRevision)
+        assertTrue(revisionReady.decoderControlReady)
+    }
+
+    @Test
+    fun decoderObservationIsClearedAcrossPendingTeardownAndGenerationBoundaries() {
+        val gate = ProducerGenerationGate()
+        val generation = gate.begin(nowMs = 0L)
+        val topology = AppProducerTopology(
+            generation = generation,
+            producers = listOf(
+                AppProducerDescriptor(
+                    producerId = 1L,
+                    layerIndex = 0,
+                    kind = AppProducerKind.VIDEO_DECODER,
+                    primary = true,
+                ),
+            ),
+        )
+        assertTrue(gate.expect(topology, nowMs = 1L))
+        assertTrue(gate.activate(generation, nowMs = 2L))
+        assertTrue(gate.accept(generation, 1L, primary = true, nowMs = 3L))
+        assertEquals(1L, gate.readiness(generation, nowMs = 4L).decoderObservationFrameCount)
+
+        assertTrue(gate.markTopologyPending(generation))
+        val pending = gate.readiness(generation, nowMs = 5L)
+        assertNull(pending.committedTopology)
+        assertFalse(pending.decoderExpected)
+        assertEquals(0L, pending.decoderObservationFrameCount)
+        assertNull(pending.decoderLastFrameAgeMs)
+
+        assertTrue(gate.expect(topology, nowMs = 6L))
+        assertTrue(gate.activate(generation, nowMs = 7L))
+        assertTrue(gate.accept(generation, 1L, primary = true, nowMs = 8L))
+        assertEquals(2L, gate.readiness(generation, nowMs = 9L).decoderGenerationFrameCount)
+        assertTrue(gate.markTeardownComplete(generation))
+        val tornDown = gate.readiness(generation, nowMs = 10L)
+        assertNull(tornDown.committedTopology)
+        assertFalse(tornDown.decoderExpected)
+        assertEquals(0L, tornDown.decoderObservationFrameCount)
+
+        val next = gate.begin(nowMs = 11L)
+        assertFalse(gate.accept(generation, 1L, primary = true, nowMs = 12L))
+        assertEquals(0L, gate.readiness(next, nowMs = 13L).decoderGenerationFrameCount)
+    }
+
+    @Test
+    fun runtimeFailureRevokesTypedTopologyAndRejectsLaterDecoderFrames() {
+        val gate = ProducerGenerationGate()
+        val generation = gate.begin(nowMs = 0L)
+        val topology = AppProducerTopology(
+            generation = generation,
+            producers = listOf(
+                AppProducerDescriptor(
+                    producerId = 7L,
+                    layerIndex = 0,
+                    kind = AppProducerKind.VIDEO_DECODER,
+                    primary = true,
+                ),
+            ),
+        )
+        assertTrue(gate.expect(topology, nowMs = 1L))
+        assertTrue(gate.activate(generation, nowMs = 2L))
+        assertTrue(gate.accept(generation, 7L, primary = true, nowMs = 3L))
+
+        assertTrue(gate.markRuntimeFailure(generation, "codec failed"))
+        val failed = gate.readiness(generation, nowMs = 4L)
+        assertNull(failed.committedTopology)
+        assertFalse(failed.decoderExpected)
+        assertEquals(1L, failed.decoderGenerationFrameCount)
+        assertEquals(0L, failed.decoderObservationFrameCount)
+        assertNull(failed.decoderLastFrameAgeMs)
+        assertFalse(failed.decoderControlReady)
+        assertFalse(gate.accept(generation, 7L, primary = true, nowMs = 5L))
+        assertEquals(
+            1L,
+            gate.readiness(generation, nowMs = 6L).decoderGenerationFrameCount,
+        )
+    }
+
+    @Test
+    fun reorderingSameTypedProducerIdsRequiresFreshObservation() {
+        val gate = ProducerGenerationGate()
+        val generation = gate.begin(nowMs = 0L)
+        val initial = AppProducerTopology(
+            generation = generation,
+            producers = listOf(
+                AppProducerDescriptor(
+                    producerId = 1L,
+                    layerIndex = 0,
+                    kind = AppProducerKind.VIDEO_DECODER,
+                    primary = true,
+                ),
+                AppProducerDescriptor(
+                    producerId = 2L,
+                    layerIndex = 1,
+                    kind = AppProducerKind.CANVAS_SURFACE,
+                    primary = false,
+                ),
+            ),
+        )
+        assertTrue(gate.expect(initial, nowMs = 1L))
+        assertTrue(gate.activate(generation, nowMs = 2L))
+        assertTrue(gate.accept(generation, 1L, primary = true, nowMs = 3L))
+        assertTrue(gate.accept(generation, 2L, primary = false, nowMs = 4L))
+        assertTrue(gate.readiness(generation, nowMs = 5L).ready)
+
+        val reordered = AppProducerTopology(
+            generation = generation,
+            producers = listOf(
+                AppProducerDescriptor(
+                    producerId = 2L,
+                    layerIndex = 0,
+                    kind = AppProducerKind.VIDEO_DECODER,
+                    primary = true,
+                ),
+                AppProducerDescriptor(
+                    producerId = 1L,
+                    layerIndex = 1,
+                    kind = AppProducerKind.CANVAS_SURFACE,
+                    primary = false,
+                ),
+            ),
+        )
+        assertTrue(gate.expect(reordered, nowMs = 6L))
+        val reset = gate.readiness(generation, nowMs = 7L)
+        assertFalse(reset.ready)
+        assertEquals(0, reset.observedCount)
+        assertEquals(0L, reset.decoderObservationFrameCount)
+
+        assertFalse(gate.accept(generation, 2L, primary = false, nowMs = 8L))
+        assertTrue(gate.accept(generation, 2L, primary = true, nowMs = 9L))
+        assertTrue(gate.accept(generation, 1L, primary = false, nowMs = 10L))
+        assertTrue(gate.readiness(generation, nowMs = 11L).ready)
     }
 }

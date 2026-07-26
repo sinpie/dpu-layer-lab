@@ -19,10 +19,10 @@ Canonical remote:
 |---|---|
 | launcher/project | `DPULayerTest` |
 | application ID | `com.example.dpulayerlab` |
-| versionCode | `9` |
-| release versionName | `20260726_152112` |
-| debug versionName | `20260726_152112-debug` |
-| tag | `v20260726_152112` |
+| versionCode | `10` |
+| release versionName | `20260727_005420` |
+| debug versionName | `20260727_005420-debug` |
+| tag | `v20260727_005420` |
 | Soong module/APK | `DpuLayerLab` |
 | report prefix | `dpu-layer-lab-` |
 
@@ -38,19 +38,19 @@ package, automation component/action, report prefix와 Soong 이름은 제품 �
 
 GitHub Release에는 다음 세 파일만 올린다.
 
-- `DPULayerTest-20260726_152112-debug.apk`
-- `DPULayerTest-20260726_152112-release-unsigned.apk`
+- `DPULayerTest-20260727_005420-debug.apk`
+- `DPULayerTest-20260727_005420-release-unsigned.apk`
 - `SHA256SUMS.txt`
 
 현재 checksum은 최종 source 상태의 APK를 빌드·검증한 뒤 이 위치에 고정한다. 다른
 version의 값을 재사용하지 않는다.
 
 ```text
-c62277f4c4dad3f0671fd77bbcf629408e2b76feaf887db0a3118e5b6e12126f  DPULayerTest-20260726_152112-debug.apk
-ab1ec03e607b66ede4677e1b6b33ce01a8d3c53c0077f0691033f4d1a9cb0d04  DPULayerTest-20260726_152112-release-unsigned.apk
+58d39563a46c8c7fcfb8ef993c7c668eff766bec692d4af2b27c1352b9e2036c  DPULayerTest-20260727_005420-debug.apk
+06b8d85254060f0a1095804fb31282f86740452eab50e336fe65c49ed15b06d1  DPULayerTest-20260727_005420-release-unsigned.apk
 ```
 
-이 값은 tag `v20260726_152112`의 공개 asset에만 해당한다. 새 build에 재사용하지
+이 값은 tag `v20260727_005420`의 공개 asset에만 해당한다. 새 build에 재사용하지
 않는다. 아래 release evidence도 이 문서만 authority이며 가변 test 수를 README나
 PROJECT_MEMORY에 복제하지 않는다.
 
@@ -59,13 +59,13 @@ PROJECT_MEMORY에 복제하지 않는다.
 최종 gate가 끝나면 XML/report와 APK 자체를 기준으로 다음 표를 채운다. 명령 exit code만
 성공 증거로 사용하지 않는다.
 
-| 검증 | `20260726_152112` 결과 |
+| 검증 | `20260727_005420` 결과 |
 |---|---|
 | host toolchain | Android Studio JBR OpenJDK 21.0.10, Java/Kotlin target 17, SDK/build-tools 36.0.0, Gradle 8.13 |
-| JVM unit test XML | 44 suites / 792 tests / failure 0 / error 0 / skipped 0 |
+| JVM unit test XML | 45 suites / 813 tests / failure 0 / error 0 / skipped 0 |
 | `lintDebug` XML | fatal 0 / error 0 / warning 5 — dependency 새 version 알림만 존재 |
-| assemble | `assembleDebug`, `assembleRelease`, `assembleDebugAndroidTest` 성공 — 25,319,800 B / 18,811,778 B |
-| APK badging | debug `com.example.dpulayerlab.debug` / `20260726_152112-debug`; release `com.example.dpulayerlab` / `20260726_152112`; 모두 code 9, label `DPULayerTest`, SDK 29/36 |
+| assemble | `--rerun-tasks`로 `assembleDebug`, `assembleRelease`, `assembleDebugAndroidTest` 포함 123/123 task 실행 성공 — debug 25,419,484 B / release unsigned 18,877,242 B / debug AndroidTest 2,070,274 B |
+| APK badging | debug `com.example.dpulayerlab.debug` / `20260727_005420-debug`; release `com.example.dpulayerlab` / `20260727_005420`; 모두 code 10, label `DPULayerTest`, SDK 29/36 |
 | APK signing | debug v2, `C=US, O=Android, CN=Android Debug`, cert SHA-256 `d8fab8fa579e800823ef9f571f938581356ab5bb0515b4686c01ff9b35864d9d`; release는 의도대로 unsigned이며 `apksigner`가 `Missing META-INF/MANIFEST.MF`로 거부 |
 | zip alignment | 두 APK 모두 `zipalign -c -P 16 4` 통과; native library 0개 |
 | merged manifest | release alias만 `CONTROL_TESTS`(`signature\|privileged`) 요구; debug alias permission 없음; 두 variant 모두 alias action 3개, `CATEGORY_DEFAULT` 0개, MainActivity automation action 0개 |

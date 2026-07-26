@@ -29,6 +29,9 @@ import android.view.View
 import android.widget.FrameLayout
 import androidx.core.graphics.withSave
 import com.example.dpulayerlab.model.ABRUPT_LAYER_SIZE_PROFILE_STEPS
+import com.example.dpulayerlab.model.AppProducerDescriptor
+import com.example.dpulayerlab.model.AppProducerKind
+import com.example.dpulayerlab.model.AppProducerTopology
 import com.example.dpulayerlab.model.BufferSize
 import com.example.dpulayerlab.model.BufferPresentation
 import com.example.dpulayerlab.model.GRADUAL_MID_MIN_FRACTION
@@ -42,6 +45,7 @@ import com.example.dpulayerlab.model.PhaseSpec
 import com.example.dpulayerlab.model.PixelRoute
 import com.example.dpulayerlab.model.coverageBitAt
 import com.example.dpulayerlab.model.normalizedSizeForLayer
+import com.example.dpulayerlab.model.requiresSelectedDecoderProducer
 import com.example.dpulayerlab.model.usesSelectedMediaDecoder
 import java.util.IdentityHashMap
 import java.util.concurrent.CountDownLatch
@@ -84,7 +88,7 @@ class LayerStageView @JvmOverloads constructor(
     private val animatedChildren = mutableListOf<View>()
     private val childCropBounds = IdentityHashMap<View, Rect>()
     private var producerFrameCallback: ProducerFrameCallback? = null
-    private var expectedProducersCallback: ((Long, Set<Long>) -> Unit)? = null
+    private var expectedProducersCallback: ((AppProducerTopology) -> Unit)? = null
     private var producerTopologyPendingCallback: ((Long) -> Unit)? = null
     private var layerGeometryRequestedCallback: ((Long, Long, Int) -> Unit)? = null
     private var layerGeometryAppliedCallback: ((Long, Long, Int, Int) -> Unit)? = null
@@ -115,9 +119,8 @@ class LayerStageView @JvmOverloads constructor(
     private var pendingLayerGeometryProfileOrdinal = -1
     private var pendingLayerGeometryCoverageBit = 0
     private var pendingLayerGeometryAckFrames = 0
-    private var lastPublishedExpectedGeneration = Long.MIN_VALUE
-    private var lastPublishedProducerIds: Set<Long> = emptySet()
-    private var lastPublishedExpectedCallback: ((Long, Set<Long>) -> Unit)? = null
+    private var lastPublishedProducerTopology: AppProducerTopology? = null
+    private var lastPublishedExpectedCallback: ((AppProducerTopology) -> Unit)? = null
     private var capacityGeometryReady = false
     private val viewIdentity: (View) -> View = { it }
     private val renderChildView: (RenderChild) -> View = { it.view }
@@ -137,7 +140,7 @@ class LayerStageView @JvmOverloads constructor(
         newPhaseElapsedMs: Long,
         newProducerControlRevision: Long,
         onProducerFrame: ProducerFrameCallback? = null,
-        onExpectedProducers: ((generation: Long, producerIds: Set<Long>) -> Unit)? = null,
+        onExpectedProducers: ((topology: AppProducerTopology) -> Unit)? = null,
         onProducerTopologyPending: ((generation: Long) -> Unit)? = null,
         onLayerGeometryRequested:
             ((generation: Long, revision: Long, profileOrdinal: Int) -> Unit)? = null,
@@ -379,8 +382,7 @@ class LayerStageView @JvmOverloads constructor(
         producerBindingsCommitted = false
         expectedTopologyDirty = true
         forceExpectedProducerRepublish = false
-        lastPublishedExpectedGeneration = Long.MIN_VALUE
-        lastPublishedProducerIds = emptySet()
+        lastPublishedProducerTopology = null
         lastPublishedExpectedCallback = null
         resetLayerGeometryTracking()
     }
@@ -657,6 +659,18 @@ class LayerStageView @JvmOverloads constructor(
     }
 
     private fun rebuildLayers(desiredTopology: LayerTopology): Boolean {
+        val current = phase ?: return false
+        val selectedMedia = selectedMediaUri
+        val selectedDecoder = videoDecoderSelection
+        requireSelectedDecoderBinding(
+            decoderProducerRequired = current.requiresSelectedDecoderProducer(),
+            selectedMediaPresent = selectedMedia != null,
+            selectedDecoderPresent = selectedDecoder != null,
+            decoderMediaMatches =
+                selectedDecoder != null &&
+                    selectedMedia != null &&
+                    selectedDecoder.mediaUri == selectedMedia,
+        )
         producerBindingsCommitted = false
         expectedTopologyDirty = true
         invalidateLayerGeometryKey()
@@ -668,11 +682,13 @@ class LayerStageView @JvmOverloads constructor(
             topology = null
             return false
         }
-        val current = phase ?: return false
         val installed = installRenderChildren { install ->
             when (current.backend) {
                 LayerBackend.FLATTENED_TEXTURE -> {
-                    val relay = newProducerRelay(primary = true)
+                    val relay = newProducerRelay(
+                        primary = true,
+                        kind = AppProducerKind.FLATTENED_CANVAS,
+                    )
                     install(
                         RenderChild(
                             view = MultiLayerTextureView(
@@ -714,8 +730,35 @@ class LayerStageView @JvmOverloads constructor(
 
     private fun createLayer(current: PhaseSpec, index: Int): RenderChild {
         val primary = index == 0
-        val relay = newProducerRelay(primary)
-        val view = if (current.includeGlLayer && index == current.activeLayers - 1) {
+        val selectedDecoder = videoDecoderSelection
+        val selectedMedia = selectedMediaUri
+        val useGl = current.includeGlLayer && index == current.activeLayers - 1
+        val usesSelectedDecoder =
+            primary &&
+                !useGl &&
+                current.pixelRoute.usesSelectedMediaDecoder()
+        requireSelectedDecoderBinding(
+            decoderProducerRequired = usesSelectedDecoder,
+            selectedMediaPresent = selectedMedia != null,
+            selectedDecoderPresent = selectedDecoder != null,
+            decoderMediaMatches =
+                selectedDecoder != null &&
+                    selectedMedia != null &&
+                    selectedDecoder.mediaUri == selectedMedia,
+        )
+        val useTexture =
+            !useGl &&
+                !usesSelectedDecoder &&
+                current.backend == LayerBackend.MIXED_SURFACE_TEXTURE &&
+                index % 3 == 2
+        val kind = when {
+            useGl -> AppProducerKind.GPU_GL
+            usesSelectedDecoder -> AppProducerKind.VIDEO_DECODER
+            useTexture -> AppProducerKind.CANVAS_TEXTURE
+            else -> AppProducerKind.CANVAS_SURFACE
+        }
+        val relay = newProducerRelay(primary, kind)
+        val view = if (useGl) {
             StressGlSurfaceView(
                 context = context,
                 complexity = current.workloads.gpu,
@@ -727,40 +770,17 @@ class LayerStageView @JvmOverloads constructor(
                 onProducerLifecycleTransition = producerLifecycleCallbackFor(relay),
             )
         } else {
-            val selectedDecoder = videoDecoderSelection
-            val selectedMedia = selectedMediaUri
-            val wantsSelectedDecoder =
-                primary &&
-                    selectedMedia != null &&
-                    current.pixelRoute.usesSelectedMediaDecoder()
-            if (
-                wantsSelectedDecoder &&
-                selectedDecoder != null &&
-                selectedDecoder.mediaUri == selectedMedia
-            ) {
+            if (usesSelectedDecoder) {
                 VideoSurfaceView(
                     context = context,
-                    selection = selectedDecoder,
+                    selection = checkNotNull(selectedDecoder),
                     targetFps = current.producerFps,
                     captureFrameCommit = relay::captureCallback,
                     onTeardownFailure = teardownFailureCallbackFor(relay),
                     onRuntimeFailure = runtimeFailureCallbackFor(relay),
                     onProducerLifecycleTransition = producerLifecycleCallbackFor(relay),
                 )
-            } else if (wantsSelectedDecoder) {
-                // A selected source must never silently turn into the procedural YUV proxy if its
-                // immutable hardware-decoder binding is missing or belongs to another URI.
-                UnavailableDecoderSurfaceView(
-                    context = context,
-                    onUnavailable = {
-                        runtimeFailureCallbackFor(relay).invoke(
-                            "Selected decoder binding is unavailable",
-                        )
-                    },
-                )
             } else {
-                val useTexture =
-                    current.backend == LayerBackend.MIXED_SURFACE_TEXTURE && index % 3 == 2
                 if (useTexture) {
                     PatternTextureView(
                         context = context,
@@ -1102,13 +1122,17 @@ class LayerStageView @JvmOverloads constructor(
     private fun primaryRequiresReplacement(): Boolean =
         animatedChildren.firstOrNull() is VideoSurfaceView
 
-    private fun newProducerRelay(primary: Boolean): ProducerFrameRelay =
+    private fun newProducerRelay(
+        primary: Boolean,
+        kind: AppProducerKind,
+    ): ProducerFrameRelay =
         ProducerFrameRelay(
             producerId = allocateProducerId(),
             generation = producerGeneration,
             primary = primary,
             controlRevision = committedProducerControlRevision,
             callback = producerFrameCallback,
+            kind = kind,
         )
 
     private fun allocateProducerId(): Long {
@@ -1524,33 +1548,43 @@ class LayerStageView @JvmOverloads constructor(
     private fun publishExpectedProducersUnchecked() {
         val relayIdentities =
             ArrayList<ExpectedProducerRelayIdentity>(producerRelays.size)
-        val expected = buildSet {
-            producerRelays.forEach { (view, relay) ->
-                relayIdentities += ExpectedProducerRelayIdentity(
-                    view = view,
-                    relay = relay,
-                    binding = relay.captureFailureDispatch(),
-                )
-                add(relay.producerId)
+        val descriptors = ArrayList<AppProducerDescriptor>(animatedChildren.size)
+        animatedChildren.forEachIndexed { layerIndex, view ->
+            val relay = checkNotNull(producerRelays[view]) {
+                "Committed renderer child is missing its producer relay"
             }
+            relayIdentities += ExpectedProducerRelayIdentity(
+                view = view,
+                relay = relay,
+                binding = relay.captureFailureDispatch(),
+            )
+            descriptors += AppProducerDescriptor(
+                producerId = relay.producerId,
+                layerIndex = layerIndex,
+                kind = relay.kind,
+                primary = relay.primary,
+            )
         }
-        if (expected.isEmpty()) return
+        if (descriptors.isEmpty()) return
         val callback = expectedProducersCallback ?: run {
             // A forced recovery publication is the only acknowledgment that clears the
             // controller/FrameTracker pending latch. Preserve it until a callback really runs.
             if (!forceExpectedProducerRepublish) expectedTopologyDirty = false
             return
         }
+        val topology = AppProducerTopology(
+            generation = producerGeneration,
+            producers = descriptors,
+        )
         val publication = ExpectedProducerPublicationSnapshot(
             mutationEpoch = expectedPublicationMutationEpoch,
             generation = producerGeneration,
             callback = callback,
-            expectedProducerIds = expected,
+            topology = topology,
             relayIdentities = relayIdentities,
         )
         val sameAsLastPublication =
-            publication.generation == lastPublishedExpectedGeneration &&
-                publication.expectedProducerIds == lastPublishedProducerIds &&
+            publication.topology == lastPublishedProducerTopology &&
                 callback === lastPublishedExpectedCallback
         if (
             !shouldPublishExpectedProducerSet(
@@ -1563,7 +1597,7 @@ class LayerStageView @JvmOverloads constructor(
             expectedTopologyDirty = false
             return
         }
-        callback.invoke(publication.generation, publication.expectedProducerIds)
+        callback.invoke(publication.topology)
         if (!isExpectedProducerPublicationCurrent(publication)) {
             // A synchronous callback may release or reconfigure the stage. The nested transaction
             // owns all current dirty/force/bookkeeping fields; never let this stale callback clear
@@ -1574,8 +1608,7 @@ class LayerStageView @JvmOverloads constructor(
         // Clear only after callback completion. If callback.invoke throws, the forced retry stays
         // armed and a later valid configure/size pass can re-issue the exact same expected set.
         forceExpectedProducerRepublish = false
-        lastPublishedExpectedGeneration = publication.generation
-        lastPublishedProducerIds = publication.expectedProducerIds
+        lastPublishedProducerTopology = publication.topology
         lastPublishedExpectedCallback = callback
     }
 
@@ -1622,7 +1655,6 @@ class LayerStageView @JvmOverloads constructor(
             is MultiLayerTextureView -> child.requestStop()
             is VideoSurfaceView -> child.requestStop()
             is StressGlSurfaceView -> child.requestStopLab()
-            is UnavailableDecoderSurfaceView -> child.requestStop()
         }
     }
 
@@ -1633,7 +1665,6 @@ class LayerStageView @JvmOverloads constructor(
             is MultiLayerTextureView -> child.release(stopDeadlineNanos)
             is VideoSurfaceView -> child.release(stopDeadlineNanos)
             is StressGlSurfaceView -> child.releaseLab(stopDeadlineNanos)
-            is UnavailableDecoderSurfaceView -> true
             else -> true
         }
 
@@ -2096,8 +2127,8 @@ class LayerStageView @JvmOverloads constructor(
     private data class ExpectedProducerPublicationSnapshot(
         val mutationEpoch: Long,
         val generation: Long,
-        val callback: (Long, Set<Long>) -> Unit,
-        val expectedProducerIds: Set<Long>,
+        val callback: (AppProducerTopology) -> Unit,
+        val topology: AppProducerTopology,
         val relayIdentities: List<ExpectedProducerRelayIdentity>,
     )
 
@@ -2465,6 +2496,25 @@ internal fun producerControlRevisionIsValid(
         (generationChanged || requestedRevision >= currentRevision)
 
 /**
+ * A decoder-designated producer is valid only when the immutable source URI and the prepared
+ * MediaCodec binding still match. Call this before allocating a relay or child View so a race
+ * cannot publish a VIDEO topology backed only by a placeholder Surface.
+ */
+internal fun requireSelectedDecoderBinding(
+    decoderProducerRequired: Boolean,
+    selectedMediaPresent: Boolean,
+    selectedDecoderPresent: Boolean,
+    decoderMediaMatches: Boolean,
+) {
+    check(
+        !decoderProducerRequired ||
+            (selectedMediaPresent && selectedDecoderPresent && decoderMediaMatches),
+    ) {
+        "Selected decoder binding is unavailable"
+    }
+}
+
+/**
  * Includes expected-set construction and the controller callback in one fail-closed boundary.
  * The rollback returns the authoritative terminal failure so fatal VM identity survives cleanup.
  */
@@ -2619,8 +2669,9 @@ internal inline fun <Child> rollbackOwnedRendererChildren(
 internal class ProducerFrameRelay(
     val producerId: Long,
     generation: Long,
-    private val primary: Boolean,
+    val primary: Boolean,
     controlRevision: Long = 0L,
+    val kind: AppProducerKind = AppProducerKind.UNKNOWN,
     callback: ProducerFrameCallback?,
 ) {
     @Volatile
@@ -3579,31 +3630,6 @@ private class RendererLeaseStart(
                 }
             }
         }
-    }
-}
-
-@SuppressLint("ViewConstructor")
-private class UnavailableDecoderSurfaceView(
-    context: Context,
-    onUnavailable: () -> Unit,
-) : SurfaceView(context) {
-    private val callback = AtomicReference<(() -> Unit)?>(onUnavailable)
-    private val notifyUnavailable = Runnable {
-        callback.getAndSet(null)?.invoke()
-    }
-
-    init {
-        holder.setFormat(PixelFormat.OPAQUE)
-    }
-
-    override fun onAttachedToWindow() {
-        super.onAttachedToWindow()
-        post(notifyUnavailable)
-    }
-
-    fun requestStop() {
-        callback.set(null)
-        removeCallbacks(notifyUnavailable)
     }
 }
 

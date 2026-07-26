@@ -92,6 +92,7 @@ release configuration에 local keystore, platform key 경로나 credential을 �
 | Test | 계약 |
 |---|---|
 | `model/LabModelsTest.kt` | model normalization, duration, terminal reason, dynamic size coverage mask |
+| `model/AppProducerTopologyTest.kt` | renderer precedence와 동일한 planned V/S/T/G/F role, 최대 20개 ordered descriptor, generation/ID uniqueness |
 | `model/ScenarioPlanPolicyTest.kt` | 수동 queue 무고정상한/external 40 source cap, whole-queue repeat, 지원 시간 배율, overflow, 중복 preset 1회 immutable materialization과 duration safety cap |
 | `model/ScenarioQueueEditorTest.kt` | 40개 초과 수동 append/restore, duplicate, order, move, unknown restore |
 | `model/ScenarioSafetyPolicyTest.kt` | hard cap, negative/sub-effective load reject, duration, graphics budget, typed phase, FIT/1:1/90°와 capacity-tile 조합 |
@@ -104,8 +105,8 @@ release configuration에 local keystore, platform key 경로나 credential을 �
 
 | Test | 계약 |
 |---|---|
-| `engine/ScenarioCatalogTest.kt` | 36개 preset uniqueness/validity, 1K↔8K, 2K/4K/8K 90° FIT, resolution-only와 FIT/crop A/B/A |
-| `engine/LabControllerMathTest.kt` | verdict, bounded warm-up topology/geometry/fresh-first-buffer baseline gate, telemetry/HWC coverage, session-calibration deadline, projection/orientation origin·topology·HWC contract, atomic error notice, size-profile arm·coverage, terminal linear endpoint revision/timeout/recovery/fidelity seal, cleanup fatal precedence와 media-worker fatal relay |
+| `engine/ScenarioCatalogTest.kt` | 40개 preset uniqueness/validity, 1K↔8K, 2K/4K/8K 90° FIT, resolution-only와 FIT/crop A/B/A, 4K60/8K60 decoder visibility·load surge/drop, decoder-backed 318,000/1,870,000 ms(17.01%, strict >10%) |
+| `engine/LabControllerMathTest.kt` | verdict, bounded warm-up topology/geometry/fresh-first-buffer baseline gate, telemetry/HWC coverage, session-calibration deadline, projection/orientation origin·topology·HWC contract, atomic error notice, size-profile arm·coverage, terminal linear endpoint revision/timeout/recovery/fidelity seal, decoder terminal evidence append 실패의 in-flight fatal identity 보존, cleanup fatal precedence와 media-worker fatal relay |
 | `engine/HwcCapacityCalibrationSessionTest.kt` | process one-shot claim/reuse, terminal N/A, Activity recreation scope와 display projection invalidation |
 | `engine/DeviceRenderSafetyTest.kt` | RAM/power-save/low-RAM envelope |
 | `engine/AutomationIntentContractTest.kt` | explicit action, malformed extras, STOP ordering |
@@ -147,7 +148,7 @@ release configuration에 local keystore, platform key 경로나 credential을 �
 | `monitor/KernelSensorProviderTest.kt` | typed ABI parse, Xclipse/KGSL/GED, units, key별 sysfs allowlist와 exact underrun default |
 | `monitor/LongTimestampMapTest.kt` | 20-producer timestamp map과 expansion OOME 원자성 |
 | `monitor/SurfaceFlingerProbeTest.kt` | bounded dump parse/lifecycle, worker·child all-action cleanup과 fatal 원본 재전파 |
-| `monitor/ProducerGenerationGateTest.kt` | fresh generation count, 같은 ID의 physical producer 재생성 뒤 fresh-buffer 강제와 generation-scoped geometry revision/profile acknowledgment |
+| `monitor/ProducerGenerationGateTest.kt` | fresh generation count, 같은 ID의 physical producer 재생성 뒤 fresh-buffer 강제와 generation-scoped geometry revision/profile acknowledgment, typed committed VIDEO producer만 받는 decoder callback count/freshness/revision과 pending/rebuild reset |
 | `monitor/CapabilityScannerTest.kt` | display/codec capability projection |
 | `vendor/VendorBridgeStateTest.kt` | API version, session, lane, NPU/SBWC/power restore, broker permission/signer trust와 fatal rollback |
 
@@ -155,7 +156,7 @@ release configuration에 local keystore, platform key 경로나 credential을 �
 
 | Test | 계약 |
 |---|---|
-| `ui/DpuLayerLabAppMathTest.kt`, `engine/LabControllerMathTest.kt` | 목적/facet/preview, lazy queue 편집, 40개/400회 초과 수동 whole-loop repeat와 시간 배율 복원, 장시간 format, decoder-media 노출, topology-pending 즉시 `—P`, 1 Hz dynamic HUD bucket, HWC APP RAW D/C/T freshness/provenance/scope 문구와 atomic-tuple peak |
+| `ui/DpuLayerLabAppMathTest.kt`, `engine/LabControllerMathTest.kt` | 목적/facet/preview, lazy queue 편집, 40개/400회 초과 수동 whole-loop repeat와 시간 배율 복원, 실제 selected source class/dimensions/FPS+minimum, 표시 방식/회전/이동·확대/layer 크기의 개별 HUD 행, APP PRODUCER MAP planned outline/committed fill, decoder state/count/age/revision, topology-pending 즉시 `—P`, 1 Hz dynamic HUD bucket, HWC APP RAW D/C/T freshness/provenance/scope 문구와 atomic-tuple peak |
 | `ui/RendererContainerRememberOwnerTest.kt` | Compose renderer owner identity |
 | `MainActivityMathTest.kt` | display/window/automation, Battery Saver 전용→일반 settings 순서와 cleanup defer |
 | `engine/ReportWriterMathTest.kt` | projection/orientation/effective duration schema, provenance, 400 retention, atomic naming helper |
@@ -271,6 +272,24 @@ Capacity 변경은 다음 경계를 별도로 검증해야 한다.
 - raw D/C/T와 FrameTracker의 committed `PHYSICAL` producer count를 별도 값으로 유지
 - scoped BSP evidence/per-layer producer identity가 없을 때 raw tuple로 capacity
   ceiling이나 producer별 DEVICE/CLIENT assignment를 산출하지 않는 boundary를 검증
+
+## App producer map과 decoder evidence 검증
+
+- 40개 catalog ID와 신규 4K60/8K60 visibility·load surge/drop phase shape가 고정되고
+  decoder-backed 명목 duration `318,000 / 1,870,000 = 17.01%`가 strict 10% 초과
+- 단일 8K60 URI로 4K60 minimum preset을 실행할 때 HUD가 실제 8K class,
+  visible dimensions/FPS와 4K minimum을 구분
+- topology commit 전 V/S/T/G/F가 outline이고, 같은 generation의 ordered typed
+  descriptor commit 뒤에만 fill
+- mixed/flattened/GL/decoder role precedence가 renderer가 실제 만든 producer와 일치
+- 다른 generation·producer ID·kind·primary callback은 decoder count에 들어가지 않음
+- pending, teardown, Surface 재생성과 generation rebuild에서 observation count·age·revision
+  evidence가 reset되고, report용 generation 누계가 남아도 fresh matching
+  `OnFrameRendered` callback 전에는 `ACTIVE`가 아님
+- `DECODER_PHASE_ACTIVE`와 정상·unsupported·abort·cancel·inconclusive·error terminal path의
+  `DECODER_FRAME_EVIDENCE`가 decoder phase마다 정확히 한 번 남고, generation 생성 전
+  실패는 `N/A`로 구분하며 UI/report 어디에서도 callback을 HWC assignment 또는 DPU
+  scanout evidence로 표현하지 않음
 
 ## LayerSizeProfile 검증
 
@@ -542,6 +561,8 @@ if ($missing.Count -gt 0) {
 
 - status/navigation bar hide acknowledgment 뒤 producer 시작
 - HUD 값에 source/quality 표시
+- 4K60/8K60 decoder preset에서 실제 selected source dimensions/FPS, 세로 V/S/T/G/F
+  planned/committed map과 decoder callback age/count가 표시되고 HWC assignment 아님을 명시
 - `HWC APP RAW D/C/T`, age/source와 scope 미분리 문구가 표시되고 HUD subtree가
   추가 Surface를 만들지 않는지
 - expected/observed producer와 frame fidelity 충족

@@ -75,9 +75,9 @@ stateDiagram-v2
 ```mermaid
 stateDiagram-v2
     [*] --> Unpublished
-    Unpublished --> Pending: relay 교체/lease drain 필요
-    Unpublished --> Published: 실제 relay set commit
-    Pending --> Published: replacement 완료 + expected set 1회 게시
+    Unpublished --> Pending: planned V/S/T/G/F만 존재
+    Unpublished --> Published: relay set + ordered typed topology commit
+    Pending --> Published: replacement 완료 + 같은 generation에 1회 게시
     Published --> Activated: preparation observation reset
     Activated --> Ready: 모든 physical producer fresh first buffer/heartbeat
     Ready --> Pending: route/topology 또는 physical Surface 재생성
@@ -89,12 +89,40 @@ stateDiagram-v2
 불변식:
 
 - expected producer는 실제 relay set commit 전에는 0(`—P`)이다.
+- planned V/S/T/G/F는 outline일 뿐이며 fill은 ordered
+  `producerId/layerIndex/kind/primary` topology가 같은 generation에 commit된 뒤만 허용한다.
 - generation activation은 pre-activation first buffer를 지운다.
 - callback은 immutable generation token과 physical producer ID를 함께 사용한다.
 - topology pending/discontinuity 동안 phase clock, frame budget과 cross-load를 pause한다.
 - 같은 generation의 Canvas/Texture/Video/GL BufferQueue 재생성도 geometry와 HWC/
   first-buffer evidence를 지우고 forced expected-set publication을 다시 거친다.
 - teardown complete/failure의 늦은 callback은 active generation에만 귀속한다.
+
+### Decoder frame evidence
+
+```mermaid
+stateDiagram-v2
+    [*] --> NotApplicable
+    NotApplicable --> TopologyWait: decoder phase / planned V
+    TopologyWait --> FrameWait: typed VIDEO topology committed
+    FrameWait --> Active: matching generation/ID/primary callback
+    Active --> Active: fresh callback + matching control revision
+    Active --> Stale: last frame age > freshness window
+    Active --> RevisionWait: requested revision mismatch
+    FrameWait --> TopologyWait: topology pending/rebuild
+    Active --> TopologyWait: pending/teardown/discontinuity reset
+    Stale --> Active: fresh matching callback
+    RevisionWait --> Active: matching revision callback
+```
+
+`MediaCodec.OnFrameRenderedListener` callback은 committed descriptor의 generation,
+producer ID, `VIDEO_DECODER` kind와 primary identity가 모두 맞을 때만 count한다.
+Pending/teardown/rebuild는 observation count, age와 revision evidence를 지우며 새
+commit과 fresh callback 전에는 이전 `Active`를 재사용하지 않는다. Generation 전체
+callback count는 report용 누계로만 남고 HUD의 pending 상태에서는 active evidence처럼
+표시하지 않는다.
+`Active`는 app decoder frame-render evidence이지 HWC assignment나 DPU scanout
+완료 상태가 아니다.
 
 ## Phase transaction
 

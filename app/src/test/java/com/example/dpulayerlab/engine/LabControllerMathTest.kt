@@ -54,6 +54,117 @@ import org.junit.Test
 
 class LabControllerMathTest {
     @Test
+    fun decoderTerminalEvidenceRecordingPreservesEscapingFatalIdentity() {
+        listOf(
+            OutOfMemoryError("decoder phase OOM"),
+            ThreadDeath(),
+        ).forEach { fatal ->
+            val recordFailure = IllegalStateException("evidence append failed")
+            var thrown: Throwable? = null
+
+            try {
+                recordDecoderTerminalEvidencePreservingFailure(fatal) {
+                    throw recordFailure
+                }
+            } catch (failure: Throwable) {
+                thrown = failure
+            }
+
+            assertSame(fatal, thrown)
+            assertTrue(fatal.suppressed.any { it === recordFailure })
+        }
+    }
+
+    @Test
+    fun decoderTerminalEvidenceClassifiesCompletionAndAbortPaths() {
+        assertEquals(
+            DecoderPhaseTerminalEvidence(
+                outcome = DecoderPhaseTerminalOutcome.COMPLETED,
+                reason = "none",
+            ),
+            decoderPhaseTerminalEvidence(failure = null, cancellationReason = "stale"),
+        )
+        assertEquals(
+            DecoderPhaseTerminalEvidence(
+                outcome = DecoderPhaseTerminalOutcome.ABORTED,
+                reason = "codec callback stopped",
+            ),
+            decoderPhaseTerminalEvidence(
+                failure = PlanAbortException("producer failed"),
+                cancellationReason = "codec callback stopped",
+            ),
+        )
+        assertEquals(
+            DecoderPhaseTerminalOutcome.UNSUPPORTED,
+            decoderPhaseTerminalEvidence(
+                failure = UnsupportedRunException("decoder capability unavailable"),
+                cancellationReason = null,
+            ).outcome,
+        )
+        assertEquals(
+            DecoderPhaseTerminalOutcome.CANCELLED,
+            decoderPhaseTerminalEvidence(
+                failure = CancellationException("user stop"),
+                cancellationReason = null,
+            ).outcome,
+        )
+        assertEquals(
+            DecoderPhaseTerminalOutcome.INCONCLUSIVE,
+            decoderPhaseTerminalEvidence(
+                failure = InconclusiveRunException("frame proof incomplete"),
+                cancellationReason = null,
+            ).outcome,
+        )
+        assertEquals(
+            DecoderPhaseTerminalOutcome.ERROR,
+            decoderPhaseTerminalEvidence(
+                failure = IllegalStateException("codec runtime error"),
+                cancellationReason = null,
+            ).outcome,
+        )
+    }
+
+    @Test
+    fun decoderTerminalEvidenceMessageKeepsAppCallbackProvenanceAndNoHwcClaim() {
+        val message = decoderFrameEvidenceMessage(
+            phaseId = "decoder-load-drop",
+            generation = 42L,
+            readiness = ProducerReadiness(
+                producerControlRequestedRevision = 9L,
+                decoderGenerationFrameCount = 120L,
+                decoderObservationFrameCount = 12L,
+                decoderLastFrameAgeMs = 16L,
+                decoderLastControlRevision = 9L,
+                decoderControlReady = true,
+            ),
+            terminal = DecoderPhaseTerminalEvidence(
+                outcome = DecoderPhaseTerminalOutcome.ABORTED,
+                reason = "codec runtime error",
+            ),
+        )
+
+        assertTrue(message.contains("phase=decoder-load-drop; generation=42"))
+        assertTrue(message.contains("outcome=ABORTED; terminalReason=codec runtime error"))
+        assertTrue(message.contains("renderedCallbacks=120; observationCallbacks=12"))
+        assertTrue(message.contains("controlRevision=9/9; decoderReady=true"))
+        assertTrue(message.contains("source=MediaCodec.OnFrameRenderedListener"))
+        assertTrue(message.endsWith("hwcProof=false"))
+
+        val preGeneration = decoderFrameEvidenceMessage(
+            phaseId = "decoder-preparation",
+            generation = null,
+            readiness = null,
+            terminal = DecoderPhaseTerminalEvidence(
+                outcome = DecoderPhaseTerminalOutcome.CANCELLED,
+                reason = "user stop",
+            ),
+        )
+        assertTrue(preGeneration.contains("generation=N/A"))
+        assertTrue(preGeneration.contains("renderedCallbacks=N/A"))
+        assertTrue(preGeneration.contains("controlRevision=N/A; decoderReady=N/A"))
+    }
+
+    @Test
     fun planPositionEventPreservesTheRequestedDurationMultiplier() {
         val progress = PlanProgress(
             state = PlanState.RUNNING,

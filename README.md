@@ -18,8 +18,8 @@ service를 연결하면 DPU·DDR·HWC·SBWC·NPU와 같은 제품 전용 기능�
 있습니다.
 
 현재 launcher/Gradle project 표시 이름은 **DPULayerTest**입니다. 현재 release는
-[`v20260726_152112`](https://github.com/sinpie/dpu-layer-lab/releases/tag/v20260726_152112)
-(`versionCode 9`), debug version은 `20260726_152112-debug`입니다. Version name은 KST
+[`v20260727_005420`](https://github.com/sinpie/dpu-layer-lab/releases/tag/v20260727_005420)
+(`versionCode 10`), debug version은 `20260727_005420-debug`입니다. Version name은 KST
 build 시각을 `yyyyMMdd_HHmmss`로 고정한
 형식입니다. 앱 상단과 실행 HUD에 실제 build version을 노출해 결과를 만든 바이너리를
 현장에서 바로 식별할 수 있습니다.
@@ -92,7 +92,11 @@ Soong module/APK 통합 이름 `DpuLayerLab`은 이름을 바꾸지 않는 호�
 - 실행 중 좌측 상단 build version, layer/DPU/CPU/GPU 숫자·점유율·60-sample 그래프
   (`observed/—P`는 topology commit 대기, `observed/expected P`는 commit 완료).
   같은 HUD에서 요청 시간 배율 `TIME n×`와 `BUFFER · 1K/2K/4K/8K · FIT/1:1 · 0°/90°`를
-  현재 phase 기준으로 확인할 수 있습니다.
+  현재 phase 기준으로 확인할 수 있습니다. Decoder phase는 단일 선택 URI에서 실제
+  선택된 source class·visible dimensions·FPS와 preset의 최소 요구 크기를 함께 표시합니다.
+  표시 방식(FIT/1:1 crop), 고정 layer·영상 metadata 회전, 이동·zoom, destination
+  layer 크기는 짧은 이름의 개별 행으로 나누고 말줄임 없이 줄바꿈해 작은 화면에서도
+  어느 속성인지와 실제 값을 함께 확인할 수 있습니다.
   각 gauge는 source/quality를 함께 표시하고 provenance 변경이나 unavailable 구간에서는
   선을 연결하지 않습니다. HUD는 상위 renderer의 100 ms recomposition과 분리된
   immutable app-side state snapshot을 사용해 동적 text/progress 교체를 최대 1 Hz로
@@ -103,6 +107,13 @@ Soong module/APK 통합 이름 `DpuLayerLab`은 이름을 바꾸지 않는 호�
   `APP_RAW_UNSEPARATED`, control/root 포함·보정 없음과 `PHYSICAL` app producer가
   별도임을 함께 표시합니다. Pair가 없으면 반복 N/A 대신 측정값 없음과 원인을
   표시합니다.
+- 실행 HUD의 세로 `APP PRODUCER MAP`. 최대 20개 producer를 `V`(video decoder),
+  `S`(Surface canvas), `T`(Texture canvas), `G`(GL), `F`(flattened canvas)로 표시하며
+  계획 상태는 outline, generation에 결속된 ordered topology commit 뒤에는 fill로
+  표시합니다. 이 map은 app producer 역할/commit 상태이지 HWC assignment가 아닙니다.
+  Decoder의 `ACTIVE`도 committed `V` producer에서 generation에 승인된
+  `MediaCodec.OnFrameRenderedListener` callback이 fresh하다는 뜻이며 DPU scanout 또는
+  HWC plane 배치 증거가 아닙니다.
 - 실행 HUD의 destination screen-equivalent footprint. 일반 phase는
   `LayerSizeProfile`의 base scale만 합하고, `CAPACITY_TILES`는 명시적인 예외로 crop
   union 1 screen-equivalent와 평균 `100 / producer count`%를 표시합니다. HUD는
@@ -503,7 +514,7 @@ Battery Saver exact restore 순서를 조합해 확인합니다. Host 검증은 
 
 ## 시나리오
 
-현재 source candidate catalog에는 다음 **36개 preset**이 있습니다. Custom은 catalog
+현재 source candidate catalog에는 다음 **40개 preset**이 있습니다. Custom은 catalog
 preset 수에 포함하지 않습니다.
 
 | 카테고리 | 대표 테스트 |
@@ -511,7 +522,7 @@ preset 수에 포함하지 않습니다.
 | Layer / HWC | HWC Plane Staircase, backend만 바꾸는 HWC ↔ GPU Composition Pivot, 4L DEVICE Candidate Burst, 20L CLIENT Fallback Candidate |
 | Layer size | Small-layer Density, Small/Mixed/Full Matrix, Gradual Expansion, Abrupt Toggle, Size+Layer+FPS Burst, Sized DEVICE/CLIENT |
 | Transform | 12-layer Transform Storm, 2K/4K/8K 90° FIT Matrix, 8K FIT ↔ 1:1 Crop A/B/A |
-| Video / Format | Resolution-only 1K ↔ 8K, 4K YUV + RGB Overlay, 8K30 YUV / 8K60 P010 Decoder Pressure, Linear ↔ SBWC |
+| Video / Format | Resolution-only 1K ↔ 8K, 4K YUV + RGB Overlay, 4K60/8K60 Visibility, 4K60/8K60 Load Surge/Drop, 8K60 YUV / 8K60 P010 Decoder Pressure, Linear ↔ SBWC |
 | Refresh | 60 → 90 → 120 Hz baseline, mixed producer pacing |
 | Resource | Fixed-topology Resource Pulse, NPU Cross-load |
 | Load Transition | Display-pipeline Repeated Step Shock, Instant Isolated Contention, Instant Step & Burst, Topology + Load Combined Ramp, Continuous Fixed-topology Cross-load Ramp, 1K → 8K → 1K Load Sweep, Triangle Wave & Soak Recovery |
@@ -567,9 +578,16 @@ event 계약은 [Process-session HWC capacity calibration](docs/HWC_CAPACITY_CAL
 않도록 줄이거나 종료하며, STOP/cancel은 필수 teardown만 확인하고 선택적인 3초
 zero-load settle을 기다리지 않습니다. 이때 one-shot은 terminal `UNAVAILABLE`로 닫혀
 같은 process에서 20-layer 계측을 다시 실행하지 않습니다.
-8K60 preset은 decoder primary 한 장, RGB overlay 6장과 GL tail 한 장으로 총 8개의
-physical layer를 구성합니다. 8K30 preset과 분리되어 있으므로 8K30-only 장치가 8K60
-capability 때문에 불필요하게 거부되지 않습니다.
+기존 `8k60-p010-pressure` preset은 decoder primary 한 장, RGB overlay 6장과 GL tail
+한 장으로 총 8개의 physical layer를 구성합니다. 별도의 `8k-decoder-pressure`는
+8K60 YUV decoder primary를 검증합니다.
+
+추가된 4K60/8K60 visibility preset은 0° FIT, 90° FIT, zoom/pan을 각각 같은 decoder
+source에서 확인합니다. Load surge/drop preset은 decoder route를 유지하면서 logical
+layer와 CPU/memory 부하를 올렸다가 낮춰 복구 구간까지 비교합니다. Catalog의 명목
+phase 합은 1,870,000 ms이고 이 중 selected-media decoder-backed phase는 318,000 ms,
+즉 **17.01%**입니다. 이 비율은 Custom과 preflight/warm-up/cooldown/report I/O를 제외한
+source catalog phase duration 기준입니다.
 
 해상도와 투영을 검증하는 네 preset은 서로 다른 질문을 분리합니다.
 `Resolution-only 1K / 2K / 4K / 8K A/B`는 1L/30fps/60Hz/FIT/0°/정적/zero-load를
@@ -629,6 +647,9 @@ DVFS preset의 settle 구간은 작은 layer/FPS/Hz 부하를 유지해 governor
    adapter 연결 상태를 확인합니다.
 2. YUV/P010/SBWC/4K/8K decoder test라면 **시나리오** 탭에서 실험용 로컬 영상을
    선택합니다. 선택·pin·preflight된 media가 없으면 decoder preset은 실행되지 않습니다.
+   앱은 URI 하나만 사용하므로 4K preset도 4K60 “정확히”가 아니라 visible 4K 이상·
+   source 60fps 이상을 최소 조건으로 검사합니다. 8K60 소스를 선택해 4K60 preset을
+   실행할 수 있으며, 실행 HUD의 `SOURCE`가 실제 class·dimensions·FPS를 보여줍니다.
 3. 먼저 목적 카드의 **급격한 DPU 부하**, **DEVICE 후보 유지**,
    **CLIENT 전환 목표** 중 하나를 고릅니다. DEVICE 목적은 `CLIENT_REQUIRED` phase가
    섞인 preset을 제외합니다. DPU burst는 이름이나 tag가 아니라 1~2L/30fps 이하의
@@ -665,11 +686,16 @@ DVFS preset의 settle 구간은 작은 layer/FPS/Hz 부하를 유지해 governor
    Activity root/control과 workload producer의 scope는 분리하지 않습니다.
    Typed HWC phase의 `현재값 일치/불일치/없음`은 2.5초 이내의 동일
    source·quality·timestamp DEVICE/CLIENT 쌍을 즉시 해석한 보조 표시입니다. Pair가
-   없으면 반복 N/A 대신 측정값 없음과 bounded reason을 표시합니다. Target topology 이후의 distinct
-   fresh sample 수와 phase 간 방향성까지 확인하는 controller 최종 판정은 결과 event를
-   사용하므로 `현재값 일치`만으로 phase 성공을 확정하면 안 됩니다.
-   `STOP`은 작은 화면/landscape의 스크롤 아래로 숨지 않도록 상단 실행 header에 항상
-   표시됩니다.
+    없으면 반복 N/A 대신 측정값 없음과 bounded reason을 표시합니다. Target topology 이후의 distinct
+    fresh sample 수와 phase 간 방향성까지 확인하는 controller 최종 판정은 결과 event를
+    사용하므로 `현재값 일치`만으로 phase 성공을 확정하면 안 됩니다.
+    오른쪽 세로 `APP PRODUCER MAP`의 V/S/T/G/F는 planned outline과 committed fill을
+    구분하며 HWC assignment가 아닙니다. `VIDEO DECODER ACTIVE`는 committed V producer의
+    generation-accepted frame-render callback 증거일 뿐 HWC/DPU scanout 증거가 아닙니다.
+   `STOP`은 portrait/landscape 모두 진단 내용의 스크롤 아래로 숨지 않도록 상단 실행
+   header에 항상 고정됩니다. 상단 HUD는 남은 높이로 제한되고 진단 body만 세로
+   스크롤되므로 source/변환 행이 늘어나도 PHYSICAL/DPU/CPU/GPU/traffic과 하단 transition
+   panel을 가리지 않습니다.
 9. 종료 후 run별 결과와 report를 확인하고 안전 clamp/reject/derate/abort event가
    있었는지 먼저 확인합니다.
 10. `Exact underrun Δ`가 값이면 직접 counter 판정입니다. `Suspected proxy`만 증가한
@@ -915,6 +941,9 @@ FPS, codec profile/string을 사용합니다. Crop은 horizontal pair와 vertica
 독립 처리합니다. 한 축의 pair가 모두 없으면 encoded frame의 그 축 전체를 사용하고,
 각 pair 내부의 key가 하나만 있거나 좌표가 범위를 벗어나면 fail-closed합니다. 알려진
 source FPS가 phase 요청 FPS보다 낮거나 FPS metadata가 없으면 실행하지 않습니다.
+단일 선택 URI를 모든 decoder preset이 공유하므로 4K60 preset은 visible dimensions
+4K 이상과 source FPS 60 이상을 최소 조건으로 사용하며, 실제 선택 source의 class,
+visible dimensions와 FPS를 실행 HUD에 표시합니다.
 Hardware codec의 size/rate capability는 exact encoded dimensions와 source FPS,
 decoder phase target 및 직전 transition origin에서 decoder topology가 실제 도달할 수
 있는 FPS의 최댓값으로 검사합니다. Gradual transition은 직전 FPS 전체를, STEP은
@@ -1006,14 +1035,14 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 - debug: `app/build/outputs/apk/debug/app-debug.apk`
 - release: `app/build/outputs/apk/release/app-release-unsigned.apk`
 
-### `20260726_152112` 릴리스 산출물의 의미
+### `20260727_005420` 릴리스 산출물의 의미
 
-- release tag는 `v20260726_152112`입니다.
-- `DPULayerTest-20260726_152112-debug.apk`는 Android debug key로 서명되어 바로 설치 가능한
+- release tag는 `v20260727_005420`입니다.
+- `DPULayerTest-20260727_005420-debug.apk`는 Android debug key로 서명되어 바로 설치 가능한
   **전용 lab/개발용** APK입니다. Explicit automation alias에는 debug manifest에서
   `CONTROL_TESTS` permission이 제거되어 있으므로 ADB 사용이 쉽지만, 신뢰 경계가 열린
   이 동작을 제품 release 보안으로 간주하거나 일반 사용자 단말에 배포하면 안 됩니다.
-- `DPULayerTest-20260726_152112-release-unsigned.apk`는 제품 빌드/서명 파이프라인
+- `DPULayerTest-20260727_005420-release-unsigned.apk`는 제품 빌드/서명 파이프라인
   입력을 위한 **서명되지 않은 통합 산출물**입니다. 그대로 설치 가능한 최종 제품
   APK가 아닙니다.
 - 실제 제품 APK는 secure product build 환경에서 platform/product key로 서명하고
@@ -1076,6 +1105,11 @@ private platform/vendor key 자체를 저장소나 Release에 넣어서는 안 �
 - 선택한 영상의 표시 이름, MIME, codec profile/string, 해상도, FPS, 길이 같은
   metadata가 `MEDIA_SOURCE` event에 포함될 수 있습니다. 영상 본문은 보고서에
   복사하지 않습니다.
+- Decoder phase는 `DECODER_PHASE_ACTIVE`와 phase terminal마다 정확히 한 번 남는
+  `DECODER_FRAME_EVIDENCE` event로 실제 selected source/codec, 정상·중단 outcome,
+  generation-accepted frame-render callback 수·freshness를 남깁니다. Generation 생성
+  전 실패 수치는 `N/A`이고, event message는 사람이 읽는 bounded detail이며 HWC/DPU
+  scanout 증거가 아닙니다.
 - `allowBackup=false`이며 cloud backup, device-to-device transfer와 legacy backup
   rule에서 internal/external files, database, shared preferences, device-protected
   storage를 포함한 앱 데이터 전체를 명시적으로 제외합니다. 다른 제품으로 복원된

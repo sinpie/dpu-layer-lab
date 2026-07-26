@@ -200,6 +200,25 @@ Warm-up baseline gate는 다음 event로 감사한다.
 - `WARMUP_BASELINE_INVALIDATED`: fresh baseline sample 중 topology/geometry/readiness가
   바뀌어 baseline 폐기와 run 중단
 
+Decoder phase는 다음 stable event type으로 감사한다.
+
+- `DECODER_PHASE_ACTIVE`: phase 시작 시 requested buffer/FPS, 실제 selected source의
+  visible dimensions/FPS, concrete codec과
+  `source=MediaCodec.OnFrameRenderedListener; hwcProof=false`를 기록
+- `DECODER_FRAME_EVIDENCE`: decoder phase의 정상 완료뿐 아니라 unsupported/abort/
+  cancel/inconclusive/error terminal path에서도 정확히 한 번 기록한다. outcome과 bounded
+  terminal reason, generation, generation/observation callback count, last-frame age,
+  current/requested control revision과 decoder-ready 상태를 포함하며 generation 생성 전
+  실패한 값은 `N/A`로 남긴다. 이 terminal diagnostic의 생성·append가 별도로 실패하면
+  in-flight failure와 fatal-first로 병합해 기존 `ThreadDeath`/`VirtualMachineError`
+  identity를 대체하지 않는다. VM 자체가 event allocation을 끝내지 못하는 경우에도
+  원 fatal 전파가 event 완성보다 우선한다.
+
+두 event의 `message`는 bounded human-readable detail이며 별도 typed field가 아니다.
+Consumer는 이를 parsing해 HWC assignment, DPU scanout 또는 hardware composition
+증거로 승격하면 안 된다. Live `APP PRODUCER MAP`의 planned/committed V/S/T/G/F도
+현재 schema의 구조화된 `phases[]`/`samples[]` field가 아니다.
+
 Consumer는 모르는 event type을 무시할 수 있어야 하며 known event의 의미를 문자열
 pattern만으로 추론하지 않는다.
 

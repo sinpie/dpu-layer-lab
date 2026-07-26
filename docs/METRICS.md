@@ -61,6 +61,7 @@ quality 순서는 “더 큰 enum 값이 더 정확하다”는 일반 우선순
 | app PSS | `MB` | `Debug.getPss` measured | 없음 | process resident estimate |
 | display refresh | `Hz` | `Display.getRefreshRate` | 없음 | 요청값과 실제값을 구분 |
 | produced FPS | `fps` | producer callback interval | baseline 전 N/A | aggregate fidelity와 별개 |
+| decoder rendered callback | count/age | typed committed VIDEO producer의 `MediaCodec.OnFrameRenderedListener` | 없음 | generation-accepted app evidence; HWC/DPU scanout 아님 |
 | exact underrun | count | vendor v1 | configured kernel counter | monotonic continuity 필수 |
 | suspected underrun | count | `FrameTracker` | 없음 | Choreographer deadline miss proxy |
 | GPU busy | `%` | vendor v1 | typed kernel GPU ABI | encoding과 source 결속 |
@@ -294,6 +295,32 @@ teardown 뒤 reattach도 새 topology와 geometry acknowledgment를 publish하�
 
 HUD의 expected count는 topology unpublished/pending 또는 process lease 중에는 0,
 `—P` 의미로 표시한다. committed frame-budget count와 UI projection을 혼동하지 않는다.
+
+### App producer topology와 decoder evidence
+
+`AppProducerTopology`은 generation에 결속된 최대 20개의 ordered
+`AppProducerDescriptor(producerId, layerIndex, kind, primary)`다. Kind는
+`V`(video decoder), `S`(Surface canvas), `T`(Texture canvas), `G`(GL),
+`F`(flattened canvas)다. Renderer transaction이 끝나기 전에는 phase에서 계산한
+planned kind만 outline으로 표시하고, 실제 relay set과 typed descriptor가 함께 commit된
+뒤에만 fill로 표시한다. 순서와 kind는 app-owned producer identity이며
+SurfaceFlinger/HWC layer identity 또는 plane assignment가 아니다.
+
+FrameTracker는 expected topology의 같은 generation·producer ID·`VIDEO_DECODER` kind와
+primary identity가 모두 일치하는 callback만 decoder evidence로 받는다.
+`ACTIVE`는 committed decoder가 있고, generation-accepted
+`MediaCodec.OnFrameRenderedListener` callback이 3초 freshness 안에 있으며 요청된
+producer control revision과 일치할 때만 표시한다. Count는 generation 전체와 current
+observation window를 분리하고 last-frame age/revision을 함께 보존한다.
+
+Topology unpublished/pending, teardown, generation rebuild와 physical producer
+discontinuity에서는 decoder expected와 observation count/age/revision evidence를
+지운다. Generation 전체 callback count는 report용 누계로만 남고 active evidence로
+재사용하지 않는다. 다시 commit, activation과 fresh callback을 통과하기 전에는 이전
+`ACTIVE`를 재사용하지 않는다.
+`DECODER_PHASE_ACTIVE`와 `DECODER_FRAME_EVIDENCE` event는 source/codec 및 이 callback
+evidence를 감사하기 위한 기록이며, decoder output이 HWC plane 또는 DPU scanout에
+실제로 사용됐다는 증거가 아니다.
 
 ## Workload-only linear scanout-input reference
 

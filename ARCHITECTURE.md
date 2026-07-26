@@ -128,6 +128,8 @@ app API로 root를 HWC `DEVICE`/`CLIENT` 중 하나로 강제하거나 HWC 관�
   source
 - `PlanProgress`: queue/repeat 전체 진행, 요청 duration multiplier와 terminal reason
 - `RunProgress`: 현재 stage/phase/target, transition fraction, producer generation/readiness
+- `AppProducerTopology`: generation에 결속된 최대 20개 ordered
+  `producerId/layerIndex/kind/primary` descriptor. Kind는 VIDEO/Surface/Texture/GL/flattened
 - `TelemetrySnapshot`: 값·단위·quality·source가 결속된 한 번의 telemetry transaction
 - `RunSummary`: verdict, exact/proxy delta, peak, event와 sample
 
@@ -258,7 +260,8 @@ run을 fail-closed한다.
 3. 이전 phase/target을 null로 게시하고 physical producer teardown barrier를 기다린다.
 4. 필요한 vendor SBWC route를 적용한다.
 5. 새 producer generation을 발행하고 topology transaction을 시작한다.
-6. expected producer set publication과 모든 first buffer/heartbeat를 기다린다.
+6. 실제 relay set과 ordered typed `AppProducerTopology`을 한 transaction으로 publish하고
+   모든 first buffer/heartbeat를 기다린다.
 7. fresh counter sample 뒤 active phase clock, frame budget과 workload를 시작한다.
 8. absolute-deadline 100 ms cadence로 transition과 runtime safety를 평가한다.
 9. typed HWC target이면 serialized fresh DEVICE/CLIENT evidence를 수집한다.
@@ -292,7 +295,9 @@ physical producer에는 들어가지만 app Window root로 flatten되므로 독�
 DEVICE/CLIENT total을 계산하지 않는다.
 
 topology 생성, child add, relay 연결과 runtime control은 하나의 transaction이다.
-모두 성공하기 전에 expected topology를 publish하지 않는다. 실패/OOM에서는 callback
+모두 성공하기 전에 expected topology나 typed `AppProducerTopology`을 publish하지 않는다.
+성공 시 physical producer ID 순서, layer index, V/S/T/G/F kind와 primary identity를
+같은 generation에 한 번 commit한다. 실패/OOM에서는 callback
 detach, stop request, shared deadline join, child removal 순서로 rollback한다.
 
 producer callback은 다음 두 identity로 보호된다.
@@ -330,6 +335,17 @@ bounded preallocated epoch+PTS queue에 결속한다. Submit 실패는 epoch+PTS
 identity exact rollback을 사용한다. EOS는 listener disable, callback-looper의 재사용
 barrier를 이용한 flush 전후 drain, queue clear, overflow-safe epoch 증가, listener
 재설치 순서이며 teardown도 같은 callback 경계를 닫는다.
+
+Decoder frame evidence는 expected typed topology에서 같은 generation·producer ID,
+`VIDEO_DECODER` kind와 primary identity가 모두 일치하는
+`MediaCodec.OnFrameRenderedListener` callback만 받는다. FrameTracker는 generation 전체와
+observation-window callback count, last-frame age와 control revision을 보존한다.
+Topology unpublished/pending, teardown, rebuild 또는 physical Surface discontinuity에서는
+observation count·age·revision을 지우며 새 typed commit과 fresh callback 전에는
+`ACTIVE`가 아니다. Generation 전체 count는 report용 누계로만 남고 active evidence로
+재사용하지 않는다.
+이는 app decoder producer가 matching generation에 frame을 render했다는 증거이지
+SurfaceFlinger/HWC assignment 또는 DPU scanout 증거가 아니다.
 
 ## Workload subsystem
 

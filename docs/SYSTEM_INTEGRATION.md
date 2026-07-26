@@ -56,10 +56,10 @@ Product image
 
 샘플 `Android.bp`는 Soong이 platform certificate로 다시 서명하는 구성입니다. 외부에서 이미 platform key로 서명한 APK를 쓴다면 `certificate: "PRESIGNED"`로 바꿉니다.
 
-최신 공개 GitHub Release의 `DPULayerTest-20260726_152112-debug.apk`는 Android debug key로 서명된
+최신 공개 GitHub Release의 `DPULayerTest-20260727_005420-debug.apk`는 Android debug key로 서명된
 lab-only 산출물이며 debug manifest가 automation alias의 `CONTROL_TESTS` permission을
 제거합니다. 제품 이미지에 넣지 마세요.
-`DPULayerTest-20260726_152112-release-unsigned.apk`는 Soong 또는 secure signing
+`DPULayerTest-20260727_005420-release-unsigned.apk`는 Soong 또는 secure signing
 pipeline 입력용이며 그대로 설치하는 최종 제품 APK가 아닙니다. Platform key,
 certificate, keystore, password/token은 저장소, GitHub Release, `dist/`에 두지 않고
 제품 보안 환경에서만 사용합니다. Release에는 두 APK와 `SHA256SUMS.txt`만 배포합니다.

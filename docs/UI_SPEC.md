@@ -156,17 +156,20 @@ Selected-media가 필요한 route는 media와 codec preflight 없이 실행하�
 ### Layout
 
 ```text
-┌────────────────────────────────────────────┐
-│ Scenario · QUEUE x/y · LOOP x/y · TIME n× │
-│ Buffer·FIT/crop·0°/90° · BUILD    [STOP]   │
-│ Plan / phase progress                       │
-│ PHYSICAL observed/expected + committed graph │
-│ LOGICAL requested/active count (별도 label)  │
-│ DPU     value + graph + source/quality      │
-│ CPU     value + graph + source/quality      │
-│ GPU     value + graph + source/quality      │
-│ DPU-read / producer-write traffic           │
-└────────────────────────────────────────────┘
+┌──────────────────────────────────┬─────────┐
+│ Scenario · QUEUE/LOOP · TIME n× │ APP     │
+│ Buffer·projection·rotation·BUILD │ PRODUCER│
+│ Actual selected SOURCE    [STOP] │ MAP     │
+│ 표시 방식 · FIT / 1:1 crop       │ 1 V     │
+│ 회전 · layer / video metadata    │ 2 S     │
+│ 이동/확대 · zoom/pan/parallax    │ …       │
+│ 레이어 크기 · full/small/dynamic │ 20 G    │
+│ Plan / phase progress             │         │
+│ PHYSICAL observed/expected graph │         │
+│ LOGICAL · DPU · CPU · GPU        │         │
+│ scanout-input / producer-write   │         │
+│ VIDEO DECODER state/evidence     │ no HWC  │
+└──────────────────────────────────┴─────────┘
 
 ┌────────────────────────────────────────────┐
 │ transition · current→target · next phase    │
@@ -180,6 +183,13 @@ HUD는 display cutout inset을 적용하고 좌측 상단에 둔다. HUD는 `Lay
 추가하는 physical producer와 SF/HWC surface는 0이다. Report의
 `controlLayerIncluded=true`는 Compose HUD를 담은 app Window root가 화면에 남는다는
 뜻이지 HUD 전용 HWC layer가 있다는 뜻이 아니다.
+
+현재 테스트 내용은 source, 표시 방식, 고정 layer·영상 metadata 회전, 이동·확대,
+destination layer 크기, app producer 성격, 부하를 각각 label이 있는 행으로 표시한다.
+이 행들은 compact/portrait에서도 하나의 긴 transform 문장으로 합치지 않고 말줄임 없이
+줄바꿈한다. 모든 layout에서 상단 Surface는 하단 transition panel을 제외한 남은 높이로
+bounded되고, header/STOP 바깥의 진단 body만 vertical scroll하므로 모든 값을 확인할 수
+있다.
 
 Running HUD의 동적 값은 하나의 immutable snapshot 인자로 전달하고 그 snapshot을
 app-side 최대 1 Hz로만 교체한다. 상위 renderer/progress가 100 ms cadence로
@@ -198,6 +208,8 @@ Activity root buffer가 갱신될 수 있으며, cadence를 멈추거나 HUD를 
 | CPU | AP CPU % 또는 N/A | provenance segment별 gap |
 | GPU | busy % 또는 N/A | provenance segment별 gap |
 | HWC APP RAW D/C/T | complete same-sample pair와 `T=D+C`; control/root 보정 없음 | pair가 없거나 stale이면 측정값 없음+bounded reason |
+| APP PRODUCER MAP | ordered V/S/T/G/F 1~20; planned outline / generation-committed fill | graph 없음; HWC assignment가 아님 |
+| VIDEO DECODER | generation-accepted rendered callback count/age/revision과 state | graph 없음; HWC/DPU scanout 증거가 아님 |
 
 각 metric은 source/quality label을 숨기지 않는다. Gauge provenance가 바뀌거나 unavailable인
 경계에서 graph 선을 연결하지 않는다.
@@ -213,6 +225,25 @@ Producer count 표기:
 - `PHYSICAL`은 BufferQueue/frame callback producer 수다. Pure Compose HUD/Activity
   root는 포함하지 않고, mixed backend의 `TextureView` producer는 포함하므로
   SurfaceFlinger/HWC layer 수 또는 `HWC APP RAW T`와 같다고 해석하지 않는다.
+
+App producer map 표기:
+
+- `V`: selected-media `MediaCodec` decoder, `S`: Surface canvas, `T`: Texture canvas,
+  `G`: GL, `F`: flattened canvas
+- phase contract에서 예상한 역할은 transparent outline, 같은 generation의 ordered typed
+  topology가 commit된 역할은 fill
+- 각 cell은 layer index·kind·source class를 세로로 표시하고 최대 20개를 넘지 않음
+- planned/committed 수와 observed/expected producer count를 함께 표시하되 HWC
+  assignment나 DEVICE/CLIENT 결과로 표현하지 않음
+
+Decoder phase의 source line은 단일 선택 URI에서 실제 선택된 class,
+visible dimensions·FPS와 preset minimum을 표시한다. 4K60 preset은 visible 4K 이상과
+source 60fps 이상이 minimum이므로 8K60 source를 사용해도 실제 source를 4K라고
+축약하지 않는다. `VIDEO DECODER ACTIVE`는 committed `V` producer의 matching
+generation·producer ID·primary identity에 결속된 `OnFrameRenderedListener` callback이
+fresh하고 control revision이 맞는 상태다. Pending/rebuild/teardown에서는 evidence를
+지우고 `ACTIVE`를 유지하지 않으며, 어떤 상태도 HWC plane 또는 DPU scanout 증거로
+표시하지 않는다.
 
 ### Traffic
 

@@ -42,6 +42,9 @@ DEVICE→CLIENT 전환, layer 크기 변화와 교차 자원 경합을 선택하
 - 현재 `HWC APP RAW D/C/T`는 Activity root/control과 workload producer scope가
   분리되지 않은 atomic tuple이다. FrameTracker `PHYSICAL` producer count와 별도로
   보존하며 raw count로 producer ceiling이나 per-layer assignment를 추론하지 않는다.
+- Ordered `APP PRODUCER MAP`과 decoder rendered callback은 app-owned topology/frame
+  evidence다. V/S/T/G/F commit 또는 decoder `ACTIVE`를 HWC assignment/DPU scanout
+  증거로 승격하지 않는다.
 - layer 표시 면적을 줄여도 physical producer 수, buffer allocation과 graphics
   safety budget을 축소했다고 가정하지 않는다.
 - HWC capacity candidate는 process session에서 한 번만 시도하고 terminal 결과를
@@ -51,6 +54,24 @@ DEVICE→CLIENT 전환, layer 크기 변화와 교차 자원 경합을 선택하
   display request와 system bar 상태 복구를 확인한다.
 
 ## Now
+
+### P-008 decoder coverage와 app producer evidence (P0)
+
+- **상태:** `DONE`
+- **범위:** catalog 40개, 4K60/8K60 visibility·load surge/drop, 실제 selected source
+  HUD, ordered typed producer map, generation-scoped decoder callback evidence와 report event
+- **완료 조건:**
+  - catalog 명목 phase 1,870,000 ms 중 decoder-backed 318,000 ms(17.01%)로 strict
+    10% 초과가 test로 고정
+  - 단일 URI에서 4K60 minimum과 실제 source class·dimensions·FPS를 구분
+  - V/S/T/G/F planned outline과 같은 generation의 ordered committed fill을 구분하고
+    최대 20개를 세로 표시
+  - decoder evidence가 matching generation/producer ID/kind/primary/revision만 받고
+    pending·teardown·rebuild에서 reset
+  - `DECODER_PHASE_ACTIVE`/`DECODER_FRAME_EVIDENCE`를 남기되 HWC/DPU proof로 표현하지 않음
+  - host test, lint, debug/release build와 문서 gate 통과
+- **검증:** 2026-07-27 `--rerun-tasks`로 `testDebugUnitTest`, `lintDebug`,
+  `assembleDebug`, `assembleRelease`, `assembleDebugAndroidTest` 포함 123/123 task 통과
 
 ### P-007 scoped HWC evidence와 per-layer producer identity (P0)
 
@@ -81,7 +102,7 @@ DEVICE→CLIENT 전환, layer 크기 변화와 교차 자원 경합을 선택하
   - 지원 refresh mode와 physical display size
   - vendor API version 및 exact underrun source
   - DEVICE/CLIENT atomic pair 지원 여부
-  - 4K/8K/P010 검증 media
+  - 4K60 이상/8K60/P010 검증 media
 - 연결된 실기기에서 stress scenario를 자동 실행하지 않는다.
 
 ## Later

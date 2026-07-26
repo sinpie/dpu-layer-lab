@@ -1,12 +1,19 @@
 package com.example.dpulayerlab.ui
 
 import com.example.dpulayerlab.engine.ScenarioCatalog
+import com.example.dpulayerlab.model.BufferPresentation
+import com.example.dpulayerlab.model.BufferSize
 import com.example.dpulayerlab.model.Gauge
 import com.example.dpulayerlab.model.HwcCompositionExpectation
 import com.example.dpulayerlab.model.HwcCompositionEvidenceAvailability
+import com.example.dpulayerlab.model.LayerBackend
+import com.example.dpulayerlab.model.LayerOrientation
 import com.example.dpulayerlab.model.LayerSizeProfile
 import com.example.dpulayerlab.model.LayerTrafficEstimate
 import com.example.dpulayerlab.model.MetricQuality
+import com.example.dpulayerlab.model.MotionProfile
+import com.example.dpulayerlab.model.PhaseSpec
+import com.example.dpulayerlab.model.PixelRoute
 import com.example.dpulayerlab.model.PlanState
 import com.example.dpulayerlab.model.RunnerStage
 import com.example.dpulayerlab.model.ScenarioCategory
@@ -18,6 +25,7 @@ import com.example.dpulayerlab.model.ScenarioQueueEditor
 import com.example.dpulayerlab.model.ScenarioSelectionFilter
 import com.example.dpulayerlab.model.TelemetrySnapshot
 import com.example.dpulayerlab.monitor.HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS
+import com.example.dpulayerlab.monitor.ProducerReadiness
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -474,7 +482,7 @@ class DpuLayerLabAppMathTest {
 
         assertEquals(ScenarioCatalog.presets.size, plan.scenarios.size)
         assertEquals(10, plan.repeatCount)
-        assertEquals(360, plan.totalRuns)
+        assertEquals(400, plan.totalRuns)
         assertEquals(10, plan.durationMultiplier)
         assertEquals(null, ScenarioPlanPolicy.validate(plan))
         assertEquals(
@@ -762,15 +770,208 @@ class DpuLayerLabAppMathTest {
     }
 
     @Test
-    fun addingAllThirtySixCatalogResultsAgainCreatesSeventyTwoExecutionEntries() {
+    fun addingAllFortyCatalogResultsAgainCreatesEightyExecutionEntries() {
         val catalogIds = ScenarioCatalog.presets.map { it.id }
 
         val appended = ScenarioQueueEditor.appendAll(catalogIds, catalogIds)
 
-        assertEquals(36, catalogIds.size)
-        assertEquals(72, appended.size)
-        assertEquals(catalogIds, appended.take(36))
-        assertEquals(catalogIds, appended.drop(36))
+        assertEquals(40, catalogIds.size)
+        assertEquals(80, appended.size)
+        assertEquals(catalogIds, appended.take(catalogIds.size))
+        assertEquals(catalogIds, appended.drop(catalogIds.size))
+    }
+
+    @Test
+    fun currentTestSummarySeparatesActualVideoSourceFromRequestedMinimumAndTransform() {
+        val scenario = checkNotNull(ScenarioCatalog.byId("4k60-video-visibility"))
+        val rotated = scenario.phases[1]
+        val zoomPan = scenario.phases[2]
+
+        val rotatedSummary = currentTestHudSummary(
+            phase = rotated,
+            decoderVisibleWidthPx = 7_680,
+            decoderVisibleHeightPx = 4_320,
+            decoderSourceFps = 60f,
+            decoderSourceRotationDegrees = 0,
+        )
+        assertTrue(rotatedSummary.source.contains("실제 8K 7680×4320 @60fps"))
+        assertTrue(rotatedSummary.source.contains("요구 4K 이상"))
+        assertTrue(rotatedSummary.source.contains("영상/MediaCodec"))
+        assertTrue(rotatedSummary.presentation.contains("FIT"))
+        assertTrue(rotatedSummary.rotation.contains("layer 90°"))
+        assertTrue(rotatedSummary.rotation.contains("영상 metadata 0°"))
+        assertTrue(rotatedSummary.motion.contains("이동 없음"))
+        val rows = currentTestHudRows(rotatedSummary)
+        assertEquals(7, rows.size)
+        assertTrue(rows[1].startsWith("표시 방식 ·"))
+        assertTrue(rows[2].startsWith("회전 ·"))
+        assertTrue(rows[3].startsWith("이동/확대 ·"))
+        assertTrue(rows[4].startsWith("레이어 크기 ·"))
+
+        val movingSummary = currentTestHudSummary(
+            phase = zoomPan,
+            decoderVisibleWidthPx = 3_840,
+            decoderVisibleHeightPx = 2_160,
+            decoderSourceFps = 59.94f,
+            decoderSourceRotationDegrees = 0,
+        )
+        assertTrue(movingSummary.motion.contains("zoom 0.72–1.28× + 이동"))
+        assertTrue(movingSummary.producers.contains("영상(MediaCodec) 1"))
+
+        val rotatedZoomSummary = currentTestHudSummary(
+            phase = rotated.copy(motion = MotionProfile.ZOOM_PAN),
+            decoderVisibleWidthPx = 7_680,
+            decoderVisibleHeightPx = 4_320,
+            decoderSourceFps = 60f,
+            decoderSourceRotationDegrees = 0,
+        )
+        assertTrue(rotatedZoomSummary.motion.contains("zoom 0.72–1.00×"))
+    }
+
+    @Test
+    fun currentTestSummaryNamesRasterTextureGpuResolutionCropRotationAndMotion() {
+        val phase = PhaseSpec(
+            id = "mixed-visible",
+            label = "mixed-visible",
+            durationMs = 10_000L,
+            activeLayers = 4,
+            producerFps = 60f,
+            requestedDisplayHz = 120f,
+            backend = LayerBackend.MIXED_SURFACE_TEXTURE,
+            pixelRoute = PixelRoute.RGB_8888,
+            bufferSize = BufferSize.UHD_8K,
+            bufferPresentation = BufferPresentation.PIXEL_1_TO_1_CROP,
+            layerOrientation = LayerOrientation.ROTATION_90,
+            layerSizeProfile = LayerSizeProfile.MIXED_SIZES,
+            motion = MotionProfile.TRANSFORM_STORM,
+            includeGlLayer = true,
+        )
+
+        val summary = currentTestHudSummary(
+            phase = phase,
+            decoderVisibleWidthPx = null,
+            decoderVisibleHeightPx = null,
+            decoderSourceFps = null,
+            decoderSourceRotationDegrees = null,
+        )
+
+        assertTrue(summary.source.contains("Canvas raster 2"))
+        assertTrue(summary.source.contains("Canvas Texture 1"))
+        assertTrue(summary.source.contains("GPU GL 1"))
+        assertTrue(summary.source.contains("8K Canvas primary"))
+        assertTrue(summary.presentation.contains("1:1 원본 픽셀"))
+        assertTrue(summary.rotation.contains("layer 90°"))
+        assertTrue(summary.motion.contains("비균일 zoom"))
+        assertTrue(summary.motion.contains("이동"))
+        assertTrue(summary.layerSize.contains("목적지 크기 혼합"))
+    }
+
+    @Test
+    fun parallaxHudNamesConditionalRotationOscillation() {
+        val phase = PhaseSpec(
+            id = "parallax-hud",
+            label = "parallax-hud",
+            durationMs = 10_000L,
+            activeLayers = 4,
+            producerFps = 60f,
+            requestedDisplayHz = 120f,
+            backend = LayerBackend.INDEPENDENT_SURFACES,
+            pixelRoute = PixelRoute.RGB_8888,
+            bufferSize = BufferSize.FHD,
+            motion = MotionProfile.PARALLAX,
+        )
+
+        val alphaOverlap = motionHudLabel(phase.copy(alphaOverlap = true))
+        assertTrue(alphaOverlap.contains("Parallax"))
+        assertTrue(alphaOverlap.contains("±8°"))
+        assertTrue(alphaOverlap.contains("회전"))
+
+        val opaque = motionHudLabel(phase.copy(alphaOverlap = false))
+        assertTrue(opaque.contains("Parallax"))
+        assertTrue(opaque.contains("추가 회전 없음"))
+        assertFalse(opaque.contains("±8°"))
+    }
+
+    @Test
+    fun decoderHudDistinguishesTopologyFrameRevisionActiveStaleAndInvalid() {
+        val phase = checkNotNull(ScenarioCatalog.byId("8k60-video-visibility")).phases.first()
+
+        assertEquals(
+            DecoderHudEvidenceState.TOPOLOGY_WAIT,
+            decoderHudProjection(phase, ProducerReadiness(), expectedProducerCount = 0).state,
+        )
+        val pendingWithOldGenerationCount = decoderHudProjection(
+            phase,
+            ProducerReadiness(
+                topologyPending = true,
+                decoderGenerationFrameCount = 99L,
+            ),
+            expectedProducerCount = 0,
+        )
+        assertFalse(pendingWithOldGenerationCount.text.contains("99"))
+        val committedWithoutFrame = ProducerReadiness(
+            expectedCount = 1,
+            topologyPublished = true,
+            decoderExpected = true,
+        )
+        assertEquals(
+            DecoderHudEvidenceState.FIRST_FRAME_WAIT,
+            decoderHudProjection(
+                phase,
+                committedWithoutFrame,
+                expectedProducerCount = 1,
+            ).state,
+        )
+        val active = committedWithoutFrame.copy(
+            decoderGenerationFrameCount = 42L,
+            decoderObservationFrameCount = 3L,
+            decoderLastFrameAgeMs = 12L,
+            decoderControlReady = true,
+        )
+        assertEquals(
+            DecoderHudEvidenceState.ACTIVE,
+            decoderHudProjection(phase, active, expectedProducerCount = 1).state,
+        )
+        assertTrue(
+            decoderHudProjection(phase, active, expectedProducerCount = 1).text
+                .contains("current 3 rendered · generation 42"),
+        )
+        assertEquals(
+            DecoderHudEvidenceState.REVISION_WAIT,
+            decoderHudProjection(
+                phase,
+                active.copy(
+                    producerControlRequestedRevision = 3L,
+                    decoderControlReady = false,
+                ),
+                expectedProducerCount = 1,
+            ).state,
+        )
+        assertEquals(
+            DecoderHudEvidenceState.STALE,
+            decoderHudProjection(
+                phase,
+                active.copy(decoderLastFrameAgeMs = 3_001L),
+                expectedProducerCount = 1,
+            ).state,
+        )
+        assertEquals(
+            DecoderHudEvidenceState.INVALID,
+            decoderHudProjection(
+                phase,
+                active.copy(topologyMissed = true),
+                expectedProducerCount = 1,
+            ).state,
+        )
+    }
+
+    @Test
+    fun resolutionClassIsOrientationIndependentAcrossOneToEightK() {
+        assertEquals("8K", sourceResolutionClass(4_320, 7_680))
+        assertEquals("4K", sourceResolutionClass(3_840, 2_160))
+        assertEquals("2K", sourceResolutionClass(1_920, 1_080))
+        assertEquals("1K", sourceResolutionClass(1_024, 576))
+        assertEquals("N/A", sourceResolutionClass(0, 0))
     }
 
     private fun atomicHwcTelemetry(

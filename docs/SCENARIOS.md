@@ -248,7 +248,10 @@ per-layer identity로 분리하지 않는다. 따라서 raw D/C/T가 matching ta
 
 ## Catalog 목적별 지도
 
-현재 source candidate의 catalog는 36개 preset이며 Custom은 이 수에 포함하지 않는다.
+현재 source candidate의 catalog는 40개 preset이며 Custom은 이 수에 포함하지 않는다.
+모든 catalog phase의 명목 duration 합은 1,870,000 ms이고 selected-media decoder route
+phase는 318,000 ms로 **17.01%**다. 따라서 decoder-backed 명목 시간이 strict 10%를
+초과한다. 이 계산은 Custom과 preflight, warm-up, cooldown, report I/O를 제외한다.
 
 ### Baseline, DVFS와 DPU burst
 
@@ -307,14 +310,28 @@ GPU/CPU/DRAM-free 또는 단일 원인 실험으로 설명하면 안 된다.
 |---|---|
 | `dvfs-video-shock` | 검증된 4K media와 concrete hardware decoder |
 | `4k-mixed` | 4K decoder Surface + RGB overlay + memory pulse |
-| `8k-decoder-pressure` | 8K30 metadata와 size/rate를 지원하는 hardware decoder |
+| `4k60-video-visibility` | 4K 이상 60fps decoder source의 0° FIT, 90° FIT, zoom/pan visibility |
+| `4k60-video-load-surge-drop` | 4K 이상 60fps decoder route에서 1→8→1→5→1L과 CPU/memory surge/drop |
+| `8k-decoder-pressure` | 8K60 metadata와 size/rate를 지원하는 YUV hardware decoder |
+| `8k60-video-visibility` | 8K60 YUV decoder source의 0° FIT, 90° FIT, zoom/pan visibility |
+| `8k60-video-load-surge-drop` | 8K60 YUV decoder route에서 1→5→1→3→1L과 CPU/memory surge/drop |
 | `8k60-p010-pressure` | 8K60 10-bit P010 fingerprint와 hardware decoder |
 | `sbwc-matrix` | 동일 decoder content와 vendor SBWC route acknowledgment |
 | `resolution-only-sweep` | 1L/30fps/60Hz/FIT/0°/static/zero-load 고정, 1K→8K→1K resolution-only A/B |
 
+두 visibility preset은 1L/60fps/60Hz에서 각각 15초의 0° FIT static,
+90° FIT static, zoom/pan phase를 사용한다. 4K load surge/drop은 각 15초의
+1→8→1→5→1L, 8K load surge/drop은 1→5→1→3→1L 순서이며 CPU/memory setpoint도
+peak 뒤 0으로 내리고 더 낮은 두 번째 pulse 뒤 recovery한다. 모든 구간은 selected-media
+decoder route를 유지한다. 8K60 YUV preset은 8-bit 경로이며 P010 계약과 독립적이다.
+
 YUV/P010/SBWC phase는 procedural RGBA로 대체하지 않는다. selected media의 URI,
 descriptor, dimensions, FPS, MIME, profile, codec name과 P010 fingerprint를 preflight와
 renderer에서 재검증한다.
+Decoder preset은 선택 URI 하나를 공유한다. 따라서 4K60 preset의 `UHD_4K`는
+visible 4K 이상·source 60fps 이상의 minimum이며 8K60 source도 사용할 수 있다. 실행
+HUD는 preset label이 아니라 실제 selected source class·visible dimensions·FPS와 minimum을
+함께 표시한다.
 
 ### Pacing, resource와 transition
 

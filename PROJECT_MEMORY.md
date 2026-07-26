@@ -112,6 +112,9 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
    binding 없이 procedural RGBA proxy로 실행하지 않는다. Source/capability FPS는
    phase target뿐 아니라 decoder topology에서 도달 가능한 transition origin까지
    검사하며 gradual transition은 직전 FPS 전체, STEP은 `min(60, 직전 FPS)`를 포함한다.
+   모든 preset은 선택 URI 하나를 공유한다. 4K60 preset의 `UHD_4K`는 visible 4K 이상과
+   source 60fps 이상의 minimum이며 더 큰 실제 source를 허용하고, HUD는 실제 source
+   class·visible dimensions·FPS와 minimum을 분리해 표시한다.
 10. **traffic은 별도 모델이다.** hardware counter와 합치지 않고 workload producer만의
    linear full-buffer scanout-input/producer-write reference로 표시한다. Activity
    root/HUD, SystemUI, actual CLIENT fallback과 vendor-specific DPU fetch를 포함하지
@@ -378,6 +381,10 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
   시작하지 않으며, activation 직전 fresh counter sample 뒤 first-buffer 관측을
   새로 시작한다. 같은 generation의 반복 expected publication은 최초 publication
   epoch를 바꾸지 않는다.
+- Expected set과 함께 같은 generation의 ordered typed `AppProducerTopology`을 한 번
+  commit한다. Descriptor는 producer ID, layer index, V/S/T/G/F kind와 primary identity를
+  보존한다. Commit 전 planned role은 HUD outline일 뿐이고 commit 뒤에만 fill이며, 이
+  app producer map은 SurfaceFlinger/HWC layer identity나 assignment가 아니다.
 - active topology가 pending으로 바뀌는 callback은 그 timestamp와 aggregate physical
   frame total로 expected budget을 즉시 정산·pause하고 교차 부하를 0으로 내린다.
   Controller의 다음 100 ms poll 경계까지 이전 producer count를 적분하거나 부하를
@@ -394,6 +401,13 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
   discontinuity다. Lifecycle callback에서 즉시 pending과 evidence clear를 수행하고,
   fresh geometry acknowledgment와 forced expected-set publication 뒤의 frame만 새
   readiness로 사용한다.
+- Decoder frame은 typed committed topology의 같은 generation·producer ID,
+  `VIDEO_DECODER` kind와 primary identity에 결속된
+  `MediaCodec.OnFrameRenderedListener` callback만 evidence로 받는다. Generation 누계와
+  observation count, last-frame age와 control revision을 분리한다. Pending/teardown/rebuild는
+  observation count·age·revision을 reset하고, generation 누계는 report용으로만 보존한다.
+  Fresh matching callback과 revision이 확인된 `ACTIVE`도 app decoder producer evidence일
+  뿐 HWC assignment나 DPU scanout 증거가 아니다.
 - Renderer resource owner storage는 bounded maximum을 child 생성 전에 선할당한다.
   Thread-start/stop/release callback의 알림이 실패해도 detach, interrupt, looper quit,
   bounded join과 owner clear를 끝까지 시도한다. Ordinary rollback failure도 성공
@@ -611,12 +625,14 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
 
 ## 현재 구현
 
-- DPULayerTest release `20260726_152112` / `20260726_152112-debug`(`versionCode 9`)
+- DPULayerTest release `20260727_005420` / `20260727_005420-debug`(`versionCode 10`)
   launcher/Gradle project, 화면/HUD/report build version과 stable
   `com.example.dpulayerlab`/`DpuLayerLab` 제품 통합 identifier
 - Compose 기반 scenario browser, system dashboard, running HUD, result 화면. 실행
   header의 STOP은 compact/landscape에서도 상단에 유지한다.
-- 36개 catalog preset 및 custom phase. 1K↔8K load/resolution sweep, 2K/4K/8K
+- 40개 catalog preset 및 custom phase. 명목 catalog phase 1,870,000 ms 중
+  decoder-backed phase는 318,000 ms(17.01%, strict 10% 초과)다. 4K60/8K60 decoder
+  visibility와 load surge/drop을 포함하며, 1K↔8K load/resolution sweep, 2K/4K/8K
   90° FIT matrix, 8K FIT↔1:1 A/B/A와 4L DEVICE candidate/CLIENT plane-overflow의 typed
   HWC 관측 probe와 generated cross-load 0인 `Display-pipeline Repeated Step Shock`
   (`dpu-only-repeat-shock` stable ID), fixed-topology resource isolation,
@@ -659,6 +675,13 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
   graph gap을 둔다. HUD subtree는 pure Compose라 추가 Surface를 만들지 않고 동적
   text/progress immutable state는 최대 1 Hz로 교체하지만 Activity root/window layer는
   남는다.
+  단일 URI의 실제 selected source class·visible dimensions·FPS와 요구 minimum을
+  표시한다. FIT/1:1 crop, layer·영상 metadata 회전, 이동·zoom, destination layer
+  크기와 producer 성격은 label이 있는 개별 행으로 나누고 말줄임 없이 줄바꿈한다.
+  또한
+  최대 20개 세로 `APP PRODUCER MAP`의 planned outline/committed V/S/T/G/F fill,
+  generation-accepted decoder callback count/age/revision도 표시한다. Map과 decoder
+  `ACTIVE`는 HWC assignment/DPU scanout 증거가 아님을 함께 표시한다.
 - Test plan은 Window token으로 소유한 immersive session에서만 실행한다. status와
   navigation bar가 모두 invisible이라는 Insets acknowledgment 전에는 producer를
   게시하지 않고 queue/loop·terminal sample·teardown까지 유지한다. 최초 hide 전이는
@@ -740,6 +763,9 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
   allocation은 decoder/BSP 정책에 달려 있다. YUV/P010/SBWC route 자체를 decoder
   output B/px의 증거로 사용하지 않는다.
 - codec capability는 sustained 또는 concurrent decode 가능성을 보장하지 않는다.
+- `OnFrameRenderedListener` callback은 matching app decoder producer의 frame-render
+  evidence지만 SurfaceFlinger present, HWC plane assignment 또는 DPU scanout 완료를
+  증명하지 않는다.
 - requested display Hz는 실제 mode 전환을 보장하지 않는다.
 - DPU frequency counter는 read-only이고, settle 구간이 실제 clock 하강을 보장하지 않는다.
 - API v3 provider reference implementation은 저장소에 없다. 일반 APK 또는 platform

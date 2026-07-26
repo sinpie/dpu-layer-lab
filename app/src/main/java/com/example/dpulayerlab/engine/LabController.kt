@@ -4453,6 +4453,10 @@ class LabController internal constructor(
         while (phaseIndex < scenario.phases.size) {
             currentCoroutineContext().ensureActive()
             val requestedPhase = scenario.phases[phaseIndex]
+            val decoderEvidenceRequired = requestedPhase.requiresSelectedDecoderProducer()
+            var decoderEvidenceGeneration: Long? = null
+            var decoderPhaseFailure: Throwable? = null
+            try {
             var targetPhase = applyPersistentSafety(requestedPhase)
             val adaptiveCandidate = isAdaptiveBoundaryCandidate(
                 scenarioId = scenario.id,
@@ -4534,6 +4538,7 @@ class LabController internal constructor(
             val adaptiveBoundaryContinuityBefore =
                 adaptiveBoundaryBefore?.let { exactCounterContinuous } ?: false
             val producerGeneration = beginTrackedProducerGeneration()
+            decoderEvidenceGeneration = producerGeneration
             val preparationPhase = rendererPreparationPhase(initialRuntime)
             val topologyRequestedAtMs = SystemClock.elapsedRealtime()
             val topologyDeadlineMs = saturatingAdd(
@@ -4716,6 +4721,22 @@ class LabController internal constructor(
                     "transition=${targetPhase.transition.summary()}; " +
                     "hwcExpectation=${targetPhase.hwcCompositionExpectation.name}",
             )
+            if (targetPhase.requiresSelectedDecoderProducer()) {
+                val decoder = selectedVideoDecoder
+                runEvents += event(
+                    "DECODER_PHASE_ACTIVE",
+                    "phase=${targetPhase.id}; requested=${targetPhase.bufferSize.label}" +
+                        "@${targetPhase.producerFps}fps; actual=" +
+                        if (decoder != null) {
+                            "${decoder.expectedVisibleWidthPx}x" +
+                                "${decoder.expectedVisibleHeightPx}@" +
+                                "${decoder.expectedSourceFps}fps; codec=${decoder.codecName}; " +
+                                "source=MediaCodec.OnFrameRenderedListener; hwcProof=false"
+                        } else {
+                            "N/A; source=MediaCodec.OnFrameRenderedListener; hwcProof=false"
+                        },
+                )
+            }
             var lastRawRuntime = initialRawRuntime
             var firstControlTick = false
             var runtimeTargetPhase = targetPhase
@@ -6061,6 +6082,30 @@ class LabController internal constructor(
                 )
             } else {
                 phaseIndex++
+            }
+            } catch (failure: Throwable) {
+                decoderPhaseFailure = failure
+                throw failure
+            } finally {
+                if (decoderEvidenceRequired) {
+                    recordDecoderTerminalEvidencePreservingFailure(decoderPhaseFailure) {
+                        val terminal = decoderPhaseTerminalEvidence(
+                            failure = decoderPhaseFailure,
+                            cancellationReason = cancellationReason,
+                        )
+                        val readiness =
+                            decoderEvidenceGeneration?.let(frameTracker::producerReadiness)
+                        runEvents += event(
+                            "DECODER_FRAME_EVIDENCE",
+                            decoderFrameEvidenceMessage(
+                                phaseId = requestedPhase.id,
+                                generation = decoderEvidenceGeneration,
+                                readiness = readiness,
+                                terminal = terminal,
+                            ),
+                        )
+                    }
+                }
             }
         }
     }
@@ -8617,8 +8662,6 @@ class LabController internal constructor(
         val error: String? = null,
     )
 
-    private class UnsupportedRunException(message: String) : Exception(message)
-
     private companion object {
         val ACTIVE_STAGES = setOf(
             RunnerStage.PRECHECK,
@@ -8675,6 +8718,70 @@ class LabController internal constructor(
         )
     }
 }
+
+internal enum class DecoderPhaseTerminalOutcome {
+    COMPLETED,
+    UNSUPPORTED,
+    ABORTED,
+    CANCELLED,
+    INCONCLUSIVE,
+    ERROR,
+}
+
+internal data class DecoderPhaseTerminalEvidence(
+    val outcome: DecoderPhaseTerminalOutcome,
+    val reason: String,
+)
+
+internal fun decoderPhaseTerminalEvidence(
+    failure: Throwable?,
+    cancellationReason: String?,
+): DecoderPhaseTerminalEvidence {
+    if (failure == null) {
+        return DecoderPhaseTerminalEvidence(
+            outcome = DecoderPhaseTerminalOutcome.COMPLETED,
+            reason = "none",
+        )
+    }
+    val outcome = when (failure) {
+        is UnsupportedRunException -> DecoderPhaseTerminalOutcome.UNSUPPORTED
+        is PlanAbortException -> DecoderPhaseTerminalOutcome.ABORTED
+        is CancellationException -> DecoderPhaseTerminalOutcome.CANCELLED
+        is InconclusiveRunException -> DecoderPhaseTerminalOutcome.INCONCLUSIVE
+        else -> DecoderPhaseTerminalOutcome.ERROR
+    }
+    val reason = (
+        cancellationReason?.takeIf(String::isNotBlank)
+            ?: failure.message?.takeIf(String::isNotBlank)
+            ?: failure.javaClass.simpleName.takeIf(String::isNotBlank)
+            ?: "unspecified"
+        )
+        .replace('\r', ' ')
+        .replace('\n', ' ')
+        .take(MAX_DECODER_TERMINAL_REASON_CHARS)
+    return DecoderPhaseTerminalEvidence(outcome = outcome, reason = reason)
+}
+
+internal fun decoderFrameEvidenceMessage(
+    phaseId: String,
+    generation: Long?,
+    readiness: ProducerReadiness?,
+    terminal: DecoderPhaseTerminalEvidence,
+): String =
+    "phase=$phaseId; generation=${generation ?: "N/A"}; " +
+        "outcome=${terminal.outcome.name}; terminalReason=${terminal.reason}; " +
+        "renderedCallbacks=${readiness?.decoderGenerationFrameCount ?: "N/A"}; " +
+        "observationCallbacks=${readiness?.decoderObservationFrameCount ?: "N/A"}; " +
+        "lastFrameAgeMs=${readiness?.decoderLastFrameAgeMs ?: "N/A"}; " +
+        "controlRevision=" +
+        if (readiness != null) {
+            "${readiness.decoderLastControlRevision}/" +
+                "${readiness.producerControlRequestedRevision}; " +
+                "decoderReady=${readiness.decoderControlReady}; "
+        } else {
+            "N/A; decoderReady=N/A; "
+        } +
+        "source=MediaCodec.OnFrameRenderedListener; hwcProof=false"
 
 enum class ErrorRecoveryAction {
     OPEN_BATTERY_SAVER_SETTINGS,
@@ -11227,6 +11334,7 @@ internal fun invalidateEarlierPlanResultsForRestoreFailure(
 private const val MAX_SHARE_REPORT_PATH_CHARS = 4_096
 private const val MAX_PLAN_RESTORE_FAILURE_REASON_CHARS = 300
 private const val MAX_REPORT_PUBLICATION_FAILURE_TYPE_CHARS = 80
+private const val MAX_DECODER_TERMINAL_REASON_CHARS = 300
 private const val MEDIA_PREFLIGHT_AWAIT_POLL_MS = 20L
 private const val MEDIA_PREFLIGHT_AWAIT_MAX_POLL_MS = 50L
 private const val NANOS_PER_MILLISECOND = 1_000_000L
@@ -11234,6 +11342,8 @@ private const val NANOS_PER_MILLISECOND = 1_000_000L
 internal class PlanAbortException(message: String) : CancellationException(message)
 
 internal class InconclusiveRunException(message: String) : Exception(message)
+
+internal class UnsupportedRunException(message: String) : Exception(message)
 
 /**
  * Serializes the complete descriptor-open + native-parser preflight across Activity recreation.
@@ -11423,6 +11533,21 @@ internal fun mergeControllerFailurePreservingFatal(
         // Preserve the selected identity even when suppressed-state allocation is unavailable.
     }
     return terminal
+}
+
+/**
+ * Keeps decoder terminal diagnostics fail-closed without allowing their secondary allocation or
+ * append failure to replace an already escaping VM-fatal identity.
+ */
+internal inline fun recordDecoderTerminalEvidencePreservingFailure(
+    escapingFailure: Throwable?,
+    record: () -> Unit,
+) {
+    try {
+        record()
+    } catch (recordFailure: Throwable) {
+        throw mergeControllerFailurePreservingFatal(escapingFailure, recordFailure)
+    }
 }
 
 /** Relays a bounded worker's fatal identity to its owning coroutine after worker cleanup. */

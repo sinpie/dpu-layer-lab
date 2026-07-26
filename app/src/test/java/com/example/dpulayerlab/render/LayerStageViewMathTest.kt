@@ -14,10 +14,42 @@ import com.example.dpulayerlab.model.requiredCoverageMask
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class LayerStageViewMathTest {
+    @Test
+    fun decoderProducerRequiresMatchingPreparedBindingBeforeAllocation() {
+        requireSelectedDecoderBinding(
+            decoderProducerRequired = false,
+            selectedMediaPresent = false,
+            selectedDecoderPresent = false,
+            decoderMediaMatches = false,
+        )
+        requireSelectedDecoderBinding(
+            decoderProducerRequired = true,
+            selectedMediaPresent = true,
+            selectedDecoderPresent = true,
+            decoderMediaMatches = true,
+        )
+
+        listOf(
+            Triple(false, true, true),
+            Triple(true, false, true),
+            Triple(true, true, false),
+        ).forEach { (mediaPresent, decoderPresent, mediaMatches) ->
+            assertThrows(IllegalStateException::class.java) {
+                requireSelectedDecoderBinding(
+                    decoderProducerRequired = true,
+                    selectedMediaPresent = mediaPresent,
+                    selectedDecoderPresent = decoderPresent,
+                    decoderMediaMatches = mediaMatches,
+                )
+            }
+        }
+    }
+
     @Test
     fun bufferPresentationMathDistinguishesFitFromOneToOneCrop() {
         val fit = bufferPresentationScalePacked(
