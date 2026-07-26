@@ -1,5 +1,6 @@
 package com.example.dpulayerlab.render
 
+import com.example.dpulayerlab.model.AppProducerKind
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
@@ -11,6 +12,21 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 class ProducerFrameRelayTest {
+    @Test
+    fun producerKindRemainsBoundToPhysicalRelayAcrossGenerationRebind() {
+        val relay = ProducerFrameRelay(
+            producerId = 41L,
+            generation = 1L,
+            primary = true,
+            kind = AppProducerKind.VIDEO_DECODER,
+        ) { _, _, _, _ -> Unit }
+
+        relay.update(2L) { _, _, _, _ -> Unit }
+
+        assertEquals(AppProducerKind.VIDEO_DECODER, relay.kind)
+        assertTrue(relay.primary)
+    }
+
     @Test
     fun physicalProducerRelayPreservesIdentityAndPrimaryAttribution() {
         val events = mutableListOf<Triple<Long, Long, Boolean>>()

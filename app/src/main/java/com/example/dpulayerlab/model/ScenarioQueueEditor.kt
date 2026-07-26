@@ -4,14 +4,14 @@ package com.example.dpulayerlab.model
  * Pure queue operations shared by the Compose catalog and unit tests.
  *
  * Duplicate IDs are intentional: a tester can build A/B/A without cloning a preset. Every
- * operation returns a new list only when the queue actually changes, which also avoids needless
- * Compose state invalidation when the hard plan limit has already been reached.
+ * operation returns a new list only when the queue actually changes. Manual UI callers have no
+ * arbitrary item cap; bounded callers may still provide [maximumItems] explicitly.
  */
 object ScenarioQueueEditor {
     fun append(
         queue: List<String>,
         scenarioId: String,
-        maximumItems: Int = ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS,
+        maximumItems: Int = Int.MAX_VALUE,
     ): List<String> {
         if (scenarioId.isBlank() || maximumItems <= 0 || queue.size >= maximumItems) return queue
         return queue + scenarioId
@@ -21,16 +21,19 @@ object ScenarioQueueEditor {
      * Appends the currently filtered catalog result in display order.
      *
      * Existing and incoming duplicates remain meaningful queue entries. Blank IDs are ignored,
-     * and the operation stops exactly at the hard plan-item cap without allocating a large
-     * intermediate list for hostile input.
+     * and an explicit caller-provided cap is honored without allocating a large intermediate list.
      */
     fun appendAll(
         queue: List<String>,
         scenarioIds: Iterable<String>,
-        maximumItems: Int = ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS,
+        maximumItems: Int = Int.MAX_VALUE,
     ): List<String> {
         if (maximumItems <= 0 || queue.size >= maximumItems) return queue
-        val result = ArrayList<String>(minOf(maximumItems, queue.size + 8))
+        val initialCapacity = minOf(
+            maximumItems.toLong(),
+            queue.size.toLong() + 8L,
+        ).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+        val result = ArrayList<String>(initialCapacity)
         result.addAll(queue)
         for (scenarioId in scenarioIds) {
             if (result.size >= maximumItems) break
@@ -72,7 +75,7 @@ object ScenarioQueueEditor {
     fun retainKnown(
         queue: List<String>,
         knownScenarioIds: Set<String>,
-        maximumItems: Int = ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS,
+        maximumItems: Int = Int.MAX_VALUE,
     ): List<String> {
         if (maximumItems <= 0) return if (queue.isEmpty()) queue else emptyList()
         if (

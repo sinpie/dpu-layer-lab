@@ -1,10 +1,13 @@
 package com.example.dpulayerlab.engine
 
 import android.media.MediaCodecInfo
+import com.example.dpulayerlab.model.BufferPresentation
 import com.example.dpulayerlab.model.BufferSize
 import com.example.dpulayerlab.model.Gauge
 import com.example.dpulayerlab.model.HwcCompositionExpectation
+import com.example.dpulayerlab.model.HwcCompositionEvidenceAvailability
 import com.example.dpulayerlab.model.LayerBackend
+import com.example.dpulayerlab.model.LayerOrientation
 import com.example.dpulayerlab.model.LayerSizeProfile
 import com.example.dpulayerlab.model.LoadTransitionEvaluator
 import com.example.dpulayerlab.model.LoadSetpoints
@@ -13,6 +16,9 @@ import com.example.dpulayerlab.model.MotionProfile
 import com.example.dpulayerlab.model.PhaseSpec
 import com.example.dpulayerlab.model.PixelRoute
 import com.example.dpulayerlab.model.PlanRunResult
+import com.example.dpulayerlab.model.PlanProgress
+import com.example.dpulayerlab.model.PlanSource
+import com.example.dpulayerlab.model.PlanState
 import com.example.dpulayerlab.model.RunProgress
 import com.example.dpulayerlab.model.RunEvent
 import com.example.dpulayerlab.model.RunSummary
@@ -47,6 +53,152 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class LabControllerMathTest {
+    @Test
+    fun decoderTerminalEvidenceRecordingPreservesEscapingFatalIdentity() {
+        listOf(
+            OutOfMemoryError("decoder phase OOM"),
+            ThreadDeath(),
+        ).forEach { fatal ->
+            val recordFailure = IllegalStateException("evidence append failed")
+            var thrown: Throwable? = null
+
+            try {
+                recordDecoderTerminalEvidencePreservingFailure(fatal) {
+                    throw recordFailure
+                }
+            } catch (failure: Throwable) {
+                thrown = failure
+            }
+
+            assertSame(fatal, thrown)
+            assertTrue(fatal.suppressed.any { it === recordFailure })
+        }
+    }
+
+    @Test
+    fun decoderTerminalEvidenceClassifiesCompletionAndAbortPaths() {
+        assertEquals(
+            DecoderPhaseTerminalEvidence(
+                outcome = DecoderPhaseTerminalOutcome.COMPLETED,
+                reason = "none",
+            ),
+            decoderPhaseTerminalEvidence(failure = null, cancellationReason = "stale"),
+        )
+        assertEquals(
+            DecoderPhaseTerminalEvidence(
+                outcome = DecoderPhaseTerminalOutcome.ABORTED,
+                reason = "codec callback stopped",
+            ),
+            decoderPhaseTerminalEvidence(
+                failure = PlanAbortException("producer failed"),
+                cancellationReason = "codec callback stopped",
+            ),
+        )
+        assertEquals(
+            DecoderPhaseTerminalOutcome.UNSUPPORTED,
+            decoderPhaseTerminalEvidence(
+                failure = UnsupportedRunException("decoder capability unavailable"),
+                cancellationReason = null,
+            ).outcome,
+        )
+        assertEquals(
+            DecoderPhaseTerminalOutcome.CANCELLED,
+            decoderPhaseTerminalEvidence(
+                failure = CancellationException("user stop"),
+                cancellationReason = null,
+            ).outcome,
+        )
+        assertEquals(
+            DecoderPhaseTerminalOutcome.INCONCLUSIVE,
+            decoderPhaseTerminalEvidence(
+                failure = InconclusiveRunException("frame proof incomplete"),
+                cancellationReason = null,
+            ).outcome,
+        )
+        assertEquals(
+            DecoderPhaseTerminalOutcome.ERROR,
+            decoderPhaseTerminalEvidence(
+                failure = IllegalStateException("codec runtime error"),
+                cancellationReason = null,
+            ).outcome,
+        )
+    }
+
+    @Test
+    fun decoderTerminalEvidenceMessageKeepsAppCallbackProvenanceAndNoHwcClaim() {
+        val message = decoderFrameEvidenceMessage(
+            phaseId = "decoder-load-drop",
+            generation = 42L,
+            readiness = ProducerReadiness(
+                producerControlRequestedRevision = 9L,
+                decoderGenerationFrameCount = 120L,
+                decoderObservationFrameCount = 12L,
+                decoderLastFrameAgeMs = 16L,
+                decoderLastControlRevision = 9L,
+                decoderControlReady = true,
+            ),
+            terminal = DecoderPhaseTerminalEvidence(
+                outcome = DecoderPhaseTerminalOutcome.ABORTED,
+                reason = "codec runtime error",
+            ),
+        )
+
+        assertTrue(message.contains("phase=decoder-load-drop; generation=42"))
+        assertTrue(message.contains("outcome=ABORTED; terminalReason=codec runtime error"))
+        assertTrue(message.contains("renderedCallbacks=120; observationCallbacks=12"))
+        assertTrue(message.contains("controlRevision=9/9; decoderReady=true"))
+        assertTrue(message.contains("source=MediaCodec.OnFrameRenderedListener"))
+        assertTrue(message.endsWith("hwcProof=false"))
+
+        val preGeneration = decoderFrameEvidenceMessage(
+            phaseId = "decoder-preparation",
+            generation = null,
+            readiness = null,
+            terminal = DecoderPhaseTerminalEvidence(
+                outcome = DecoderPhaseTerminalOutcome.CANCELLED,
+                reason = "user stop",
+            ),
+        )
+        assertTrue(preGeneration.contains("generation=N/A"))
+        assertTrue(preGeneration.contains("renderedCallbacks=N/A"))
+        assertTrue(preGeneration.contains("controlRevision=N/A; decoderReady=N/A"))
+    }
+
+    @Test
+    fun planPositionEventPreservesTheRequestedDurationMultiplier() {
+        val progress = PlanProgress(
+            state = PlanState.RUNNING,
+            source = PlanSource.USER_SELECTION,
+            repeatIndex = 1,
+            repeatCount = 3,
+            durationMultiplier = 100,
+            queueIndex = 2,
+            queueSize = 4,
+            completedRuns = 6,
+            totalRuns = 12,
+        )
+
+        assertEquals(
+            "source=USER_SELECTION; run=7/12; repeat=2/3; queue=3/4; " +
+                "durationMultiplier=100",
+            planPositionEventMessage(progress),
+        )
+    }
+
+    @Test
+    fun staleSnackbarConsumeCannotClearANewerAtomicErrorNotice() {
+        val old = ErrorNotice(
+            id = 1,
+            message = "Battery Saver active",
+            recoveryAction = ErrorRecoveryAction.OPEN_BATTERY_SAVER_SETTINGS,
+        )
+        val newer = ErrorNotice(id = 2, message = "Settings could not be opened")
+
+        assertNull(errorNoticeAfterConsume(old, old.id))
+        assertSame(newer, errorNoticeAfterConsume(newer, old.id))
+        assertNull(errorNoticeAfterConsume(newer, null))
+    }
+
     @Test
     fun processSessionCalibrationTopologyIsExactlyTwentyDisplayOnlyLayers() {
         val phase = processSessionHwcCapacityCalibrationPhase()
@@ -531,12 +683,15 @@ class LabControllerMathTest {
         )
 
         val guidance = capacityReuseGuidance(observed)
-        assertEquals(8, guidance.deviceCandidateCeiling)
-        assertEquals(9, guidance.clientPressureCandidate)
-        assertTrue(guidance.detail.contains("advisory only"))
+        assertEquals(20, guidance.candidateProducerCount)
+        assertEquals(8, guidance.observedAppDeviceLayers)
+        assertEquals(12, guidance.observedAppClientLayers)
+        assertTrue(guidance.detail.contains("no producer ceiling is inferred"))
+        assertTrue(guidance.uiSummary().contains("workload DEVICE ceiling N/A"))
         assertTrue(observed.uiSummary().contains("HARDWARE_COUNTER@vendor:test"))
         assertTrue(observed.eventDetail().contains("requested=20; candidate=20"))
         assertTrue(observed.eventDetail().contains("lifetime=process-session"))
+        assertTrue(observed.eventDetail().contains("control-root-not-corrected"))
 
         val unavailable = capacityReuseGuidance(
             HwcCapacityCalibrationResult(
@@ -545,8 +700,9 @@ class LabControllerMathTest {
                 detail = "no fresh pair",
             ),
         )
-        assertNull(unavailable.deviceCandidateCeiling)
-        assertNull(unavailable.clientPressureCandidate)
+        assertEquals(20, unavailable.candidateProducerCount)
+        assertNull(unavailable.observedAppDeviceLayers)
+        assertNull(unavailable.observedAppClientLayers)
     }
 
     @Test
@@ -1606,6 +1762,186 @@ class LabControllerMathTest {
         )
         assertFalse(safeGpuRelease.includeGlLayer)
         assertEquals(0f, safeGpuRelease.workloads.gpu, 0f)
+    }
+
+    @Test
+    fun projectionAndOrientationKeepMeasuredOriginUntilDiscreteTargetStarts() {
+        val origin = checkNotNull(ScenarioCatalog.byId("baseline-display-modes"))
+            .phases.first()
+            .copy(
+                bufferSize = BufferSize.UHD_8K,
+                bufferPresentation = BufferPresentation.FIT,
+                layerOrientation = LayerOrientation.ROTATION_0,
+                motion = MotionProfile.STATIC,
+                layerSizeProfile = LayerSizeProfile.FULL_SCREEN,
+            )
+        val target = origin.copy(
+            id = "projected-target",
+            pixelRoute = PixelRoute.SBWC_REQUIRED,
+            bufferPresentation = BufferPresentation.PIXEL_1_TO_1_CROP,
+            layerOrientation = LayerOrientation.ROTATION_90,
+        )
+
+        val fractionZero = LoadTransitionEvaluator.interpolate(origin, target, 0f)
+        val preparedZero = allocationRouteSafePhase(fractionZero, target)
+        assertEquals(target.pixelRoute, preparedZero.pixelRoute)
+        assertEquals(origin.bufferPresentation, preparedZero.bufferPresentation)
+        assertEquals(origin.layerOrientation, preparedZero.layerOrientation)
+
+        val fractionPositive = LoadTransitionEvaluator.interpolate(origin, target, 0.01f)
+        val preparedPositive = allocationRouteSafePhase(fractionPositive, target)
+        assertEquals(target.bufferPresentation, preparedPositive.bufferPresentation)
+        assertEquals(target.layerOrientation, preparedPositive.layerOrientation)
+
+        assertTrue(rendererTopologyChanged(origin, target))
+        assertTrue(
+            rendererTopologyChanged(
+                origin,
+                origin.copy(layerOrientation = LayerOrientation.ROTATION_90),
+            ),
+        )
+        val typedOrigin = origin.copy(
+            hwcCompositionExpectation = HwcCompositionExpectation.DEVICE_ONLY,
+        )
+        assertFalse(
+            hwcCompositionContractPreserved(
+                typedOrigin,
+                typedOrigin.copy(
+                    bufferPresentation = BufferPresentation.PIXEL_1_TO_1_CROP,
+                ),
+            ),
+        )
+        assertFalse(
+            hwcCompositionContractPreserved(
+                typedOrigin,
+                typedOrigin.copy(layerOrientation = LayerOrientation.ROTATION_90),
+            ),
+        )
+    }
+
+    @Test
+    fun warmupBaselineRequiresFreshProducerGeometryAndNoCleanupLease() {
+        val profile = LayerSizeProfile.FULL_SCREEN.ordinal
+        val ready = ProducerReadiness(
+            expectedCount = 1,
+            observedCount = 1,
+            everObservedCount = 1,
+            ready = true,
+            topologyPublished = true,
+            topologyPending = false,
+            geometryRequestedRevision = 2L,
+            geometryAppliedRevision = 2L,
+            geometryRequestedProfileOrdinal = profile,
+            geometryAppliedProfileOrdinal = profile,
+            geometryReady = true,
+        )
+
+        assertTrue(
+            warmupProducerReadyForBaseline(
+                readiness = ready,
+                expectedProfileOrdinal = profile,
+                processLeaseActive = false,
+            ),
+        )
+        listOf(
+            ready.copy(ready = false),
+            ready.copy(observedCount = 0),
+            ready.copy(topologyPublished = false),
+            ready.copy(topologyPending = true),
+            ready.copy(topologyMissed = true),
+            ready.copy(teardownCompleted = true),
+            ready.copy(teardownFailed = true),
+            ready.copy(runtimeFailureReason = "failed"),
+            ready.copy(geometryReady = false),
+            ready.copy(geometryAppliedProfileOrdinal = profile + 1),
+        ).forEach { invalid ->
+            assertFalse(
+                warmupProducerReadyForBaseline(
+                    readiness = invalid,
+                    expectedProfileOrdinal = profile,
+                    processLeaseActive = false,
+                ),
+            )
+        }
+        assertFalse(
+            warmupProducerReadyForBaseline(
+                readiness = ready,
+                expectedProfileOrdinal = profile,
+                processLeaseActive = true,
+            ),
+        )
+
+        val boundary = checkNotNull(
+            captureWarmupBaselineProducerBoundary(
+                readiness = ready,
+                expectedProfileOrdinal = profile,
+                processLeaseActive = false,
+            ),
+        )
+        assertTrue(
+            warmupBaselineProducerBoundaryUnchanged(
+                expected = boundary,
+                readiness = ready,
+                expectedProfileOrdinal = profile,
+                processLeaseActive = false,
+            ),
+        )
+        assertFalse(
+            warmupBaselineProducerBoundaryUnchanged(
+                expected = boundary,
+                readiness = ready.copy(topologyDiscontinuitySerial = 1L),
+                expectedProfileOrdinal = profile,
+                processLeaseActive = false,
+            ),
+        )
+        assertFalse(
+            warmupBaselineProducerBoundaryUnchanged(
+                expected = boundary,
+                readiness = ready.copy(topologyRevision = 1L),
+                expectedProfileOrdinal = profile,
+                processLeaseActive = false,
+            ),
+        )
+        assertFalse(
+            warmupBaselineProducerBoundaryUnchanged(
+                expected = boundary,
+                readiness = ready.copy(geometryAppliedRevision = 3L),
+                expectedProfileOrdinal = profile,
+                processLeaseActive = false,
+            ),
+        )
+    }
+
+    @Test
+    fun warmupReadinessCannotSucceedAfterItsDeadline() {
+        assertFalse(
+            warmupReadyWindowOpen(
+                nowMs = 1_199L,
+                minimumReadyMs = 1_200L,
+                deadlineMs = 5_000L,
+            ),
+        )
+        assertTrue(
+            warmupReadyWindowOpen(
+                nowMs = 1_200L,
+                minimumReadyMs = 1_200L,
+                deadlineMs = 5_000L,
+            ),
+        )
+        assertTrue(
+            warmupReadyWindowOpen(
+                nowMs = 5_000L,
+                minimumReadyMs = 1_200L,
+                deadlineMs = 5_000L,
+            ),
+        )
+        assertFalse(
+            warmupReadyWindowOpen(
+                nowMs = 5_001L,
+                minimumReadyMs = 1_200L,
+                deadlineMs = 5_000L,
+            ),
+        )
     }
 
     @Test
@@ -3555,8 +3891,16 @@ class LabControllerMathTest {
     fun reportTelemetryUsesOneRunRelativeMonotonicAxis() {
         val relative = TelemetrySnapshot(
             monotonicMs = 1_200L,
+            hwcDeviceLayers = 2,
+            hwcDeviceLayersQuality = MetricQuality.SYSTEM_SERVICE,
+            hwcDeviceLayersSource = "SurfaceFlinger",
+            hwcClientLayers = 0,
+            hwcClientLayersQuality = MetricQuality.SYSTEM_SERVICE,
+            hwcClientLayersSource = "SurfaceFlinger",
             hwcCompositionEvidenceMonotonicMs = 1_100L,
             hwcCompositionEvidenceAgeMs = 100L,
+            hwcCompositionEvidenceAvailability =
+                HwcCompositionEvidenceAvailability.AVAILABLE,
             surfaceFlingerEvidenceMonotonicMs = 1_150L,
             surfaceFlingerEvidenceAgeMs = 50L,
         ).toRunRelativeTelemetry(runStartMonotonicMs = 1_000L)
@@ -3564,6 +3908,10 @@ class LabControllerMathTest {
         assertEquals(200L, relative.monotonicMs)
         assertEquals(100L, relative.hwcCompositionEvidenceMonotonicMs)
         assertEquals(100L, relative.hwcCompositionEvidenceAgeMs)
+        assertEquals(
+            HwcCompositionEvidenceAvailability.AVAILABLE,
+            relative.hwcCompositionEvidenceAvailability,
+        )
         assertEquals(150L, relative.surfaceFlingerEvidenceMonotonicMs)
         assertEquals(50L, relative.surfaceFlingerEvidenceAgeMs)
 
@@ -3605,6 +3953,8 @@ class LabControllerMathTest {
             hwcClientLayersSource = "SurfaceFlinger",
             hwcCompositionEvidenceMonotonicMs = 900L,
             hwcCompositionEvidenceAgeMs = 0L,
+            hwcCompositionEvidenceAvailability =
+                HwcCompositionEvidenceAvailability.AVAILABLE,
         ).toRunRelativeTelemetry(runStartMonotonicMs = 1_000L)
         assertEquals(0L, preRunSample.monotonicMs)
         assertNull(preRunSample.hwcCompositionEvidenceMonotonicMs)
@@ -3613,6 +3963,10 @@ class LabControllerMathTest {
         assertNull(preRunSample.hwcClientLayers)
         assertEquals(MetricQuality.UNAVAILABLE, preRunSample.hwcDeviceLayersQuality)
         assertEquals("", preRunSample.hwcDeviceLayersSource)
+        assertEquals(
+            HwcCompositionEvidenceAvailability.EVIDENCE_INVALID,
+            preRunSample.hwcCompositionEvidenceAvailability,
+        )
 
         val inconsistentAge = TelemetrySnapshot(
             monotonicMs = 1_200L,
@@ -3624,11 +3978,17 @@ class LabControllerMathTest {
             hwcClientLayersSource = "SurfaceFlinger",
             hwcCompositionEvidenceMonotonicMs = 1_100L,
             hwcCompositionEvidenceAgeMs = 99L,
+            hwcCompositionEvidenceAvailability =
+                HwcCompositionEvidenceAvailability.AVAILABLE,
         ).toRunRelativeTelemetry(runStartMonotonicMs = 1_000L)
         assertNull(inconsistentAge.hwcCompositionEvidenceMonotonicMs)
         assertNull(inconsistentAge.hwcDeviceLayers)
         assertEquals(MetricQuality.UNAVAILABLE, inconsistentAge.hwcDeviceLayersQuality)
         assertEquals("", inconsistentAge.hwcDeviceLayersSource)
+        assertEquals(
+            HwcCompositionEvidenceAvailability.EVIDENCE_INVALID,
+            inconsistentAge.hwcCompositionEvidenceAvailability,
+        )
     }
 
     @Test

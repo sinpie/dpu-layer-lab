@@ -1,8 +1,10 @@
 package com.example.dpulayerlab.render
 
 import com.example.dpulayerlab.model.BufferSize
+import com.example.dpulayerlab.model.BufferPresentation
 import com.example.dpulayerlab.model.LayerBackend
 import com.example.dpulayerlab.model.LayerSizeProfile
+import com.example.dpulayerlab.model.LayerOrientation
 import com.example.dpulayerlab.model.MotionProfile
 import com.example.dpulayerlab.model.PhaseSpec
 import com.example.dpulayerlab.model.PixelRoute
@@ -12,10 +14,119 @@ import com.example.dpulayerlab.model.requiredCoverageMask
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class LayerStageViewMathTest {
+    @Test
+    fun decoderProducerRequiresMatchingPreparedBindingBeforeAllocation() {
+        requireSelectedDecoderBinding(
+            decoderProducerRequired = false,
+            selectedMediaPresent = false,
+            selectedDecoderPresent = false,
+            decoderMediaMatches = false,
+        )
+        requireSelectedDecoderBinding(
+            decoderProducerRequired = true,
+            selectedMediaPresent = true,
+            selectedDecoderPresent = true,
+            decoderMediaMatches = true,
+        )
+
+        listOf(
+            Triple(false, true, true),
+            Triple(true, false, true),
+            Triple(true, true, false),
+        ).forEach { (mediaPresent, decoderPresent, mediaMatches) ->
+            assertThrows(IllegalStateException::class.java) {
+                requireSelectedDecoderBinding(
+                    decoderProducerRequired = true,
+                    selectedMediaPresent = mediaPresent,
+                    selectedDecoderPresent = decoderPresent,
+                    decoderMediaMatches = mediaMatches,
+                )
+            }
+        }
+    }
+
+    @Test
+    fun bufferPresentationMathDistinguishesFitFromOneToOneCrop() {
+        val fit = bufferPresentationScalePacked(
+            stageWidth = 1_920,
+            stageHeight = 1_080,
+            sourceWidth = 7_680,
+            sourceHeight = 4_320,
+            presentation = BufferPresentation.FIT,
+            orientation = LayerOrientation.ROTATION_0,
+        )
+        assertEquals(1f, packedPresentationScaleX(fit), 0.0001f)
+        assertEquals(1f, packedPresentationScaleY(fit), 0.0001f)
+
+        val oneToOne = bufferPresentationScalePacked(
+            stageWidth = 1_920,
+            stageHeight = 1_080,
+            sourceWidth = 7_680,
+            sourceHeight = 4_320,
+            presentation = BufferPresentation.PIXEL_1_TO_1_CROP,
+            orientation = LayerOrientation.ROTATION_0,
+        )
+        assertEquals(4f, packedPresentationScaleX(oneToOne), 0.0001f)
+        assertEquals(4f, packedPresentationScaleY(oneToOne), 0.0001f)
+    }
+
+    @Test
+    fun ninetyDegreeEightKFitPreservesAspectInsidePortraitStage() {
+        val packed = bufferPresentationScalePacked(
+            stageWidth = 1_080,
+            stageHeight = 2_400,
+            sourceWidth = 7_680,
+            sourceHeight = 4_320,
+            presentation = BufferPresentation.FIT,
+            orientation = LayerOrientation.ROTATION_90,
+        )
+        val preRotationWidth =
+            1_080f * packedPresentationScaleX(packed)
+        val preRotationHeight =
+            2_400f * packedPresentationScaleY(packed)
+        assertEquals(1_920f, preRotationWidth, 0.01f)
+        assertEquals(1_080f, preRotationHeight, 0.01f)
+        assertTrue(preRotationHeight <= 1_080f)
+        assertTrue(preRotationWidth <= 2_400f)
+    }
+
+    @Test
+    fun fixedQuarterTurnFitMotionIsClampedToLetterboxSlack() {
+        assertEquals(
+            0f,
+            clampFitTranslation(
+                requested = 400f,
+                stageExtent = 1_080f,
+                contentExtent = 1_080f,
+            ),
+            0f,
+        )
+        assertEquals(
+            240f,
+            clampFitTranslation(
+                requested = 400f,
+                stageExtent = 2_400f,
+                contentExtent = 1_920f,
+            ),
+            0f,
+        )
+        assertEquals(
+            -240f,
+            clampFitTranslation(
+                requested = -400f,
+                stageExtent = 2_400f,
+                contentExtent = 1_920f,
+            ),
+            0f,
+        )
+        assertEquals(0f, clampFitTranslation(Float.NaN, 2_400f, 1_920f), 0f)
+    }
+
     @Test
     fun phaseDefaultsToFullScreenLayerGeometry() {
         val phase = PhaseSpec(

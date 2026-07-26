@@ -1,6 +1,7 @@
 package com.example.dpulayerlab.monitor
 
 import com.example.dpulayerlab.model.Gauge
+import com.example.dpulayerlab.model.HwcCompositionEvidenceAvailability
 import com.example.dpulayerlab.model.MetricQuality
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -464,6 +465,145 @@ class SystemMonitorMathTest {
         )
         assertNull(stale.deviceLayers)
         assertNull(stale.clientLayers)
+    }
+
+    @Test
+    fun activeLoadAvailabilityExplainsSuppressedSfAndExactVendorFailure() {
+        val noSurfacePair = CompositionEvidenceProjection(
+            snapshot = CompositionSnapshot(
+                compositionAvailability =
+                    SurfaceFlingerCompositionAvailability.DUMP_PERMISSION_UNAVAILABLE,
+            ),
+            completedMonotonicMs = 950L,
+            ageMs = 50L,
+        )
+        val selected = HwcCompositionEvidenceProjection()
+
+        assertEquals(
+            HwcCompositionEvidenceAvailability.ACTIVE_RUN_VENDOR_PAIR_UNAVAILABLE,
+            classifyHwcCompositionEvidenceAvailability(
+                policy = SurfaceFlingerProbePolicy.TYPED_BOUNDARY,
+                selected = selected,
+                vendorDeviceLayers = null,
+                vendorClientLayers = null,
+                vendorSource = null,
+                vendorCompletedMonotonicMs = null,
+                vendorSessionVerified = false,
+                surfaceFlinger = noSurfacePair,
+                observedMonotonicMs = 1_000L,
+                maxAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
+            ),
+        )
+        assertEquals(
+            HwcCompositionEvidenceAvailability.ACTIVE_RUN_VENDOR_PAIR_INVALID,
+            classifyHwcCompositionEvidenceAvailability(
+                policy = SurfaceFlingerProbePolicy.SUPPRESS_DURING_LOAD,
+                selected = selected,
+                vendorDeviceLayers = 4,
+                vendorClientLayers = null,
+                vendorSource = "vendor",
+                vendorCompletedMonotonicMs = 950L,
+                vendorSessionVerified = true,
+                surfaceFlinger = noSurfacePair,
+                observedMonotonicMs = 1_000L,
+                maxAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
+            ),
+        )
+        assertEquals(
+            HwcCompositionEvidenceAvailability.ACTIVE_RUN_VENDOR_PAIR_STALE,
+            classifyHwcCompositionEvidenceAvailability(
+                policy = SurfaceFlingerProbePolicy.TYPED_BOUNDARY,
+                selected = selected,
+                vendorDeviceLayers = 4,
+                vendorClientLayers = 0,
+                vendorSource = "vendor",
+                vendorCompletedMonotonicMs = 1_000L,
+                vendorSessionVerified = true,
+                surfaceFlinger = noSurfacePair,
+                observedMonotonicMs = 4_000L,
+                maxAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
+            ),
+        )
+    }
+
+    @Test
+    fun idleAvailabilityUsesTypedSurfaceFlingerFailureWithoutParsingDetailText() {
+        fun classify(
+            availability: SurfaceFlingerCompositionAvailability,
+        ): HwcCompositionEvidenceAvailability =
+            classifyHwcCompositionEvidenceAvailability(
+                policy = SurfaceFlingerProbePolicy.PERIODIC,
+                selected = HwcCompositionEvidenceProjection(),
+                vendorDeviceLayers = null,
+                vendorClientLayers = null,
+                vendorSource = null,
+                vendorCompletedMonotonicMs = null,
+                vendorSessionVerified = false,
+                surfaceFlinger = CompositionEvidenceProjection(
+                    snapshot = CompositionSnapshot(
+                        detail = "localized or vendor-specific text",
+                        compositionAvailability = availability,
+                    ),
+                    completedMonotonicMs = 950L,
+                    ageMs = 50L,
+                ),
+                observedMonotonicMs = 1_000L,
+                maxAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
+            )
+
+        assertEquals(
+            HwcCompositionEvidenceAvailability.DUMP_PERMISSION_UNAVAILABLE,
+            classify(SurfaceFlingerCompositionAvailability.DUMP_PERMISSION_UNAVAILABLE),
+        )
+        assertEquals(
+            HwcCompositionEvidenceAvailability.SURFACE_FLINGER_PAIR_UNAVAILABLE,
+            classify(SurfaceFlingerCompositionAvailability.PAIR_UNAVAILABLE),
+        )
+        assertEquals(
+            HwcCompositionEvidenceAvailability.SURFACE_FLINGER_PAIR_INVALID,
+            classify(SurfaceFlingerCompositionAvailability.PAIR_INVALID),
+        )
+        assertEquals(
+            HwcCompositionEvidenceAvailability.SURFACE_FLINGER_PROBE_FAILED,
+            classify(SurfaceFlingerCompositionAvailability.PROBE_FAILED),
+        )
+        assertEquals(
+            HwcCompositionEvidenceAvailability.SURFACE_FLINGER_EVIDENCE_STALE,
+            classify(SurfaceFlingerCompositionAvailability.STALE),
+        )
+    }
+
+    @Test
+    fun availableAtomicPairAlwaysWinsOverDiagnosticFallbackReason() {
+        assertEquals(
+            HwcCompositionEvidenceAvailability.AVAILABLE,
+            classifyHwcCompositionEvidenceAvailability(
+                policy = SurfaceFlingerProbePolicy.PERIODIC,
+                selected = HwcCompositionEvidenceProjection(
+                    deviceLayers = 4,
+                    clientLayers = 0,
+                    quality = MetricQuality.HARDWARE_COUNTER,
+                    source = "vendor session=7",
+                    completedMonotonicMs = 950L,
+                    ageMs = 50L,
+                ),
+                vendorDeviceLayers = 4,
+                vendorClientLayers = 0,
+                vendorSource = "vendor session=7",
+                vendorCompletedMonotonicMs = 950L,
+                vendorSessionVerified = true,
+                surfaceFlinger = CompositionEvidenceProjection(
+                    snapshot = CompositionSnapshot(
+                        compositionAvailability =
+                            SurfaceFlingerCompositionAvailability.DUMP_PERMISSION_UNAVAILABLE,
+                    ),
+                    completedMonotonicMs = 950L,
+                    ageMs = 50L,
+                ),
+                observedMonotonicMs = 1_000L,
+                maxAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
+            ),
+        )
     }
 
     @Test

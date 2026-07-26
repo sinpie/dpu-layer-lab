@@ -42,6 +42,257 @@ class SurfaceFlingerProbeTest {
     }
 
     @Test
+    fun parsesStandardAospTwoLineMinidumpWithoutUsingTokensInLayerNames() {
+        val parsed = parseSurfaceFlingerDump(
+            """
+                Display 4619827259835644672 (active) HWC layers:
+                ----------------------------------------------------------------
+                 Layer name
+                 Z | Window Type | Comp Type | Transform | Disp Frame (LTRB)
+                ----------------------------------------------------------------
+                 DPULayerTest CLIENT DEVICE root#10
+                  0 | 1 | DEVICE | 0 | 0 0 100 100
+                 SurfaceView[DPULayerTest]#11
+                  rel 1 | 1 | CLIENT | 0 | 0 0 100 100
+                 StatusBar#12
+                  2 | 2000 | DEVICE | 0 | 0 0 100 20
+            """.trimIndent(),
+        )
+
+        assertEquals(1, parsed.deviceLayers)
+        assertEquals(1, parsed.clientLayers)
+        assertEquals(
+            SurfaceFlingerCompositionAvailability.AVAILABLE,
+            parsed.compositionAvailability,
+        )
+        assertTrue(parsed.detail.contains("format=aosp-minidump"))
+        assertTrue(parsed.source.endsWith("display=4619827259835644672"))
+    }
+
+    @Test
+    fun parsesOlderAospTableWithCompositionAsSecondColumn() {
+        val parsed = parseSurfaceFlingerDump(
+            """
+                Display 0 HWC layers:
+                Layer name
+                Z | Comp Type | Transform | Disp Frame (LTRB)
+                DPULayerTest#10
+                  0 | CLIENT | 0 | 0 0 100 100
+            """.trimIndent(),
+        )
+
+        assertEquals(0, parsed.deviceLayers)
+        assertEquals(1, parsed.clientLayers)
+        assertTrue(parsed.source.endsWith("display=0"))
+    }
+
+    @Test
+    fun selectsOnlyTheSingleDisplaySectionContainingAppLayers() {
+        val parsed = parseSurfaceFlingerDump(
+            """
+                Display 0 HWC layers:
+                Z | Comp Type | Transform
+                StatusBar#1
+                  0 | DEVICE | 0
+                Display 1 HWC layers:
+                Z | Comp Type | Transform
+                DPULayerTest#10
+                  0 | DEVICE | 0
+                SurfaceView[DPULayerTest]#11
+                  1 | CLIENT | 0
+            """.trimIndent(),
+        )
+
+        assertEquals(1, parsed.deviceLayers)
+        assertEquals(1, parsed.clientLayers)
+        assertTrue(parsed.source.endsWith("display=1"))
+    }
+
+    @Test
+    fun appLayersOnMultipleDisplaysRemainUnavailableInsteadOfBeingSummed() {
+        val parsed = parseSurfaceFlingerDump(
+            """
+                Display 0 (active) HWC layers:
+                Z | Comp Type | Transform
+                DPULayerTest#10
+                  0 | DEVICE | 0
+                Display 1 (inactive) HWC layers:
+                Z | Comp Type | Transform
+                SurfaceView[DPULayerTest]#11
+                  0 | CLIENT | 0
+            """.trimIndent(),
+        )
+
+        assertNull(parsed.deviceLayers)
+        assertNull(parsed.clientLayers)
+        assertEquals(
+            SurfaceFlingerCompositionAvailability.PAIR_INVALID,
+            parsed.compositionAvailability,
+        )
+        assertTrue(parsed.detail.contains("scope ambiguous"))
+        assertEquals("dumpsys SurfaceFlinger --hwclayers", parsed.source)
+    }
+
+    @Test
+    fun partialUnknownOrMultiplyClassifiedAospRowsFailClosed() {
+        val partial = parseSurfaceFlingerDump(
+            """
+                Display 0 HWC layers:
+                Z | Comp Type | Transform
+                DPULayerTest#10
+            """.trimIndent(),
+        )
+        val unknown = parseSurfaceFlingerDump(
+            """
+                Display 0 HWC layers:
+                Z | Comp Type | Transform
+                DPULayerTest#10
+                  0 | INVALID | 0
+            """.trimIndent(),
+        )
+        val multiple = parseSurfaceFlingerDump(
+            """
+                Display 0 HWC layers:
+                Z | Comp Type | Comp Type | Transform
+                DPULayerTest#10
+                  0 | DEVICE | CLIENT | 0
+            """.trimIndent(),
+        )
+
+        listOf(partial, unknown, multiple).forEach { parsed ->
+            assertNull(parsed.deviceLayers)
+            assertNull(parsed.clientLayers)
+            assertEquals(
+                SurfaceFlingerCompositionAvailability.PAIR_INVALID,
+                parsed.compositionAvailability,
+            )
+        }
+    }
+
+    @Test
+    fun aospTableUsesOnlyTheUniqueCompositionColumn() {
+        val invalidComposition = parseSurfaceFlingerDump(
+            """
+                Display 0 HWC layers:
+                Z | Vendor Type | Comp Type
+                DPULayerTest#10
+                  0 | DEVICE | INVALID
+            """.trimIndent(),
+        )
+        val validComposition = parseSurfaceFlingerDump(
+            """
+                Display 0 HWC layers:
+                Z | Vendor Type | Comp Type
+                DPULayerTest#10
+                  0 | CLIENT | DEVICE
+            """.trimIndent(),
+        )
+
+        assertNull(invalidComposition.deviceLayers)
+        assertNull(invalidComposition.clientLayers)
+        assertEquals(
+            SurfaceFlingerCompositionAvailability.PAIR_INVALID,
+            invalidComposition.compositionAvailability,
+        )
+        assertEquals(1, validComposition.deviceLayers)
+        assertEquals(0, validComposition.clientLayers)
+    }
+
+    @Test
+    fun hostileLongRowsAndRepeatedExplicitPropertiesFailClosedWithoutMatchLists() {
+        val hostileTableRow = buildString {
+            append("  0 | INVALID")
+            repeat(350_000) {
+                append(" | DEVICE")
+            }
+        }
+        val table = parseSurfaceFlingerDump(
+            buildString {
+                appendLine("Display 0 HWC layers:")
+                appendLine("Z | Comp Type")
+                appendLine("DPULayerTest#10")
+                append(hostileTableRow)
+            },
+        )
+        val hostileExplicit = buildString {
+            append("DPULayerTest composition type=DEVICE")
+            repeat(120_000) {
+                append(" composition type=DEVICE")
+            }
+        }
+        val explicit = parseSurfaceFlingerDump(hostileExplicit)
+
+        assertTrue(hostileTableRow.length < 4 * 1_024 * 1_024)
+        assertTrue(hostileExplicit.length < 4 * 1_024 * 1_024)
+        listOf(table, explicit).forEach { parsed ->
+            assertNull(parsed.deviceLayers)
+            assertNull(parsed.clientLayers)
+            assertEquals(
+                SurfaceFlingerCompositionAvailability.PAIR_INVALID,
+                parsed.compositionAvailability,
+            )
+        }
+    }
+
+    @Test
+    fun legacySameLineIgnoresCompositionWordsBeforeTheExplicitProperty() {
+        val parsed = parseSurfaceFlingerDump(
+            "DPULayerTest CLIENT workload composition type=DEVICE",
+        )
+
+        assertEquals(1, parsed.deviceLayers)
+        assertEquals(0, parsed.clientLayers)
+        assertTrue(parsed.detail.contains("legacy unscoped single-section"))
+        assertTrue(parsed.source.endsWith("display=unscoped"))
+    }
+
+    @Test
+    fun displaySourceLabelIsSanitizedAndBounded() {
+        val unsafeLabel = "a".repeat(80) + " /unsafe?"
+        val parsed = parseSurfaceFlingerDump(
+            """
+                Display $unsafeLabel HWC layers:
+                Z | Comp Type | Transform
+                DPULayerTest#10
+                  0 | DEVICE | 0
+            """.trimIndent(),
+        )
+
+        assertEquals(1, parsed.deviceLayers)
+        assertTrue(parsed.source.endsWith("display=${"a".repeat(64)}"))
+        assertFalse(parsed.source.contains("/unsafe"))
+    }
+
+    @Test
+    fun malformedOrExcessiveDisplaySectionsRemainUnavailable() {
+        val malformed = parseSurfaceFlingerDump(
+            """
+                Display 0 HWC layers
+                DPULayerTest layer composition type=DEVICE
+            """.trimIndent(),
+        )
+        val excessive = parseSurfaceFlingerDump(
+            buildString {
+                repeat(17) { display ->
+                    appendLine("Display $display HWC layers:")
+                    appendLine("Z | Comp Type | Transform")
+                    appendLine("StatusBar#$display")
+                    appendLine("  0 | DEVICE | 0")
+                }
+            },
+        )
+
+        listOf(malformed, excessive).forEach { parsed ->
+            assertNull(parsed.deviceLayers)
+            assertNull(parsed.clientLayers)
+            assertEquals(
+                SurfaceFlingerCompositionAvailability.PAIR_INVALID,
+                parsed.compositionAvailability,
+            )
+        }
+    }
+
+    @Test
     fun parsesMultilineCompositionBlocks() {
         val dump = """
             Total missed frame count: 15

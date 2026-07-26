@@ -1,8 +1,10 @@
 package com.example.dpulayerlab.engine
 
 import com.example.dpulayerlab.model.BufferSize
+import com.example.dpulayerlab.model.BufferPresentation
 import com.example.dpulayerlab.model.HwcCompositionExpectation
 import com.example.dpulayerlab.model.LayerBackend
+import com.example.dpulayerlab.model.LayerOrientation
 import com.example.dpulayerlab.model.LayerSizeProfile
 import com.example.dpulayerlab.model.LoadSetpoints
 import com.example.dpulayerlab.model.LoadShape
@@ -18,6 +20,7 @@ import com.example.dpulayerlab.model.ScenarioSpec
 import com.example.dpulayerlab.model.SelectedDecoderBuffer
 import com.example.dpulayerlab.model.TransitionMode
 import com.example.dpulayerlab.model.TransitionSpec
+import com.example.dpulayerlab.model.requiresSelectedDecoderProducer
 import com.example.dpulayerlab.model.usesSelectedMediaDecoder
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -25,10 +28,126 @@ import org.junit.Test
 
 class ScenarioCatalogTest {
     @Test
+    fun rotatedFitMatrixCoversTwoFourAndEightKAtFixedNinetyDegrees() {
+        val scenario = requireNotNull(ScenarioCatalog.byId("rotated-resolution-fit-matrix"))
+        assertTrue(
+            setOf(BufferSize.FHD, BufferSize.UHD_4K, BufferSize.UHD_8K)
+                .all { size -> scenario.phases.any { it.bufferSize == size } },
+        )
+        assertTrue(
+            scenario.phases.all {
+                it.bufferPresentation == BufferPresentation.FIT &&
+                    it.layerOrientation == LayerOrientation.ROTATION_90
+            },
+        )
+        assertTrue(
+            scenario.phases.count { it.bufferSize == BufferSize.UHD_8K } >= 3,
+        )
+        assertTrue(scenario.phases.any { it.motion == MotionProfile.ZOOM_PAN })
+        assertTrue(scenario.phases.any { it.motion == MotionProfile.PARALLAX })
+    }
+
+    @Test
+    fun resolutionOnlySweepChangesNoOtherExperimentAxis() {
+        val scenario = requireNotNull(ScenarioCatalog.byId("resolution-only-sweep"))
+        assertEquals(
+            listOf(
+                BufferSize.HD_1K,
+                BufferSize.FHD,
+                BufferSize.UHD_4K,
+                BufferSize.UHD_8K,
+                BufferSize.UHD_4K,
+                BufferSize.FHD,
+                BufferSize.HD_1K,
+            ),
+            scenario.phases.map { it.bufferSize },
+        )
+        val reference = scenario.phases.first()
+        scenario.phases.drop(1).forEach { phase ->
+            assertEquals(
+                reference.copy(
+                    id = phase.id,
+                    label = phase.label,
+                    bufferSize = phase.bufferSize,
+                ),
+                phase,
+            )
+        }
+        scenario.phases.forEach {
+            assertEquals(1, it.activeLayers)
+            assertEquals(30f, it.producerFps)
+            assertEquals(60f, it.requestedDisplayHz)
+            assertEquals(BufferPresentation.FIT, it.bufferPresentation)
+            assertEquals(LayerOrientation.ROTATION_0, it.layerOrientation)
+            assertEquals(MotionProfile.STATIC, it.motion)
+            assertEquals(LoadSetpoints(), it.workloads)
+        }
+    }
+
+    @Test
+    fun eightKPresentationAbaChangesOnlyProjectionMode() {
+        val scenario = requireNotNull(ScenarioCatalog.byId("8k-presentation-fit-crop-aba"))
+        assertEquals(
+            listOf(
+                BufferPresentation.FIT,
+                BufferPresentation.PIXEL_1_TO_1_CROP,
+                BufferPresentation.FIT,
+            ),
+            scenario.phases.map { it.bufferPresentation },
+        )
+        val reference = scenario.phases.first()
+        scenario.phases.drop(1).forEach { phase ->
+            assertEquals(
+                reference.copy(
+                    id = phase.id,
+                    label = phase.label,
+                    bufferPresentation = phase.bufferPresentation,
+                ),
+                phase,
+            )
+        }
+    }
+
+    @Test
+    fun resolutionLoadSweepCoversOneToEightKInBothDirections() {
+        val scenario = requireNotNull(ScenarioCatalog.byId("resolution-load-sweep"))
+        assertEquals(
+            listOf(
+                BufferSize.HD_1K,
+                BufferSize.FHD,
+                BufferSize.UHD_4K,
+                BufferSize.UHD_8K,
+                BufferSize.UHD_4K,
+                BufferSize.FHD,
+                BufferSize.HD_1K,
+            ),
+            scenario.phases.map { it.bufferSize },
+        )
+        val peakIndex = scenario.phases.indexOfFirst {
+            it.bufferSize == BufferSize.UHD_8K
+        }
+        assertEquals(3, peakIndex)
+        assertTrue(
+            scenario.phases.take(peakIndex + 1)
+                .zipWithNext()
+                .all { (first, second) ->
+                    second.workloads.memory >= first.workloads.memory
+                },
+        )
+        assertTrue(
+            scenario.phases.drop(peakIndex)
+                .zipWithNext()
+                .all { (first, second) ->
+                    second.workloads.memory <= first.workloads.memory
+                },
+        )
+    }
+
+    @Test
     fun presetIdsAreUniqueAndPhasesAreRunnable() {
         val presets = ScenarioCatalog.presets
         assertEquals(presets.size, presets.map { it.id }.distinct().size)
-        assertEquals(32, presets.size)
+        assertEquals(40, presets.size)
         assertTrue(
             setOf(
                 "dpu-device-envelope-burst",
@@ -46,6 +165,10 @@ class ScenarioCatalogTest {
                 "gradual-load-transitions",
                 "continuous-crossload-ramp",
                 "adaptive-underrun-hunt",
+                "4k60-video-visibility",
+                "4k60-video-load-surge-drop",
+                "8k60-video-visibility",
+                "8k60-video-load-surge-drop",
             ).all { ScenarioCatalog.byId(it) != null },
         )
         presets.forEach { scenario ->
@@ -78,6 +201,112 @@ class ScenarioCatalogTest {
                     )
                 }
             }
+        }
+    }
+
+    @Test
+    fun actualVideoVisibilityPresetsUseOneRealDecoderSurfaceAtSixtyFps() {
+        listOf(
+            "4k60-video-visibility" to BufferSize.UHD_4K,
+            "8k60-video-visibility" to BufferSize.UHD_8K,
+        ).forEach { (scenarioId, expectedSize) ->
+            val scenario = checkNotNull(ScenarioCatalog.byId(scenarioId))
+
+            assertEquals(3, scenario.phases.size)
+            assertEquals(
+                listOf(
+                    LayerOrientation.ROTATION_0,
+                    LayerOrientation.ROTATION_90,
+                    LayerOrientation.ROTATION_0,
+                ),
+                scenario.phases.map { it.layerOrientation },
+            )
+            assertEquals(
+                listOf(
+                    MotionProfile.STATIC,
+                    MotionProfile.STATIC,
+                    MotionProfile.ZOOM_PAN,
+                ),
+                scenario.phases.map { it.motion },
+            )
+            scenario.phases.forEach { phase ->
+                assertEquals(1, phase.activeLayers)
+                assertEquals(60f, phase.producerFps)
+                assertEquals(60f, phase.requestedDisplayHz)
+                assertEquals(PixelRoute.YUV_420, phase.pixelRoute)
+                assertEquals(expectedSize, phase.bufferSize)
+                assertEquals(BufferPresentation.FIT, phase.bufferPresentation)
+                assertEquals(LoadSetpoints(), phase.workloads)
+                assertTrue(!phase.includeGlLayer)
+                assertTrue(!phase.alphaOverlap)
+            }
+        }
+    }
+
+    @Test
+    fun videoLoadSurgeDropPresetsUseDecoderAtEveryExplicitRebuildStage() {
+        listOf(
+            Triple(
+                "4k60-video-load-surge-drop",
+                BufferSize.UHD_4K,
+                listOf(1, 8, 1, 5, 1),
+            ),
+            Triple(
+                "8k60-video-load-surge-drop",
+                BufferSize.UHD_8K,
+                listOf(1, 5, 1, 3, 1),
+            ),
+        ).forEach { (scenarioId, expectedSize, expectedLayers) ->
+            val scenario = checkNotNull(ScenarioCatalog.byId(scenarioId))
+
+            assertEquals(expectedLayers, scenario.phases.map { it.activeLayers })
+            assertTrue(scenario.description.contains("단계 전환 시 decoder Surface를 새로 준비"))
+            scenario.phases.forEach { phase ->
+                assertEquals(60f, phase.producerFps)
+                assertEquals(60f, phase.requestedDisplayHz)
+                assertEquals(PixelRoute.YUV_420, phase.pixelRoute)
+                assertEquals(expectedSize, phase.bufferSize)
+                assertTrue(phase.pixelRoute.usesSelectedMediaDecoder())
+                assertTrue(!phase.includeGlLayer)
+            }
+            listOf(0, 2, 4).forEach { phaseIndex ->
+                assertEquals(LoadSetpoints(), scenario.phases[phaseIndex].workloads)
+            }
+            assertTrue(scenario.phases[1].workloads.memory > 0f)
+            assertTrue(scenario.phases[3].workloads.memory > 0f)
+        }
+    }
+
+    @Test
+    fun decoderBackedPhasesExceedTenPercentOfNominalCatalogDuration() {
+        val totalDurationMs = ScenarioCatalog.presets.sumOf { it.durationMs }
+        val decoderDurationMs = ScenarioCatalog.presets.sumOf { scenario ->
+            scenario.phases
+                .filter(PhaseSpec::requiresSelectedDecoderProducer)
+                .sumOf { it.durationMs }
+        }
+
+        assertEquals(1_870_000L, totalDurationMs)
+        assertEquals(318_000L, decoderDurationMs)
+        assertTrue(totalDurationMs > 0L)
+        assertTrue(decoderDurationMs > 0L)
+        assertTrue(Math.multiplyExact(decoderDurationMs, 10L) > totalDurationMs)
+    }
+
+    @Test
+    fun everyActualDecoderPhaseUsesFourKOrEightKAtSixtyFps() {
+        val decoderPhases = ScenarioCatalog.presets
+            .flatMap(ScenarioSpec::phases)
+            .filter(PhaseSpec::requiresSelectedDecoderProducer)
+
+        assertTrue(decoderPhases.isNotEmpty())
+        decoderPhases.forEach { phase ->
+            assertTrue(
+                phase.bufferSize == BufferSize.UHD_4K ||
+                    phase.bufferSize == BufferSize.UHD_8K,
+            )
+            assertEquals(60f, phase.producerFps)
+            assertTrue(phase.requestedDisplayHz >= 60f)
         }
     }
 
@@ -119,6 +348,8 @@ class ScenarioCatalogTest {
             "transform-storm",
             "resource-pulse",
             "adaptive-underrun-hunt",
+            "4k60-video-load-surge-drop",
+            "8k60-video-load-surge-drop",
             "dvfs-single-layer-wake",
             "dvfs-composition-shock",
             "dpu-device-envelope-burst",
@@ -316,10 +547,13 @@ class ScenarioCatalogTest {
     }
 
     @Test
-    fun dpuOnlyRepeatShockChangesOnlyLayerFpsAndHzAndEndsRecovered() {
+    fun displayPipelineRepeatShockKeepsGeneratedCrossLoadsZeroAndEndsRecovered() {
         val scenario = checkNotNull(ScenarioCatalog.byId("dpu-only-repeat-shock"))
         assertEquals(ScenarioCategory.TRANSITION, scenario.category)
         assertEquals(7, scenario.phases.size)
+        assertTrue(scenario.name.contains("Display-pipeline"))
+        assertTrue(scenario.description.contains("producer Canvas draw"))
+        assertTrue(scenario.description.contains("DPU 단일축이 아닌"))
 
         val low = scenario.phases.first()
         val burstIndices = listOf(1, 3, 5)
@@ -773,44 +1007,44 @@ class ScenarioCatalogTest {
     }
 
     @Test
-    fun eightKThirtyAndSixtyPresetsHaveIndependentMediaRequirements() {
-        val thirty = checkNotNull(ScenarioCatalog.byId("8k-decoder-pressure"))
-        val sixty = checkNotNull(ScenarioCatalog.byId("8k60-p010-pressure"))
-        val thirtyDecoderPhases =
-            thirty.phases.filter { it.pixelRoute.usesSelectedMediaDecoder() }
-        val sixtyDecoderPhases =
-            sixty.phases.filter { it.pixelRoute.usesSelectedMediaDecoder() }
+    fun eightKSixtyYuvAndP010PresetsHaveIndependentMediaRequirements() {
+        val yuv = checkNotNull(ScenarioCatalog.byId("8k-decoder-pressure"))
+        val p010 = checkNotNull(ScenarioCatalog.byId("8k60-p010-pressure"))
+        val yuvDecoderPhases =
+            yuv.phases.filter { it.pixelRoute.usesSelectedMediaDecoder() }
+        val p010DecoderPhases =
+            p010.phases.filter { it.pixelRoute.usesSelectedMediaDecoder() }
 
-        assertTrue(thirtyDecoderPhases.isNotEmpty())
+        assertTrue(yuvDecoderPhases.isNotEmpty())
         assertTrue(
-            thirtyDecoderPhases.all {
+            yuvDecoderPhases.all {
                 it.pixelRoute == PixelRoute.YUV_420 &&
                     it.bufferSize == BufferSize.UHD_8K &&
-                    it.producerFps == 30f
+                    it.producerFps == 60f
             },
         )
-        assertEquals(setOf("8K30 decoder", "8K 30fps local media"), thirty.requirements)
+        assertEquals(setOf("8K60 decoder", "8K 60fps local media"), yuv.requirements)
 
-        assertTrue(sixtyDecoderPhases.isNotEmpty())
+        assertTrue(p010DecoderPhases.isNotEmpty())
         assertTrue(
-            sixtyDecoderPhases.all {
+            p010DecoderPhases.all {
                 it.pixelRoute == PixelRoute.P010 &&
                     it.bufferSize == BufferSize.UHD_8K &&
                     it.producerFps == 60f
             },
         )
-        val sixtyPressure = sixtyDecoderPhases.single()
-        assertTrue(sixtyPressure.includeGlLayer)
+        val p010Pressure = p010DecoderPhases.single()
+        assertTrue(p010Pressure.includeGlLayer)
         assertEquals(
             "decoder primary + six overlays + GL tail",
             8,
-            sixtyPressure.activeLayers,
+            p010Pressure.activeLayers,
         )
         assertEquals(
             setOf("8K60 10-bit decoder", "8K 60fps 10-bit local media"),
-            sixty.requirements,
+            p010.requirements,
         )
-        listOf(thirty, sixty).forEach { scenario ->
+        listOf(yuv, p010).forEach { scenario ->
             assertEquals("release", scenario.phases.last().id)
             assertEquals(LoadSetpoints(), scenario.phases.last().workloads)
         }
@@ -821,7 +1055,7 @@ class ScenarioCatalogTest {
         val scenarios = ScenarioCatalog.presets.filter {
             it.category == ScenarioCategory.TRANSITION
         }
-        assertEquals(9, scenarios.size)
+        assertEquals(10, scenarios.size)
         assertEquals(
             setOf(
                 "instant-isolated-contention",
@@ -833,6 +1067,7 @@ class ScenarioCatalogTest {
                 "gradual-layer-size-expansion",
                 "abrupt-layer-size-toggle",
                 "layer-size-fps-burst",
+                "resolution-load-sweep",
             ),
             scenarios.mapTo(mutableSetOf()) { it.id },
         )
@@ -1223,6 +1458,8 @@ class ScenarioCatalogTest {
         val backend: LayerBackend,
         val pixelRoute: PixelRoute,
         val bufferSize: BufferSize,
+        val bufferPresentation: BufferPresentation,
+        val layerOrientation: LayerOrientation,
         val motion: MotionProfile,
         val layerSizeProfile: LayerSizeProfile,
         val alphaOverlap: Boolean,
@@ -1236,6 +1473,8 @@ class ScenarioCatalogTest {
         backend = backend,
         pixelRoute = pixelRoute,
         bufferSize = bufferSize,
+        bufferPresentation = bufferPresentation,
+        layerOrientation = layerOrientation,
         motion = motion,
         layerSizeProfile = layerSizeProfile,
         alphaOverlap = alphaOverlap,
@@ -1249,6 +1488,8 @@ class ScenarioCatalogTest {
         val backend: LayerBackend,
         val pixelRoute: PixelRoute,
         val bufferSize: BufferSize,
+        val bufferPresentation: BufferPresentation,
+        val layerOrientation: LayerOrientation,
         val motion: MotionProfile,
         val layerSizeProfile: LayerSizeProfile,
         val workloads: LoadSetpoints,
@@ -1264,6 +1505,8 @@ class ScenarioCatalogTest {
         backend = backend,
         pixelRoute = pixelRoute,
         bufferSize = bufferSize,
+        bufferPresentation = bufferPresentation,
+        layerOrientation = layerOrientation,
         motion = motion,
         layerSizeProfile = layerSizeProfile,
         workloads = workloads,

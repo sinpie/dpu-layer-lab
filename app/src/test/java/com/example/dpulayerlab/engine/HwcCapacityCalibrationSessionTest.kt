@@ -80,7 +80,7 @@ class HwcCapacityCalibrationSessionTest {
         assertTrue(neverRenderedReuse.result.eventDetail().contains("candidate=N/A"))
         assertTrue(
             neverRenderedReuse.result.uiSummary()
-                .contains("요청 20L · 실제 후보 N/A"),
+                .contains("요청 20L · 실제 producer 후보 N/A"),
         )
     }
 
@@ -150,7 +150,7 @@ class HwcCapacityCalibrationSessionTest {
         assertEquals(innerDisplay.shortEdgePx, stored.calibrationDisplayShortEdgePx)
         assertEquals(innerDisplay.longEdgePx, stored.calibrationDisplayLongEdgePx)
         assertTrue(stored.eventDetail().contains("requested=20; candidate=12"))
-        assertTrue(stored.uiSummary().contains("요청 20L · 실제 후보 12L"))
+        assertTrue(stored.uiSummary().contains("요청 20L · 실제 producer 후보 12P"))
     }
 
     @Test(expected = IllegalArgumentException::class)

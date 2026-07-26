@@ -163,6 +163,15 @@ ordered load zero와 acknowledgment가 실패할 때 run을 중단한다.
 
 ### Battery Saver 때문에 시작되지 않음
 
+이 사유로 시작이 거부되면 snackbar의 `설정 열기`를 눌러 Android 배터리 절약 설정으로
+이동할 수 있습니다. 이동은 performance-policy 원상복구, plan finalizer와 Test Window
+SystemUI 복구가 모두 확인될 때까지 자동 보류됩니다. Activity가 잠시 background로 가면
+요청을 잃지 않고 foreground 복귀 뒤 이어서 확인하며, defer timeout 또는 설정 Activity
+실행 실패 시 같은 `설정 열기` action을 다시 제공합니다. 전용 Battery Saver 화면을
+처리할 수 없는 기기에서는 일반 Android 설정으로 fallback합니다. 설정에서 Battery
+Saver를 끈 뒤 앱으로 돌아와 새 plan을 시작합니다. 이 이동 기능은 설정 화면만 열며 앱이
+system policy를 직접 변경하지 않습니다.
+
 비절전 envelope의 active run 중 Battery Saver가 다시 켜지면
 `SAFETY_ENVELOPE_CHANGED`로 중단한다. Vendor API v3가 없어도 Battery Saver가 이미
 OFF라면 app-only monitoring으로 실행할 수 있다. Saver가 ON이거나 원격 변경 여부가

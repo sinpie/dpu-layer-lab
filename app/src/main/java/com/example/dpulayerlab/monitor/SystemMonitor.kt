@@ -10,6 +10,7 @@ import android.os.SystemClock
 import android.view.Display
 import com.example.dpulayerlab.engine.LoadManager
 import com.example.dpulayerlab.model.Gauge
+import com.example.dpulayerlab.model.HwcCompositionEvidenceAvailability
 import com.example.dpulayerlab.model.MetricQuality
 import com.example.dpulayerlab.model.SensorReading
 import com.example.dpulayerlab.model.TelemetrySnapshot
@@ -402,6 +403,8 @@ class SystemMonitor private constructor(
                     detail =
                         "SurfaceFlinger fallback suppressed because vendor telemetry " +
                             "worker completion was not confirmed",
+                    compositionAvailability =
+                        SurfaceFlingerCompositionAvailability.PROBE_FAILED,
                 ),
                 completedMonotonicMs = SystemClock.elapsedRealtime(),
             )
@@ -516,6 +519,24 @@ class SystemMonitor private constructor(
             observedMonotonicMs = evidenceMonotonicMs,
             maxAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
         )
+        val hwcCompositionEvidenceAvailability =
+            classifyHwcCompositionEvidenceAvailability(
+                policy = request.surfaceFlingerProbePolicy,
+                selected = hwcCompositionEvidence,
+                vendorDeviceLayers = vendor?.deviceLayers,
+                vendorClientLayers = vendor?.clientLayers,
+                vendorSource = vendorSource,
+                vendorCompletedMonotonicMs = vendorEvidenceCompletedMonotonicMs,
+                vendorSessionVerified =
+                    vendorCompositionPathCanReplaceSurfaceFlinger(
+                        verifiedVendorCompositionSession =
+                            verifiedVendorCompositionSession,
+                        currentVendorServiceSession = currentVendorServiceSession,
+                    ),
+                surfaceFlinger = compositionEvidence,
+                observedMonotonicMs = evidenceMonotonicMs,
+                maxAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
+            )
         latestReadings = buildList {
             vendorBrokerAvailability.failure?.let { failure ->
                 add(
@@ -692,6 +713,7 @@ class SystemMonitor private constructor(
             hwcCompositionEvidenceMonotonicMs =
                 hwcCompositionEvidence.completedMonotonicMs,
             hwcCompositionEvidenceAgeMs = hwcCompositionEvidence.ageMs,
+            hwcCompositionEvidenceAvailability = hwcCompositionEvidenceAvailability,
             surfaceFlingerHwcMissed = composition.hwcMissedFrames,
             surfaceFlingerGpuMissed = composition.gpuMissedFrames,
             surfaceFlingerMissSource = if (
@@ -1175,6 +1197,13 @@ internal fun projectCompositionEvidence(
             CompositionSnapshot(
                 source = evidence?.snapshot?.source.orEmpty(),
                 detail = "SurfaceFlinger evidence unavailable or stale",
+                compositionAvailability =
+                    if (ageMs != null && ageMs > maxAgeMs) {
+                        SurfaceFlingerCompositionAvailability.STALE
+                    } else {
+                        evidence?.snapshot?.compositionAvailability
+                            ?: SurfaceFlingerCompositionAvailability.UNKNOWN
+                    },
             )
         },
         completedMonotonicMs = completedMonotonicMs,
@@ -1244,6 +1273,105 @@ internal fun selectHwcCompositionEvidence(
         quality = MetricQuality.SYSTEM_SERVICE,
         completedMonotonicMs = surfaceFlinger.completedMonotonicMs,
     ) ?: HwcCompositionEvidenceProjection()
+}
+
+private enum class VendorCompositionPairAvailability {
+    AVAILABLE,
+    UNAVAILABLE,
+    INVALID,
+    STALE,
+}
+
+/**
+ * Produces one bounded reason code for the same evidence selection published in telemetry.
+ *
+ * Active-load policies intentionally give the vendor path precedence in the reason: SurfaceFlinger
+ * is suppressed by policy there, so a missing DUMP permission was never the cause of that sample.
+ * Idle/calibration paths instead expose the typed SurfaceFlinger failure that was actually
+ * observed. No localized [CompositionSnapshot.detail] text is parsed.
+ */
+internal fun classifyHwcCompositionEvidenceAvailability(
+    policy: SurfaceFlingerProbePolicy,
+    selected: HwcCompositionEvidenceProjection,
+    vendorDeviceLayers: Int?,
+    vendorClientLayers: Int?,
+    vendorSource: String?,
+    vendorCompletedMonotonicMs: Long?,
+    vendorSessionVerified: Boolean,
+    surfaceFlinger: CompositionEvidenceProjection,
+    observedMonotonicMs: Long,
+    maxAgeMs: Long,
+): HwcCompositionEvidenceAvailability {
+    require(observedMonotonicMs >= 0L)
+    require(maxAgeMs >= 0L)
+
+    if (
+        selected.deviceLayers?.let { it >= 0 } == true &&
+        selected.clientLayers?.let { it >= 0 } == true &&
+        selected.quality != MetricQuality.UNAVAILABLE &&
+        selected.source.isNotBlank() &&
+        selected.completedMonotonicMs?.let { it in 0L..observedMonotonicMs } == true &&
+        selected.ageMs?.let { it in 0L..maxAgeMs } == true
+    ) {
+        return HwcCompositionEvidenceAvailability.AVAILABLE
+    }
+
+    val vendorPairAvailability = when {
+        vendorDeviceLayers == null && vendorClientLayers == null ->
+            VendorCompositionPairAvailability.UNAVAILABLE
+        vendorDeviceLayers == null ||
+            vendorClientLayers == null ||
+            vendorDeviceLayers < 0 ||
+            vendorClientLayers < 0 ||
+            !vendorSessionVerified ||
+            vendorSource.isNullOrBlank() ->
+            VendorCompositionPairAvailability.INVALID
+        vendorCompletedMonotonicMs == null ||
+            vendorCompletedMonotonicMs < 0L ||
+            vendorCompletedMonotonicMs > observedMonotonicMs ->
+            VendorCompositionPairAvailability.INVALID
+        observedMonotonicMs - vendorCompletedMonotonicMs > maxAgeMs ->
+            VendorCompositionPairAvailability.STALE
+        else -> VendorCompositionPairAvailability.AVAILABLE
+    }
+
+    if (
+        policy == SurfaceFlingerProbePolicy.TYPED_BOUNDARY ||
+        policy == SurfaceFlingerProbePolicy.SUPPRESS_DURING_LOAD
+    ) {
+        return when (vendorPairAvailability) {
+            VendorCompositionPairAvailability.UNAVAILABLE ->
+                HwcCompositionEvidenceAvailability.ACTIVE_RUN_VENDOR_PAIR_UNAVAILABLE
+            VendorCompositionPairAvailability.STALE ->
+                HwcCompositionEvidenceAvailability.ACTIVE_RUN_VENDOR_PAIR_STALE
+            VendorCompositionPairAvailability.AVAILABLE,
+            VendorCompositionPairAvailability.INVALID ->
+                HwcCompositionEvidenceAvailability.ACTIVE_RUN_VENDOR_PAIR_INVALID
+        }
+    }
+
+    return when (surfaceFlinger.snapshot.compositionAvailability) {
+        SurfaceFlingerCompositionAvailability.DUMP_PERMISSION_UNAVAILABLE ->
+            HwcCompositionEvidenceAvailability.DUMP_PERMISSION_UNAVAILABLE
+        SurfaceFlingerCompositionAvailability.PAIR_UNAVAILABLE ->
+            HwcCompositionEvidenceAvailability.SURFACE_FLINGER_PAIR_UNAVAILABLE
+        SurfaceFlingerCompositionAvailability.PAIR_INVALID ->
+            HwcCompositionEvidenceAvailability.SURFACE_FLINGER_PAIR_INVALID
+        SurfaceFlingerCompositionAvailability.STALE ->
+            HwcCompositionEvidenceAvailability.SURFACE_FLINGER_EVIDENCE_STALE
+        SurfaceFlingerCompositionAvailability.PROBE_FAILED ->
+            HwcCompositionEvidenceAvailability.SURFACE_FLINGER_PROBE_FAILED
+        SurfaceFlingerCompositionAvailability.AVAILABLE ->
+            HwcCompositionEvidenceAvailability.SURFACE_FLINGER_PAIR_INVALID
+        SurfaceFlingerCompositionAvailability.UNKNOWN -> when {
+            surfaceFlinger.ageMs?.let { it > maxAgeMs } == true ->
+                HwcCompositionEvidenceAvailability.SURFACE_FLINGER_EVIDENCE_STALE
+            surfaceFlinger.snapshot.deviceLayers != null ||
+                surfaceFlinger.snapshot.clientLayers != null ->
+                HwcCompositionEvidenceAvailability.SURFACE_FLINGER_PAIR_INVALID
+            else -> HwcCompositionEvidenceAvailability.UNAVAILABLE
+        }
+    }
 }
 
 internal data class CpuTimes(

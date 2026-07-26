@@ -112,8 +112,14 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
    binding 없이 procedural RGBA proxy로 실행하지 않는다. Source/capability FPS는
    phase target뿐 아니라 decoder topology에서 도달 가능한 transition origin까지
    검사하며 gradual transition은 직전 FPS 전체, STEP은 `min(60, 직전 FPS)`를 포함한다.
-10. **traffic은 별도 모델이다.** hardware counter와 합치지 않고 linear full-buffer
-   estimate로만 표시한다. Selected decoder primary의 B/px는 요청 route가 아니라
+   모든 preset은 선택 URI 하나를 공유한다. 4K60 preset의 `UHD_4K`는 visible 4K 이상과
+   source 60fps 이상의 minimum이며 더 큰 실제 source를 허용하고, HUD는 실제 source
+   class·visible dimensions·FPS와 minimum을 분리해 표시한다.
+10. **traffic은 별도 모델이다.** hardware counter와 합치지 않고 workload producer만의
+   linear full-buffer scanout-input/producer-write reference로 표시한다. Activity
+   root/HUD, SystemUI, actual CLIENT fallback과 vendor-specific DPU fetch를 포함하지
+   않으므로 actual DPU traffic이라고 부르지 않는다. Selected decoder primary의 B/px는
+   요청 route가 아니라
    extractor MIME/profile에서 검증한 8-bit YUV420(1.5) 또는 10-bit P010(3.0) descriptor를
    사용하며 판별 불가이거나 B/px가 non-finite/0 이하/16 초과이면 aggregate traffic은
    `N/A`다. VP9 Profile 2는 canonical `vp09.02.<level>.10...`에서 bit-depth 10이
@@ -149,10 +155,17 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
 15. **실험 선택은 직교 facet과 ordered queue다.** Catalog의 카테고리·변화 파형·예상
     강도·부하/조건은 같은 facet 안에서 OR, facet 사이에서 AND로 결합한다. Filter
     결과는 catalog 순서로 queue에 append/replace하고, queue는 중복과 명시적 이동을
-    보존하되 복원된 unknown ID는 실행 index를 만들기 전에 제거한다. Repeat는 1~10,
-    expanded plan은 40 run 상한이다. DPU 저→고 burst와 HWC DEVICE/CLIENT 목적도
+    보존하되 복원된 unknown ID는 실행 index를 만들기 전에 제거한다. 앱 UI repeat
+    `N`은 전체 queue를 N회 실행하며, `N > 1`인 회차 경계에서만 마지막 scenario 다음에
+    첫 scenario로 돌아간다. 1은 전체 queue 한 번이며 수동 목록에는 임의의 고정
+    entry/expanded-run 상한을 두지 않는다. 외부 Intent는 기존 expanded 40-run 상한을
+    유지한다. Repeat는 전체 expanded list로 만들지 않고 queue×repeat 중첩 순회로
+    실행한다.
+    실행 직전의 1/2/5/10/50/100× 시간 배율은 immutable plan copy의 phase duration과
+    transition window/cycle에 정확히 한 번 적용한 뒤 기존 duration safety cap을
+    통과한다. DPU 저→고 burst와 HWC DEVICE/CLIENT 목적도
     phase의 typed control/expectation으로 분류하며 이름이나 tag에서 실행 의미를
-    추론하지 않는다. UI는 기본 정보를 `테스트 선택`과 `순서·반복` 두 단계로 분리하고
+    추론하지 않는다. UI는 기본 정보를 `테스트 선택`과 `순서·반복·시간` 두 단계로 분리하고
     목적 선택과 일괄 queue mutation을 중복 배치하지 않는다. Catalog subtree는
     saveable-state holder로 step/filter/펼침/scroll을 보존한다. Queue/facet/repeat
     action은 event 시점의 최신 state를 다시 sanitize/reduce해 빠른 연속 입력의
@@ -167,7 +180,9 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
     있었다면 임시 해제 중에도 power-save safety envelope를 유지한다. Broker가 없고
     Saver가 이미 꺼진 경우만 app-only monitor로 실행한다. Thermal/low-memory 보호는
     비활성화하지 않고, Doze/device-idle은 강제 해제하지 않으며, DVFS/governor/frequency
-    write나 lock은 하지 않는다.
+    write나 lock은 하지 않는다. Saver가 켜져 시작이 거부되면 UI는 전용 Battery Saver
+    설정, 일반 설정 순서의 명시적 navigation action만 제공하고 앱이 정책을 직접
+    변경하지 않는다. 복귀 뒤에는 새 plan이 상태를 처음부터 다시 검증한다.
 17. **장기 자원에는 명시적 owner와 cleanup 증거가 필요하다.** Activity보다 오래 살 수
     있는 monitor/vendor/load cleanup은 application context 또는 Activity-free callback만
     보유한다. Renderer container, receiver, coroutine, worker, codec/EGL/Surface,
@@ -226,6 +241,13 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
     `LAYER_SIZE_COVERAGE_MISSING`/`INCONCLUSIVE`, 충족되면 `LAYER_SIZE_COVERAGE`를
     남긴다. Narrow stage horizontal stagger는 scale-aware bound로 최소 1 px visibility를
     유지한다.
+19. **Source buffer projection은 allocation과 분리한다.** `BufferPresentation.FIT`은
+    고정 0°/90° orientation을 반영해 motion 전 전체 source를 aspect-preserving
+    letterbox하고, `PIXEL_1_TO_1_CROP`은 source 1 px와 display 1 px를 맞춘 centered
+    overflow crop이다. 고정 orientation은 motion과 별도다. 1:1은 `FULL_SCREEN`과
+    non-scaling motion만, `CAPACITY_TILES`는 FIT/0°만 허용한다. 이 projection·rotation은
+    full source graphics budget과 linear traffic estimate를 줄이지 않으며 discrete
+    변경은 fresh generation/readiness/evidence를 다시 요구한다.
 
 ## 반드시 유지할 불변식
 
@@ -242,7 +264,7 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
   phase가 1 layer로 clamp될 때는 GL-only로 바뀌지 않도록 primary를 보존한다. GL
   color와 보수적 depth attachment는 각각 triple-buffered budget에 포함한다.
 - `FLATTENED_TEXTURE`는 logical layer 수와 무관한 display-sized RGBA 단일 physical
-  producer이며 decoder route 또는 explicit 4K/8K buffer라고 보고하지 않는다. Custom
+  producer이며 decoder route 또는 explicit non-DISPLAY buffer라고 보고하지 않는다. Custom
   입력의 incompatible route/size는 UI label/tag와 함께 DISPLAY/RGB로 정규화한다.
 - Flattened 1-layer의 GPU intensity도 실제 hardware-canvas work를 바꿔야 한다. 0은
   기본 pass, policy를 통과한 `0.001` 초과 값은 intensity에 따라 bounded 1~8 extra
@@ -359,6 +381,10 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
   시작하지 않으며, activation 직전 fresh counter sample 뒤 first-buffer 관측을
   새로 시작한다. 같은 generation의 반복 expected publication은 최초 publication
   epoch를 바꾸지 않는다.
+- Expected set과 함께 같은 generation의 ordered typed `AppProducerTopology`을 한 번
+  commit한다. Descriptor는 producer ID, layer index, V/S/T/G/F kind와 primary identity를
+  보존한다. Commit 전 planned role은 HUD outline일 뿐이고 commit 뒤에만 fill이며, 이
+  app producer map은 SurfaceFlinger/HWC layer identity나 assignment가 아니다.
 - active topology가 pending으로 바뀌는 callback은 그 timestamp와 aggregate physical
   frame total로 expected budget을 즉시 정산·pause하고 교차 부하를 0으로 내린다.
   Controller의 다음 100 ms poll 경계까지 이전 producer count를 적분하거나 부하를
@@ -375,6 +401,13 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
   discontinuity다. Lifecycle callback에서 즉시 pending과 evidence clear를 수행하고,
   fresh geometry acknowledgment와 forced expected-set publication 뒤의 frame만 새
   readiness로 사용한다.
+- Decoder frame은 typed committed topology의 같은 generation·producer ID,
+  `VIDEO_DECODER` kind와 primary identity에 결속된
+  `MediaCodec.OnFrameRenderedListener` callback만 evidence로 받는다. Generation 누계와
+  observation count, last-frame age와 control revision을 분리한다. Pending/teardown/rebuild는
+  observation count·age·revision을 reset하고, generation 누계는 report용으로만 보존한다.
+  Fresh matching callback과 revision이 확인된 `ACTIVE`도 app decoder producer evidence일
+  뿐 HWC assignment나 DPU scanout 증거가 아니다.
 - Renderer resource owner storage는 bounded maximum을 child 생성 전에 선할당한다.
   Thread-start/stop/release callback의 알림이 실패해도 detach, interrupt, looper quit,
   bounded join과 owner clear를 끝까지 시도한다. Ordinary rollback failure도 성공
@@ -518,7 +551,11 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
   두는 이유는 Activity 재생성·후속 START에는 재측정 부하를 만들지 않으면서 다른
   process/device 환경에는 오래된 경계를 적용하지 않기 위해서다. 결과는 matching opaque
   RGB topology의 advisory이며 universal maximum, safety cap 또는 typed phase evidence가
-  아니다. 요청 topology, deadline, display scope, telemetry serialization과 cleanup의
+  아니다. 현재 raw D/C/T는 Activity root/control과 workload producer가 분리되지
+  않으므로 candidate producer 수와 raw D/T의 차이로 producer ceiling을 추론하지
+  않는다. Reuse guidance도 candidate producer와 observed app raw D/C를 분리하고
+  workload device ceiling은 N/A로 유지한다. 요청 topology, deadline, display scope,
+  telemetry serialization과 cleanup의
   현재 계약은
   [HWC capacity calibration](docs/HWC_CAPACITY_CALIBRATION.md)이 authority다.
   Producer-active poll과 100ms stabilization은 post-sample reserve를 침범하지 않도록
@@ -532,8 +569,19 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
 - Active phase는 SurfaceFlinger child를 생성하지 않는다. Typed boundary도 fresh vendor
   pair만 사용하고 없으면 INCONCLUSIVE다. Session calibration의 SF cache를 phase evidence로
   재사용하지 않으며 untyped active sweep도 vendor pair가 없으면 N/A를 보존한다.
-- 실행 HUD의 typed HWC 상태는 동일 source·quality·timestamp이고 2.5초 freshness를
-  만족한 현재 pair만 `RAW MATCH/WAIT`로 표시하며 그 밖은 `RAW N/A`다. 이는 target
+- 실행 HUD는 동일 source·quality·timestamp이고 2.5초 freshness를 만족한 tuple만
+  `HWC APP RAW D/C/T · AGE · SRC`와 typed `현재값 일치/불일치`로 표시하며 그 밖은
+  반복 N/A 대신 `HWC 합성 계측 · 측정값 없음 · bounded reason`을 표시한다.
+  `T=D+C`는 같은 tuple의 합이지 physical producer count가 아니다.
+  Pure Compose HUD subtree는 추가 Surface를 만들지 않지만 Activity root/window
+  layer는 남고 HWC assignment를 강제할 수 없다. 현재 tuple은 control/root와
+  workload producer의 per-layer scope를 분리하지 않으므로
+  `APP_RAW_UNSEPARATED`, control/root 무보정과 PHYSICAL producer 분리를 표시한다.
+  동적 HUD text/progress는 최대
+  1 Hz로 제한한다. 이를 위해 상위 renderer의 100 ms recomposition과 분리된 immutable
+  app-side HUD state snapshot 하나를 넘기며 topology/safety 경계는 즉시 반영한다. 각 run의
+  `HWC_COUNT_SCOPE` event도 `APP_RAW_UNSEPARATED`, control layer 포함, subtraction
+  없음과 FrameTracker `PHYSICAL` count가 별도라는 계약을 남긴다. 이는 target
   readiness, distinct sample 수와 cross-phase delta를 확인하는 controller verdict와
   별개인 보조 상태다.
 - missed frame, HWC/GPU miss, producer stall은 proxy이며 exact DPU underrun으로
@@ -577,19 +625,26 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
 
 ## 현재 구현
 
-- DPULayerTest release `20260725_170750` / `20260725_170750-debug`(`versionCode 6`)
+- DPULayerTest release `20260727_005420` / `20260727_005420-debug`(`versionCode 10`)
   launcher/Gradle project, 화면/HUD/report build version과 stable
   `com.example.dpulayerlab`/`DpuLayerLab` 제품 통합 identifier
 - Compose 기반 scenario browser, system dashboard, running HUD, result 화면. 실행
   header의 STOP은 compact/landscape에서도 상단에 유지한다.
-- 32개 catalog preset 및 custom phase. 4L DEVICE candidate/CLIENT plane-overflow의 typed
-  HWC 관측 probe와 cross-load 없는 repeated DPU step shock, fixed-topology resource isolation,
+- 40개 catalog preset 및 custom phase. 명목 catalog phase 1,870,000 ms 중
+  decoder-backed phase는 318,000 ms(17.01%, strict 10% 초과)다. 4K60/8K60 decoder
+  visibility와 load surge/drop을 포함하며, 1K↔8K load/resolution sweep, 2K/4K/8K
+  90° FIT matrix, 8K FIT↔1:1 A/B/A와 4L DEVICE candidate/CLIENT plane-overflow의 typed
+  HWC 관측 probe와 generated cross-load 0인 `Display-pipeline Repeated Step Shock`
+  (`dpu-only-repeat-shock` stable ID), fixed-topology resource isolation,
   instant isolated contention, continuous cross-load ramp, paired mid-load reference,
-  backend-only composition pivot과 다변수 adaptive hunt의 용도를 구분한다.
+  backend-only composition pivot과 다변수 adaptive hunt의 용도를 구분한다. 전자는
+  Canvas draw/buffer post/producer write 비용이 남으므로 DPU 단일축으로 해석하지 않는다.
 - Typed DPU burst/DEVICE-only/CLIENT-required 목적 quick filter와 접힌 고급
   카테고리/변화 파형/예상 강도/부하·조건 filter. 같은 행 OR, 목적을 포함한 서로 다른
   행 AND를 유지하며 filtered append/replace, 중복·이동이 가능한 ordered queue,
-  restored unknown-ID sanitize, repeat 1~10과 expanded 40-run cap을 적용한다.
+  restored unknown-ID sanitize, 고정 상한 없는 수동 ordered queue, UI whole-queue
+  repeat 1~10과 1/2/5/10/50/100× 시간 배율을 적용한다. 외부 automation은 별도의
+  40-run cap을 유지한다.
 - 독립 Surface, mixed Surface/Texture, flattened RGBA, app-owned EGL stress layer
 - scroll/zoom/pan/rotate/parallax/storm과 physical HWC 변경으로 오해하지 않는
   View/client Z-order proxy animation
@@ -615,9 +670,18 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
 - 저부하 settle 뒤 single-layer/composition/4K shock, 중간 부하 perturbation과
   `STEADY` memory plateau를 쓰는 adaptive boundary preset
 - 1초 telemetry sample과 최근 60 sample HUD. 좌측 상단에 build version,
-  layer/DPU/CPU/GPU 숫자·그래프와 linear full-buffer 예상 DPU read/producer write
-  traffic을 표시한다. Gauge source/quality를 노출하고 provenance/unavailable 경계에
-  graph gap을 둔다.
+  layer/DPU/CPU/GPU 숫자·그래프와 workload-only linear `SCANOUT INPUT`/`PRODUCER W`
+  reference를 표시한다. Gauge source/quality를 노출하고 provenance/unavailable 경계에
+  graph gap을 둔다. HUD subtree는 pure Compose라 추가 Surface를 만들지 않고 동적
+  text/progress immutable state는 최대 1 Hz로 교체하지만 Activity root/window layer는
+  남는다.
+  단일 URI의 실제 selected source class·visible dimensions·FPS와 요구 minimum을
+  표시한다. FIT/1:1 crop, layer·영상 metadata 회전, 이동·zoom, destination layer
+  크기와 producer 성격은 label이 있는 개별 행으로 나누고 말줄임 없이 줄바꿈한다.
+  또한
+  최대 20개 세로 `APP PRODUCER MAP`의 planned outline/committed V/S/T/G/F fill,
+  generation-accepted decoder callback count/age/revision도 표시한다. Map과 decoder
+  `ACTIVE`는 HWC assignment/DPU scanout 증거가 아님을 함께 표시한다.
 - Test plan은 Window token으로 소유한 immersive session에서만 실행한다. status와
   navigation bar가 모두 invisible이라는 Insets acknowledgment 전에는 producer를
   게시하지 않고 queue/loop·terminal sample·teardown까지 유지한다. 최초 hide 전이는
@@ -632,8 +696,8 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
   일반 UI를 복구한다. Foreign Window hide는 100 ms 간격의 4회 verification/attempt로
   제한하고, 끝내 확인되지 않으면 원래 lease owner에 fail-closed 오염 신호를 보내며
   START를 계속 차단한다. Owner Activity close는 matching failure callback만 분리해
-  파괴된 Activity를 보존하지 않되 sticky process lease는 해제하지 않는다. HUD를 위한
-  앱 client target은 제거 대상이 아니다.
+  파괴된 Activity를 보존하지 않되 sticky process lease는 해제하지 않는다. HUD를 담은
+  app root/window layer는 제거 대상이 아니다.
 - GPU kernel probe는 path별 encoding/unit을 고정한다. KGSL `gpubusy`는 누적 counter가
   아닌 window busy/total이다. Exynos Xclipse(AMD RDNA)는 DRM
   `card0/device/gpu_busy_percent`, legacy Mali utilization과 MediaTek `gpu_loading`은
@@ -658,9 +722,11 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
 - Function-level pure policy/state/ownership helper test 뒤 controller 전체 흐름의
   partial start, cancellation, Activity 재생성, backend termination과 restore ordering을
   조합하는 검증 구조
-- stable-provenance DPU/GPU/bus/produced FPS/HWC DEVICE·CLIENT result peak
+- stable-provenance DPU/GPU/bus/produced FPS peak와, 독립 D/C maxima를 합치지 않고
+  한 complete atomic tuple의 최대 T(D+C)·D tie-break로 선택하는 HWC result peak
 - Android service, kernel allowlist, SurfaceFlinger parser, vendor AIDL 계측
-- post-warmup baseline/continuity가 적용된 exact/proxy verdict
+- warm-up topology/geometry/generation activation과 모든 producer의 fresh first
+  buffer를 bounded 확인한 뒤 설정하는 baseline/continuity 기반 exact/proxy verdict
 - physical producer aggregate frame 적분과 `PRODUCER_RATE_SHORTFALL` fidelity verdict
 - ordered scenario plan/repeat 실행과 보호된 explicit `AutomationActivity`
   START/STOP/SHOW Intent 계약
@@ -677,6 +743,9 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
 
 - DPU utilization, DDR busy, exact underrun, DEVICE/CLIENT layer와 SBWC state는
   BSP/vendor source 없이는 일반화할 수 없다.
+- 현재 HWC APP RAW D/C/T는 Activity root/control과 workload producer를 per-layer로
+  분리하지 않는다. Pure Compose HUD는 추가 Surface를 만들지 않을 뿐 root layer의
+  HWC assignment를 제거·강제하지 못하며, raw count는 producer ceiling이 아니다.
 - SurfaceFlinger text dump parser는 release/BSP별 형식 변화에 취약하다.
 - graphics budget은 stride, tile, codec reference/private buffer를 완전히 반영하지 않는다.
 - RAM/core/emulator 기반 envelope는 알 수 없는 HWC plane 수나 sustained SoC 성능을
@@ -687,11 +756,16 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
 - Remote provider 또는 native extractor가 cancellation/interruption에 즉시 응답한다는
   보장은 없다. 앱은 timeout 뒤 worker가 실제 `finally`에 도달할 때까지 process-wide
   media preflight lease로 후속 plan을 막지만 해당 외부 구현을 강제 종료하지는 못한다.
-- traffic estimate는 crop/cache/tiling/intermediate target/SBWC ratio를 반영하지 않는다.
+- workload-only linear scanout-input reference는 Activity root/HUD, SystemUI,
+  crop/cache/tiling/intermediate target, actual CLIENT fallback과 SBWC ratio를 반영하지
+  않으며 actual DPU traffic이 아니다.
 - P010 입력은 extractor의 10-bit profile로 gate하지만 실제 decoder output format과
   allocation은 decoder/BSP 정책에 달려 있다. YUV/P010/SBWC route 자체를 decoder
   output B/px의 증거로 사용하지 않는다.
 - codec capability는 sustained 또는 concurrent decode 가능성을 보장하지 않는다.
+- `OnFrameRenderedListener` callback은 matching app decoder producer의 frame-render
+  evidence지만 SurfaceFlinger present, HWC plane assignment 또는 DPU scanout 완료를
+  증명하지 않는다.
 - requested display Hz는 실제 mode 전환을 보장하지 않는다.
 - DPU frequency counter는 read-only이고, settle 구간이 실제 clock 하강을 보장하지 않는다.
 - API v3 provider reference implementation은 저장소에 없다. 일반 APK 또는 platform
@@ -699,7 +773,7 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
   Saver-off인 상태를 감시할 뿐이다. Doze/device-idle을 강제로 해제하는 typed 계약도
   현재 없다.
 - report에 build fingerprint와 선택 media의 이름/metadata가 포함될 수 있다.
-- `dpu-layer-lab-` prefix와 앱 파일명 형식이 확인된 완료 report만 최근 200개로
+- `dpu-layer-lab-` prefix와 앱 파일명 형식이 확인된 완료 report만 최근 400개로
   process-serialized best-effort retention한다. 방금 발행한 파일은 보호하고 `.part`와
   unrelated `.json`은 건드리지 않으며, 사용자 설정형 만료 정책은 아직 없다.
 - vendor service는 샘플 계약만 있고 reference provider 구현은 이 저장소에 없다.
@@ -713,7 +787,9 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
 2. API v3의 system-wide Battery Saver arbitration과 exact prior-state restore를 포함한
    vendor broker reference implementation 및 VINTF-stable AIDL/version/hash 정책
 3. broker의 NPU/SBWC lease token, heartbeat, client-death/timeout watchdog
-4. HWC composition snapshot과 DPU/DDR counter의 display/sampling scope 명문화
+4. [PLAN.md](PLAN.md)의 P-007: HWC composition snapshot의 display/CRTC scope,
+   committed producer per-layer identity와 control/root 분리를 갖춘 scoped BSP evidence
+   (향후 P0). DPU/DDR counter의 display/sampling scope도 함께 명문화
 5. 4K/8K/P010/SBWC 자산 manifest와 decoder output/allocation 검증
 6. physical-device endurance, `MemoryInfo.lowMemory`, thermal, Activity lifecycle
    fault-injection test

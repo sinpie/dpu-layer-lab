@@ -33,6 +33,8 @@
 | `backend` | independent, mixed Surface/Texture, flattened GPU 경로 |
 | `pixelRoute` | RGB/YUV/P010/SBWC 입력 계약 |
 | `bufferSize` | primary source/allocation 검증 크기 |
+| `bufferPresentation` | source를 stage에 투영하는 base `FIT`/`PIXEL_1_TO_1_CROP` 계약 |
+| `layerOrientation` | motion과 별도인 고정 0°/90° base orientation |
 | `motion` | scroll/zoom/rotate/parallax 등의 View transform |
 | `layerSizeProfile` | physical child의 destination footprint |
 | `workloads` | CPU, memory, GPU, NPU normalized setpoint |
@@ -50,7 +52,18 @@ cooldown, report I/O는 포함하지 않는다.
 ### Plan
 
 `ScenarioRunPlan`은 queue 순서와 repeat를 보존한다. 같은 scenario를 여러 번 넣는 것은
-A/B/A 실험을 위해 허용된다. repeat는 최대 10회, queue×repeat는 최대 40 run이다.
+A/B/A 실험을 위해 허용된다. `repeatCount=N`은 전체 queue를 처음부터 끝까지 N회
+실행한다. `N > 1`이면 각 회차 경계에서 마지막 scenario 다음에 첫 scenario로 돌아가며,
+1은 전체 queue 한 번이다. 앱 UI의 수동 queue에는 임의의 고정 항목/expanded-run
+상한이 없고 repeat는 expanded list로 만들지 않고 순차 실행한다. 외부 Intent
+automation은 기존 expanded 40-run 상한을 유지한다.
+
+`durationMultiplier`는 실행 직전 `1×, 2×, 5×, 10×, 50×, 100×` 중 하나를 고른다.
+각 phase의 duration, transition window와 cycle에 immutable execution snapshot을 만들 때
+정확히 한 번 함께 적용해 ramp/soak/cyclic 의미를 보존한다. 그 뒤 기존 phase 10분,
+scenario 30분 safety cap이 명시적 adjustment 또는 reject를 수행할 수 있다. 예상 시간은
+phase 합계이며 preflight, warm-up, cooldown, report I/O를 포함하지 않는다. 이 옵션은
+외부 Intent extra로 노출하지 않는다.
 
 ## Backend와 physical producer
 
@@ -66,6 +79,31 @@ primary media 또는 explicit buffer와 GL tail이 모두 필요한 1L 요청은
 승격될 수 있다.
 
 ## LayerSizeProfile
+
+### 1K~8K 실제 버퍼 sweep
+
+`resolution-load-sweep` preset은 destination footprint와 별도로 primary producer의 실제
+`BufferSize`를 `1K → 2K/1080p → 4K → 8K → 4K → 2K/1080p → 1K` 순서로 바꾼다.
+상승 구간에서는 memory/CPU 교차 부하를 단계적으로 높이고 하강 구간에서는 낮춰,
+해상도와 부하 증가·복구의 결합을 한 plan에서 관찰한다. 8K peak는 한 physical
+producer로 제한하며 각 phase는 기존 triple-buffer graphics-memory budget을 그대로
+통과해야 한다. Budget을 넘으면 해상도를 축소하지 않고 plan을 거부한다.
+
+### Source buffer projection과 고정 orientation
+
+`BufferSize`는 `DISPLAY`, `HD_1K`(1024×576), `FHD`(2K/1080p, 1920×1080),
+`UHD_4K`, `UHD_8K`를 제공한다. `BufferPresentation.FIT`은 고정 0°/90° orientation을
+먼저 반영한 source aspect ratio를 보존해 motion 전 전체 source가 stage 안에
+letterbox되게 한다. `PIXEL_1_TO_1_CROP`은 source 1 px를 display 1 px로 두고 stage 밖
+overflow를 중앙 crop한다.
+
+고정 `LayerOrientation`은 motion과 별도인 base transform이다. 1:1 의미를 흐리지 않도록
+`PIXEL_1_TO_1_CROP`은 `FULL_SCREEN`과 non-scaling motion만 허용하며, capacity calibration의
+`CAPACITY_TILES`는 FIT/0°만 허용한다. Projection·orientation·crop은 full source
+allocation, conservative graphics-memory budget이나 full-buffer traffic estimate를
+줄이지 않는다. 일반 FIT 뒤 motion은 추가 transform일 수 있지만
+`rotated-resolution-fit-matrix`의 90° parallax/zoom은 현재 letterbox slack과 1.0 이하
+zoom으로 제한해 전체 buffer가 계속 보이게 한다.
 
 `LayerSizeProfile`은 source buffer 크기나 producer 수가 아니라 destination footprint를
 선택한다. `MotionProfile`과 독립적이므로 small layer도 scroll/zoom/rotate할 수 있다.
@@ -200,9 +238,20 @@ Fresh evidence가 같은 target geometry를 나타내야 하므로
 `GRADUAL_SMALL_TO_FULL`/`ABRUPT_SMALL_FULL` dynamic profile을 결합한 typed phase도
 reject한다.
 
+실행 HUD의 `HWC APP RAW · D/C/T · AGE · SRC`는 위 controller 계약의 입력이 될 수
+있는 현재 atomic tuple을 보여줄 뿐이다. `T`는 같은 tuple의 `D+C`이고, 현재
+portable/vendor 계약은 Activity root/control과 committed workload producer를
+per-layer identity로 분리하지 않는다. 따라서 raw D/C/T가 matching target에서
+관측됐다는 사실을 producer별 assignment나 plane ceiling으로 바꾸어 해석하지 않는다.
+그 주장은 display/CRTC scope와 committed producer identity에 결속된 BSP evidence가
+추가된 뒤에만 가능하다.
+
 ## Catalog 목적별 지도
 
-현재 source candidate의 catalog는 32개 preset이며 Custom은 이 수에 포함하지 않는다.
+현재 source candidate의 catalog는 40개 preset이며 Custom은 이 수에 포함하지 않는다.
+모든 catalog phase의 명목 duration 합은 1,870,000 ms이고 selected-media decoder route
+phase는 318,000 ms로 **17.01%**다. 따라서 decoder-backed 명목 시간이 strict 10%를
+초과한다. 이 계산은 Custom과 preflight, warm-up, cooldown, report I/O를 제외한다.
 
 ### Baseline, DVFS와 DPU burst
 
@@ -213,13 +262,21 @@ reject한다.
 | `dvfs-composition-shock` | settle 뒤 HWC-friendly, alpha/client, DRAM+3D shock | 단계별 복합 ramp |
 | `dpu-device-envelope-burst` | 1L/30fps→opaque RGB 4L/120fps/120Hz | 보수적 DEVICE candidate |
 | `dpu-client-fallback-burst` | 1L/30fps→20L mixed/alpha/GL 120fps | CLIENT fallback candidate |
-| `dpu-only-repeat-shock` | cross-load 0, 1L/30fps↔12L/120fps 반복 | display-only 급변 |
+| `dpu-only-repeat-shock` | generated cross-load 0, 1L/30fps↔12L/120fps 반복 | display-pipeline 급변; DPU 단일축 아님 |
 
 4L이나 20L은 제품의 보편적 HWC 한계가 아니다. Process-session capacity calibration은
 20L를 요청하지만 safety/graphics budget이 actual candidate를 줄일 수 있다. 최초
 terminal 결과를 이후 scenario/repeat/START가 재사용하더라도 matching opaque RGB
 DISPLAY tile topology의 advisory boundary일 뿐이며 catalog target, safety cap 또는 typed
-phase evidence를 바꾸지 않는다.
+phase evidence를 바꾸지 않는다. Raw D/C/T에는 Activity root/control 분리가 없으므로
+candidate producer 수와 raw D 또는 T의 차이를 이용해 producer ceiling을 추론하지
+않는다.
+
+`dpu-only-repeat-shock`는 automation 호환성을 위해 stable ID를 유지하지만
+사용자-facing 이름은 `Display-pipeline Repeated Step Shock`이다. `workloads=0`은
+명시적 CPU/memory/GPU/NPU generator가 idle이라는 뜻이다. 각 Canvas producer의 draw,
+buffer post와 memory write는 producer FPS에 따라 계속되므로 이 preset을 DPU-only,
+GPU/CPU/DRAM-free 또는 단일 원인 실험으로 설명하면 안 된다.
 
 ### Layer size profile
 
@@ -244,6 +301,8 @@ phase evidence를 바꾸지 않는다.
 | `composition-pivot` | content와 pacing을 고정하고 independent→mixed→flattened backend 전환 |
 | `transform-storm` | 12L zoom/scroll/rotate/parallax와 View/client Z proxy |
 | `mid-load-perturbation` | 4~8L, 60~90fps의 A/B/A 중간 부하 matrix |
+| `rotated-resolution-fit-matrix` | 2K/4K/8K 고정 90° FIT; 8K static/parallax/bounded zoom |
+| `8k-presentation-fit-crop-aba` | 같은 8K allocation에서 FIT→1:1 crop→FIT projection-only A/B/A |
 
 ### Video, format와 compression
 
@@ -251,13 +310,28 @@ phase evidence를 바꾸지 않는다.
 |---|---|
 | `dvfs-video-shock` | 검증된 4K media와 concrete hardware decoder |
 | `4k-mixed` | 4K decoder Surface + RGB overlay + memory pulse |
-| `8k-decoder-pressure` | 8K30 metadata와 size/rate를 지원하는 hardware decoder |
+| `4k60-video-visibility` | 4K 이상 60fps decoder source의 0° FIT, 90° FIT, zoom/pan visibility |
+| `4k60-video-load-surge-drop` | 4K 이상 60fps decoder route에서 1→8→1→5→1L과 CPU/memory surge/drop |
+| `8k-decoder-pressure` | 8K60 metadata와 size/rate를 지원하는 YUV hardware decoder |
+| `8k60-video-visibility` | 8K60 YUV decoder source의 0° FIT, 90° FIT, zoom/pan visibility |
+| `8k60-video-load-surge-drop` | 8K60 YUV decoder route에서 1→5→1→3→1L과 CPU/memory surge/drop |
 | `8k60-p010-pressure` | 8K60 10-bit P010 fingerprint와 hardware decoder |
 | `sbwc-matrix` | 동일 decoder content와 vendor SBWC route acknowledgment |
+| `resolution-only-sweep` | 1L/30fps/60Hz/FIT/0°/static/zero-load 고정, 1K→8K→1K resolution-only A/B |
+
+두 visibility preset은 1L/60fps/60Hz에서 각각 15초의 0° FIT static,
+90° FIT static, zoom/pan phase를 사용한다. 4K load surge/drop은 각 15초의
+1→8→1→5→1L, 8K load surge/drop은 1→5→1→3→1L 순서이며 CPU/memory setpoint도
+peak 뒤 0으로 내리고 더 낮은 두 번째 pulse 뒤 recovery한다. 모든 구간은 selected-media
+decoder route를 유지한다. 8K60 YUV preset은 8-bit 경로이며 P010 계약과 독립적이다.
 
 YUV/P010/SBWC phase는 procedural RGBA로 대체하지 않는다. selected media의 URI,
 descriptor, dimensions, FPS, MIME, profile, codec name과 P010 fingerprint를 preflight와
 renderer에서 재검증한다.
+Decoder preset은 선택 URI 하나를 공유한다. 따라서 4K60 preset의 `UHD_4K`는
+visible 4K 이상·source 60fps 이상의 minimum이며 8K60 source도 사용할 수 있다. 실행
+HUD는 preset label이 아니라 실제 selected source class·visible dimensions·FPS와 minimum을
+함께 표시한다.
 
 ### Pacing, resource와 transition
 
@@ -269,6 +343,7 @@ renderer에서 재검증한다.
 | `instant-burst-transitions` | layer/FPS STEP 뒤 contention duty cycle |
 | `gradual-load-transitions` | topology와 cross-load의 combined ramp/staircase |
 | `continuous-crossload-ramp` | 고정 8L topology에서 cross-load 0→high→hold→0 |
+| `resolution-load-sweep` | 1K→2K→4K→8K→4K→2K→1K와 cross-load 상승·감소 |
 | `wave-soak-recovery` | triangle 반복과 attack/hold/release |
 | `npu-cross-load` | vendor NPU + memory/GPU; adapter 없으면 `UNSUPPORTED` |
 | `adaptive-underrun-hunt` | layer/backend/alpha/memory 다축 staircase |
@@ -285,7 +360,8 @@ facet은 같은 행의 여러 값이 OR, 서로 다른 행이 AND다.
 - Pattern: 순간 STEP, 느린 점진, 반복/펄스, 고정 유지
 - Estimated load band: 낮음, 보통, 높음, 매우 높음
 - Condition: display-only, multi-layer, CPU/memory/GPU/NPU, video/format,
-  transform/high refresh/DVFS, DPU burst, DEVICE/CLIENT 목표, layer size
+  1K/2K/4K/8K, 1:1 crop, 고정 90°, transform/high refresh/DVFS, DPU burst,
+  DEVICE/CLIENT 목표, layer size
 
 intensity score는 catalog 비교와 UI 탐색용 추정치다. 실제 HW capacity 또는 위험 판정이
 아니다. layer-size score도 visible-area heuristic이며 safety memory budget을 줄이지 않는다.
@@ -300,8 +376,11 @@ UI의 빠른 목적은 다음 질문에 대응한다.
 - **CLIENT 전환 목표:** mixed/alpha/GL pressure 뒤 CLIENT>0 fresh evidence가 반복되는가?
 
 각 card는 “입력 변화”, “합성 목표”, “확인할 metric”을 실행 전에 보여야 한다.
-`RAW MATCH/WAIT/N/A`는 2.5초 이내 동일 source/quality/timestamp pair의 보조 표시이며
-controller의 phase coverage verdict를 대신하지 않는다.
+`현재값 일치/불일치/없음`과 `HWC APP RAW D/C/T`는 2.5초 이내 동일
+source/quality/timestamp pair의 보조 표시이며 controller의 phase coverage verdict를
+대신하지 않는다. Pure Compose HUD는 별도 Surface를 추가하지 않지만 Activity
+root/window layer의 HWC assignment를 강제하지도 않으며, 현재 raw tuple에서 이를
+workload producer와 분리하지 못한다.
 
 ## Custom scenario
 
@@ -315,6 +394,8 @@ Custom builder도 catalog와 같은 `ScenarioSafetyPolicy`를 통과한다.
 - positive GPU load에는 실제 GPU-backed producer 필요
 - decoder route에는 선택·검증된 media와 concrete codec binding 필요
 - graphics budget이 맞지 않으면 silent clamp 대신 reject될 수 있음
+- buffer projection은 FIT/1:1 crop, 고정 orientation은 0°/90° 중 선택
+- 1:1 crop은 `FULL_SCREEN`과 non-scaling motion만 허용
 
 Custom ID는 process 내에서 고유하게 생성되며 외부 Intent automation에서는 허용되지 않는다.
 

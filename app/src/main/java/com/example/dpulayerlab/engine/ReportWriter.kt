@@ -11,9 +11,36 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+/** Independent storage-retention policy; it is not a manual plan or queue limit. */
+internal const val MANAGED_REPORT_RETENTION_COUNT = 400
+
 object ReportWriter {
     @Synchronized
-    fun write(context: Context, summary: RunSummary): File {
+    fun write(context: Context, summary: RunSummary): File =
+        writeInternal(
+            context = context,
+            summary = summary,
+            obsoleteReport = null,
+        )
+
+    /**
+     * Atomically publishes a revised report, removes the obsolete publication, and only then
+     * applies retention. This ordering keeps the retained set at 400 reports instead of pruning
+     * one extra report before the obsolete replacement is removed.
+     */
+    @Synchronized
+    fun replace(context: Context, summary: RunSummary, obsoleteReport: File?): File =
+        writeInternal(
+            context = context,
+            summary = summary,
+            obsoleteReport = obsoleteReport,
+        )
+
+    private fun writeInternal(
+        context: Context,
+        summary: RunSummary,
+        obsoleteReport: File?,
+    ): File {
         // Reports contain build fingerprints and vendor telemetry. Keep them in credential-
         // encrypted internal storage on every supported API; sharing is only through FileProvider.
         val directory = File(context.filesDir, "reports")
@@ -37,12 +64,14 @@ object ReportWriter {
             }
             // Publication is the required operation; retention is deliberately best-effort.
             // Serializing writers prevents one run from pruning another run while it is between
-            // destination selection and publication.
+            // destination selection and publication. A replacement removes its obsolete report
+            // before pruning so the temporary 401st publication does not consume a retained slot.
             runCatching {
-                pruneCompletedReports(
+                finalizePublishedReportRetention(
                     directory = directory,
                     protectedReport = destination,
-                    keepCount = MAX_COMPLETED_REPORTS,
+                    obsoleteReport = obsoleteReport,
+                    keepCount = MANAGED_REPORT_RETENTION_COUNT,
                 )
             }
             return destination
@@ -165,6 +194,10 @@ object ReportWriter {
                 append(""""backend": ${quote(phase.backend.name)}, """)
                 append(""""pixelRoute": ${quote(phase.pixelRoute.name)}, """)
                 append(""""bufferSize": ${quote(phase.bufferSize.name)}, """)
+                append(
+                    """"bufferPresentation": ${quote(phase.bufferPresentation.name)}, """,
+                )
+                append(""""layerOrientation": ${quote(phase.layerOrientation.name)}, """)
                 append(""""motion": ${quote(phase.motion.name)}, """)
                 append(""""layerSizeProfile": ${quote(phase.layerSizeProfile.name)}, """)
                 append(""""motionSemantics": ${quote(phase.motion.semantics.name)}, """)
@@ -340,6 +373,11 @@ object ReportWriter {
                         sample.hwcCompositionEvidenceAgeMs ?: "null"
                     }, """,
                 )
+                append(
+                    """"hwcCompositionEvidenceAvailability": ${
+                        quote(sample.hwcCompositionEvidenceAvailability.name)
+                    }, """,
+                )
                 append(""""surfaceFlingerHwcMissed": ${sample.surfaceFlingerHwcMissed ?: "null"}, """)
                 append(""""surfaceFlingerGpuMissed": ${sample.surfaceFlingerGpuMissed ?: "null"}, """)
                 append(
@@ -455,37 +493,79 @@ object ReportWriter {
         error("Too many report filename collisions for $baseName")
     }
 
-    private fun pruneCompletedReports(
-        directory: File,
-        protectedReport: File,
-        keepCount: Int,
-    ) {
-        val files = directory.listFiles()?.filter(File::isFile).orEmpty()
-        val namesToDelete = selectCompletedReportsForDeletion(
-            entries = files.map {
-                ReportRetentionEntry(
-                    name = it.name,
-                    lastModifiedMs = it.lastModified(),
-                )
-            },
-            protectedReportName = protectedReport.name,
-            keepCount = keepCount,
-        )
-        files.forEach { file ->
-            if (file.name in namesToDelete) {
-                runCatching { file.delete() }
-            }
-        }
-    }
-
     private const val MAX_REPORT_ID_CHARS = 80
-    private const val MAX_COMPLETED_REPORTS = 200
 }
 
 internal data class ReportRetentionEntry(
     val name: String,
     val lastModifiedMs: Long,
 )
+
+/**
+ * Finishes a serialized publication transaction. If an obsolete replacement cannot be proven
+ * deleted, retention is skipped so a failed replacement cleanup cannot evict another plan report.
+ */
+internal fun finalizePublishedReportRetention(
+    directory: File,
+    protectedReport: File,
+    obsoleteReport: File?,
+    keepCount: Int,
+): Boolean {
+    val obsoleteRemoved = removeObsoleteReportForReplacement(
+        directory = directory,
+        protectedReport = protectedReport,
+        obsoleteReport = obsoleteReport,
+    )
+    if (!obsoleteRemoved) return false
+    pruneCompletedReports(
+        directory = directory,
+        protectedReport = protectedReport,
+        keepCount = keepCount,
+    )
+    return true
+}
+
+private fun removeObsoleteReportForReplacement(
+    directory: File,
+    protectedReport: File,
+    obsoleteReport: File?,
+): Boolean {
+    if (obsoleteReport == null) return true
+    val canonicalDirectory = directory.canonicalFile
+    val canonicalProtected = protectedReport.canonicalFile
+    val canonicalObsolete = obsoleteReport.canonicalFile
+    if (canonicalObsolete == canonicalProtected) return true
+    if (
+        canonicalObsolete.parentFile != canonicalDirectory ||
+        !isManagedCompletedReportName(canonicalObsolete.name)
+    ) {
+        return false
+    }
+    return !canonicalObsolete.exists() || canonicalObsolete.delete()
+}
+
+private fun pruneCompletedReports(
+    directory: File,
+    protectedReport: File,
+    keepCount: Int,
+) {
+    val files = directory.listFiles()?.filter(File::isFile).orEmpty()
+    val namesToDelete = selectCompletedReportsForDeletion(
+        entries = files.map {
+            ReportRetentionEntry(
+                name = it.name,
+                lastModifiedMs = it.lastModified(),
+            )
+        },
+        protectedReportName = protectedReport.name,
+        keepCount = keepCount,
+    )
+    files.forEach { file ->
+        if (file.name in namesToDelete) {
+            runCatching { file.delete() }
+        }
+    }
+}
 
 /**
  * Selects only completed JSON reports beyond the newest [keepCount].

@@ -15,6 +15,16 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.LockSupport
 
+enum class SurfaceFlingerCompositionAvailability {
+    AVAILABLE,
+    DUMP_PERMISSION_UNAVAILABLE,
+    PAIR_UNAVAILABLE,
+    PAIR_INVALID,
+    PROBE_FAILED,
+    STALE,
+    UNKNOWN,
+}
+
 data class CompositionSnapshot(
     val deviceLayers: Int? = null,
     val clientLayers: Int? = null,
@@ -22,6 +32,8 @@ data class CompositionSnapshot(
     val gpuMissedFrames: Long? = null,
     val source: String = "",
     val detail: String = "",
+    val compositionAvailability: SurfaceFlingerCompositionAvailability =
+        SurfaceFlingerCompositionAvailability.UNKNOWN,
 )
 
 class SurfaceFlingerProbe(context: Context) : AutoCloseable {
@@ -34,28 +46,43 @@ class SurfaceFlingerProbe(context: Context) : AutoCloseable {
         context.checkSelfPermission(Manifest.permission.DUMP) == PackageManager.PERMISSION_GRANTED
 
     fun sample(): CompositionSnapshot {
-        if (!hasDumpPermission()) return CompositionSnapshot(detail = "DUMP 권한 없음")
+        if (!hasDumpPermission()) {
+            return CompositionSnapshot(
+                detail = "DUMP 권한 없음",
+                compositionAvailability =
+                    SurfaceFlingerCompositionAvailability.DUMP_PERMISSION_UNAVAILABLE,
+            )
+        }
         if (!processChildren.isRestartSafe()) {
-            return CompositionSnapshot(detail = "이전 SurfaceFlinger process 종료 확인 대기 중")
+            return CompositionSnapshot(
+                detail = "이전 SurfaceFlinger process 종료 확인 대기 중",
+                compositionAvailability = SurfaceFlingerCompositionAvailability.PROBE_FAILED,
+            )
         }
         return when (val result = laneLease.execute()) {
             is ProbeLaneResult.Completed -> result.value
             ProbeLaneResult.Busy ->
-                CompositionSnapshot(detail = "이전 SurfaceFlinger probe 종료 대기 중")
+                unavailableProbeSnapshot("이전 SurfaceFlinger probe 종료 대기 중")
             ProbeLaneResult.Closed ->
-                CompositionSnapshot(detail = "SurfaceFlinger probe 종료됨")
+                unavailableProbeSnapshot("SurfaceFlinger probe 종료됨")
             ProbeLaneResult.Cancelled ->
-                CompositionSnapshot(detail = "SurfaceFlinger probe 중단됨")
+                unavailableProbeSnapshot("SurfaceFlinger probe 중단됨")
             ProbeLaneResult.Interrupted ->
-                CompositionSnapshot(detail = "SurfaceFlinger probe 중단됨")
+                unavailableProbeSnapshot("SurfaceFlinger probe 중단됨")
             ProbeLaneResult.TimedOut ->
-                CompositionSnapshot(detail = "SurfaceFlinger 응답 시간 초과")
+                unavailableProbeSnapshot("SurfaceFlinger 응답 시간 초과")
             is ProbeLaneResult.Failed ->
-                CompositionSnapshot(
-                    detail = "SurfaceFlinger probe 실패: ${result.error.javaClass.simpleName}",
+                unavailableProbeSnapshot(
+                    "SurfaceFlinger probe 실패: ${result.error.javaClass.simpleName}",
                 )
         }
     }
+
+    private fun unavailableProbeSnapshot(detail: String): CompositionSnapshot =
+        CompositionSnapshot(
+            detail = detail,
+            compositionAvailability = SurfaceFlingerCompositionAvailability.PROBE_FAILED,
+        )
 
     /**
      * Waits without closing the shared lane. This is used after a bounded sample timeout so the
@@ -905,60 +932,47 @@ internal fun readBoundedText(reader: java.io.Reader, maxChars: Int): String {
 
 internal fun parseSurfaceFlingerDump(text: String): CompositionSnapshot {
     val source = "dumpsys SurfaceFlinger --hwclayers"
-    var appBlockCount = 0
-    var appBlockDeviceCount = 0
-    var appBlockClientCount = 0
-    var appBlockClassificationComplete = true
-    var currentAppBlock = false
-    var currentBlockHasDevice = false
-    var currentBlockHasClient = false
-    var fallbackAppLineCount = 0
-    var fallbackDeviceCount = 0
-    var fallbackClientCount = 0
-    var fallbackClassificationComplete = true
+    val implicitScope = SurfaceFlingerDisplayScope(
+        displayLabel = null,
+        displayState = null,
+    )
+    val explicitScopes = mutableListOf<SurfaceFlingerDisplayScope>()
+    var currentScope = implicitScope
+    var malformedDisplayMarker = false
+    var tooManyDisplaySections = false
+    var compositionParsingDisabled = false
     var hwcMissed: Long? = null
     var gpuMissed: Long? = null
 
-    fun finishBlock() {
-        if (!currentAppBlock) return
-        appBlockCount += 1
-        if (currentBlockHasDevice) appBlockDeviceCount += 1
-        if (currentBlockHasClient) appBlockClientCount += 1
-        if (currentBlockHasDevice == currentBlockHasClient) {
-            // Neither classification means the vendor format is unknown; both means the block is
-            // ambiguous. In either case zero/partial counts would be fabricated evidence.
-            appBlockClassificationComplete = false
-        }
-    }
-
-    // One bounded pass avoids split/filter/toList copies of a dump that may be almost 4 MiB.
-    // The block counters retain the old "one count per matching * Layer block" semantics, while
-    // fallback counters retain the legacy line-oriented parser for vendor formats without blocks.
+    // Parse each display independently. A --hwclayers dump can contain several physical displays;
+    // summing matching records across them would turn mirroring into fabricated app-layer counts.
     text.lineSequence().forEach { line ->
-        val startsLayerBlock = line.startsWith("* Layer ")
-        if (startsLayerBlock) {
-            finishBlock()
-            currentAppBlock = containsDpuLabToken(line)
-            currentBlockHasDevice = false
-            currentBlockHasClient = false
-        }
-
-        val appLine = containsDpuLabToken(line)
-        if (appLine) {
-            fallbackAppLineCount += 1
-        }
-        val hasDevice = SURFACE_FLINGER_DEVICE_PATTERN.containsMatchIn(line)
-        val hasClient = SURFACE_FLINGER_CLIENT_PATTERN.containsMatchIn(line)
-        if (currentAppBlock && !startsLayerBlock) {
-            // DEVICE/CLIENT tokens in an app-controlled layer name are not composition evidence.
-            // Structured block dumps must expose the classification in a following property row.
-            currentBlockHasDevice = currentBlockHasDevice || hasDevice
-            currentBlockHasClient = currentBlockHasClient || hasClient
-        }
-        if (appLine) {
-            if (hasDevice) fallbackDeviceCount += 1
-            if (hasClient) fallbackClientCount += 1
-            if (hasDevice == hasClient) fallbackClassificationComplete = false
+        val displayHeader = SURFACE_FLINGER_DISPLAY_HEADER_PATTERN.matchEntire(line)
+        if (displayHeader != null) {
+            currentScope.finish()
+            if (explicitScopes.size >= SURFACE_FLINGER_MAX_DISPLAY_SECTIONS) {
+                tooManyDisplaySections = true
+                compositionParsingDisabled = true
+            } else {
+                currentScope = SurfaceFlingerDisplayScope(
+                    displayLabel = sanitizeSurfaceFlingerDisplayLabel(
+                        displayHeader.groupValues[1].trim(),
+                    ),
+                    displayState = displayHeader.groupValues[2]
+                        .takeIf { it.isNotBlank() }
+                        ?.lowercase(),
+                )
+                explicitScopes += currentScope
+            }
+        } else {
+            if (SURFACE_FLINGER_DISPLAY_MARKER_PATTERN.containsMatchIn(line)) {
+                // A display boundary which cannot be identified must not be collapsed into the
+                // preceding scope.
+                malformedDisplayMarker = true
+            }
+            if (!compositionParsingDisabled) {
+                currentScope.accept(line)
+            }
         }
         if (hwcMissed == null) {
             hwcMissed = SURFACE_FLINGER_HWC_MISSED_PATTERN
@@ -975,31 +989,557 @@ internal fun parseSurfaceFlingerDump(text: String): CompositionSnapshot {
                 ?.toLongOrNull()
         }
     }
-    finishBlock()
+    currentScope.finish()
 
-    val hasAppBlocks = appBlockCount > 0
-    val device = if (hasAppBlocks) appBlockDeviceCount else fallbackDeviceCount
-    val client = if (hasAppBlocks) appBlockClientCount else fallbackClientCount
-    val matchedCount = if (hasAppBlocks) appBlockCount else fallbackAppLineCount
-    val classificationComplete = if (hasAppBlocks) {
-        appBlockClassificationComplete
-    } else {
-        fallbackClassificationComplete
+    val duplicateDisplayLabels = explicitScopes
+        .groupingBy { it.displayLabel.orEmpty().lowercase() }
+        .eachCount()
+        .any { (_, count) -> count > 1 }
+    val explicitAppScopes = explicitScopes.filter { it.appTokenObserved }
+    val scopeUnavailableDetail = when {
+        tooManyDisplaySections ->
+            "display scope unavailable: more than $SURFACE_FLINGER_MAX_DISPLAY_SECTIONS sections"
+        malformedDisplayMarker ->
+            "display scope unavailable: malformed HWC display marker"
+        duplicateDisplayLabels ->
+            "display scope unavailable: duplicate HWC display sections"
+        explicitScopes.isNotEmpty() && implicitScope.appTokenObserved ->
+            "display scope ambiguous: app records exist outside display sections"
+        explicitAppScopes.size > 1 ->
+            "display scope ambiguous: app records found on ${explicitAppScopes.size} displays"
+        else -> null
+    }
+    val selectedScope = when {
+        scopeUnavailableDetail != null -> null
+        explicitScopes.isNotEmpty() -> explicitAppScopes.singleOrNull()
+        else -> implicitScope
+    }
+    val classificationAvailable =
+        selectedScope != null &&
+            selectedScope.appRecordCount > 0 &&
+            selectedScope.classificationComplete &&
+            !selectedScope.mixedRecordFormats
+    val selectedScopeDetail = selectedScope?.detail(
+        unscoped = explicitScopes.isEmpty(),
+    )
+    val detail = scopeUnavailableDetail ?: when {
+        selectedScope == null ->
+            "no uniquely scoped app HWC layer records"
+        classificationAvailable ->
+            selectedScopeDetail.orEmpty()
+        selectedScope.appTokenObserved ->
+            "$selectedScopeDetail; composition classification unavailable"
+        explicitScopes.isNotEmpty() ->
+            "no app HWC layer records in ${explicitScopes.size} display sections"
+        else ->
+            "no app HWC layer records; legacy unscoped single-section"
+    }
+    val availability = when {
+        scopeUnavailableDetail != null ->
+            SurfaceFlingerCompositionAvailability.PAIR_INVALID
+        classificationAvailable ->
+            SurfaceFlingerCompositionAvailability.AVAILABLE
+        selectedScope?.appTokenObserved == true ->
+            SurfaceFlingerCompositionAvailability.PAIR_INVALID
+        else ->
+            SurfaceFlingerCompositionAvailability.PAIR_UNAVAILABLE
+    }
+    val scopedSource = when {
+        scopeUnavailableDetail != null || selectedScope == null -> source
+        explicitScopes.isEmpty() -> "$source · display=unscoped"
+        else -> "$source · display=${sanitizeSurfaceFlingerDisplayLabel(selectedScope.displayLabel)}"
     }
     return CompositionSnapshot(
-        deviceLayers = device.takeIf { matchedCount > 0 && classificationComplete },
-        clientLayers = client.takeIf { matchedCount > 0 && classificationComplete },
+        deviceLayers = selectedScope
+            ?.deviceLayers
+            ?.takeIf { classificationAvailable },
+        clientLayers = selectedScope
+            ?.clientLayers
+            ?.takeIf { classificationAvailable },
         hwcMissedFrames = hwcMissed,
         gpuMissedFrames = gpuMissed,
-        source = source,
-        detail = if (matchedCount > 0 && classificationComplete) {
-            "$matchedCount app layers parsed"
-        } else if (matchedCount > 0) {
-            "$matchedCount app layers found; composition classification unavailable"
-        } else {
-            "앱 layer가 dump에 노출되지 않음"
-        },
+        source = scopedSource,
+        detail = detail,
+        compositionAvailability = availability,
     )
+}
+
+private enum class SurfaceFlingerComposition {
+    DEVICE,
+    CLIENT,
+}
+
+private enum class SurfaceFlingerRecordFormat(
+    val detailLabel: String,
+) {
+    AOSP_MINIDUMP("aosp-minidump"),
+    STRUCTURED_BLOCK("structured-block"),
+    LEGACY_SAME_LINE("legacy-same-line"),
+}
+
+private data class SurfaceFlingerTableRow(
+    val composition: SurfaceFlingerComposition?,
+)
+
+/**
+ * One independently delimited `Display ... HWC layers:` section. When a legacy vendor omits
+ * display headers, the complete dump is represented by one implicit scope and [detail] identifies
+ * that weaker provenance.
+ */
+private class SurfaceFlingerDisplayScope(
+    val displayLabel: String?,
+    private val displayState: String?,
+) {
+    var appTokenObserved: Boolean = false
+        private set
+    var appRecordCount: Int = 0
+        private set
+    var deviceLayers: Int = 0
+        private set
+    var clientLayers: Int = 0
+        private set
+    var classificationComplete: Boolean = true
+        private set
+    var mixedRecordFormats: Boolean = false
+        private set
+
+    private var recordFormat: SurfaceFlingerRecordFormat? = null
+    private var structuredBlockOpen = false
+    private var structuredBlockIsApp = false
+    private var structuredBlockInvalid = false
+    private var structuredBlockDevice = false
+    private var structuredBlockClient = false
+    private var tableOpen = false
+    private var tableCompositionColumnIndex = INVALID_SURFACE_FLINGER_COLUMN_INDEX
+    private var pendingTableName = false
+    private var pendingTableNameIsApp = false
+    private var finished = false
+
+    fun accept(line: String) {
+        check(!finished)
+        val startsLayerBlock = SURFACE_FLINGER_LAYER_BLOCK_PATTERN.containsMatchIn(line)
+        if (startsLayerBlock) {
+            finishPendingTableName()
+            finishStructuredBlock()
+            tableOpen = false
+            tableCompositionColumnIndex = INVALID_SURFACE_FLINGER_COLUMN_INDEX
+            structuredBlockOpen = true
+            structuredBlockIsApp = containsDpuLabToken(line)
+            if (structuredBlockIsApp) {
+                appTokenObserved = true
+                observeFormat(SurfaceFlingerRecordFormat.STRUCTURED_BLOCK)
+            }
+            return
+        }
+
+        if (SURFACE_FLINGER_TABLE_HEADER_PATTERN.containsMatchIn(line)) {
+            finishPendingTableName()
+            finishStructuredBlock()
+            tableOpen = true
+            tableCompositionColumnIndex =
+                findUniqueSurfaceFlingerCompositionColumnIndex(line)
+            return
+        }
+
+        if (structuredBlockOpen) {
+            if (structuredBlockIsApp) {
+                observeStructuredClassification(line)
+            }
+            return
+        }
+
+        if (tableOpen) {
+            acceptTableLine(line)
+            return
+        }
+
+        acceptLegacyLine(line)
+    }
+
+    fun finish() {
+        if (finished) return
+        finishPendingTableName()
+        finishStructuredBlock()
+        finished = true
+    }
+
+    fun detail(unscoped: Boolean): String {
+        val scope = if (unscoped) {
+            "display=unscoped"
+        } else {
+            buildString {
+                append("display=")
+                append(displayLabel)
+                if (displayState != null) {
+                    append(" (")
+                    append(displayState)
+                    append(')')
+                }
+            }
+        }
+        val format = if (mixedRecordFormats) {
+            "mixed"
+        } else {
+            recordFormat?.detailLabel ?: "unknown"
+        }
+        return buildString {
+            append(scope)
+            append("; ")
+            append(appRecordCount)
+            append(" app layers found; format=")
+            append(format)
+            if (unscoped) {
+                append("; legacy unscoped single-section")
+            }
+        }
+    }
+
+    private fun acceptTableLine(line: String) {
+        if (line.isBlank()) {
+            finishPendingTableName()
+            tableOpen = false
+            tableCompositionColumnIndex = INVALID_SURFACE_FLINGER_COLUMN_INDEX
+            return
+        }
+        if (isSurfaceFlingerTableSeparator(line)) return
+
+        val row = parseSurfaceFlingerTableRow(
+            line = line,
+            compositionColumnIndex = tableCompositionColumnIndex,
+        )
+        if (row != null) {
+            if (pendingTableNameIsApp) {
+                recordAppLayer(
+                    format = SurfaceFlingerRecordFormat.AOSP_MINIDUMP,
+                    composition = row.composition,
+                )
+            } else if (!pendingTableName && containsDpuLabToken(line)) {
+                // A row with no preceding name cannot be safely associated with an app layer.
+                appTokenObserved = true
+                recordAppLayer(
+                    format = SurfaceFlingerRecordFormat.AOSP_MINIDUMP,
+                    composition = null,
+                )
+            }
+            pendingTableName = false
+            pendingTableNameIsApp = false
+            return
+        }
+
+        // AOSP prints one layer-name line followed by exactly one table row. A second name before
+        // the row makes the first app record partial rather than silently dropping it.
+        finishPendingTableName()
+        pendingTableName = true
+        pendingTableNameIsApp = containsDpuLabToken(line)
+        if (pendingTableNameIsApp) {
+            appTokenObserved = true
+            observeFormat(SurfaceFlingerRecordFormat.AOSP_MINIDUMP)
+        }
+    }
+
+    private fun acceptLegacyLine(line: String) {
+        if (!containsDpuLabToken(line)) return
+        appTokenObserved = true
+        val parsed = if (
+            SURFACE_FLINGER_EXPLICIT_COMPOSITION_PATTERN.containsMatchIn(line)
+        ) {
+            parseSurfaceFlingerExplicitComposition(line)
+        } else {
+            null
+        }
+        recordAppLayer(
+            format = SurfaceFlingerRecordFormat.LEGACY_SAME_LINE,
+            composition = parsed,
+        )
+    }
+
+    private fun observeStructuredClassification(line: String) {
+        SURFACE_FLINGER_EXPLICIT_COMPOSITION_PATTERN.findAll(line).forEach { match ->
+            when (classifySurfaceFlingerComposition(match.groupValues[1])) {
+                SurfaceFlingerComposition.DEVICE -> structuredBlockDevice = true
+                SurfaceFlingerComposition.CLIENT -> structuredBlockClient = true
+                null -> structuredBlockInvalid = true
+            }
+        }
+
+        // Preserve fail-closed handling for vendor property rows which expose a second bare
+        // classification. The layer-name row never reaches this path, so tokens in names cannot
+        // become composition evidence.
+        SURFACE_FLINGER_BARE_COMPOSITION_PATTERN.findAll(line).forEach { match ->
+            when (classifySurfaceFlingerComposition(match.value)) {
+                SurfaceFlingerComposition.DEVICE -> structuredBlockDevice = true
+                SurfaceFlingerComposition.CLIENT -> structuredBlockClient = true
+                null -> Unit
+            }
+        }
+    }
+
+    private fun finishStructuredBlock() {
+        if (!structuredBlockOpen) return
+        if (structuredBlockIsApp) {
+            val composition = when {
+                structuredBlockInvalid -> null
+                structuredBlockDevice == structuredBlockClient -> null
+                structuredBlockDevice -> SurfaceFlingerComposition.DEVICE
+                else -> SurfaceFlingerComposition.CLIENT
+            }
+            recordAppLayer(
+                format = SurfaceFlingerRecordFormat.STRUCTURED_BLOCK,
+                composition = composition,
+            )
+        }
+        structuredBlockOpen = false
+        structuredBlockIsApp = false
+        structuredBlockInvalid = false
+        structuredBlockDevice = false
+        structuredBlockClient = false
+    }
+
+    private fun finishPendingTableName() {
+        if (pendingTableNameIsApp) {
+            recordAppLayer(
+                format = SurfaceFlingerRecordFormat.AOSP_MINIDUMP,
+                composition = null,
+            )
+        }
+        pendingTableName = false
+        pendingTableNameIsApp = false
+    }
+
+    private fun recordAppLayer(
+        format: SurfaceFlingerRecordFormat,
+        composition: SurfaceFlingerComposition?,
+    ) {
+        appTokenObserved = true
+        observeFormat(format)
+        appRecordCount += 1
+        when (composition) {
+            SurfaceFlingerComposition.DEVICE -> deviceLayers += 1
+            SurfaceFlingerComposition.CLIENT -> clientLayers += 1
+            null -> classificationComplete = false
+        }
+    }
+
+    private fun observeFormat(format: SurfaceFlingerRecordFormat) {
+        val previous = recordFormat
+        if (previous == null) {
+            recordFormat = format
+        } else if (previous != format) {
+            mixedRecordFormats = true
+        }
+    }
+}
+
+private fun parseSurfaceFlingerTableRow(
+    line: String,
+    compositionColumnIndex: Int,
+): SurfaceFlingerTableRow? {
+    if (!SURFACE_FLINGER_TABLE_ROW_PREFIX_PATTERN.containsMatchIn(line)) return null
+    return SurfaceFlingerTableRow(
+        composition = classifySurfaceFlingerPipeField(
+            line = line,
+            targetColumnIndex = compositionColumnIndex,
+        ),
+    )
+}
+
+private fun parseSurfaceFlingerExplicitComposition(line: String): SurfaceFlingerComposition? {
+    val matches = SURFACE_FLINGER_EXPLICIT_COMPOSITION_PATTERN.findAll(line).iterator()
+    if (!matches.hasNext()) return null
+    val match = matches.next()
+    // A same-line legacy record has exactly one explicit composition property. Stop as soon as a
+    // second property appears so a bounded dump cannot amplify into an unbounded MatchResult list.
+    if (matches.hasNext()) return null
+    val explicitComposition =
+        classifySurfaceFlingerComposition(match.groupValues[1]) ?: return null
+    var hasDevice = explicitComposition == SurfaceFlingerComposition.DEVICE
+    var hasClient = explicitComposition == SurfaceFlingerComposition.CLIENT
+
+    // Tokens before the first explicit property belong to the same-line layer name. Only a second
+    // token after the final property can make the classification ambiguous.
+    SURFACE_FLINGER_BARE_COMPOSITION_PATTERN
+        .findAll(line, match.range.last + 1)
+        .forEach { trailingMatch ->
+        when (classifySurfaceFlingerComposition(trailingMatch.value)) {
+            SurfaceFlingerComposition.DEVICE -> hasDevice = true
+            SurfaceFlingerComposition.CLIENT -> hasClient = true
+            null -> Unit
+        }
+        if (hasDevice && hasClient) return null
+    }
+    return when {
+        hasDevice == hasClient -> null
+        hasDevice -> SurfaceFlingerComposition.DEVICE
+        else -> SurfaceFlingerComposition.CLIENT
+    }
+}
+
+/**
+ * Finds the sole pipe-delimited `Comp Type` header without splitting a potentially hostile line.
+ *
+ * A missing or duplicate column is invalid. The row parser then records the app layer as
+ * unclassified instead of borrowing a DEVICE/CLIENT-looking token from another vendor column.
+ */
+private fun findUniqueSurfaceFlingerCompositionColumnIndex(line: String): Int {
+    var fieldStart = 0
+    var fieldIndex = 0
+    var matchIndex = INVALID_SURFACE_FLINGER_COLUMN_INDEX
+    var cursor = 0
+    while (cursor <= line.length) {
+        if (cursor == line.length || line[cursor] == '|') {
+            if (
+                surfaceFlingerPipeFieldEquals(
+                    line = line,
+                    startIndex = fieldStart,
+                    endIndexExclusive = cursor,
+                    expected = "Comp Type",
+                )
+            ) {
+                if (matchIndex != INVALID_SURFACE_FLINGER_COLUMN_INDEX) {
+                    return INVALID_SURFACE_FLINGER_COLUMN_INDEX
+                }
+                matchIndex = fieldIndex
+            }
+            fieldIndex += 1
+            fieldStart = cursor + 1
+        }
+        cursor += 1
+    }
+    return matchIndex
+}
+
+private fun classifySurfaceFlingerPipeField(
+    line: String,
+    targetColumnIndex: Int,
+): SurfaceFlingerComposition? {
+    if (targetColumnIndex < 0) return null
+    var fieldStart = 0
+    var fieldIndex = 0
+    var cursor = 0
+    while (cursor <= line.length) {
+        if (cursor == line.length || line[cursor] == '|') {
+            if (fieldIndex == targetColumnIndex) {
+                return classifySurfaceFlingerCompositionField(
+                    line = line,
+                    startIndex = fieldStart,
+                    endIndexExclusive = cursor,
+                )
+            }
+            fieldIndex += 1
+            fieldStart = cursor + 1
+        }
+        cursor += 1
+    }
+    return null
+}
+
+private fun classifySurfaceFlingerCompositionField(
+    line: String,
+    startIndex: Int,
+    endIndexExclusive: Int,
+): SurfaceFlingerComposition? {
+    var trimmedStart = startIndex.coerceIn(0, line.length)
+    var trimmedEnd = endIndexExclusive.coerceIn(trimmedStart, line.length)
+    while (trimmedStart < trimmedEnd && line[trimmedStart].isWhitespace()) {
+        trimmedStart += 1
+    }
+    while (trimmedEnd > trimmedStart && line[trimmedEnd - 1].isWhitespace()) {
+        trimmedEnd -= 1
+    }
+    return when {
+        surfaceFlingerRegionEquals(line, trimmedStart, trimmedEnd, "CLIENT") ->
+            SurfaceFlingerComposition.CLIENT
+        SURFACE_FLINGER_DEVICE_COMPOSITION_TOKENS.any { token ->
+            surfaceFlingerRegionEquals(line, trimmedStart, trimmedEnd, token)
+        } -> SurfaceFlingerComposition.DEVICE
+        else -> null
+    }
+}
+
+private fun surfaceFlingerPipeFieldEquals(
+    line: String,
+    startIndex: Int,
+    endIndexExclusive: Int,
+    expected: String,
+): Boolean {
+    var trimmedStart = startIndex.coerceIn(0, line.length)
+    var trimmedEnd = endIndexExclusive.coerceIn(trimmedStart, line.length)
+    while (trimmedStart < trimmedEnd && line[trimmedStart].isWhitespace()) {
+        trimmedStart += 1
+    }
+    while (trimmedEnd > trimmedStart && line[trimmedEnd - 1].isWhitespace()) {
+        trimmedEnd -= 1
+    }
+    return surfaceFlingerRegionEquals(
+        line = line,
+        startIndex = trimmedStart,
+        endIndexExclusive = trimmedEnd,
+        expected = expected,
+    )
+}
+
+private fun surfaceFlingerRegionEquals(
+    line: String,
+    startIndex: Int,
+    endIndexExclusive: Int,
+    expected: String,
+): Boolean =
+    endIndexExclusive - startIndex == expected.length &&
+        line.regionMatches(
+            thisOffset = startIndex,
+            other = expected,
+            otherOffset = 0,
+            length = expected.length,
+            ignoreCase = true,
+        )
+
+private fun classifySurfaceFlingerComposition(value: String): SurfaceFlingerComposition? =
+    when (value.trim().uppercase()) {
+        "CLIENT" -> SurfaceFlingerComposition.CLIENT
+        "DEVICE",
+        "SOLID_COLOR",
+        "CURSOR",
+        "SIDEBAND",
+        "DISPLAY_DECORATION",
+        "REFRESH_RATE_INDICATOR",
+        -> SurfaceFlingerComposition.DEVICE
+        else -> null
+    }
+
+private fun isSurfaceFlingerTableSeparator(line: String): Boolean {
+    var hasDash = false
+    line.forEach { character ->
+        when {
+            character == '-' -> hasDash = true
+            character.isWhitespace() -> Unit
+            else -> return false
+        }
+    }
+    return hasDash
+}
+
+private fun sanitizeSurfaceFlingerDisplayLabel(label: String?): String {
+    val source = label.orEmpty()
+    val result = StringBuilder(minOf(source.length, SURFACE_FLINGER_DISPLAY_LABEL_MAX_CHARS))
+    source.forEach { character ->
+        if (result.length >= SURFACE_FLINGER_DISPLAY_LABEL_MAX_CHARS) return@forEach
+        result.append(
+            if (
+                character in 'a'..'z' ||
+                character in 'A'..'Z' ||
+                character in '0'..'9' ||
+                character == '.' ||
+                character == '_' ||
+                character == ':' ||
+                character == '-'
+            ) {
+                character
+            } else {
+                '_'
+            },
+        )
+    }
+    return result.toString().ifBlank { "unknown" }
 }
 
 private fun containsDpuLabToken(line: String): Boolean =
@@ -1011,13 +1551,40 @@ private fun containsDpuLabToken(line: String): Boolean =
 // across the user-facing DPULayerTest rename.
 private val SURFACE_FLINGER_APP_TOKENS =
     arrayOf("dpulayerlab", "DpuLab", "DPU Layer Lab", "DPULayerTest")
-private val SURFACE_FLINGER_DEVICE_PATTERN = Regex(
-    """composition\s+type=(DEVICE|SOLID_COLOR|CURSOR|SIDEBAND)|\b(DEVICE|SOLID_COLOR|CURSOR|SIDEBAND)\b""",
+private val SURFACE_FLINGER_DISPLAY_HEADER_PATTERN = Regex(
+    """^\s*Display\s+(.+?)(?:\s+\((active|inactive)\))?\s+HWC\s+layers:\s*$""",
     RegexOption.IGNORE_CASE,
 )
-private val SURFACE_FLINGER_CLIENT_PATTERN =
-    Regex("""composition\s+type=CLIENT|\bCLIENT\b""", RegexOption.IGNORE_CASE)
+private val SURFACE_FLINGER_DISPLAY_MARKER_PATTERN =
+    Regex("""\bDisplay\b.*\bHWC\s+layers\b""", RegexOption.IGNORE_CASE)
+private val SURFACE_FLINGER_LAYER_BLOCK_PATTERN =
+    Regex("""^\s*\*\s+Layer\b""", RegexOption.IGNORE_CASE)
+private val SURFACE_FLINGER_TABLE_HEADER_PATTERN =
+    Regex("""(?:^|\|)\s*Comp\s+Type\s*(?:\||$)""", RegexOption.IGNORE_CASE)
+private val SURFACE_FLINGER_TABLE_ROW_PREFIX_PATTERN = Regex(
+    """^\s*(?:rel\s+)?-?\d+\s*\|""",
+    RegexOption.IGNORE_CASE,
+)
+private val SURFACE_FLINGER_EXPLICIT_COMPOSITION_PATTERN = Regex(
+    """\b(?:composition\s*type|compositionType|comp\s*type)\s*[:=]\s*([A-Z][A-Z0-9_]*)""",
+    RegexOption.IGNORE_CASE,
+)
+private val SURFACE_FLINGER_BARE_COMPOSITION_PATTERN = Regex(
+    """\b(?:DEVICE|CLIENT|SOLID_COLOR|CURSOR|SIDEBAND|DISPLAY_DECORATION|REFRESH_RATE_INDICATOR)\b""",
+    RegexOption.IGNORE_CASE,
+)
 private val SURFACE_FLINGER_HWC_MISSED_PATTERN =
     Regex("""HWC missed frame count:\s*(\d+)""", RegexOption.IGNORE_CASE)
 private val SURFACE_FLINGER_GPU_MISSED_PATTERN =
     Regex("""GPU missed frame count:\s*(\d+)""", RegexOption.IGNORE_CASE)
+private const val SURFACE_FLINGER_DISPLAY_LABEL_MAX_CHARS = 64
+private const val SURFACE_FLINGER_MAX_DISPLAY_SECTIONS = 16
+private const val INVALID_SURFACE_FLINGER_COLUMN_INDEX = -1
+private val SURFACE_FLINGER_DEVICE_COMPOSITION_TOKENS = arrayOf(
+    "DEVICE",
+    "SOLID_COLOR",
+    "CURSOR",
+    "SIDEBAND",
+    "DISPLAY_DECORATION",
+    "REFRESH_RATE_INDICATOR",
+)

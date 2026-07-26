@@ -21,10 +21,13 @@ import androidx.compose.runtime.setValue
 import androidx.core.content.FileProvider
 import androidx.core.content.ContextCompat
 import com.example.dpulayerlab.model.BufferSize
+import com.example.dpulayerlab.model.BufferPresentation
 import com.example.dpulayerlab.model.DecoderLinearReference
 import com.example.dpulayerlab.model.Gauge
 import com.example.dpulayerlab.model.HwcCompositionExpectation
+import com.example.dpulayerlab.model.HwcCompositionEvidenceAvailability
 import com.example.dpulayerlab.model.LayerBackend
+import com.example.dpulayerlab.model.LayerOrientation
 import com.example.dpulayerlab.model.LayerSizeProfile
 import com.example.dpulayerlab.model.LOAD_CONTROL_CADENCE_MS
 import com.example.dpulayerlab.model.MIN_EFFECTIVE_LOAD
@@ -57,6 +60,7 @@ import com.example.dpulayerlab.model.TransitionSample
 import com.example.dpulayerlab.model.TransitionSegment
 import com.example.dpulayerlab.model.TransitionSpec
 import com.example.dpulayerlab.model.coverageBitAt
+import com.example.dpulayerlab.model.materializeDurationMultiplier
 import com.example.dpulayerlab.model.requiresSelectedDecoderProducer
 import com.example.dpulayerlab.model.requiredCoverageMask
 import com.example.dpulayerlab.model.terminalReason
@@ -196,7 +200,9 @@ data class HwcCapacityCalibrationResult(
             "${calibrationDisplayShortEdgePx ?: "N/A"}x" +
             "${calibrationDisplayLongEdgePx ?: "N/A"}; " +
             "lifetime=process-session; " +
-            "scope=observed-at-candidate-not-universal-max; detail=${detail.ifBlank { "N/A" }}"
+            "scope=unseparated-app-raw-control-root-not-corrected; " +
+            "meaning=observed-at-candidate-not-universal-max; " +
+            "detail=${detail.ifBlank { "N/A" }}"
 
     fun uiSummary(): String =
         when (status) {
@@ -204,26 +210,37 @@ data class HwcCapacityCalibrationResult(
                 "HWC capacity · 앱 session 최초 1회 · 요청 20L · 측정 대기"
             HwcCapacityCalibrationStatus.OBSERVED_AT_CANDIDATE ->
                 "HWC capacity · session 1회 · 요청 20L · " +
-                    "실제 후보 ${candidateLayers ?: "N/A"}L에서 " +
-                    "D${observedDeviceLayers ?: "N/A"}/C${observedClientLayers ?: "N/A"} · " +
+                    "실제 producer 후보 ${candidateProducerLabel()} · " +
+                    "APP RAW D${observedDeviceLayers ?: "N/A"}/" +
+                    "C${observedClientLayers ?: "N/A"}/" +
+                    "T${observedCompositionTotal()} · " +
                     "${quality.name}@${source.ifBlank { "N/A" }} · " +
                     capacityReuseGuidance(this).uiSummary()
             HwcCapacityCalibrationStatus.UNAVAILABLE ->
                 "HWC capacity · session 1회 N/A · 요청 20L · " +
-                    "실제 후보 ${candidateLayers ?: "N/A"}L · " +
+                    "실제 producer 후보 ${candidateProducerLabel()} · " +
                     "${quality.name}@${source.ifBlank { "N/A" }} · " +
                     detail.ifBlank { "fresh pair unavailable" }
         }
+
+    private fun observedCompositionTotal(): String {
+        val device = observedDeviceLayers?.takeIf { it >= 0 } ?: return "N/A"
+        val client = observedClientLayers?.takeIf { it >= 0 } ?: return "N/A"
+        return (device.toLong() + client.toLong()).toString()
+    }
+
+    private fun candidateProducerLabel(): String =
+        candidateLayers?.takeIf { it > 0 }?.let { "${it}P" } ?: "N/A"
 }
 
 data class HwcCapacityReuseGuidance(
-    val deviceCandidateCeiling: Int? = null,
-    val clientPressureCandidate: Int? = null,
+    val candidateProducerCount: Int? = null,
+    val observedAppDeviceLayers: Int? = null,
+    val observedAppClientLayers: Int? = null,
     val detail: String,
 ) {
     fun uiSummary(): String =
-        "ref DEVICE≤${deviceCandidateCeiling ?: "N/A"}L / " +
-            "CLIENT≥${clientPressureCandidate ?: "N/A"}L · topology별 재검증"
+        "workload DEVICE ceiling N/A · control/root 보정 없음"
 }
 
 /**
@@ -728,8 +745,20 @@ class LabController internal constructor(
         ) ?: HwcCapacityCalibrationResult(HwcCapacityCalibrationStatus.PENDING),
     )
         private set
-    var errorMessage by mutableStateOf<String?>(null)
+    private val errorNoticeSequence = AtomicInteger()
+    var errorNotice by mutableStateOf<ErrorNotice?>(null)
         private set
+    var errorMessage: String?
+        get() = errorNotice?.message
+        private set(value) {
+            if (value == null) {
+                errorNotice = null
+            } else {
+                publishError(value)
+            }
+        }
+    val errorRecoveryAction: ErrorRecoveryAction?
+        get() = errorNotice?.recoveryAction
     var safetyLimits by mutableStateOf(frontendInputs.initialSafetyLimits)
         private set
     var lastSafetyAdjustments by mutableStateOf<List<String>>(emptyList())
@@ -738,6 +767,14 @@ class LabController internal constructor(
         private set
     val canConfigureRuntimeProtection: Boolean
         get() = !planStartBlocked(runJobPresent = runJob != null, isRunning = isRunning)
+    val canOpenBatterySaverSettings: Boolean
+        get() =
+            canConfigureRuntimeProtection &&
+                performancePolicyRestoreConfirmed.get() &&
+                performanceIsolationLifecycle == PerformanceIsolationLifecycle.IDLE &&
+                !performanceIsolationOwned &&
+                performanceSessionTicket == null &&
+                performanceRenewalJob == null
     val activeSevereThermalDeratingEnabled: Boolean
         get() = activeRuntimeProtectionPolicy.severeThermalDeratingEnabled
     val directSensors = mutableStateListOf<SensorReading>()
@@ -1091,8 +1128,8 @@ class LabController internal constructor(
         selectedMediaLinearReference = null
     }
 
-    fun clearError() {
-        errorMessage = null
+    fun clearError(noticeId: Int? = null) {
+        errorNotice = errorNoticeAfterConsume(errorNotice, noticeId)
     }
 
     /**
@@ -1109,7 +1146,25 @@ class LabController internal constructor(
     }
 
     fun showError(message: String) {
-        errorMessage = message.take(MAX_EVENT_MESSAGE_CHARS)
+        publishError(message)
+    }
+
+    fun showBatterySaverSettingsError(message: String) {
+        publishError(
+            message = message,
+            recoveryAction = ErrorRecoveryAction.OPEN_BATTERY_SAVER_SETTINGS,
+        )
+    }
+
+    private fun publishError(
+        message: String,
+        recoveryAction: ErrorRecoveryAction? = null,
+    ) {
+        errorNotice = ErrorNotice(
+            id = nextBoundedSequence(errorNoticeSequence),
+            message = message.take(MAX_EVENT_MESSAGE_CHARS),
+            recoveryAction = recoveryAction,
+        )
     }
 
     fun startScenario(requestedScenario: ScenarioSpec) {
@@ -1124,8 +1179,9 @@ class LabController internal constructor(
     /**
      * Starts an immutable snapshot of [requestedPlan].
      *
-     * Empty queues and excessive repeat/expanded-run counts are rejected. Duplicate scenarios
-     * are deliberately preserved because queue order itself is part of the experiment.
+     * Empty queues, invalid repeat counts, unrepresentable indexed progress, and oversized
+     * external plans are rejected. Duplicate scenarios are deliberately preserved because queue
+     * order itself is part of the experiment.
      */
     fun startPlan(requestedPlan: ScenarioRunPlan): Boolean {
         if (closed) {
@@ -1299,15 +1355,7 @@ class LabController internal constructor(
         val runtimeProtectionPolicySnapshot = RuntimeProtectionPolicy(
             severeThermalDeratingEnabled = severeThermalDeratingEnabled,
         )
-        val plan = requestedPlan.copy(
-            scenarios = requestedPlan.scenarios.map { scenario ->
-                scenario.copy(
-                    tags = scenario.tags.toSet(),
-                    requirements = scenario.requirements.toSet(),
-                    phases = scenario.phases.map { it.copy() },
-                )
-            },
-        )
+        val plan = requestedPlan.materializeDurationMultiplier()
 
         resetPlanState()
         activeRuntimeProtectionPolicy = runtimeProtectionPolicySnapshot
@@ -1378,6 +1426,7 @@ class LabController internal constructor(
             source = plan.source,
             repeatIndex = 0,
             repeatCount = plan.repeatCount,
+            durationMultiplier = requestedPlan.durationMultiplier,
             queueIndex = 0,
             queueSize = plan.scenarios.size,
             completedRuns = 0,
@@ -1506,6 +1555,7 @@ class LabController internal constructor(
                     val reason =
                         "Battery Saver 복원 결과를 보고서에 안전하게 기록하지 못해 plan을 " +
                             "완료로 판정하지 않습니다."
+
                     cancellationReason = reason
                     throw PlanAbortException(reason)
                 }
@@ -2313,6 +2363,7 @@ class LabController internal constructor(
                     )
                     failPerformanceIsolation(
                         "broker 승인 뒤에도 Battery Saver=off를 확인할 수 없습니다.",
+                        ErrorRecoveryAction.OPEN_BATTERY_SAVER_SETTINGS,
                     )
                 }
                 performanceIsolationLifecycle = PerformanceIsolationLifecycle.ACTIVE
@@ -2345,7 +2396,15 @@ class LabController internal constructor(
                         "remote 정책 변경/복원이 불명확한 ticket을 반환함"
                     else -> result.detail
                 }
-                failPerformanceIsolation("성능 격리 broker 승인 실패: $policyDetail")
+                failPerformanceIsolation(
+                    reason = "성능 격리 broker 승인 실패: $policyDetail",
+                    recoveryAction =
+                        if (batterySaverActive) {
+                            ErrorRecoveryAction.OPEN_BATTERY_SAVER_SETTINGS
+                        } else {
+                            null
+                        },
+                )
             }
         }
     }
@@ -2507,6 +2566,7 @@ class LabController internal constructor(
                 }
             }
             constructedRenewal = renewalOwner
+
             performanceRenewalJob = renewalOwner
             renewalOwner.invokeOnCompletion { cause ->
                 val operationFailure =
@@ -2746,6 +2806,7 @@ class LabController internal constructor(
             val originalStateRestored =
                 awaitOriginalBatterySaverState(originalPowerSaveMode)
             performanceSessionTicket = null
+
             performanceIsolationOwned = false
             if (originalStateRestored) {
                 performancePolicyRestoreConfirmed.set(true)
@@ -2759,9 +2820,9 @@ class LabController internal constructor(
                 performanceBaselinePowerSaveMode = null
                 "복원 확인 · Battery Saver 정책"
             } else if (!originalStateRestored) {
-                errorMessage =
+                errorMessage = (
                     "성능 정책 원상복구 실패($reason): Battery Saver 원래 상태 불일치"
-                        .take(MAX_EVENT_MESSAGE_CHARS)
+                    ).take(MAX_EVENT_MESSAGE_CHARS)
                 "복원 실패 · Battery Saver 원상태 불일치"
             } else {
                 "복원 실패 · renew 종료 미확인"
@@ -2809,9 +2870,7 @@ class LabController internal constructor(
         while (currentCoroutineContext().isActive) {
             val saverOff = runCatching {
                 !powerManager.isPowerSaveMode
-            }.getOrElse {
-                return false
-            }
+            }.getOrElse { return false }
             if (saverOff) return true
             if (SystemClock.elapsedRealtime() >= deadline) return false
             delay(PERFORMANCE_POLICY_POLL_MS)
@@ -2819,12 +2878,15 @@ class LabController internal constructor(
         return false
     }
 
-    private fun failPerformanceIsolation(reason: String): Nothing {
+    private fun failPerformanceIsolation(
+        reason: String,
+        recoveryAction: ErrorRecoveryAction? = null,
+    ): Nothing {
         val bounded = reason.take(MAX_EVENT_MESSAGE_CHARS)
         performanceIsolationLifecycle = PerformanceIsolationLifecycle.FAILED
         performanceIsolationStatus = "실패 · 시작 거부"
         cancellationReason = bounded
-        errorMessage = bounded
+        publishError(bounded, recoveryAction)
         throw PlanAbortException(bounded)
     }
 
@@ -3596,12 +3658,22 @@ class LabController internal constructor(
             runEvents += event(
                 "SESSION_HWC_CAPACITY_REUSE_GUIDANCE",
                 capacityReuseGuidance(hwcCapacityCalibration).let { guidance ->
-                    "deviceCandidateCeiling=" +
-                        "${guidance.deviceCandidateCeiling ?: "N/A"}; " +
-                        "clientPressureCandidate=" +
-                        "${guidance.clientPressureCandidate ?: "N/A"}; " +
-                        guidance.detail
+                    "candidateProducerCount=" +
+                        "${guidance.candidateProducerCount ?: "N/A"}; " +
+                        "observedAppDeviceLayers=" +
+                        "${guidance.observedAppDeviceLayers ?: "N/A"}; " +
+                        "observedAppClientLayers=" +
+                        "${guidance.observedAppClientLayers ?: "N/A"}; " +
+                        "workloadDeviceCeiling=N/A; " +
+                    guidance.detail
                 },
+            )
+            runEvents += event(
+                "HWC_COUNT_SCOPE",
+                "APP_RAW_UNSEPARATED; controlLayerIncluded=true; " +
+                    "control/root subtraction=none; FrameTracker PHYSICAL producer count is " +
+                    "reported separately; workload-scoped HWC attribution requires typed BSP " +
+                    "layer identity evidence",
             )
             val isolationToken = activeTestWindowIsolationToken
             if (
@@ -3643,10 +3715,7 @@ class LabController internal constructor(
             }
             runEvents += event(
                 "PLAN_POSITION",
-                "source=${planProgress.source.name}; " +
-                    "run=${planProgress.completedRuns + 1}/${planProgress.totalRuns}; " +
-                    "repeat=${planProgress.currentRepeat}/${planProgress.repeatCount}; " +
-                    "queue=${planProgress.currentQueuePosition}/${planProgress.queueSize}",
+                planPositionEventMessage(planProgress),
             )
             if (thermalReduced) {
                 runEvents += event(
@@ -3747,13 +3816,15 @@ class LabController internal constructor(
             delay(PRECHECK_DELAY_MS)
             verifyPerformanceEnvironmentBeforeProducer()
 
+            val warmupPhase = scenario.phases.firstOrNull()
+                ?.let(::applyPersistentSafety)
+                ?.let(::safeWarmupPhaseFor)
+                ?: throw UnsupportedRunException("실행할 warm-up phase가 없습니다.")
             val warmupProducerGeneration = beginTrackedProducerGeneration()
             progress = progress.copy(
                 stage = RunnerStage.WARMUP,
                 phaseIndex = 0,
-                phase = scenario.phases.firstOrNull()
-                    ?.let(::applyPersistentSafety)
-                    ?.let(::safeWarmupPhaseFor),
+                phase = warmupPhase,
                 targetPhase = scenario.phases.firstOrNull()?.let(::applyPersistentSafety),
                 transitionFraction = 0f,
                 statusText = "surface warm-up",
@@ -3786,7 +3857,114 @@ class LabController internal constructor(
                     "working-set allocation/page touch confirmed; measured-byte baseline reset",
                 )
             }
-            delay(WARMUP_DELAY_MS)
+            val warmupReadinessStartedMs = SystemClock.elapsedRealtime()
+            val warmupReadinessDeadlineMs = saturatingAdd(
+                warmupReadinessStartedMs,
+                PRODUCER_RECOVERY_TIMEOUT_MS,
+            )
+            val warmupMinimumCompleteMs = saturatingAdd(
+                warmupReadinessStartedMs,
+                WARMUP_DELAY_MS,
+            )
+            var warmupGenerationActivated = false
+            var warmupReadyBoundary: WarmupBaselineProducerBoundary
+            while (true) {
+                currentCoroutineContext().ensureActive()
+                val readiness = frameTracker.producerReadiness(warmupProducerGeneration)
+                val processLeaseActive = RendererSafetyState.hasUnconfirmedTeardown()
+                readiness.runtimeFailureReason?.let { failure ->
+                    val reason = "Warm-up producer 실행 실패: $failure"
+                    cancellationReason = reason
+                    throw PlanAbortException(reason)
+                }
+                if (readiness.teardownFailed || readiness.topologyMissed) {
+                    val reason =
+                        "Warm-up producer topology/teardown 증거가 무효화되어 baseline을 " +
+                            "수집하지 않습니다."
+
+                    cancellationReason = reason
+                    throw PlanAbortException(reason)
+                }
+                if (
+                    !warmupGenerationActivated &&
+                    readiness.topologyPublished &&
+                    !readiness.topologyPending &&
+                    readiness.geometryReady &&
+                    readiness.geometryAppliedProfileOrdinal ==
+                    warmupPhase.layerSizeProfile.ordinal &&
+                    !processLeaseActive &&
+                    frameTracker.activateProducerGeneration(warmupProducerGeneration)
+                ) {
+                    // Activation clears every preparation-era callback. Baseline readiness can
+                    // now be satisfied only by a fresh first buffer from the committed producer.
+                    warmupGenerationActivated = true
+                }
+                val refreshedReadiness =
+                    frameTracker.producerReadiness(warmupProducerGeneration)
+                val refreshedProcessLeaseActive =
+                    RendererSafetyState.hasUnconfirmedTeardown()
+                val nowMs = SystemClock.elapsedRealtime()
+                val readyBoundary = captureWarmupBaselineProducerBoundary(
+                    readiness = refreshedReadiness,
+                    expectedProfileOrdinal = warmupPhase.layerSizeProfile.ordinal,
+                    processLeaseActive = refreshedProcessLeaseActive,
+                )
+                if (
+                    warmupGenerationActivated &&
+                    readyBoundary != null &&
+                    warmupReadyWindowOpen(
+                        nowMs = nowMs,
+                        minimumReadyMs = warmupMinimumCompleteMs,
+                        deadlineMs = warmupReadinessDeadlineMs,
+                    )
+                ) {
+                    warmupReadyBoundary = readyBoundary
+                    progress = progress.copy(
+                        expectedProducerCount = refreshedReadiness.expectedCount,
+                        observedProducerCount = refreshedReadiness.observedCount,
+                        statusText = "warm-up first buffer 확인 · fresh baseline 수집",
+                    )
+                    runEvents += event(
+                        "WARMUP_READY",
+                        "generation=$warmupProducerGeneration; " +
+                            "expected=${refreshedReadiness.expectedCount}; " +
+                            "observed=${refreshedReadiness.observedCount}; " +
+                            "geometryRevision=${refreshedReadiness.geometryAppliedRevision}",
+                    )
+                    break
+                }
+                if (nowMs >= warmupReadinessDeadlineMs) {
+                    frameTracker.markProducerTeardownFailure(warmupProducerGeneration)
+                    val reason =
+                        "Warm-up topology와 fresh first buffer가 " +
+                            "${PRODUCER_RECOVERY_TIMEOUT_MS}ms 안에 준비되지 않았습니다 " +
+                            "(published=${refreshedReadiness.topologyPublished}, " +
+                            "pending=${refreshedReadiness.topologyPending}, " +
+                            "expected=${refreshedReadiness.expectedCount}, " +
+                            "observed=${refreshedReadiness.observedCount}, " +
+                            "geometry=${refreshedReadiness.geometryAppliedRevision}/" +
+                            "${refreshedReadiness.geometryRequestedRevision}, " +
+                            "processLease=$processLeaseActive)."
+                    cancellationReason = reason
+                    runEvents += event("WARMUP_READINESS_TIMEOUT", reason)
+                    throw PlanAbortException(reason)
+                }
+                progress = progress.copy(
+                    expectedProducerCount = visibleExpectedProducerCount(
+                        committedExpectedCount = refreshedReadiness.expectedCount,
+                        topologyPublished = refreshedReadiness.topologyPublished,
+                        topologyPending = refreshedReadiness.topologyPending,
+                        processLeaseActive = refreshedProcessLeaseActive,
+                    ),
+                    observedProducerCount = refreshedReadiness.observedCount,
+                    statusText = if (warmupGenerationActivated) {
+                        "warm-up fresh first buffer 확인 중"
+                    } else {
+                        "warm-up topology/geometry commit 확인 중"
+                    },
+                )
+                delay(RENDERER_TEARDOWN_POLL_MS)
+            }
             // Attribute deltas to the actual scenario, not Surface creation, codec preparation,
             // or the Compose transition into the run screen.
             val baselineSample = try {
@@ -3798,6 +3976,32 @@ class LabController internal constructor(
                     "warm-up 이후 fresh counter baseline을 얻지 못했습니다: " +
                         error.javaClass.simpleName,
                 )
+            }
+            val postBaselineReadiness =
+                frameTracker.producerReadiness(warmupProducerGeneration)
+            val expectedWarmupReadyBoundary = warmupReadyBoundary
+            if (
+                !warmupBaselineProducerBoundaryUnchanged(
+                    expected = expectedWarmupReadyBoundary,
+                    readiness = postBaselineReadiness,
+                    expectedProfileOrdinal = warmupPhase.layerSizeProfile.ordinal,
+                    processLeaseActive = RendererSafetyState.hasUnconfirmedTeardown(),
+                )
+            ) {
+                val reason =
+                    "Fresh baseline 수집 중 warm-up producer topology/readiness가 변경되어 " +
+                        "측정 시작을 중단합니다."
+                cancellationReason = reason
+                runEvents += event(
+                    "WARMUP_BASELINE_INVALIDATED",
+                    "$reason before=$expectedWarmupReadyBoundary; " +
+                        "afterTopologyRevision=${postBaselineReadiness.topologyRevision}; " +
+                        "afterDiscontinuitySerial=" +
+                        "${postBaselineReadiness.topologyDiscontinuitySerial}; " +
+                        "afterGeometryRevision=" +
+                        "${postBaselineReadiness.geometryAppliedRevision}",
+                )
+                throw PlanAbortException(reason)
             }
             establishCounterBaseline(baselineSample)
             runScenarioPhases(scenario)
@@ -3812,6 +4016,7 @@ class LabController internal constructor(
                 val reason =
                     "부하, physical producer 또는 compression 해제를 확인할 수 없어 " +
                         "plan을 안전 중단합니다."
+
                 cancellationReason = reason
                 throw PlanAbortException(reason)
             }
@@ -4248,6 +4453,10 @@ class LabController internal constructor(
         while (phaseIndex < scenario.phases.size) {
             currentCoroutineContext().ensureActive()
             val requestedPhase = scenario.phases[phaseIndex]
+            val decoderEvidenceRequired = requestedPhase.requiresSelectedDecoderProducer()
+            var decoderEvidenceGeneration: Long? = null
+            var decoderPhaseFailure: Throwable? = null
+            try {
             var targetPhase = applyPersistentSafety(requestedPhase)
             val adaptiveCandidate = isAdaptiveBoundaryCandidate(
                 scenarioId = scenario.id,
@@ -4329,6 +4538,7 @@ class LabController internal constructor(
             val adaptiveBoundaryContinuityBefore =
                 adaptiveBoundaryBefore?.let { exactCounterContinuous } ?: false
             val producerGeneration = beginTrackedProducerGeneration()
+            decoderEvidenceGeneration = producerGeneration
             val preparationPhase = rendererPreparationPhase(initialRuntime)
             val topologyRequestedAtMs = SystemClock.elapsedRealtime()
             val topologyDeadlineMs = saturatingAdd(
@@ -4511,6 +4721,22 @@ class LabController internal constructor(
                     "transition=${targetPhase.transition.summary()}; " +
                     "hwcExpectation=${targetPhase.hwcCompositionExpectation.name}",
             )
+            if (targetPhase.requiresSelectedDecoderProducer()) {
+                val decoder = selectedVideoDecoder
+                runEvents += event(
+                    "DECODER_PHASE_ACTIVE",
+                    "phase=${targetPhase.id}; requested=${targetPhase.bufferSize.label}" +
+                        "@${targetPhase.producerFps}fps; actual=" +
+                        if (decoder != null) {
+                            "${decoder.expectedVisibleWidthPx}x" +
+                                "${decoder.expectedVisibleHeightPx}@" +
+                                "${decoder.expectedSourceFps}fps; codec=${decoder.codecName}; " +
+                                "source=MediaCodec.OnFrameRenderedListener; hwcProof=false"
+                        } else {
+                            "N/A; source=MediaCodec.OnFrameRenderedListener; hwcProof=false"
+                        },
+                )
+            }
             var lastRawRuntime = initialRawRuntime
             var firstControlTick = false
             var runtimeTargetPhase = targetPhase
@@ -4579,6 +4805,7 @@ class LabController internal constructor(
                 pendingControlCoverage =
                     discardPendingControlCoverageForProducerRecovery(discardedControlCoverage)
                 recoveryPaused = true
+
                 producerRecoveryPaused = true
                 phaseClock.pause(
                     boundedBoundaryMs,
@@ -5594,6 +5821,7 @@ class LabController internal constructor(
                 }
                 }
             } finally {
+
                 producerRecoveryPaused = false
                 if (activePhaseClock === phaseClock) {
                     activePhaseClock = null
@@ -5854,6 +6082,30 @@ class LabController internal constructor(
                 )
             } else {
                 phaseIndex++
+            }
+            } catch (failure: Throwable) {
+                decoderPhaseFailure = failure
+                throw failure
+            } finally {
+                if (decoderEvidenceRequired) {
+                    recordDecoderTerminalEvidencePreservingFailure(decoderPhaseFailure) {
+                        val terminal = decoderPhaseTerminalEvidence(
+                            failure = decoderPhaseFailure,
+                            cancellationReason = cancellationReason,
+                        )
+                        val readiness =
+                            decoderEvidenceGeneration?.let(frameTracker::producerReadiness)
+                        runEvents += event(
+                            "DECODER_FRAME_EVIDENCE",
+                            decoderFrameEvidenceMessage(
+                                phaseId = requestedPhase.id,
+                                generation = decoderEvidenceGeneration,
+                                readiness = readiness,
+                                terminal = terminal,
+                            ),
+                        )
+                    }
+                }
             }
         }
     }
@@ -6234,9 +6486,7 @@ class LabController internal constructor(
     }
 
     private fun throwForStaleRuntimeLoadReleaseFailure(
-        phaseId: String,
-        operation: String,
-        orderedZeroConfirmed: Boolean,
+        phaseId: String, operation: String, orderedZeroConfirmed: Boolean,
     ) {
         if (orderedZeroConfirmed) return
         val reason =
@@ -6518,6 +6768,7 @@ class LabController internal constructor(
             abortForSafety(
                 reason = "실행 중 Battery Saver가 활성화되어 기존 safety envelope를 폐기합니다.",
                 eventType = "SAFETY_ENVELOPE_CHANGED",
+                recoveryAction = ErrorRecoveryAction.OPEN_BATTERY_SAVER_SETTINGS,
             )
             return
         }
@@ -6847,6 +7098,7 @@ class LabController internal constructor(
                 abortForSafety(
                     reason = "실행 중 Battery Saver가 활성화되어 성능 격리를 잃었습니다.",
                     eventType = "SAFETY_ENVELOPE_CHANGED",
+                    recoveryAction = ErrorRecoveryAction.OPEN_BATTERY_SAVER_SETTINGS,
                 )
                 return
             }
@@ -6936,11 +7188,15 @@ class LabController internal constructor(
             workloads = LoadSetpoints(shape = target.workloads.shape),
         )
 
-    private fun abortForSafety(reason: String, eventType: String) {
+    private fun abortForSafety(
+        reason: String,
+        eventType: String,
+        recoveryAction: ErrorRecoveryAction? = null,
+    ) {
         if (cancellationReason != null) return
         cancellationReason = reason
         runEvents += event(eventType, reason)
-        errorMessage = "$reason. 테스트를 중단했습니다."
+        publishError("$reason. 테스트를 중단했습니다.", recoveryAction)
         // Publish producer removal and zero local/NPU setpoints at the observation point. The
         // run coroutine may currently be waiting in a bounded vendor call and will perform the
         // confirmed/retried cleanup when cancellation reaches it.
@@ -7199,7 +7455,11 @@ class LabController internal constructor(
         val previousReport = lastReportFile
         val replacement = try {
             withContext(NonCancellable + Dispatchers.IO) {
-                ReportWriter.write(appContext, updatedSummary)
+                ReportWriter.replace(
+                    context = appContext,
+                    summary = updatedSummary,
+                    obsoleteReport = previousReport,
+                )
             }
         } catch (error: Exception) {
             val publicationFailureSummary =
@@ -7222,9 +7482,9 @@ class LabController internal constructor(
                 summary = publicationFailureSummary,
                 reportFile = null,
             )
-            errorMessage =
+            errorMessage = (
                 "성능 정책 복원 결과 보고서 저장 실패: ${error.javaClass.simpleName}"
-                    .take(MAX_EVENT_MESSAGE_CHARS)
+                ).take(MAX_EVENT_MESSAGE_CHARS)
             withContext(NonCancellable + Dispatchers.IO) {
                 deleteManagedCompletedReportBestEffort(
                     reportsDirectory = File(appContext.filesDir, "reports"),
@@ -7234,19 +7494,12 @@ class LabController internal constructor(
             return false
         }
         lastReportFile = replacement
+
         lastPerformanceRestoreReportPersisted = true
         updateLatestPlanResultFromSummary(
             summary = updatedSummary,
             reportFile = replacement,
         )
-        if (previousReport != null && previousReport != replacement) {
-            withContext(NonCancellable + Dispatchers.IO) {
-                deleteManagedCompletedReportBestEffort(
-                    reportsDirectory = File(appContext.filesDir, "reports"),
-                    reportFile = previousReport,
-                )
-            }
-        }
         return true
     }
 
@@ -7743,6 +7996,7 @@ class LabController internal constructor(
             throw cancelled
         }
         if (!completedInTime) {
+
             var terminalFailure: Throwable? = null
             try {
                 abandonProviderOpen()
@@ -7768,6 +8022,7 @@ class LabController internal constructor(
             // Cancellation can arrive after the provider worker has published its descriptor but
             // before ownership is transferred below. Reclaim that completed result as well as a
             // still-running provider open.
+
             var terminal: Throwable = cancelled
             try {
                 abandonProviderOpen()
@@ -7900,6 +8155,7 @@ class LabController internal constructor(
             throw cancelled
         }
         if (!completedInTime) {
+
             var terminalFailure: Throwable? = null
             try {
                 abandonInspection()
@@ -8256,13 +8512,13 @@ class LabController internal constructor(
         // The concrete input format is configured unchanged. Bind every advertised optional
         // profile/level/bitrate key, not only P010, to the chosen codec's format support query.
         val requiredProfile = boundMedia.profile
+        // MediaCodec receives the selected track's original format. A 120 fps source used by a
+        // 60 fps phase must therefore be assigned to a codec that advertises 120 fps, even though
+        // output release is intentionally paced at the lower phase target.
         val hardwareCodecName = CapabilityScanner.findHardwareVideoDecoder(
             mime = mime,
             width = width,
             height = height,
-            // MediaCodec receives the selected track's original format. A 120 fps source used
-            // by a 60 fps phase must therefore be assigned to a codec that advertises 120 fps,
-            // even though output release is intentionally paced at the lower phase target.
             framesPerSecond = decoderCapabilityFps,
             requiredProfile = requiredProfile,
             requiredLevel = boundMedia.level,
@@ -8406,8 +8662,6 @@ class LabController internal constructor(
         val error: String? = null,
     )
 
-    private class UnsupportedRunException(message: String) : Exception(message)
-
     private companion object {
         val ACTIVE_STAGES = setOf(
             RunnerStage.PRECHECK,
@@ -8462,6 +8716,94 @@ class LabController internal constructor(
             MetricQuality.HARDWARE_COUNTER,
             MetricQuality.KERNEL,
         )
+    }
+}
+
+internal enum class DecoderPhaseTerminalOutcome {
+    COMPLETED,
+    UNSUPPORTED,
+    ABORTED,
+    CANCELLED,
+    INCONCLUSIVE,
+    ERROR,
+}
+
+internal data class DecoderPhaseTerminalEvidence(
+    val outcome: DecoderPhaseTerminalOutcome,
+    val reason: String,
+)
+
+internal fun decoderPhaseTerminalEvidence(
+    failure: Throwable?,
+    cancellationReason: String?,
+): DecoderPhaseTerminalEvidence {
+    if (failure == null) {
+        return DecoderPhaseTerminalEvidence(
+            outcome = DecoderPhaseTerminalOutcome.COMPLETED,
+            reason = "none",
+        )
+    }
+    val outcome = when (failure) {
+        is UnsupportedRunException -> DecoderPhaseTerminalOutcome.UNSUPPORTED
+        is PlanAbortException -> DecoderPhaseTerminalOutcome.ABORTED
+        is CancellationException -> DecoderPhaseTerminalOutcome.CANCELLED
+        is InconclusiveRunException -> DecoderPhaseTerminalOutcome.INCONCLUSIVE
+        else -> DecoderPhaseTerminalOutcome.ERROR
+    }
+    val reason = (
+        cancellationReason?.takeIf(String::isNotBlank)
+            ?: failure.message?.takeIf(String::isNotBlank)
+            ?: failure.javaClass.simpleName.takeIf(String::isNotBlank)
+            ?: "unspecified"
+        )
+        .replace('\r', ' ')
+        .replace('\n', ' ')
+        .take(MAX_DECODER_TERMINAL_REASON_CHARS)
+    return DecoderPhaseTerminalEvidence(outcome = outcome, reason = reason)
+}
+
+internal fun decoderFrameEvidenceMessage(
+    phaseId: String,
+    generation: Long?,
+    readiness: ProducerReadiness?,
+    terminal: DecoderPhaseTerminalEvidence,
+): String =
+    "phase=$phaseId; generation=${generation ?: "N/A"}; " +
+        "outcome=${terminal.outcome.name}; terminalReason=${terminal.reason}; " +
+        "renderedCallbacks=${readiness?.decoderGenerationFrameCount ?: "N/A"}; " +
+        "observationCallbacks=${readiness?.decoderObservationFrameCount ?: "N/A"}; " +
+        "lastFrameAgeMs=${readiness?.decoderLastFrameAgeMs ?: "N/A"}; " +
+        "controlRevision=" +
+        if (readiness != null) {
+            "${readiness.decoderLastControlRevision}/" +
+                "${readiness.producerControlRequestedRevision}; " +
+                "decoderReady=${readiness.decoderControlReady}; "
+        } else {
+            "N/A; decoderReady=N/A; "
+        } +
+        "source=MediaCodec.OnFrameRenderedListener; hwcProof=false"
+
+enum class ErrorRecoveryAction {
+    OPEN_BATTERY_SAVER_SETTINGS,
+}
+
+data class ErrorNotice(
+    val id: Int,
+    val message: String,
+    val recoveryAction: ErrorRecoveryAction? = null,
+)
+
+internal fun errorNoticeAfterConsume(
+    current: ErrorNotice?,
+    consumedId: Int?,
+): ErrorNotice? =
+    if (consumedId == null || current?.id == consumedId) null else current
+
+private fun nextBoundedSequence(sequence: AtomicInteger): Int {
+    while (true) {
+        val current = sequence.get()
+        val next = if (current == Int.MAX_VALUE) 1 else (current + 1).coerceAtLeast(1)
+        if (sequence.compareAndSet(current, next)) return next
     }
 }
 
@@ -9055,6 +9397,82 @@ internal fun producerRecoveryDeadlineExceeded(
 }
 
 /**
+ * A warm-up delay is not producer readiness. The scenario-wide counter baseline is valid only
+ * after the committed warm-up topology, matching geometry, and a fresh post-activation buffer are
+ * all visible at the same bounded observation point.
+ */
+internal fun warmupProducerReadyForBaseline(
+    readiness: ProducerReadiness,
+    expectedProfileOrdinal: Int,
+    processLeaseActive: Boolean,
+): Boolean =
+    readiness.topologyPublished &&
+        !readiness.topologyPending &&
+        !readiness.topologyMissed &&
+        !readiness.teardownFailed &&
+        !readiness.teardownCompleted &&
+        readiness.runtimeFailureReason == null &&
+        !processLeaseActive &&
+        readiness.ready &&
+        readiness.expectedCount > 0 &&
+        readiness.observedCount == readiness.expectedCount &&
+        readiness.geometryReady &&
+        readiness.geometryAppliedProfileOrdinal == expectedProfileOrdinal
+
+internal data class WarmupBaselineProducerBoundary(
+    val expectedCount: Int,
+    val topologyRevision: Long,
+    val topologyDiscontinuitySerial: Long,
+    val geometryRequestedRevision: Long,
+    val geometryAppliedRevision: Long,
+    val geometryProfileOrdinal: Int,
+)
+
+internal fun captureWarmupBaselineProducerBoundary(
+    readiness: ProducerReadiness,
+    expectedProfileOrdinal: Int,
+    processLeaseActive: Boolean,
+): WarmupBaselineProducerBoundary? {
+    if (
+        !warmupProducerReadyForBaseline(
+            readiness = readiness,
+            expectedProfileOrdinal = expectedProfileOrdinal,
+            processLeaseActive = processLeaseActive,
+        )
+    ) {
+        return null
+    }
+    return WarmupBaselineProducerBoundary(
+        expectedCount = readiness.expectedCount,
+        topologyRevision = readiness.topologyRevision,
+        topologyDiscontinuitySerial = readiness.topologyDiscontinuitySerial,
+        geometryRequestedRevision = readiness.geometryRequestedRevision,
+        geometryAppliedRevision = readiness.geometryAppliedRevision,
+        geometryProfileOrdinal = readiness.geometryAppliedProfileOrdinal,
+    )
+}
+
+internal fun warmupBaselineProducerBoundaryUnchanged(
+    expected: WarmupBaselineProducerBoundary,
+    readiness: ProducerReadiness,
+    expectedProfileOrdinal: Int,
+    processLeaseActive: Boolean,
+): Boolean =
+    captureWarmupBaselineProducerBoundary(
+        readiness = readiness,
+        expectedProfileOrdinal = expectedProfileOrdinal,
+        processLeaseActive = processLeaseActive,
+    ) == expected
+
+internal fun warmupReadyWindowOpen(
+    nowMs: Long,
+    minimumReadyMs: Long,
+    deadlineMs: Long,
+): Boolean =
+    minimumReadyMs <= deadlineMs &&
+        nowMs in minimumReadyMs..deadlineMs
+
+/**
  * Warm-up must never allocate codec/SBWC-labelled buffers before the matching vendor route has
  * been applied. It is intentionally a small portable RGB producer; the measured generation is
  * created only after the route-transition teardown barrier.
@@ -9067,6 +9485,8 @@ internal fun safeWarmupPhaseFor(target: PhaseSpec): PhaseSpec =
         backend = LayerBackend.INDEPENDENT_SURFACES,
         pixelRoute = PixelRoute.RGB_8888,
         bufferSize = BufferSize.DISPLAY,
+        bufferPresentation = BufferPresentation.FIT,
+        layerOrientation = LayerOrientation.ROTATION_0,
         motion = MotionProfile.STATIC,
         layerSizeProfile = LayerSizeProfile.FULL_SCREEN,
         workloads = LoadSetpoints(),
@@ -9087,6 +9507,8 @@ internal fun rendererTopologyChanged(active: PhaseSpec?, target: PhaseSpec): Boo
         active.backend != target.backend ||
         active.pixelRoute != target.pixelRoute ||
         active.bufferSize != target.bufferSize ||
+        active.bufferPresentation != target.bufferPresentation ||
+        active.layerOrientation != target.layerOrientation ||
         active.includeGlLayer != target.includeGlLayer ||
         active.alphaOverlap != target.alphaOverlap
 
@@ -9780,6 +10202,16 @@ internal fun TelemetrySnapshot.toRunRelativeTelemetry(
             hwcCompositionEvidenceAgeMs.takeIf {
                 relativeHwcEvidenceMs != null
             },
+        hwcCompositionEvidenceAvailability =
+            if (
+                relativeHwcEvidenceMs == null &&
+                hwcCompositionEvidenceAvailability ==
+                HwcCompositionEvidenceAvailability.AVAILABLE
+            ) {
+                HwcCompositionEvidenceAvailability.EVIDENCE_INVALID
+            } else {
+                hwcCompositionEvidenceAvailability
+            },
         surfaceFlingerHwcMissed = surfaceFlingerHwcMissed.takeIf {
             relativeSurfaceFlingerEvidenceMs != null
         },
@@ -10049,25 +10481,29 @@ internal fun capacityReuseGuidance(
 ): HwcCapacityReuseGuidance {
     val candidate = calibration.candidateLayers
     val device = calibration.observedDeviceLayers
+    val client = calibration.observedClientLayers
     if (
         calibration.status != HwcCapacityCalibrationStatus.OBSERVED_AT_CANDIDATE ||
         candidate == null ||
         candidate <= 0 ||
         device == null ||
-        device < 0
+        device < 0 ||
+        client == null ||
+        client < 0
     ) {
         return HwcCapacityReuseGuidance(
-            detail = "calibration unavailable; preserve catalog target and verify fresh vendor pair",
+            candidateProducerCount = candidate?.takeIf { it > 0 },
+            detail =
+                "calibration unavailable; no numeric workload composition boundary is inferred",
         )
     }
-    val deviceCeiling = minOf(device, candidate)
-    val clientCandidate = (deviceCeiling + 1)
-        .takeIf { it in 1..candidate }
     return HwcCapacityReuseGuidance(
-        deviceCandidateCeiling = deviceCeiling,
-        clientPressureCandidate = clientCandidate,
+        candidateProducerCount = candidate,
+        observedAppDeviceLayers = device,
+        observedAppClientLayers = client,
         detail =
-            "advisory only for matching opaque RGB/crop topology; never a universal safety cap",
+            "raw app composition is advisory only; control/root is not subtracted and " +
+                "no producer ceiling is inferred",
     )
 }
 
@@ -10134,6 +10570,8 @@ internal fun hwcCompositionContractPreserved(
         requested.backend == effective.backend &&
         requested.pixelRoute == effective.pixelRoute &&
         requested.bufferSize == effective.bufferSize &&
+        requested.bufferPresentation == effective.bufferPresentation &&
+        requested.layerOrientation == effective.layerOrientation &&
         requested.motion == effective.motion &&
         requested.layerSizeProfile == effective.layerSizeProfile &&
         requested.workloads == effective.workloads &&
@@ -10148,6 +10586,8 @@ internal fun hwcCompositionContractDeltaSummary(
     "layers=${requested.activeLayers}→${effective.activeLayers}; " +
         "producerFps=${requested.producerFps}→${effective.producerFps}; " +
         "displayHz=${requested.requestedDisplayHz}→${effective.requestedDisplayHz}; " +
+        "presentation=${requested.bufferPresentation.name}→${effective.bufferPresentation.name}; " +
+        "orientation=${requested.layerOrientation.name}→${effective.layerOrientation.name}; " +
         "size=${requested.layerSizeProfile.name}→${effective.layerSizeProfile.name}; " +
         "gpu=${requested.workloads.gpu}→${effective.workloads.gpu}; " +
         "gl=${requested.includeGlLayer}→${effective.includeGlLayer}"
@@ -10894,6 +11334,7 @@ internal fun invalidateEarlierPlanResultsForRestoreFailure(
 private const val MAX_SHARE_REPORT_PATH_CHARS = 4_096
 private const val MAX_PLAN_RESTORE_FAILURE_REASON_CHARS = 300
 private const val MAX_REPORT_PUBLICATION_FAILURE_TYPE_CHARS = 80
+private const val MAX_DECODER_TERMINAL_REASON_CHARS = 300
 private const val MEDIA_PREFLIGHT_AWAIT_POLL_MS = 20L
 private const val MEDIA_PREFLIGHT_AWAIT_MAX_POLL_MS = 50L
 private const val NANOS_PER_MILLISECOND = 1_000_000L
@@ -10901,6 +11342,8 @@ private const val NANOS_PER_MILLISECOND = 1_000_000L
 internal class PlanAbortException(message: String) : CancellationException(message)
 
 internal class InconclusiveRunException(message: String) : Exception(message)
+
+internal class UnsupportedRunException(message: String) : Exception(message)
 
 /**
  * Serializes the complete descriptor-open + native-parser preflight across Activity recreation.
@@ -11092,6 +11535,21 @@ internal fun mergeControllerFailurePreservingFatal(
     return terminal
 }
 
+/**
+ * Keeps decoder terminal diagnostics fail-closed without allowing their secondary allocation or
+ * append failure to replace an already escaping VM-fatal identity.
+ */
+internal inline fun recordDecoderTerminalEvidencePreservingFailure(
+    escapingFailure: Throwable?,
+    record: () -> Unit,
+) {
+    try {
+        record()
+    } catch (recordFailure: Throwable) {
+        throw mergeControllerFailurePreservingFatal(escapingFailure, recordFailure)
+    }
+}
+
 /** Relays a bounded worker's fatal identity to its owning coroutine after worker cleanup. */
 internal fun controllerWorkerFailureOrThrow(error: Throwable?): Throwable? {
     if (error is Error) throw error
@@ -11273,6 +11731,13 @@ internal fun scenarioAtExpandedIndex(
     }
     return plan.scenarios[expandedIndex % plan.scenarios.size]
 }
+
+internal fun planPositionEventMessage(progress: PlanProgress): String =
+    "source=${progress.source.name}; " +
+        "run=${progress.completedRuns + 1}/${progress.totalRuns}; " +
+        "repeat=${progress.currentRepeat}/${progress.repeatCount}; " +
+        "queue=${progress.currentQueuePosition}/${progress.queueSize}; " +
+        "durationMultiplier=${progress.durationMultiplier}"
 
 private const val ADAPTIVE_HUNT_SCENARIO_ID = "adaptive-underrun-hunt"
 private const val ADAPTIVE_HUNT_PHASE_PREFIX = "hunt-"

@@ -216,7 +216,10 @@ manifest output에서 다음을 확인한다.
 - hard layer 20
 - producer FPS 120
 - requested display 240 Hz
-- repeat 10, expanded plan 40
+- 앱 UI 수동 queue에는 임의의 고정 항목/expanded-run 상한이 없고 whole-queue repeat는
+  10회, 외부 Intent는 repeat 10/expanded plan 40
+- UI duration multiplier는 1/2/5/10/50/100이며 phase duration과 transition
+  window/cycle에 한 번 materialize한 뒤 기존 duration cap을 적용
 - exact 0 또는 `0.001` 초과 load
 - graphics buffer 최소 triple buffering
 - GL color와 보수적 4 B/px depth를 각각 triple buffering
@@ -247,6 +250,14 @@ manifest output에서 다음을 확인한다.
 
 크기는 destination transform/crop이다. physical producer source buffer는 full size를
 유지하고 graphics memory와 linear traffic safety estimate를 축소하지 않는다.
+
+`PhaseSpec`에는 `BufferPresentation(FIT, PIXEL_1_TO_1_CROP)`과
+`LayerOrientation(ROTATION_0, ROTATION_90)`도 복구한다. Buffer size는
+DISPLAY/1K(1024×576)/2K·1080p/4K/8K다. FIT은 orientation을 반영한 motion 전
+aspect-preserving letterbox, 1:1은 source/display pixel 1:1 centered crop이다.
+1:1은 FULL_SCREEN/non-scaling motion만, CAPACITY_TILES는 FIT/0°만 허용하며 이 값들은
+full allocation/budget/traffic을 줄이지 않는다. Discrete projection/orientation 변경은
+fresh producer generation/readiness를 다시 통과시킨다.
 
 Checkpoint:
 
@@ -559,8 +570,8 @@ isolation만 소유한다. controller state와 backend thread를 Activity callba
 UI는 다음을 제공한다.
 
 - 목적 중심 Dashboard와 scenario quick start
-- facet와 ordered queue/repeat
-- custom builder
+- facet와 ordered queue/whole-loop repeat/시간 배율
+- FIT/1:1, 0°/90°와 Display/1K/2K/4K/8K를 포함한 custom builder
 - 실행 중 항상 보이는 STOP
 - 좌측 상단 build/layer/DPU/CPU/GPU graph와 provenance
 - expected/observed physical producer와 pending `—P`
@@ -568,6 +579,8 @@ UI는 다음을 제공한다.
   screen-equivalent footprint와 estimator scope label
 - plan/result/report
 - system capability와 runtime protection
+- Battery Saver 시작 거부 snackbar의 설정 action. Performance-policy exact restore와
+  Window/SystemUI 복구가 끝난 뒤 전용 Saver 설정→일반 설정 fallback 순서로 이동
 
 UI의 raw HWC badge는 controller verdict를 대신하지 않는다.
 
@@ -607,7 +620,7 @@ publication:
 3. `.json.part` write, flush와 fsync
 4. atomic rename
 5. 방금 게시한 파일 보호
-6. managed completed JSON만 최신 200개 best-effort 보존
+6. managed completed JSON만 최신 400개 best-effort 보존
 
 Checkpoint:
 
@@ -651,7 +664,7 @@ exact DPU, SBWC, NPU와 DEVICE/CLIENT acceptance는
 - pure policy와 boundary test 통과
 - renderer/load의 bounded owner·teardown 증거
 - exact/proxy와 N/A provenance 보존
-- scenario queue/automation cap 유지
+- 수동 queue 무고정상한과 외부 automation 40-run cap 분리 유지
 - schema v2 및 `LayerSizeProfile` round-trip
 - debug/release build 성공
 - 공개 release와 다른 APK를 기존 tag로 위장하지 않음

@@ -159,6 +159,8 @@ object LoadTransitionEvaluator {
             previous.backend == target.backend &&
                 previous.pixelRoute == target.pixelRoute &&
                 previous.bufferSize == target.bufferSize &&
+                previous.bufferPresentation == target.bufferPresentation &&
+                previous.layerOrientation == target.layerOrientation &&
                 previous.includeGlLayer == target.includeGlLayer &&
                 previous.alphaOverlap == target.alphaOverlap
         if (safeFraction <= 0f) {
@@ -172,6 +174,8 @@ object LoadTransitionEvaluator {
                 backend = previous.backend,
                 pixelRoute = previous.pixelRoute,
                 bufferSize = previous.bufferSize,
+                bufferPresentation = previous.bufferPresentation,
+                layerOrientation = previous.layerOrientation,
                 motion = previous.motion,
                 layerSizeProfile = previous.layerSizeProfile,
                 workloads = previous.workloads,

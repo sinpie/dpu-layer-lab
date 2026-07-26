@@ -13,6 +13,17 @@ class ScenarioQueueEditorTest {
     }
 
     @Test
+    fun defaultAppendDoesNotReuseTheExternalAutomationLimit() {
+        val queue = List(40) { "a" }
+
+        assertEquals(41, ScenarioQueueEditor.append(queue, "b").size)
+        assertEquals(
+            43,
+            ScenarioQueueEditor.appendAll(queue, listOf("b", "b", "c")).size,
+        )
+    }
+
+    @Test
     fun appendRejectsBlankAndHardLimitWithoutInvalidatingState() {
         val queue = listOf("a", "b")
 
@@ -92,9 +103,16 @@ class ScenarioQueueEditorTest {
     }
 
     @Test
-    fun restoredValidDuplicatesAreCappedAtTheHardPlanLimit() {
+    fun defaultRestoreIsUncappedWhileAnExplicitUtilityLimitIsHonored() {
         val restored = List(55) { if (it % 2 == 0) "a" else "b" }
 
+        assertSame(
+            restored,
+            ScenarioQueueEditor.retainKnown(
+                queue = restored,
+                knownScenarioIds = setOf("a", "b"),
+            ),
+        )
         assertEquals(
             restored.take(40),
             ScenarioQueueEditor.retainKnown(

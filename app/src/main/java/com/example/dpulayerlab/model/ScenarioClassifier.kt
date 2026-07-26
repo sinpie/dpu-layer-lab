@@ -44,8 +44,12 @@ enum class ScenarioCondition(val label: String) {
     YUV("YUV 4:2:0"),
     P010("P010 10-bit"),
     SBWC("SBWC"),
+    ONE_K("1K"),
+    TWO_K("2K / 1080p"),
     FOUR_K("4K"),
     EIGHT_K("8K"),
+    PIXEL_1_TO_1("1:1 crop"),
+    ROTATED_90("고정 90°"),
     TRANSFORM("Scroll/Zoom/Rotate"),
     HIGH_REFRESH("> 60 FPS/Hz"),
     DVFS("DVFS/저전력"),
@@ -194,10 +198,35 @@ object ScenarioClassifier {
         if (scenario.phases.any { it.bufferSize == BufferSize.UHD_4K }) {
             result += ScenarioCondition.FOUR_K
         }
+        if (scenario.phases.any { it.bufferSize == BufferSize.HD_1K }) {
+            result += ScenarioCondition.ONE_K
+        }
+        if (scenario.phases.any { it.bufferSize == BufferSize.FHD }) {
+            result += ScenarioCondition.TWO_K
+        }
         if (scenario.phases.any { it.bufferSize == BufferSize.UHD_8K }) {
             result += ScenarioCondition.EIGHT_K
         }
-        if (scenario.phases.any { it.motion != MotionProfile.STATIC }) {
+        if (
+            scenario.phases.any {
+                it.bufferPresentation == BufferPresentation.PIXEL_1_TO_1_CROP
+            }
+        ) {
+            result += ScenarioCondition.PIXEL_1_TO_1
+        }
+        if (
+            scenario.phases.any {
+                it.layerOrientation == LayerOrientation.ROTATION_90
+            }
+        ) {
+            result += ScenarioCondition.ROTATED_90
+        }
+        if (
+            scenario.phases.any {
+                it.motion != MotionProfile.STATIC ||
+                    it.layerOrientation != LayerOrientation.ROTATION_0
+            }
+        ) {
             result += ScenarioCondition.TRANSFORM
         }
         if (
@@ -270,6 +299,7 @@ object ScenarioClassifier {
         val hzFactor = unitRatio(phase.requestedDisplayHz, 120f)
         val resolutionFactor = when (phase.bufferSize) {
             BufferSize.DISPLAY -> 0.35f
+            BufferSize.HD_1K -> 0.25f
             BufferSize.FHD -> 0.45f
             BufferSize.UHD_4K -> 0.75f
             BufferSize.UHD_8K -> 1f
@@ -304,6 +334,8 @@ object ScenarioClassifier {
             from.backend != to.backend ||
             from.pixelRoute != to.pixelRoute ||
             from.bufferSize != to.bufferSize ||
+            from.bufferPresentation != to.bufferPresentation ||
+            from.layerOrientation != to.layerOrientation ||
             from.layerSizeProfile != to.layerSizeProfile ||
             from.includeGlLayer != to.includeGlLayer ||
             from.alphaOverlap != to.alphaOverlap

@@ -3,16 +3,67 @@ package com.example.dpulayerlab.engine
 import com.example.dpulayerlab.model.DeviceIdentity
 import com.example.dpulayerlab.model.Gauge
 import com.example.dpulayerlab.model.HwcCompositionExpectation
+import com.example.dpulayerlab.model.HwcCompositionEvidenceAvailability
 import com.example.dpulayerlab.model.MetricQuality
 import com.example.dpulayerlab.model.RunSummary
 import com.example.dpulayerlab.model.RunVerdict
 import com.example.dpulayerlab.model.TelemetrySnapshot
+import java.nio.file.Files
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ReportWriterMathTest {
+    @Test
+    fun reportRetentionIsIndependentFromManualPlanLength() {
+        assertEquals(400, MANAGED_REPORT_RETENTION_COUNT)
+    }
+
+    @Test
+    fun replacementRemovesObsoleteReportBeforeApplyingThe400ReportLimit() {
+        val directory = Files.createTempDirectory("dpu-report-replacement").toFile()
+        try {
+            val reports = List(MANAGED_REPORT_RETENTION_COUNT) { index ->
+                java.io.File(
+                    directory,
+                    "dpu-layer-lab-20260724-010101-001-scenario-$index.json",
+                ).apply {
+                    writeText("{}")
+                    setLastModified(index.toLong() + 1L)
+                }
+            }
+            val oldest = reports.first()
+            val obsolete = reports.last()
+            val replacement = java.io.File(
+                directory,
+                "dpu-layer-lab-20260724-010102-001-scenario.json",
+            ).apply {
+                writeText("{}")
+                setLastModified(Long.MAX_VALUE)
+            }
+
+            assertTrue(
+                finalizePublishedReportRetention(
+                    directory = directory,
+                    protectedReport = replacement,
+                    obsoleteReport = obsolete,
+                    keepCount = MANAGED_REPORT_RETENTION_COUNT,
+                ),
+            )
+
+            val retained = directory.listFiles()
+                .orEmpty()
+                .filter { isManagedCompletedReportName(it.name) }
+            assertEquals(MANAGED_REPORT_RETENTION_COUNT, retained.size)
+            assertTrue(oldest.isFile)
+            assertFalse(obsolete.exists())
+            assertTrue(replacement.isFile)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
     @Test
     fun nonFiniteFloatsNeverProduceInvalidJsonTokens() {
         assertEquals("null", jsonNumber(null))
@@ -228,6 +279,43 @@ class ReportWriterMathTest {
     }
 
     @Test
+    fun reportPreservesBufferPresentationAndFixedOrientation() {
+        val summary = RunSummary(
+            scenario = ScenarioCatalog.byId("rotated-resolution-fit-matrix")!!,
+            startedEpochMs = 1_000L,
+            finishedEpochMs = 2_000L,
+            verdict = RunVerdict.INCONCLUSIVE,
+            exactUnderrunDelta = null,
+            exactUnderrunSource = null,
+            exactUnderrunQuality = MetricQuality.UNAVAILABLE,
+            suspectedUnderrunDelta = 0L,
+            peakCpu = null,
+            peakMemoryUsed = null,
+            peakGeneratedBandwidth = null,
+            events = emptyList(),
+            samples = emptyList(),
+        )
+
+        val json = ReportWriter.toJson(summary, TEST_DEVICE)
+        val cropJson = ReportWriter.toJson(
+            summary.copy(
+                scenario = ScenarioCatalog.byId("8k-presentation-fit-crop-aba")!!,
+            ),
+            TEST_DEVICE,
+        )
+
+        assertTrue(json.contains(""""bufferPresentation": "FIT""""))
+        assertTrue(json.contains(""""layerOrientation": "ROTATION_90""""))
+        assertTrue(json.contains(""""bufferSize": "UHD_8K""""))
+        assertTrue(
+            cropJson.contains(
+                """"bufferPresentation": "PIXEL_1_TO_1_CROP"""",
+            ),
+        )
+        assertTrue(cropJson.contains(""""layerOrientation": "ROTATION_0""""))
+    }
+
+    @Test
     fun sampleProvenanceSurvivesSourceChangesAndNonFiniteValues() {
         val vendorSample = TelemetrySnapshot(
             monotonicMs = 10L,
@@ -260,6 +348,8 @@ class ReportWriterMathTest {
             hwcClientLayersSource = "IDpuLabVendorService",
             hwcCompositionEvidenceMonotonicMs = 9L,
             hwcCompositionEvidenceAgeMs = 1L,
+            hwcCompositionEvidenceAvailability =
+                HwcCompositionEvidenceAvailability.AVAILABLE,
             surfaceFlingerHwcMissed = 1L,
             surfaceFlingerMissSource = "SurfaceFlinger latency",
             surfaceFlingerEvidenceMonotonicMs = 9L,
@@ -324,6 +414,7 @@ class ReportWriterMathTest {
         assertTrue(json.contains(""""hwcClientLayersSource": "IDpuLabVendorService""""))
         assertTrue(json.contains(""""hwcCompositionEvidenceMonotonicMs": 9"""))
         assertTrue(json.contains(""""hwcCompositionEvidenceAgeMs": 1"""))
+        assertTrue(json.contains(""""hwcCompositionEvidenceAvailability": "AVAILABLE""""))
         assertTrue(json.contains(""""hwcDeviceLayersSource": "SurfaceFlinger""""))
         assertTrue(json.contains(""""hwcClientLayersSource": "SurfaceFlinger""""))
         assertTrue(json.contains(""""hwcCompositionEvidenceMonotonicMs": 18"""))
@@ -339,6 +430,41 @@ class ReportWriterMathTest {
         assertTrue(
             json.indexOf(""""dpuBusySource": "IDpuLabVendorService"""") <
                 json.indexOf(""""dpuBusySource": "/sys/class/dpu/busy""""),
+        )
+    }
+
+    @Test
+    fun unavailableHwcEvidenceKeepsNullCountsAndBoundedReasonCode() {
+        val summary = RunSummary(
+            scenario = ScenarioCatalog.presets.first(),
+            startedEpochMs = 1_000L,
+            finishedEpochMs = 2_000L,
+            verdict = RunVerdict.INCONCLUSIVE,
+            exactUnderrunDelta = null,
+            exactUnderrunSource = null,
+            exactUnderrunQuality = MetricQuality.UNAVAILABLE,
+            suspectedUnderrunDelta = 0L,
+            peakCpu = null,
+            peakMemoryUsed = null,
+            peakGeneratedBandwidth = null,
+            events = emptyList(),
+            samples = listOf(
+                TelemetrySnapshot(
+                    hwcCompositionEvidenceAvailability =
+                        HwcCompositionEvidenceAvailability
+                            .ACTIVE_RUN_VENDOR_PAIR_UNAVAILABLE,
+                ),
+            ),
+        )
+
+        val json = ReportWriter.toJson(summary, TEST_DEVICE)
+
+        assertTrue(json.contains(""""hwcDeviceLayers": null"""))
+        assertTrue(json.contains(""""hwcClientLayers": null"""))
+        assertTrue(
+            json.contains(
+                """"hwcCompositionEvidenceAvailability": "ACTIVE_RUN_VENDOR_PAIR_UNAVAILABLE"""",
+            ),
         )
     }
 

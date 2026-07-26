@@ -39,6 +39,12 @@ DEVICE→CLIENT 전환, layer 크기 변화와 교차 자원 경합을 선택하
 
 - HWC 경로를 topology만으로 보장하지 않는다. `DEVICE_ONLY`와
   `CLIENT_REQUIRED`는 fresh DEVICE/CLIENT evidence를 요구하는 관측 계약이다.
+- 현재 `HWC APP RAW D/C/T`는 Activity root/control과 workload producer scope가
+  분리되지 않은 atomic tuple이다. FrameTracker `PHYSICAL` producer count와 별도로
+  보존하며 raw count로 producer ceiling이나 per-layer assignment를 추론하지 않는다.
+- Ordered `APP PRODUCER MAP`과 decoder rendered callback은 app-owned topology/frame
+  evidence다. V/S/T/G/F commit 또는 decoder `ACTIVE`를 HWC assignment/DPU scanout
+  증거로 승격하지 않는다.
 - layer 표시 면적을 줄여도 physical producer 수, buffer allocation과 graphics
   safety budget을 축소했다고 가정하지 않는다.
 - HWC capacity candidate는 process session에서 한 번만 시도하고 terminal 결과를
@@ -49,6 +55,44 @@ DEVICE→CLIENT 전환, layer 크기 변화와 교차 자원 경합을 선택하
 
 ## Now
 
+### P-008 decoder coverage와 app producer evidence (P0)
+
+- **상태:** `DONE`
+- **범위:** catalog 40개, 4K60/8K60 visibility·load surge/drop, 실제 selected source
+  HUD, ordered typed producer map, generation-scoped decoder callback evidence와 report event
+- **완료 조건:**
+  - catalog 명목 phase 1,870,000 ms 중 decoder-backed 318,000 ms(17.01%)로 strict
+    10% 초과가 test로 고정
+  - 단일 URI에서 4K60 minimum과 실제 source class·dimensions·FPS를 구분
+  - V/S/T/G/F planned outline과 같은 generation의 ordered committed fill을 구분하고
+    최대 20개를 세로 표시
+  - decoder evidence가 matching generation/producer ID/kind/primary/revision만 받고
+    pending·teardown·rebuild에서 reset
+  - `DECODER_PHASE_ACTIVE`/`DECODER_FRAME_EVIDENCE`를 남기되 HWC/DPU proof로 표현하지 않음
+  - host test, lint, debug/release build와 문서 gate 통과
+- **검증:** 2026-07-27 `--rerun-tasks`로 `testDebugUnitTest`, `lintDebug`,
+  `assembleDebug`, `assembleRelease`, `assembleDebugAndroidTest` 포함 123/123 task 통과
+
+### P-007 scoped HWC evidence와 per-layer producer identity (P0)
+
+- **상태:** `PROPOSED`
+- **우선순위:** 향후 BSP 통합의 P0. 현재 portable/raw 계측을 scoped evidence로
+  승격하지 않는다.
+- **의존성:**
+  - app이 실행 중인 display/CRTC에 결속된 snapshot scope
+  - committed producer generation/physical ID와 대응할 안정적인 per-layer identity
+  - Activity root/control과 workload producer를 구분하는 provider 계약
+  - 기존 API v1 raw D/C pair와 report consumer를 위한 version/migration 결정
+- **완료 조건:**
+  - D/C와 per-layer identity, display scope, completion timestamp, source/quality를
+    하나의 원자 evidence로 수집
+  - target generation/topology와 identity가 일치하지 않으면 typed verdict에서 사용하지
+    않고 `INCONCLUSIVE`
+  - HUD/report에서 `APP_RAW_UNSEPARATED`와 scoped evidence를 명확히 구분
+  - process-session capacity의 raw D/C/T 또는 candidate 차이로 producer ceiling을
+    추론하지 않는 boundary test 유지
+  - control/root subtraction이 실제 provider evidence 없이 숫자 보정으로 구현되지 않음
+
 ### P-006 수동 device validation matrix
 
 - **상태:** `BLOCKED`
@@ -58,12 +102,13 @@ DEVICE→CLIENT 전환, layer 크기 변화와 교차 자원 경합을 선택하
   - 지원 refresh mode와 physical display size
   - vendor API version 및 exact underrun source
   - DEVICE/CLIENT atomic pair 지원 여부
-  - 4K/8K/P010 검증 media
+  - 4K60 이상/8K60/P010 검증 media
 - 연결된 실기기에서 stress scenario를 자동 실행하지 않는다.
 
 ## Later
 
-- 제품별 HWC capacity advisory 결과를 scenario 결과와 비교하는 분석 도구
+- P-007 scoped evidence가 구현된 뒤 제품별 HWC capacity advisory 결과를 scenario
+  결과와 비교하는 분석 도구
 - schema v2 report의 offline 비교·회귀 요약 도구
 - vendor provider reference implementation은 별도 BSP repository에서 관리
 

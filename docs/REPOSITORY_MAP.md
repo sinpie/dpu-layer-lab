@@ -58,6 +58,7 @@ Architecture가 component 관계를 소유하고, 이 문서는 그 component가
 | 파일 | 책임 |
 |---|---|
 | `LabModels.kt` | enum/data class, phase/scenario/plan/progress/telemetry 공통 모델 |
+| `AppProducerTopology.kt` | generation에 결속된 ordered producer descriptor와 V/S/T/G/F planned role |
 | `ScenarioSafetyPolicy.kt` | hostile input validation, hard/runtime cap, graphics budget |
 | `ScenarioClassifier.kt` | catalog facet와 목적 중심 분류 |
 | `ScenarioQueueEditor.kt` | 순서·중복 보존 queue 편집 |
@@ -108,7 +109,7 @@ per-frame lambda, boxed timestamp, unbounded allocation을 추가하지 않는�
 
 | 파일 | 책임 |
 |---|---|
-| `monitor/FrameTracker.kt` | producer heartbeat, topology/readiness/control-revision evidence, frame/miss counter |
+| `monitor/FrameTracker.kt` | producer heartbeat, typed topology/readiness/control-revision, VIDEO decoder frame callback evidence, frame/miss counter |
 | `monitor/SystemMonitor.kt` | serialized telemetry transaction과 source 선택 |
 | `monitor/SurfaceFlingerProbe.kt` | bounded dumpsys child와 parsing |
 | `monitor/KernelSensorProvider.kt` | allowlisted kernel/product probe path |
@@ -122,7 +123,7 @@ Portable app은 임의 sysfs/debugfs 탐색을 하지 않는다. 제품별 path�
 
 | 경로 | 책임 |
 |---|---|
-| `ui/DpuLayerLabApp.kt` | catalog/facet/queue/run/result 화면과 HUD |
+| `ui/DpuLayerLabApp.kt` | catalog/facet/queue/run/result 화면, 실제 media source, APP PRODUCER MAP과 decoder evidence HUD |
 | `ui/theme/Theme.kt` | Compose theme |
 | `res/drawable/ic_launcher.xml` | launcher foreground vector |
 | `res/mipmap-anydpi/*` | adaptive/round icon |
@@ -158,7 +159,7 @@ Provider 구현, SELinux policy와 signing key는 이 저장소에서 생성하�
 | catalog/facet/queue | `ScenarioCatalogTest`, `ScenarioClassifierTest`, `ScenarioQueueEditorTest` |
 | controller/calibration | `LabControllerMathTest`, `HwcCapacityCalibrationSessionTest` |
 | local worker/NPU/prewarm | `LoadManager*Test`, `LoadThreadStartTest`, `LoadSafetyStateTest` |
-| producer/generation/geometry | `LayerStageViewMathTest`, `ProducerGenerationGateTest`, `LongTimestampMapTest`, `ProducerFrameCommitTest`, renderer recovery tests |
+| producer/generation/geometry | `AppProducerTopologyTest`, `LayerStageViewMathTest`, `ProducerGenerationGateTest`, `LongTimestampMapTest`, `ProducerFrameCommitTest`, renderer recovery tests |
 | selected media/codec | `VideoDecoderSelectionTest`, codec/media tests |
 | telemetry/kernel/SF | `SystemMonitor*Test`, `KernelSensorProviderTest`, `SurfaceFlingerProbeTest` |
 | vendor session/trust | `VendorBridgeStateTest` |

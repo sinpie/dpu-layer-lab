@@ -11,7 +11,7 @@
 UI의 목표는 시험자가 다음 네 질문에 한 화면 흐름으로 답할 수 있게 하는 것이다.
 
 1. 무엇을 시험할 것인가?
-2. 어떤 순서와 반복으로 실행할 것인가?
+2. 어떤 순서·전체 반복·시간 배율로 실행할 것인가?
 3. 지금 실제로 무엇이 실행되고 있는가?
 4. 결과와 증거 source가 무엇인가?
 
@@ -20,7 +20,7 @@ UI의 목표는 시험자가 다음 네 질문에 한 화면 흐름으로 답할
 | Section | 목적 | 실행 중 노출 |
 |---|---|---|
 | 대시보드 | device 상태, 주요 목적 quick start, 최근 결과 | 실행 전 |
-| 시나리오 | 목적/facet 필터, preset 상세, queue/repeat | 실행 전 |
+| 시나리오 | 목적/facet 필터, preset 상세, queue/repeat/time multiplier | 실행 전 |
 | 커스텀 | bounded custom phase 조합 | 실행 전 |
 | 시스템 | capability, permission, display/codec/sensor | 실행 전 |
 | 실행 | fullscreen renderer와 HUD | active run에서 자동 전환 |
@@ -47,7 +47,7 @@ flowchart LR
     D["Dashboard"] --> SEL["1. 테스트 선택"]
     SEL --> P["목적 선택"]
     P --> C["선택형 세부 조건"]
-    C --> Q["2. 순서·중복·repeat"]
+    C --> Q["2. 순서·중복·repeat·시간 배율"]
     Q --> M["필요할 때만 Decoder media"]
     M --> V["3. 확인 후 실행"]
     V --> R["Running fullscreen + HUD"]
@@ -78,10 +78,10 @@ Metric value가 unavailable이면 0 대신 N/A를 표시한다.
 
 ## Catalog
 
-Catalog는 한 개의 긴 설정 form 대신 `테스트 선택`과 `순서·반복` 두 단계로 나눈다.
-상단 step control로 되돌아갈 수 있고, 선택 단계 하단에는 queue 수·repeat·예상 시간을
+Catalog는 한 개의 긴 설정 form 대신 `테스트 선택`과 `순서·반복·시간` 두 단계로 나눈다.
+상단 step control로 되돌아갈 수 있고, 선택 단계 하단에는 queue 수·repeat·요청 예상 시간을
 보이는 고정 dock을 유지한다. Catalog의 step, filter, 펼침 상태와 각 단계 scroll은
-탭 왕복과 configuration 재생성 뒤에도 보존한다. `순서·반복` 단계의 Android Back은
+탭 왕복과 configuration 재생성 뒤에도 보존한다. `순서·반복·시간` 단계의 Android Back은
 Activity를 닫지 않고 먼저 `테스트 선택` 단계로 돌아간다.
 
 ### 목적 중심 선택
@@ -107,8 +107,9 @@ scenario 상세와 결과에 두어 첫 화면의 기술 용어를 줄인다. �
 - condition/format
 - composition target
 
-Filtered result는 catalog 원래 순서를 유지한다. 일괄 `queue 교체`와 `뒤에 추가`는
-한 위치에서만 제공한다. Scenario card는 이름·설명·부하 패턴·최대 layer/Hz·강도·크기와
+Filtered result는 catalog 원래 순서를 유지한다. 일괄 `결과로 교체`와 `목록 끝에 추가`는
+한 위치에서만 제공하고, 결과의 테스트 종류 수와 현재 실행 목록 항목 수를 분리해
+표시한다. Scenario card는 이름·설명·부하 패턴·최대 layer/Hz·강도·크기와
 선택 action을 기본 표시하고 phase/tag/검증 evidence는 명시적으로 펼쳤을 때만 표시한다.
 
 ### Queue와 loop
@@ -116,19 +117,22 @@ Filtered result는 catalog 원래 순서를 유지한다. 일괄 `queue 교체`�
 - 항목 순서와 duplicate를 보존
 - 항목별 remove와 explicit move
 - 기본 세로 preview는 앞 4개만 표시하고, 전체 편집기는 화면 높이에 비례한 bounded
-  내부 scroll과 목록 위 `큐 접기` action을 사용
+  lazy 내부 scroll과 목록 위 `목록 접기` action을 사용
 - 이동/삭제 action의 접근성 이름에 scenario 이름과 occurrence 번호 포함
 - position action은 render 시 queue snapshot과 event 시 최신 queue가 다르면 적용하지
   않아 연속 입력이 다른 occurrence를 수정하지 않음
 - catalog 순서로 reset
-- repeat count와 expanded run 수
-- 현재 예상 duration
+- repeat count와 expanded run 수. `N`회는 전체 queue를 N번 실행하고 `N > 1`인 회차
+  경계에서만 마지막 항목 다음에 첫 항목으로 돌아간다. 1회는 전체 queue 한 번이다.
+- 수동 UI 목록에는 임의의 고정 entry/expanded-run 상한이 없고, 외부 Intent만 기존
+  40 run 상한을 유지
+- 1×/2×/5×/10×/50×/100× phase/transition 시간 배율
+- policy 적용 전 요청 예상 duration과 phase 10분/scenario 30분 safety cap 안내
 - unknown restored ID 자동 제거
-- 40-run cap 안에서 repeat 조정
 - queue가 비면 숨은 repeat를 항상 1로 canonicalize
 
 실행 전 preview는 접을 수 있으며 input change, composition target, verification을
-요약한다. Queue mutation과 repeat 증감, START는 event 시점의 최신 state를 다시 읽어
+요약한다. Queue mutation, repeat/시간 선택과 START는 event 시점의 최신 state를 다시 읽어
 빠른 연속 입력이 이전 snapshot을 덮어쓰거나 제거한 scenario를 실행하지 않게 한다.
 
 ## Custom builder
@@ -136,13 +140,15 @@ Filtered result는 catalog 원래 순서를 유지한다. 일괄 `queue 교체`�
 Custom UI는 hard cap 안에서 다음을 구성한다.
 
 - layer 수, producer FPS, requested Hz
-- backend, pixel route, buffer size
-- motion과 layer size profile
+- backend, pixel route, Display/1K/2K/4K/8K buffer size
+- FIT/1:1 crop projection, 고정 0°/90° orientation, motion과 layer size profile
 - alpha/GL
 - CPU/memory/GPU/NPU setpoint와 shape
 - transition mode/duration/cycle/step/duty/floor
 
 `CAPACITY_TILES`는 internal calibration용 motion이므로 일반 custom selector에서 제외한다.
+1:1 crop을 고르면 `FULL_SCREEN`과 non-scaling motion만 남기고, FIT은 motion 전
+aspect-preserving base projection임을 설명한다.
 Selected-media가 필요한 route는 media와 codec preflight 없이 실행하지 않는다.
 
 ## Running screen
@@ -150,17 +156,20 @@ Selected-media가 필요한 route는 media와 codec preflight 없이 실행하�
 ### Layout
 
 ```text
-┌────────────────────────────────────────────┐
-│ Scenario · QUEUE x/y · LOOP x/y · STAGE   │
-│ Layer size · BUILD version        [STOP]   │
-│ Plan / phase progress                       │
-│ PHYSICAL observed/expected + committed graph │
-│ LOGICAL requested/active count (별도 label)  │
-│ DPU     value + graph + source/quality      │
-│ CPU     value + graph + source/quality      │
-│ GPU     value + graph + source/quality      │
-│ DPU-read / producer-write traffic           │
-└────────────────────────────────────────────┘
+┌──────────────────────────────────┬─────────┐
+│ Scenario · QUEUE/LOOP · TIME n× │ APP     │
+│ Buffer·projection·rotation·BUILD │ PRODUCER│
+│ Actual selected SOURCE    [STOP] │ MAP     │
+│ 표시 방식 · FIT / 1:1 crop       │ 1 V     │
+│ 회전 · layer / video metadata    │ 2 S     │
+│ 이동/확대 · zoom/pan/parallax    │ …       │
+│ 레이어 크기 · full/small/dynamic │ 20 G    │
+│ Plan / phase progress             │         │
+│ PHYSICAL observed/expected graph │         │
+│ LOGICAL · DPU · CPU · GPU        │         │
+│ scanout-input / producer-write   │         │
+│ VIDEO DECODER state/evidence     │ no HWC  │
+└──────────────────────────────────┴─────────┘
 
 ┌────────────────────────────────────────────┐
 │ transition · current→target · next phase    │
@@ -168,8 +177,26 @@ Selected-media가 필요한 route는 media와 codec preflight 없이 실행하�
 └────────────────────────────────────────────┘
 ```
 
-HUD는 display cutout inset을 적용하고 좌측 상단에 둔다. Renderer 전체 화면을 차지하지만
-HUD는 control layer로 남으며 report의 `controlLayerIncluded=true`와 일치한다.
+HUD는 display cutout inset을 적용하고 좌측 상단에 둔다. HUD는 `LayerStageView` 뒤에
+같은 Activity root가 그리는 pure Compose이며 HUD 전용
+`SurfaceView`/`TextureView`/`SurfaceControl`을 만들지 않는다. 따라서 HUD가 직접
+추가하는 physical producer와 SF/HWC surface는 0이다. Report의
+`controlLayerIncluded=true`는 Compose HUD를 담은 app Window root가 화면에 남는다는
+뜻이지 HUD 전용 HWC layer가 있다는 뜻이 아니다.
+
+현재 테스트 내용은 source, 표시 방식, 고정 layer·영상 metadata 회전, 이동·확대,
+destination layer 크기, app producer 성격, 부하를 각각 label이 있는 행으로 표시한다.
+이 행들은 compact/portrait에서도 하나의 긴 transform 문장으로 합치지 않고 말줄임 없이
+줄바꿈한다. 모든 layout에서 상단 Surface는 하단 transition panel을 제외한 남은 높이로
+bounded되고, header/STOP 바깥의 진단 body만 vertical scroll하므로 모든 값을 확인할 수
+있다.
+
+Running HUD의 동적 값은 하나의 immutable snapshot 인자로 전달하고 그 snapshot을
+app-side 최대 1 Hz로만 교체한다. 상위 renderer/progress가 100 ms cadence로
+recomposition되어도 HUD snapshot을 따라 무효화하지 않는다. 이 redraw 정책으로도
+Activity root buffer가 갱신될 수 있으며, cadence를 멈추거나 HUD를 pure Compose로
+유지하는 것만으로 root를 HWC `DEVICE`/`CLIENT` 중 하나로 강제하거나 raw HWC count에서
+제외할 수 없다. UI는 그런 보장을 표시하지 않는다.
 
 ### 필수 live metric
 
@@ -180,6 +207,9 @@ HUD는 control layer로 남으며 report의 `controlLayerIncluded=true`와 일�
 | DPU | busy % 또는 N/A | provenance segment별 gap |
 | CPU | AP CPU % 또는 N/A | provenance segment별 gap |
 | GPU | busy % 또는 N/A | provenance segment별 gap |
+| HWC APP RAW D/C/T | complete same-sample pair와 `T=D+C`; control/root 보정 없음 | pair가 없거나 stale이면 측정값 없음+bounded reason |
+| APP PRODUCER MAP | ordered V/S/T/G/F 1~20; planned outline / generation-committed fill | graph 없음; HWC assignment가 아님 |
+| VIDEO DECODER | generation-accepted rendered callback count/age/revision과 state | graph 없음; HWC/DPU scanout 증거가 아님 |
 
 각 metric은 source/quality label을 숨기지 않는다. Gauge provenance가 바뀌거나 unavailable인
 경계에서 graph 선을 연결하지 않는다.
@@ -192,6 +222,28 @@ Producer count 표기:
 - `PHYSICAL` 현재 값과 history는 양수인 committed expected count만 사용한다. 따라서
   `FLATTENED_TEXTURE`의 logical N-layer는 `1P`이고 pending sample은 이전 값으로 채우지
   않는다.
+- `PHYSICAL`은 BufferQueue/frame callback producer 수다. Pure Compose HUD/Activity
+  root는 포함하지 않고, mixed backend의 `TextureView` producer는 포함하므로
+  SurfaceFlinger/HWC layer 수 또는 `HWC APP RAW T`와 같다고 해석하지 않는다.
+
+App producer map 표기:
+
+- `V`: selected-media `MediaCodec` decoder, `S`: Surface canvas, `T`: Texture canvas,
+  `G`: GL, `F`: flattened canvas
+- phase contract에서 예상한 역할은 transparent outline, 같은 generation의 ordered typed
+  topology가 commit된 역할은 fill
+- 각 cell은 layer index·kind·source class를 세로로 표시하고 최대 20개를 넘지 않음
+- planned/committed 수와 observed/expected producer count를 함께 표시하되 HWC
+  assignment나 DEVICE/CLIENT 결과로 표현하지 않음
+
+Decoder phase의 source line은 단일 선택 URI에서 실제 선택된 class,
+visible dimensions·FPS와 preset minimum을 표시한다. 4K60 preset은 visible 4K 이상과
+source 60fps 이상이 minimum이므로 8K60 source를 사용해도 실제 source를 4K라고
+축약하지 않는다. `VIDEO DECODER ACTIVE`는 committed `V` producer의 matching
+generation·producer ID·primary identity에 결속된 `OnFrameRenderedListener` callback이
+fresh하고 control revision이 맞는 상태다. Pending/rebuild/teardown에서는 evidence를
+지우고 `ACTIVE`를 유지하지 않으며, 어떤 상태도 HWC plane 또는 DPU scanout 증거로
+표시하지 않는다.
 
 ### Traffic
 
@@ -206,6 +258,7 @@ Producer count 표기:
 ### Progress와 상태
 
 - queue/repeat/current/next scenario
+- 선택한 duration multiplier와 effective phase elapsed/duration
 - phase index, elapsed/duration
 - current→target layer/FPS/size/workload
 - transition mode/segment/fraction
@@ -213,9 +266,29 @@ Producer count 표기:
 - safety clamp/thermal derate/memory low
 - performance isolation
 - process-session HWC calibration requested/actual/result
-- HWC expectation은 `RAW MATCH`, `RAW WAIT`, `RAW N/A` 보조 표시
+- HWC expectation은 fresh pair가 있을 때 `HWC APP RAW · D n/C n/T n`과
+  `현재값 일치`/`현재값 불일치`, 없을 때
+  `HWC 합성 계측 · 측정값 없음 · reason` 표시
 
-RAW 상태는 controller의 distinct-sample/coverage verdict를 대체하지 않는다.
+`HWC APP RAW`는 동일 source·quality·evidence timestamp의 complete atomic D/C pair이며
+`T`도 같은 pair의 합으로만 계산한다. 이 값은 scope가 미분리되어 control/root를
+차감하지 않았고 workload producer identity도 제공하지 않는다. HUD의 extra Surface가
+0이라는 사실이나 app-side 최대 1 Hz immutable-snapshot redraw 정책으로 이 root
+contribution을 보정하지 않는다.
+RAW 상태는 controller의 target readiness, distinct-sample/coverage verdict 또는
+workload-only plane 판정을 대체하지 않는다.
+
+Unavailable reason은 active load의 SurfaceFlinger 조회 억제와 fresh vendor pair
+없음/무효/만료, idle/calibration의 DUMP 미허용·SF pair/probe 실패를 구분한다.
+`hwcCompositionEvidenceAvailability`은 bounded availability 진단이며 controller
+verdict가 아니다. N/A token을 D/C/T/AGE/SRC마다 반복하지 않는다.
+
+각 run은 `HWC_COUNT_SCOPE` event로 `APP_RAW_UNSEPARATED`,
+`controlLayerIncluded=true`, control/root subtraction 없음, FrameTracker `PHYSICAL`
+분리와 scoped BSP layer identity evidence 필요를 report에 남긴다. UI label이나
+candidate 숫자로 이 event의 제한을 숨기지 않는다. Calibration의 requested/actual
+candidate와 raw `T`도 workload plane ceiling이나 보편적 HWC maximum으로 표시하지
+않는다.
 
 ### Compact/landscape
 
@@ -240,12 +313,16 @@ Scenario detail:
 - suspected proxy delta
 - peak CPU/memory/generated traffic
 - stable-source peak DPU/GPU/bus/produced FPS
-- peak HWC DEVICE/CLIENT와 provenance
+- peak HWC app raw `(D, C, T)` atomic tuple과 provenance; control/root 보정 없음
 - sample 수
 - report path/share
 
 Exact evidence가 없으면 proxy를 exact로 승격하지 않는다. Result color만으로 verdict를
 전달하지 않고 label과 terminal reason을 함께 표시한다.
+
+HWC peak는 `max(D)`와 `max(C)`를 서로 다른 sample에서 고르지 않는다. Complete atomic
+pair가 있는 한 sample의 `T=D+C`가 가장 큰 tuple을 선택하고, 같은 T에서는 D가 큰
+tuple을 선택한다. Run 중 pair source/quality가 바뀌면 peak는 `N/A`다.
 
 ## System
 
@@ -268,6 +345,7 @@ Unavailable 기능에 “활성” toggle을 제공하지 않는다.
 | queue 비어 있음 | 실행 disabled + 추가 안내 |
 | media 필요/미선택 | requirement와 선택 action |
 | plan rejected | 현재 화면 유지 + snackbar/terminal reason |
+| Battery Saver active | `설정 열기`; cleanup/원상복구와 Window restore 뒤 전용 Saver 설정, 처리 불가 시 일반 설정. Background에서는 pending 요청을 보존하고 defer/launch 실패 시 action 재제공 |
 | topology pending | `—P`, phase clock 시작 전 준비 상태 |
 | cleanup sticky | process restart 필요 reason |
 | report 없음 | share disabled |
@@ -284,7 +362,7 @@ Unavailable 기능에 “활성” toggle을 제공하지 않는다.
 - 숫자에 unit 포함
 - N/A, pending, proxy, exact 표현을 일관되게 사용
 - destructive/reset action과 run action을 시각적으로 구분
-- 목적/개별 선택 → 순서·반복 → run → result의 두 단계 설정 흐름
+- 목적/개별 선택 → 순서·반복·시간 → run → result의 두 단계 설정 흐름
 - queue 이동/삭제는 기호만 쓰지 않고 text label과 occurrence 기반 TalkBack 설명 제공
 - 두 step control은 button 색뿐 아니라 tab role과 selected semantics를 제공
 - 선택 화면의 고정 dock은 실제 측정 높이로 bottom padding을 갱신해 큰 글꼴에서도 마지막
@@ -308,4 +386,5 @@ Unavailable 기능에 “활성” toggle을 제공하지 않는다.
 
 변경 뒤 compact/landscape STOP, graph provenance gap, `—P`, requested/actual calibration,
 queue duplicate/order, 선택/plan별 scroll·filter 복원, 연속 add/repeat 입력,
-Window hide/restore acknowledgment와 result-old-state 분리를 반드시 재검토한다.
+시간 배율 복원, Battery Saver 설정 이동의 cleanup defer/fallback, Window hide/restore
+acknowledgment와 result-old-state 분리를 반드시 재검토한다.

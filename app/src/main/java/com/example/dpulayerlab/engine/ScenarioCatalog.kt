@@ -1,9 +1,11 @@
 package com.example.dpulayerlab.engine
 
 import com.example.dpulayerlab.model.BufferSize
+import com.example.dpulayerlab.model.BufferPresentation
 import com.example.dpulayerlab.model.HwcCompositionExpectation
 import com.example.dpulayerlab.model.LayerBackend
 import com.example.dpulayerlab.model.LayerSizeProfile
+import com.example.dpulayerlab.model.LayerOrientation
 import com.example.dpulayerlab.model.LoadSetpoints
 import com.example.dpulayerlab.model.LoadShape
 import com.example.dpulayerlab.model.MotionProfile
@@ -39,8 +41,12 @@ object ScenarioCatalog {
         planeStaircase(),
         compositionPivot(),
         transformStorm(),
+        video4k60Visibility(),
         mixed4k(),
-        video8k30(),
+        video4k60LoadSurgeDrop(),
+        video8k60Visibility(),
+        video8k60LoadSurgeDrop(),
+        video8k60(),
         video8k60P010(),
         refreshPacing(),
         resourcePulse(),
@@ -48,6 +54,10 @@ object ScenarioCatalog {
         instantBurstTransitions(),
         gradualTransitions(),
         continuousCrossLoadRamp(),
+        resolutionLoadSweep(),
+        rotatedResolutionFitMatrix(),
+        resolutionOnlySweep(),
+        eightKPresentationAba(),
         waveRecoveryTransitions(),
         npuCrossLoad(),
         adaptiveHunt(),
@@ -65,6 +75,8 @@ object ScenarioCatalog {
         backend: LayerBackend,
         pixelRoute: PixelRoute,
         bufferSize: BufferSize,
+        bufferPresentation: BufferPresentation = BufferPresentation.FIT,
+        layerOrientation: LayerOrientation = LayerOrientation.ROTATION_0,
         motion: MotionProfile,
         loads: LoadSetpoints,
         layerSizeProfile: LayerSizeProfile = LayerSizeProfile.FULL_SCREEN,
@@ -190,6 +202,8 @@ object ScenarioCatalog {
                     backend = backend,
                     route = effectivePixelRoute,
                     size = effectiveBufferSize,
+                    bufferPresentation = bufferPresentation,
+                    layerOrientation = layerOrientation,
                     motion = motion,
                     layerSizeProfile = effectiveLayerSizeProfile,
                     loads = normalizedLoads,
@@ -439,20 +453,22 @@ object ScenarioCatalog {
 
     private fun dpuOnlyRepeatShock() = ScenarioSpec(
         id = "dpu-only-repeat-shock",
-        name = "DPU-only Repeated Step Shock",
+        name = "Display-pipeline Repeated Step Shock",
         description =
-            "CPU·memory·GPU·NPU cross-load와 alpha/GL을 모두 0으로 유지한 채 " +
+            "명시적 CPU·memory·GPU·NPU generator와 alpha/GL을 모두 0으로 유지한 채 " +
                 "1L/30fps/60Hz와 12L/120fps/120Hz를 세 번 STEP 왕복합니다. " +
-                "요청한 layer/FPS/Hz edge의 반복성과 DPU recovery를 비교하며, 실제 " +
+                "producer Canvas draw·buffer post·memory write 비용은 0이 아니므로 " +
+                "DPU 단일축이 아닌 display-pipeline shock입니다. 요청한 layer/FPS/Hz " +
+                "edge의 반복성과 DPU recovery를 비교하며, 실제 " +
                 "DEVICE/CLIENT 경로·주사율·DPU clock 변화는 계측 결과로만 판단합니다.",
         category = ScenarioCategory.TRANSITION,
         risk = RiskLevel.HIGH,
         tags = setOf(
-            "DPU-only",
+            "display-pipeline",
             "DPU low→high",
             "idle→burst",
             "repeat shock",
-            "no cross-load",
+            "generated cross-load 0",
             "120fps",
         ),
         requirements = setOf(
@@ -462,34 +478,34 @@ object ScenarioCatalog {
             phase("dr-settle", "DPU low-load settle · 1L/30fps", 10, 1, 30f, 60f),
             phase(
                 "dr-burst-1",
-                "DPU-only burst 1 · 12L/120fps",
+                "Display-pipeline burst 1 · 12L/120fps",
                 5,
                 12,
                 120f,
                 120f,
                 layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
             ),
-            phase("dr-release-1", "DPU-only release 1", 6, 1, 30f, 60f),
+            phase("dr-release-1", "Display-pipeline release 1", 6, 1, 30f, 60f),
             phase(
                 "dr-burst-2",
-                "DPU-only burst 2 · 12L/120fps",
+                "Display-pipeline burst 2 · 12L/120fps",
                 5,
                 12,
                 120f,
                 120f,
                 layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
             ),
-            phase("dr-release-2", "DPU-only release 2", 6, 1, 30f, 60f),
+            phase("dr-release-2", "Display-pipeline release 2", 6, 1, 30f, 60f),
             phase(
                 "dr-burst-3",
-                "DPU-only burst 3 · 12L/120fps",
+                "Display-pipeline burst 3 · 12L/120fps",
                 5,
                 12,
                 120f,
                 120f,
                 layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
             ),
-            phase("dr-recover", "DPU-only final recovery", 8, 1, 30f, 60f),
+            phase("dr-recover", "Display-pipeline final recovery", 8, 1, 30f, 60f),
         ),
     )
 
@@ -1110,27 +1126,274 @@ object ScenarioCatalog {
                 motion = MotionProfile.PARALLAX,
                 loads = LoadSetpoints(cpu = 0.25f, memory = 0.9f, shape = LoadShape.PULSE),
             ),
-            phase("release", "Bus release", 6, 5, 60f, 60f, route = PixelRoute.YUV_420),
+            phase(
+                "release",
+                "Visible 4K60 decoder release",
+                6,
+                1,
+                60f,
+                60f,
+                route = PixelRoute.YUV_420,
+                size = BufferSize.UHD_4K,
+            ),
         ),
     )
 
-    private fun video8k30() = ScenarioSpec(
-        id = "8k-decoder-pressure",
-        name = "8K30 YUV Decoder Pressure",
-        description = "8K30 YUV 영상 Surface와 6개 overlay를 결합합니다. " +
-            "장치의 8K30 codec/asset capability를 반드시 확인합니다.",
+    private fun video4k60Visibility() = ScenarioSpec(
+        id = "4k60-video-visibility",
+        name = "4K60 Actual Video Visibility",
+        description =
+            "실제 4K 이상 60fps hardware-decoder 영상을 단일 Surface로 먼저 확인한 뒤 " +
+                "90도 FIT와 확대·축소/이동을 순서대로 적용합니다. RGB visual proxy로 " +
+                "대체하지 않습니다.",
         category = ScenarioCategory.VIDEO_FORMAT,
-        risk = RiskLevel.HIGH,
-        tags = setOf("8K30", "YUV", "HEVC", "AV1", "codec"),
-        requirements = setOf("8K30 decoder", "8K 30fps local media"),
+        risk = RiskLevel.MEDIUM,
+        tags = setOf("4K60", "video", "visibility", "90°", "zoom", "pan"),
+        requirements = setOf("4K 이상 60fps local media", "4K60 hardware decoder"),
         phases = listOf(
             phase(
-                "8k30",
-                "8K30 decode path",
+                "4k60-visible",
+                "4K60 video · 0° · FIT · static",
+                15,
+                1,
+                60f,
+                60f,
+                route = PixelRoute.YUV_420,
+                size = BufferSize.UHD_4K,
+            ),
+            phase(
+                "4k60-rotated-fit",
+                "4K60 video · 90° · FIT",
+                15,
+                1,
+                60f,
+                60f,
+                route = PixelRoute.YUV_420,
+                size = BufferSize.UHD_4K,
+                layerOrientation = LayerOrientation.ROTATION_90,
+            ),
+            phase(
+                "4k60-zoom-pan",
+                "4K60 video · zoom / pan",
+                15,
+                1,
+                60f,
+                60f,
+                route = PixelRoute.YUV_420,
+                size = BufferSize.UHD_4K,
+                motion = MotionProfile.ZOOM_PAN,
+            ),
+        ),
+    )
+
+    private fun video4k60LoadSurgeDrop() = ScenarioSpec(
+        id = "4k60-video-load-surge-drop",
+        name = "4K60 Video Load Surge → Drop",
+        description =
+            "각 부하 단계에서 실제 4K 이상 60fps decoder Surface를 사용하며, 단계 전환 " +
+                "시 decoder Surface를 새로 준비합니다. 1L 안정 상태에서 8L와 CPU/DRAM " +
+                "부하를 즉시 올리고, 다시 1L/zero-load로 급감시킨 뒤 중간 부하를 재인가해 " +
+                "DPU/codec/DVFS 회복 경계를 확인합니다.",
+        category = ScenarioCategory.VIDEO_FORMAT,
+        risk = RiskLevel.HIGH,
+        tags = setOf("4K60", "video", "instant", "surge", "drop", "rebound"),
+        requirements = setOf("4K 이상 60fps local media", "4K60 hardware decoder"),
+        phases = listOf(
+            phase(
+                "4k60-load-base",
+                "4K60 video baseline · 1L",
+                15,
+                1,
+                60f,
+                60f,
+                route = PixelRoute.YUV_420,
+                size = BufferSize.UHD_4K,
+            ),
+            phase(
+                "4k60-load-surge",
+                "4K60 video instant surge · 8L",
+                15,
+                8,
+                60f,
+                60f,
+                route = PixelRoute.YUV_420,
+                size = BufferSize.UHD_4K,
+                motion = MotionProfile.PARALLAX,
+                layerSizeProfile = LayerSizeProfile.MIXED_SIZES,
+                loads = LoadSetpoints(cpu = 0.55f, memory = 0.90f),
+            ),
+            phase(
+                "4k60-load-drop",
+                "4K60 video instant drop · 1L",
+                15,
+                1,
+                60f,
+                60f,
+                route = PixelRoute.YUV_420,
+                size = BufferSize.UHD_4K,
+            ),
+            phase(
+                "4k60-load-rebound",
+                "4K60 video rebound · 5L",
+                15,
+                5,
+                60f,
+                60f,
+                route = PixelRoute.YUV_420,
+                size = BufferSize.UHD_4K,
+                motion = MotionProfile.TRANSFORM_STORM,
+                layerSizeProfile = LayerSizeProfile.MIXED_SIZES,
+                loads = LoadSetpoints(cpu = 0.35f, memory = 0.65f),
+            ),
+            phase(
+                "4k60-load-recover",
+                "4K60 video final recovery · 1L",
+                15,
+                1,
+                60f,
+                60f,
+                route = PixelRoute.YUV_420,
+                size = BufferSize.UHD_4K,
+            ),
+        ),
+    )
+
+    private fun video8k60Visibility() = ScenarioSpec(
+        id = "8k60-video-visibility",
+        name = "8K60 Actual Video Visibility",
+        description =
+            "실제 8K60 hardware-decoder 영상을 단일 Surface로 먼저 확인한 뒤 90도 FIT와 " +
+                "확대·축소/이동을 순서대로 적용합니다. 8-bit YUV 경로라 P010 전용 " +
+                "시나리오와 독립적으로 실행할 수 있습니다.",
+        category = ScenarioCategory.VIDEO_FORMAT,
+        risk = RiskLevel.HIGH,
+        tags = setOf("8K60", "video", "visibility", "90°", "zoom", "pan"),
+        requirements = setOf("8K 60fps local media", "8K60 hardware decoder"),
+        phases = listOf(
+            phase(
+                "8k60-visible",
+                "8K60 video · 0° · FIT · static",
+                15,
+                1,
+                60f,
+                60f,
+                route = PixelRoute.YUV_420,
+                size = BufferSize.UHD_8K,
+            ),
+            phase(
+                "8k60-rotated-fit",
+                "8K60 video · 90° · FIT",
+                15,
+                1,
+                60f,
+                60f,
+                route = PixelRoute.YUV_420,
+                size = BufferSize.UHD_8K,
+                layerOrientation = LayerOrientation.ROTATION_90,
+            ),
+            phase(
+                "8k60-zoom-pan",
+                "8K60 video · zoom / pan",
+                15,
+                1,
+                60f,
+                60f,
+                route = PixelRoute.YUV_420,
+                size = BufferSize.UHD_8K,
+                motion = MotionProfile.ZOOM_PAN,
+            ),
+        ),
+    )
+
+    private fun video8k60LoadSurgeDrop() = ScenarioSpec(
+        id = "8k60-video-load-surge-drop",
+        name = "8K60 Video Load Surge → Drop",
+        description =
+            "각 부하 단계에서 실제 8K60 decoder Surface를 사용하며, 단계 전환 시 decoder " +
+                "Surface를 새로 준비합니다. 1L 안정 상태에서 5L와 CPU/DRAM 부하를 즉시 " +
+                "올리고, 다시 1L/zero-load로 급감시킨 뒤 중간 부하를 재인가해 고해상도 " +
+                "codec/DPU/메모리 회복 경계를 확인합니다.",
+        category = ScenarioCategory.VIDEO_FORMAT,
+        risk = RiskLevel.HIGH,
+        tags = setOf("8K60", "video", "instant", "surge", "drop", "rebound"),
+        requirements = setOf("8K 60fps local media", "8K60 hardware decoder"),
+        phases = listOf(
+            phase(
+                "8k60-load-base",
+                "8K60 video baseline · 1L",
+                15,
+                1,
+                60f,
+                60f,
+                route = PixelRoute.YUV_420,
+                size = BufferSize.UHD_8K,
+            ),
+            phase(
+                "8k60-load-surge",
+                "8K60 video instant surge · 5L",
+                15,
+                5,
+                60f,
+                60f,
+                route = PixelRoute.YUV_420,
+                size = BufferSize.UHD_8K,
+                motion = MotionProfile.PARALLAX,
+                layerSizeProfile = LayerSizeProfile.MIXED_SIZES,
+                loads = LoadSetpoints(cpu = 0.35f, memory = 0.80f),
+            ),
+            phase(
+                "8k60-load-drop",
+                "8K60 video instant drop · 1L",
+                15,
+                1,
+                60f,
+                60f,
+                route = PixelRoute.YUV_420,
+                size = BufferSize.UHD_8K,
+            ),
+            phase(
+                "8k60-load-rebound",
+                "8K60 video rebound · 3L",
+                15,
+                3,
+                60f,
+                60f,
+                route = PixelRoute.YUV_420,
+                size = BufferSize.UHD_8K,
+                motion = MotionProfile.ZOOM_PAN,
+                layerSizeProfile = LayerSizeProfile.MIXED_SIZES,
+                loads = LoadSetpoints(cpu = 0.25f, memory = 0.55f),
+            ),
+            phase(
+                "8k60-load-recover",
+                "8K60 video final recovery · 1L",
+                15,
+                1,
+                60f,
+                60f,
+                route = PixelRoute.YUV_420,
+                size = BufferSize.UHD_8K,
+            ),
+        ),
+    )
+
+    private fun video8k60() = ScenarioSpec(
+        id = "8k-decoder-pressure",
+        name = "8K60 YUV Decoder Pressure",
+        description = "8K60 YUV 영상 Surface와 6개 overlay를 결합합니다. " +
+            "장치의 8K60 codec/asset capability를 반드시 확인합니다.",
+        category = ScenarioCategory.VIDEO_FORMAT,
+        risk = RiskLevel.HIGH,
+        tags = setOf("8K60", "YUV", "HEVC", "AV1", "codec"),
+        requirements = setOf("8K60 decoder", "8K 60fps local media"),
+        phases = listOf(
+            phase(
+                "8k60-yuv",
+                "8K60 decode path",
                 10,
                 7,
-                30f,
-                120f,
+                60f,
+                60f,
                 route = PixelRoute.YUV_420,
                 size = BufferSize.UHD_8K,
                 motion = MotionProfile.ZOOM_PAN,
@@ -1579,6 +1842,283 @@ object ScenarioCatalog {
         ),
     )
 
+    private fun resolutionLoadSweep() = ScenarioSpec(
+        id = "resolution-load-sweep",
+        name = "1K → 8K → 1K Load Sweep",
+        description =
+            "실제 primary producer 버퍼를 1K, 2K/1080p, 4K, 8K 순으로 키우며 " +
+                "교차 부하를 단계적으로 높인 뒤 같은 순서를 반대로 내려 복구를 확인합니다. " +
+                "각 해상도는 graphics-memory budget을 통과해야 하며 축소 대체하지 않습니다.",
+        category = ScenarioCategory.TRANSITION,
+        risk = RiskLevel.HIGH,
+        tags = setOf("1K", "2K", "4K", "8K", "resolution", "load rise", "load fall"),
+        phases = listOf(
+            phase(
+                "rs-1k-up",
+                "1K low-load origin",
+                5,
+                2,
+                30f,
+                60f,
+                size = BufferSize.HD_1K,
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
+            ),
+            phase(
+                "rs-2k-up",
+                "2K moderate-load rise",
+                5,
+                3,
+                60f,
+                90f,
+                size = BufferSize.FHD,
+                motion = MotionProfile.ZOOM_PAN,
+                layerSizeProfile = LayerSizeProfile.MIXED_SIZES,
+                loads = LoadSetpoints(cpu = 0.25f, memory = 0.3f),
+            ),
+            phase(
+                "rs-4k-up",
+                "4K high-load rise",
+                6,
+                2,
+                60f,
+                120f,
+                size = BufferSize.UHD_4K,
+                motion = MotionProfile.ROTATE,
+                layerSizeProfile = LayerSizeProfile.GRADUAL_SMALL_TO_FULL,
+                loads = LoadSetpoints(cpu = 0.4f, memory = 0.5f),
+            ),
+            phase(
+                "rs-8k-peak",
+                "8K bounded peak",
+                6,
+                1,
+                30f,
+                120f,
+                size = BufferSize.UHD_8K,
+                bufferPresentation = BufferPresentation.PIXEL_1_TO_1_CROP,
+                motion = MotionProfile.PARALLAX,
+                layerSizeProfile = LayerSizeProfile.FULL_SCREEN,
+                loads = LoadSetpoints(cpu = 0.5f, memory = 0.65f),
+            ),
+            phase(
+                "rs-4k-down",
+                "4K load release",
+                6,
+                2,
+                60f,
+                90f,
+                size = BufferSize.UHD_4K,
+                bufferPresentation = BufferPresentation.PIXEL_1_TO_1_CROP,
+                motion = MotionProfile.SCROLL,
+                layerSizeProfile = LayerSizeProfile.FULL_SCREEN,
+                loads = LoadSetpoints(cpu = 0.35f, memory = 0.4f),
+            ),
+            phase(
+                "rs-2k-down",
+                "2K recovery",
+                5,
+                2,
+                60f,
+                60f,
+                size = BufferSize.FHD,
+                motion = MotionProfile.ROTATE,
+                layerSizeProfile = LayerSizeProfile.MIXED_SIZES,
+                loads = LoadSetpoints(cpu = 0.15f, memory = 0.2f),
+            ),
+            phase(
+                "rs-1k-down",
+                "1K recovery baseline",
+                5,
+                1,
+                30f,
+                60f,
+                size = BufferSize.HD_1K,
+                layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
+            ),
+        ),
+    )
+
+    private fun rotatedResolutionFitMatrix() = ScenarioSpec(
+        id = "rotated-resolution-fit-matrix",
+        name = "90° Fit 2K / 4K / 8K Matrix",
+        description =
+            "2K, 4K, 8K primary producer를 고정 90° 회전하고 종횡비를 보존해 화면 안에 " +
+                "맞춘 상태에서 정적 pacing, 이동, 확대/축소와 CPU/메모리 교차 부하를 비교합니다.",
+        category = ScenarioCategory.TRANSFORM,
+        risk = RiskLevel.HIGH,
+        tags = setOf("90°", "fit", "2K", "4K", "8K", "zoom", "rotation"),
+        phases = listOf(
+            phase(
+                "rf-2k-static",
+                "2K · 90° fit · static",
+                5,
+                2,
+                60f,
+                60f,
+                size = BufferSize.FHD,
+                bufferPresentation = BufferPresentation.FIT,
+                layerOrientation = LayerOrientation.ROTATION_90,
+                layerSizeProfile = LayerSizeProfile.MIXED_SIZES,
+            ),
+            phase(
+                "rf-4k-pan",
+                "4K · 90° fit · parallax",
+                6,
+                2,
+                60f,
+                90f,
+                size = BufferSize.UHD_4K,
+                bufferPresentation = BufferPresentation.FIT,
+                layerOrientation = LayerOrientation.ROTATION_90,
+                motion = MotionProfile.PARALLAX,
+                layerSizeProfile = LayerSizeProfile.MIXED_SIZES,
+                loads = LoadSetpoints(cpu = 0.25f, memory = 0.3f),
+            ),
+            phase(
+                "rf-8k-static",
+                "8K · 90° fit · pacing",
+                6,
+                1,
+                30f,
+                120f,
+                size = BufferSize.UHD_8K,
+                bufferPresentation = BufferPresentation.FIT,
+                layerOrientation = LayerOrientation.ROTATION_90,
+                layerSizeProfile = LayerSizeProfile.FULL_SCREEN,
+                loads = LoadSetpoints(memory = 0.35f),
+            ),
+            phase(
+                "rf-8k-pan",
+                "8K · 90° fit · moving load",
+                6,
+                1,
+                30f,
+                120f,
+                size = BufferSize.UHD_8K,
+                bufferPresentation = BufferPresentation.FIT,
+                layerOrientation = LayerOrientation.ROTATION_90,
+                motion = MotionProfile.PARALLAX,
+                layerSizeProfile = LayerSizeProfile.FULL_SCREEN,
+                loads = LoadSetpoints(cpu = 0.35f, memory = 0.5f),
+            ),
+            phase(
+                "rf-8k-zoom",
+                "8K · 90° fit · bounded zoom",
+                7,
+                1,
+                30f,
+                120f,
+                size = BufferSize.UHD_8K,
+                bufferPresentation = BufferPresentation.FIT,
+                layerOrientation = LayerOrientation.ROTATION_90,
+                motion = MotionProfile.ZOOM_PAN,
+                layerSizeProfile = LayerSizeProfile.FULL_SCREEN,
+                loads = LoadSetpoints(cpu = 0.45f, memory = 0.6f),
+            ),
+            phase(
+                "rf-4k-recover",
+                "4K · 90° fit · recovery",
+                5,
+                1,
+                60f,
+                60f,
+                size = BufferSize.UHD_4K,
+                bufferPresentation = BufferPresentation.FIT,
+                layerOrientation = LayerOrientation.ROTATION_90,
+                layerSizeProfile = LayerSizeProfile.FULL_SCREEN,
+            ),
+            phase(
+                "rf-2k-recover",
+                "2K · 90° fit · recovery",
+                5,
+                1,
+                60f,
+                60f,
+                size = BufferSize.FHD,
+                bufferPresentation = BufferPresentation.FIT,
+                layerOrientation = LayerOrientation.ROTATION_90,
+                layerSizeProfile = LayerSizeProfile.FULL_SCREEN,
+            ),
+        ),
+    )
+
+    private fun resolutionOnlySweep() = ScenarioSpec(
+        id = "resolution-only-sweep",
+        name = "Resolution-only 1K / 2K / 4K / 8K A/B",
+        description =
+            "한 primary producer, 30fps/60Hz, FIT/0°, 정적 geometry와 zero cross-load를 " +
+                "고정하고 source buffer 해상도만 1K→2K→4K→8K→4K→2K→1K로 바꿉니다.",
+        category = ScenarioCategory.VIDEO_FORMAT,
+        risk = RiskLevel.HIGH,
+        tags = setOf("resolution-only", "A/B/A", "1K", "2K", "4K", "8K"),
+        phases = listOf(
+            BufferSize.HD_1K,
+            BufferSize.FHD,
+            BufferSize.UHD_4K,
+            BufferSize.UHD_8K,
+            BufferSize.UHD_4K,
+            BufferSize.FHD,
+            BufferSize.HD_1K,
+        ).mapIndexed { index, size ->
+            phase(
+                id = "ro-$index",
+                label = "${size.label} primary · fixed reference",
+                seconds = 5,
+                layers = 1,
+                fps = 30f,
+                hz = 60f,
+                size = size,
+                bufferPresentation = BufferPresentation.FIT,
+                layerOrientation = LayerOrientation.ROTATION_0,
+                motion = MotionProfile.STATIC,
+                layerSizeProfile = LayerSizeProfile.FULL_SCREEN,
+            )
+        },
+    )
+
+    private fun eightKPresentationAba() = ScenarioSpec(
+        id = "8k-presentation-fit-crop-aba",
+        name = "8K FIT ↔ 1:1 Crop A/B/A",
+        description =
+            "동일한 8K primary allocation, 1L/30fps/60Hz, 0°와 zero cross-load를 유지하고 " +
+                "전체 화면 FIT과 centered 1:1 crop 투영만 A/B/A로 비교합니다.",
+        category = ScenarioCategory.TRANSFORM,
+        risk = RiskLevel.HIGH,
+        tags = setOf("8K", "FIT", "1:1 crop", "A/B/A", "presentation-only"),
+        phases = listOf(
+            phase(
+                "pa-fit-a",
+                "8K FIT reference A",
+                6,
+                1,
+                30f,
+                60f,
+                size = BufferSize.UHD_8K,
+                bufferPresentation = BufferPresentation.FIT,
+            ),
+            phase(
+                "pa-crop",
+                "8K centered 1:1 crop B",
+                6,
+                1,
+                30f,
+                60f,
+                size = BufferSize.UHD_8K,
+                bufferPresentation = BufferPresentation.PIXEL_1_TO_1_CROP,
+            ),
+            phase(
+                "pa-fit-b",
+                "8K FIT reference A",
+                6,
+                1,
+                30f,
+                60f,
+                size = BufferSize.UHD_8K,
+                bufferPresentation = BufferPresentation.FIT,
+            ),
+        ),
+    )
+
     private fun waveRecoveryTransitions() = ScenarioSpec(
         id = "wave-soak-recovery",
         name = "Triangle Wave & Soak Recovery",
@@ -1793,6 +2333,8 @@ object ScenarioCatalog {
         backend: LayerBackend = LayerBackend.INDEPENDENT_SURFACES,
         route: PixelRoute = PixelRoute.RGB_8888,
         size: BufferSize = BufferSize.DISPLAY,
+        bufferPresentation: BufferPresentation = BufferPresentation.FIT,
+        layerOrientation: LayerOrientation = LayerOrientation.ROTATION_0,
         motion: MotionProfile = MotionProfile.STATIC,
         layerSizeProfile: LayerSizeProfile = LayerSizeProfile.FULL_SCREEN,
         loads: LoadSetpoints = LoadSetpoints(),
@@ -1810,6 +2352,8 @@ object ScenarioCatalog {
         backend = backend,
         pixelRoute = route,
         bufferSize = size,
+        bufferPresentation = bufferPresentation,
+        layerOrientation = layerOrientation,
         motion = motion,
         layerSizeProfile = layerSizeProfile,
         workloads = loads,

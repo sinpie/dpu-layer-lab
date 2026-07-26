@@ -1,6 +1,7 @@
 package com.example.dpulayerlab.model
 
 import android.os.Build
+import java.util.IdentityHashMap
 import kotlin.math.roundToInt
 
 const val MIN_EFFECTIVE_LOAD = 0.001f
@@ -73,9 +74,35 @@ fun PixelRoute.usesSelectedMediaDecoder(): Boolean = when (this) {
 
 enum class BufferSize(val label: String, val width: Int, val height: Int) {
     DISPLAY("Display", 0, 0),
-    FHD("1080p", 1920, 1080),
+    HD_1K("1K", 1024, 576),
+    FHD("2K / 1080p", 1920, 1080),
     UHD_4K("4K", 3840, 2160),
     UHD_8K("8K", 7680, 4320),
+}
+
+/**
+ * How an explicit producer buffer is projected into the physical display stage.
+ *
+ * This changes presentation only. The source BufferQueue allocation and its graphics-memory
+ * budget always remain the full [BufferSize].
+ */
+enum class BufferPresentation(val label: String) {
+    /**
+     * Preserve source aspect ratio and letterbox the complete buffer inside the stage before the
+     * optional motion transform is applied.
+     */
+    FIT("Fit"),
+
+    /**
+     * Keep one source pixel per display pixel and clip centered overflow at the stage. Safety
+     * policy excludes additional scaling profiles/motions so the one-to-one base scale is kept.
+     */
+    PIXEL_1_TO_1_CROP("1:1 crop"),
+}
+
+enum class LayerOrientation(val label: String, val degrees: Float) {
+    ROTATION_0("0°", 0f),
+    ROTATION_90("90°", 90f),
 }
 
 enum class MotionSemantics(val changesPhysicalHwcZOrder: Boolean) {
@@ -430,6 +457,8 @@ data class PhaseSpec(
     val backend: LayerBackend,
     val pixelRoute: PixelRoute,
     val bufferSize: BufferSize,
+    val bufferPresentation: BufferPresentation = BufferPresentation.FIT,
+    val layerOrientation: LayerOrientation = LayerOrientation.ROTATION_0,
     val motion: MotionProfile,
     val layerSizeProfile: LayerSizeProfile = LayerSizeProfile.FULL_SCREEN,
     val workloads: LoadSetpoints = LoadSetpoints(),
@@ -478,6 +507,7 @@ data class ScenarioRunPlan(
      */
     val scenarios: List<ScenarioSpec>,
     val repeatCount: Int = 1,
+    val durationMultiplier: Int = 1,
     val source: PlanSource = PlanSource.USER_SELECTION,
 ) {
     val totalRuns: Int
@@ -496,41 +526,122 @@ data class ScenarioRunPlan(
                 }
                 queueDurationMs += scenario.durationMs
             }
-            return if (queueDurationMs > Long.MAX_VALUE / repeatCount) {
+            val executionMultiplier = repeatCount.toLong() * durationMultiplier.toLong()
+            if (executionMultiplier <= 0L) return 0L
+            return if (queueDurationMs > Long.MAX_VALUE / executionMultiplier) {
                 Long.MAX_VALUE
             } else {
-                queueDurationMs * repeatCount
+                queueDurationMs * executionMultiplier
             }
         }
 }
 
 object ScenarioPlanPolicy {
     const val MAX_REPEAT_COUNT = 10
-    const val MAX_TOTAL_PLAN_RUNS = 40
+    /** External automation expanded-run cap retained as a compatibility/security contract. */
+    const val MAX_EXTERNAL_TOTAL_PLAN_RUNS = 40
+    val DURATION_MULTIPLIERS: List<Int> = listOf(1, 2, 5, 10, 50, 100)
     const val ALLOW_DUPLICATE_SCENARIOS = true
 
-    fun maximumRepeatCount(queueSize: Int): Int {
+    fun maximumRepeatCount(
+        queueSize: Int,
+        source: PlanSource = PlanSource.USER_SELECTION,
+    ): Int {
+        if (source != PlanSource.EXTERNAL_INTENT) return MAX_REPEAT_COUNT
         if (queueSize <= 0) return MAX_REPEAT_COUNT
         return minOf(
             MAX_REPEAT_COUNT,
-            (MAX_TOTAL_PLAN_RUNS / queueSize).coerceAtLeast(1),
+            (MAX_EXTERNAL_TOTAL_PLAN_RUNS / queueSize).coerceAtLeast(1),
         )
     }
 
-    fun normalizeRepeatCount(queueSize: Int, requested: Int): Int =
-        requested.coerceIn(1, maximumRepeatCount(queueSize))
+    fun normalizeRepeatCount(
+        queueSize: Int,
+        requested: Int,
+        source: PlanSource = PlanSource.USER_SELECTION,
+    ): Int = requested.coerceIn(1, maximumRepeatCount(queueSize, source))
 
     fun validate(plan: ScenarioRunPlan): String? {
         if (plan.scenarios.isEmpty()) return "Plan scenario queue must not be empty"
         if (plan.repeatCount !in 1..MAX_REPEAT_COUNT) {
             return "Plan repeat count must be between 1 and $MAX_REPEAT_COUNT"
         }
+        if (plan.durationMultiplier !in DURATION_MULTIPLIERS) {
+            return "Plan duration multiplier must be one of " +
+                DURATION_MULTIPLIERS.joinToString()
+        }
         val totalRuns = plan.scenarios.size.toLong() * plan.repeatCount.toLong()
-        if (totalRuns > MAX_TOTAL_PLAN_RUNS) {
-            return "Plan has $totalRuns runs; maximum is $MAX_TOTAL_PLAN_RUNS"
+        if (totalRuns > Int.MAX_VALUE) {
+            return "Plan is too large for indexed progress"
+        }
+        if (
+            plan.source == PlanSource.EXTERNAL_INTENT &&
+            totalRuns > MAX_EXTERNAL_TOTAL_PLAN_RUNS
+        ) {
+            return "Plan has $totalRuns runs; maximum for ${plan.source.name} is " +
+                MAX_EXTERNAL_TOTAL_PLAN_RUNS
+        }
+        val multiplier = plan.durationMultiplier.toLong()
+        if (plan.scenarios.any { scenario ->
+                scenario.phases.any { phase ->
+                    phase.durationMs <= 0L ||
+                        phase.transition.transitionDurationMs < 0L ||
+                        phase.transition.cycleMs <= 0L ||
+                        phase.durationMs > Long.MAX_VALUE / multiplier ||
+                        phase.transition.transitionDurationMs > Long.MAX_VALUE / multiplier ||
+                        phase.transition.cycleMs > Long.MAX_VALUE / multiplier
+                }
+            }
+        ) {
+            return "Plan duration multiplier cannot safely scale a phase duration"
         }
         return null
     }
+}
+
+/**
+ * Returns an immutable execution plan with the requested duration scale applied once.
+ *
+ * Transition edge/cycle windows scale with each phase so ramp, soak, pulse, and triangle semantic
+ * coverage is preserved. Device safety policy may still cap the resulting phase/scenario and
+ * reports every such adjustment instead of silently running a different duration.
+ */
+fun ScenarioRunPlan.materializeDurationMultiplier(): ScenarioRunPlan {
+    val multiplier = durationMultiplier.toLong()
+    val immutableCopies = IdentityHashMap<ScenarioSpec, ScenarioSpec>()
+    fun immutableCopyOf(scenario: ScenarioSpec): ScenarioSpec =
+        immutableCopies[scenario] ?: scenario.copy(
+            tags = scenario.tags.toSet(),
+            requirements = scenario.requirements.toSet(),
+            phases = scenario.phases.map { phase ->
+                if (multiplier == 1L) {
+                    phase.copy()
+                } else {
+                    phase.copy(
+                        durationMs = Math.multiplyExact(phase.durationMs, multiplier),
+                        transition = phase.transition.copy(
+                            transitionDurationMs =
+                                if (phase.transition.transitionDurationMs == 0L) {
+                                    0L
+                                } else {
+                                    Math.multiplyExact(
+                                        phase.transition.transitionDurationMs,
+                                        multiplier,
+                                    )
+                                },
+                            cycleMs = Math.multiplyExact(phase.transition.cycleMs, multiplier),
+                        ),
+                    )
+                }
+            },
+        ).also { copy ->
+            immutableCopies[scenario] = copy
+        }
+
+    return copy(
+        scenarios = scenarios.map(::immutableCopyOf),
+        durationMultiplier = 1,
+    )
 }
 
 enum class PlanState {
@@ -547,6 +658,7 @@ data class PlanProgress(
     /** Zero-based while active; -1 when no queue item is selected. */
     val repeatIndex: Int = -1,
     val repeatCount: Int = 0,
+    val durationMultiplier: Int = 1,
     /** Zero-based while active; -1 when no queue item is selected. */
     val queueIndex: Int = -1,
     val queueSize: Int = 0,
@@ -671,6 +783,28 @@ enum class MetricQuality(val label: String) {
     UNAVAILABLE("Unavailable"),
 }
 
+/**
+ * Stable reason code for the current atomic HWC DEVICE/CLIENT evidence.
+ *
+ * This is deliberately bounded and source-aware so UI/report consumers do not have to infer a
+ * cause from localized probe detail text. It describes evidence availability only; it is not a
+ * composition verdict and never upgrades APP_RAW_UNSEPARATED counts to workload-only evidence.
+ */
+enum class HwcCompositionEvidenceAvailability {
+    AVAILABLE,
+    ACTIVE_RUN_VENDOR_PAIR_UNAVAILABLE,
+    ACTIVE_RUN_VENDOR_PAIR_INVALID,
+    ACTIVE_RUN_VENDOR_PAIR_STALE,
+    DUMP_PERMISSION_UNAVAILABLE,
+    SURFACE_FLINGER_PAIR_UNAVAILABLE,
+    SURFACE_FLINGER_PAIR_INVALID,
+    SURFACE_FLINGER_EVIDENCE_STALE,
+    SURFACE_FLINGER_PROBE_FAILED,
+    EVIDENCE_INVALID,
+    EVIDENCE_STALE,
+    UNAVAILABLE,
+}
+
 data class Gauge(
     val value: Float? = null,
     val unit: String = "",
@@ -724,6 +858,9 @@ data class TelemetrySnapshot(
     val hwcCompositionEvidenceMonotonicMs: Long? = null,
     /** Age of the selected DEVICE/CLIENT pair at [monotonicMs]. */
     val hwcCompositionEvidenceAgeMs: Long? = null,
+    /** Typed availability reason for the current atomic pair; never a controller verdict. */
+    val hwcCompositionEvidenceAvailability: HwcCompositionEvidenceAvailability =
+        HwcCompositionEvidenceAvailability.UNAVAILABLE,
     val surfaceFlingerHwcMissed: Long? = null,
     val surfaceFlingerGpuMissed: Long? = null,
     val surfaceFlingerMissSource: String = "",

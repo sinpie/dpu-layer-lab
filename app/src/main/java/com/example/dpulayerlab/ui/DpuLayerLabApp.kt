@@ -3,6 +3,7 @@ package com.example.dpulayerlab.ui
 import android.app.Activity
 import android.content.Intent
 import android.content.res.Configuration
+import android.os.SystemClock
 import android.text.format.DateUtils
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -36,6 +37,7 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -61,12 +63,14 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.RememberObserver
 import androidx.compose.runtime.getValue
@@ -103,14 +107,21 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.example.dpulayerlab.BuildConfig
 import com.example.dpulayerlab.engine.LabController
+import com.example.dpulayerlab.engine.MANAGED_REPORT_RETENTION_COUNT
+import com.example.dpulayerlab.engine.ErrorRecoveryAction
 import com.example.dpulayerlab.engine.ScenarioCatalog
 import com.example.dpulayerlab.engine.GaugePeak
 import com.example.dpulayerlab.engine.consistentGaugePeak
+import com.example.dpulayerlab.model.AppProducerKind
+import com.example.dpulayerlab.model.AppProducerTopology
 import com.example.dpulayerlab.model.BufferSize
+import com.example.dpulayerlab.model.BufferPresentation
 import com.example.dpulayerlab.model.DecoderLinearReference
 import com.example.dpulayerlab.model.Gauge
 import com.example.dpulayerlab.model.HwcCompositionExpectation
+import com.example.dpulayerlab.model.HwcCompositionEvidenceAvailability
 import com.example.dpulayerlab.model.LayerBackend
+import com.example.dpulayerlab.model.LayerOrientation
 import com.example.dpulayerlab.model.LayerSizeProfile
 import com.example.dpulayerlab.model.LayerTrafficEstimate
 import com.example.dpulayerlab.model.LayerTrafficEstimator
@@ -145,12 +156,15 @@ import com.example.dpulayerlab.model.terminalReason
 import com.example.dpulayerlab.model.TransitionMode
 import com.example.dpulayerlab.model.TransitionSpec
 import com.example.dpulayerlab.model.usesSelectedMediaDecoder
+import com.example.dpulayerlab.model.plannedAppProducerKinds
 import com.example.dpulayerlab.monitor.CapabilityScanner
 import com.example.dpulayerlab.monitor.CapabilitySnapshot
 import com.example.dpulayerlab.monitor.HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS
+import com.example.dpulayerlab.monitor.ProducerReadiness
 import com.example.dpulayerlab.render.LayerStageView
 import com.example.dpulayerlab.render.ProducerFrameCallback
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.util.Locale
 import kotlin.math.roundToInt
@@ -170,12 +184,41 @@ private enum class CatalogSetupStep {
 }
 
 internal const val COLLAPSED_QUEUE_ENTRY_LIMIT = 4
+internal const val RUNNING_HUD_REFRESH_INTERVAL_MS = 1_000L
+
+internal fun runningHudRefreshBucket(monotonicMs: Long): Long =
+    monotonicMs.coerceAtLeast(0L) / RUNNING_HUD_REFRESH_INTERVAL_MS
 
 private data class RunningHudSample(
     val physicalProducerCount: Float?,
     val dpuBusy: Gauge,
     val cpuBusy: Gauge,
     val gpuBusy: Gauge,
+)
+
+@Immutable
+private data class NoExtraSurfaceHudState(
+    val progress: RunProgress,
+    val planProgress: PlanProgress,
+    val telemetry: TelemetrySnapshot,
+    val history: List<RunningHudSample>,
+    val stageWidthPx: Int,
+    val stageHeightPx: Int,
+    val mediaSelected: Boolean,
+    val mediaWidthPx: Int?,
+    val mediaHeightPx: Int?,
+    val decoderVisibleWidthPx: Int?,
+    val decoderVisibleHeightPx: Int?,
+    val decoderSourceFps: Float?,
+    val decoderSourceRotationDegrees: Int?,
+    val decoderCodecName: String?,
+    val producerReadiness: ProducerReadiness,
+    val decoderLinearReference: DecoderLinearReference?,
+    val safetyAdjustments: List<String>,
+    val performanceIsolationStatus: String,
+    val capacityCalibrationStatus: String,
+    val severeThermalDeratingEnabled: Boolean,
+    val nowMonotonicMs: Long,
 )
 
 private data class LiveHudMetricSpec(
@@ -251,14 +294,17 @@ internal data class DashboardPurposeScenario(
 )
 
 internal enum class RawHwcExpectationState(val label: String) {
-    MATCH("RAW MATCH"),
-    WAIT("RAW WAIT"),
-    N_A("RAW N/A"),
+    MATCH("현재값 일치"),
+    WAIT("현재값 불일치"),
+    N_A("현재값 없음"),
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DpuLayerLabApp(controller: LabController) {
+fun DpuLayerLabApp(
+    controller: LabController,
+    onOpenBatterySaverSettings: () -> Unit,
+) {
     var lastUserSectionKey by rememberSaveable {
         mutableStateOf(AppSection.DASHBOARD.name)
     }
@@ -293,6 +339,7 @@ fun DpuLayerLabApp(controller: LabController) {
         mutableStateOf<List<String>>(arrayListOf())
     }
     var planRepeatCount by rememberSaveable { mutableIntStateOf(1) }
+    var planDurationMultiplier by rememberSaveable { mutableIntStateOf(1) }
     val knownScenarioIds = remember {
         ScenarioCatalog.presets.mapTo(LinkedHashSet()) { it.id }
     }
@@ -305,8 +352,13 @@ fun DpuLayerLabApp(controller: LabController) {
             requested = planRepeatCount,
         )
     }
+    val validatedDurationMultiplier = remember(planDurationMultiplier) {
+        planDurationMultiplier.takeIf {
+            it in ScenarioPlanPolicy.DURATION_MULTIPLIERS
+        } ?: 1
+    }
     val snackbar = remember { SnackbarHostState() }
-    val error = controller.errorMessage
+    val errorNotice = controller.errorNotice
     val mediaPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let(controller::setMediaUri)
     }
@@ -318,10 +370,23 @@ fun DpuLayerLabApp(controller: LabController) {
             planState = planProgress.state,
         )
     }
-    LaunchedEffect(error) {
-        if (error != null) {
-            snackbar.showSnackbar(error)
-            controller.clearError()
+    LaunchedEffect(errorNotice?.id) {
+        if (errorNotice != null) {
+            val recoveryAction = errorNotice.recoveryAction
+            val result = snackbar.showSnackbar(
+                message = errorNotice.message,
+                actionLabel = when (recoveryAction) {
+                    ErrorRecoveryAction.OPEN_BATTERY_SAVER_SETTINGS -> "설정 열기"
+                    null -> null
+                },
+            )
+            if (
+                result == SnackbarResult.ActionPerformed &&
+                recoveryAction == ErrorRecoveryAction.OPEN_BATTERY_SAVER_SETTINGS
+            ) {
+                onOpenBatterySaverSettings()
+            }
+            controller.clearError(errorNotice.id)
         }
     }
     LaunchedEffect(
@@ -329,12 +394,17 @@ fun DpuLayerLabApp(controller: LabController) {
         selectedScenarioIds,
         validatedRepeatCount,
         planRepeatCount,
+        validatedDurationMultiplier,
+        planDurationMultiplier,
     ) {
         if (validatedScenarioIds != selectedScenarioIds) {
             selectedScenarioIds = validatedScenarioIds
         }
         if (planRepeatCount != validatedRepeatCount) {
             planRepeatCount = validatedRepeatCount
+        }
+        if (planDurationMultiplier != validatedDurationMultiplier) {
+            planDurationMultiplier = validatedDurationMultiplier
         }
     }
 
@@ -427,6 +497,7 @@ fun DpuLayerLabApp(controller: LabController) {
                     selectMedia = { mediaPicker.launch(arrayOf("video/*")) },
                     selectedScenarioIds = validatedScenarioIds,
                     repeatCount = validatedRepeatCount,
+                    durationMultiplier = validatedDurationMultiplier,
                 addScenario = { scenarioId ->
                     val currentQueue =
                         ScenarioQueueEditor.retainKnown(selectedScenarioIds, knownScenarioIds)
@@ -515,6 +586,7 @@ fun DpuLayerLabApp(controller: LabController) {
                 clearSelection = {
                     selectedScenarioIds = arrayListOf()
                     planRepeatCount = 1
+                    planDurationMultiplier = 1
                 },
                 resetOrder = {
                     val currentQueue =
@@ -536,15 +608,22 @@ fun DpuLayerLabApp(controller: LabController) {
                         maximumPlanRepeats(currentQueue.size),
                     )
                     },
+                    selectDurationMultiplier = { requested ->
+                        if (requested in ScenarioPlanPolicy.DURATION_MULTIPLIERS) {
+                            planDurationMultiplier = requested
+                        }
+                    },
                     runSelection = {
                         val freshPlan = catalogRunPlanSnapshot(
                             rawQueueIds = selectedScenarioIds,
                             knownScenarioIds = knownScenarioIds,
                             requestedRepeat = planRepeatCount,
+                            requestedDurationMultiplier = planDurationMultiplier,
                         )
                         selectedScenarioIds =
                             freshPlan?.scenarios?.map(ScenarioSpec::id).orEmpty()
                         planRepeatCount = freshPlan?.repeatCount ?: 1
+                        planDurationMultiplier = freshPlan?.durationMultiplier ?: 1
                         val freshMediaReady = freshPlan == null ||
                             !scenariosRequireSelectedMedia(freshPlan.scenarios) ||
                             controller.selectedMediaUri != null
@@ -708,15 +787,14 @@ private fun HeroValue(label: String, value: String) {
 
 @Composable
 private fun MetricGrid(telemetry: TelemetrySnapshot) {
+    val compositionPair = atomicHwcCompositionPair(
+        telemetry = telemetry,
+        nowMonotonicMs = SystemClock.elapsedRealtime(),
+    )
     val compositionGauge = Gauge(
-        value = telemetry.hwcDeviceLayers?.toFloat()
-            ?: telemetry.hwcClientLayers?.toFloat(),
-        quality = when {
-            telemetry.hwcDeviceLayers != null -> telemetry.hwcDeviceLayersQuality
-            telemetry.hwcClientLayers != null -> telemetry.hwcClientLayersQuality
-            else -> MetricQuality.UNAVAILABLE
-        },
-        source = compositionProvenance(telemetry),
+        value = compositionPair?.deviceLayers?.toFloat(),
+        quality = compositionPair?.quality ?: MetricQuality.UNAVAILABLE,
+        source = compositionPair?.source.orEmpty(),
     )
     val metrics = listOf(
         DashboardMetricSpec("AP CPU", telemetry.cpu, "전체 CPU"),
@@ -735,11 +813,14 @@ private fun MetricGrid(telemetry: TelemetrySnapshot) {
             detail = telemetry.dpuBusy.provenanceLabel(),
         ),
         DashboardMetricSpec(
-            label = "HWC D / C",
+            label = "HWC APP D / C",
             gauge = compositionGauge,
-            detail = compositionProvenance(telemetry),
-            valueText = "${telemetry.hwcDeviceLayers ?: "–"} / " +
-                "${telemetry.hwcClientLayers ?: "–"}",
+            detail = compositionPair?.let {
+                "${it.quality.label} · ${it.source} · age ${it.ageMs}ms · " +
+                    "control/root 보정 없음"
+            } ?: "N/A · atomic fresh pair 없음 · control/root 보정 없음",
+            valueText = "${compositionPair?.deviceLayers ?: "–"} / " +
+                "${compositionPair?.clientLayers ?: "–"}",
         ),
     )
     LazyVerticalGrid(
@@ -886,6 +967,7 @@ private fun CatalogScreen(
     selectMedia: () -> Unit,
     selectedScenarioIds: List<String>,
     repeatCount: Int,
+    durationMultiplier: Int,
     addScenario: (String) -> Unit,
     removeScenario: (String) -> Unit,
     removeQueueAt: (List<String>, Int) -> Unit,
@@ -896,6 +978,7 @@ private fun CatalogScreen(
     clearSelection: () -> Unit,
     resetOrder: () -> Unit,
     adjustRepeatCount: (Int) -> Unit,
+    selectDurationMultiplier: (Int) -> Unit,
     runSelection: () -> Unit,
 ) {
     var setupStepKey by rememberSaveable {
@@ -1170,8 +1253,6 @@ private fun CatalogScreen(
                     ScenarioCard(
                         scenario = scenario,
                         selectedPositions = selectedPositions[scenario.id].orEmpty(),
-                        queueFull =
-                            selectedScenarioIds.size >= ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS,
                         queueEditable = !controller.isRunning,
                         addSelection = { addScenario(scenario.id) },
                         removeSelection = { removeScenario(scenario.id) },
@@ -1182,9 +1263,11 @@ private fun CatalogScreen(
                     QueuePlanCard(
                         selectedScenarios = selectedScenarios,
                         repeatCount = repeatCount,
+                        durationMultiplier = durationMultiplier,
                         maximumRepeatCount = maximumPlanRepeats(selectedScenarios.size),
                         running = controller.isRunning,
                         adjustRepeatCount = adjustRepeatCount,
+                        selectDurationMultiplier = selectDurationMultiplier,
                         selectAll = selectAll,
                         clearSelection = clearSelection,
                         resetOrder = resetOrder,
@@ -1206,6 +1289,7 @@ private fun CatalogScreen(
                     PlanLaunchCard(
                         selectedScenarios = selectedScenarios,
                         repeatCount = repeatCount,
+                        durationMultiplier = durationMultiplier,
                         running = controller.isRunning,
                         mediaRequired = selectedNeedsMedia,
                         mediaSelected = controller.selectedMediaUri != null,
@@ -1218,6 +1302,7 @@ private fun CatalogScreen(
             SelectionPlanDock(
                 selectedScenarios = selectedScenarios,
                 repeatCount = repeatCount,
+                durationMultiplier = durationMultiplier,
                 openPlan = { setupStepKey = CatalogSetupStep.PLAN.name },
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -1556,13 +1641,7 @@ private fun CatalogBulkSelectionCard(
     appendResults: () -> Unit,
     replaceWithResults: () -> Unit,
 ) {
-    val availableQueueSlots =
-        (ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS - queueSize).coerceAtLeast(0)
-    val appendCount = minOf(resultCount.coerceAtLeast(0), availableQueueSlots)
-    val replaceCount = minOf(
-        resultCount.coerceAtLeast(0),
-        ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS,
-    )
+    val selectionCount = resultCount.coerceAtLeast(0)
     Card(
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.55f),
@@ -1575,18 +1654,19 @@ private fun CatalogBulkSelectionCard(
         ) {
             Text("2. 테스트 선택", style = MaterialTheme.typography.titleMedium)
             Text(
-                "현재 조건의 ${resultCount}개를 한 번에 선택하거나 아래에서 하나씩 추가하세요. " +
-                    "실행 큐는 $queueSize/${ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS}개입니다.",
+                "조건에 맞는 테스트 ${selectionCount}개 · 실행 목록 " +
+                    "${queueSize.coerceAtLeast(0)}항목\n" +
+                    "결과 전체로 목록을 바꾸거나, 같은 테스트를 반복하려면 목록 끝에 추가하세요.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.labelLarge,
             )
             if (queueSize == 0) {
                 Button(
                     onClick = replaceWithResults,
-                    enabled = replaceCount > 0 && !running,
+                    enabled = selectionCount > 0 && !running,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
-                    Text("보이는 테스트 모두 선택 · $replaceCount")
+                    Text("보이는 테스트 ${selectionCount}개를 실행 목록에 담기")
                 }
             } else {
                 Row(
@@ -1595,19 +1675,19 @@ private fun CatalogBulkSelectionCard(
                 ) {
                     OutlinedButton(
                         onClick = replaceWithResults,
-                        enabled = replaceCount > 0 && !running,
+                        enabled = selectionCount > 0 && !running,
                         modifier = Modifier.weight(1f),
                         contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp),
                     ) {
-                        Text("큐 교체 · $replaceCount")
+                        Text("결과로 교체 · $selectionCount")
                     }
                     Button(
                         onClick = appendResults,
-                        enabled = appendCount > 0 && !running,
+                        enabled = selectionCount > 0 && !running,
                         modifier = Modifier.weight(1f),
                         contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp),
                     ) {
-                        Text("뒤에 추가 · $appendCount")
+                        Text("목록 끝에 추가 · $selectionCount")
                     }
                 }
             }
@@ -1619,13 +1699,15 @@ private fun CatalogBulkSelectionCard(
 private fun SelectionPlanDock(
     selectedScenarios: List<ScenarioSpec>,
     repeatCount: Int,
+    durationMultiplier: Int,
     openPlan: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val plan = remember(selectedScenarios, repeatCount) {
+    val plan = remember(selectedScenarios, repeatCount, durationMultiplier) {
         ScenarioRunPlan(
             scenarios = selectedScenarios,
             repeatCount = repeatCount,
+            durationMultiplier = durationMultiplier,
             source = PlanSource.USER_SELECTION,
         )
     }
@@ -1649,7 +1731,7 @@ private fun SelectionPlanDock(
                     if (selectedScenarios.isEmpty()) {
                         "실행할 테스트를 선택하세요"
                     } else {
-                        "선택 ${selectedScenarios.size}개 · 총 ${plan.totalRuns}회"
+                        "실행 목록 ${selectedScenarios.size}항목 · 총 ${plan.totalRuns}회"
                     },
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.SemiBold,
@@ -1658,7 +1740,8 @@ private fun SelectionPlanDock(
                     if (selectedScenarios.isEmpty()) {
                         "목적 전체 선택 또는 개별 추가가 가능합니다."
                     } else {
-                        "현재 ${repeatCount}회 반복 · 약 ${formatDuration(plan.estimatedDurationMs)}" +
+                        "전체 LOOP ${repeatCount}회 · 시간 ${durationMultiplier}× · " +
+                            "요청 예상 ${formatDuration(plan.estimatedDurationMs)}" +
                             if (mediaRequired) " · 영상 필요" else ""
                     },
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1669,7 +1752,7 @@ private fun SelectionPlanDock(
                 onClick = openPlan,
                 enabled = selectedScenarios.isNotEmpty(),
             ) {
-                Text("순서·반복")
+                Text("순서·반복·시간")
             }
         }
     }
@@ -1714,9 +1797,11 @@ private fun FacetFilterRow(
 private fun QueuePlanCard(
     selectedScenarios: List<ScenarioSpec>,
     repeatCount: Int,
+    durationMultiplier: Int,
     maximumRepeatCount: Int,
     running: Boolean,
     adjustRepeatCount: (Int) -> Unit,
+    selectDurationMultiplier: (Int) -> Unit,
     selectAll: () -> Unit,
     clearSelection: () -> Unit,
     resetOrder: () -> Unit,
@@ -1725,21 +1810,23 @@ private fun QueuePlanCard(
 ) {
     var queueExpanded by rememberSaveable { mutableStateOf(false) }
     var detailsExpanded by rememberSaveable { mutableStateOf(false) }
-    val expandedQueueScroll = rememberScrollState()
+    val expandedQueueScroll = rememberLazyListState()
     val expandedQueueMaxHeight = (
         LocalConfiguration.current.screenHeightDp * 0.55f
         ).roundToInt().coerceIn(220, 420).dp
-    val oneLoopDurationMs = remember(selectedScenarios) {
+    val oneLoopDurationMs = remember(selectedScenarios, durationMultiplier) {
         ScenarioRunPlan(
             scenarios = selectedScenarios,
             repeatCount = 1,
+            durationMultiplier = durationMultiplier,
             source = PlanSource.USER_SELECTION,
         ).estimatedDurationMs
     }
-    val previewPlan = remember(selectedScenarios, repeatCount) {
+    val previewPlan = remember(selectedScenarios, repeatCount, durationMultiplier) {
         ScenarioRunPlan(
             scenarios = selectedScenarios,
             repeatCount = repeatCount,
+            durationMultiplier = durationMultiplier,
             source = PlanSource.USER_SELECTION,
         )
     }
@@ -1754,7 +1841,6 @@ private fun QueuePlanCard(
     val selectAllTarget = remember {
         ScenarioCatalog.presets
             .map { it.id }
-            .take(ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS)
     }
     val selectionMatchesCatalog = remember(selectedScenarios, selectAllTarget) {
         selectedScenarios.map { it.id } == selectAllTarget
@@ -1797,7 +1883,7 @@ private fun QueuePlanCard(
                     shape = RoundedCornerShape(100.dp),
                 ) {
                     Text(
-                        "${selectedScenarios.size}개",
+                        "${selectedScenarios.size}항목",
                         modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.dp),
                         color = if (selectedScenarios.isEmpty()) {
                             MaterialTheme.colorScheme.onSurfaceVariant
@@ -1815,7 +1901,7 @@ private fun QueuePlanCard(
             ) {
                 ScenarioAttribute(
                     label = "항목",
-                    value = "${selectedScenarios.size} tests",
+                    value = "${selectedScenarios.size}개",
                     modifier = Modifier.weight(1f),
                 )
                 ScenarioAttribute(
@@ -1824,7 +1910,7 @@ private fun QueuePlanCard(
                     modifier = Modifier.weight(1f),
                 )
                 ScenarioAttribute(
-                    label = "총 예상",
+                    label = "요청 예상",
                     value = formatDuration(totalDurationMs),
                     modifier = Modifier.weight(1f),
                 )
@@ -1857,15 +1943,15 @@ private fun QueuePlanCard(
                             onClick = { queueExpanded = false },
                             modifier = Modifier.fillMaxWidth(),
                         ) {
-                            Text("큐 접기 · 앞 ${COLLAPSED_QUEUE_ENTRY_LIMIT}개만 보기")
+                            Text("목록 접기 · 앞 ${COLLAPSED_QUEUE_ENTRY_LIMIT}개만 보기")
                         }
-                        Column(
+                        LazyColumn(
                             modifier = Modifier
-                                .heightIn(max = expandedQueueMaxHeight)
-                                .verticalScroll(expandedQueueScroll),
+                                .heightIn(max = expandedQueueMaxHeight),
+                            state = expandedQueueScroll,
                             verticalArrangement = Arrangement.spacedBy(7.dp),
                         ) {
-                            selectedScenarios.forEachIndexed { index, scenario ->
+                            itemsIndexed(selectedScenarios) { index, scenario ->
                                 QueueEntryRow(
                                     index = index,
                                     scenario = scenario,
@@ -1940,13 +2026,42 @@ private fun QueuePlanCard(
                 }
             }
             Text(
-                "반복 최대 ${ScenarioPlanPolicy.MAX_REPEAT_COUNT}회 · 전체 실행 최대 " +
-                    "${ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS}회 · 현재 ${totalRuns}회",
+                "반복 최대 ${ScenarioPlanPolicy.MAX_REPEAT_COUNT}회 · 현재 총 ${totalRuns}회 실행",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.labelMedium,
             )
+            if (totalRuns > MANAGED_REPORT_RETENTION_COUNT) {
+                Text(
+                    "실행 횟수 제한은 없지만 JSON 보고서는 최신 " +
+                        "${MANAGED_REPORT_RETENTION_COUNT}개를 보관합니다.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
             Text(
-                "예상 시간은 scenario phase 합계이며 precheck·warm-up·cooldown·report I/O는 제외합니다.",
+                "한 LOOP는 위 실행 목록 전체를 끝까지 실행한 뒤 첫 항목으로 돌아갑니다.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelSmall,
+            )
+            Text("테스트 시간 배율", style = MaterialTheme.typography.titleMedium)
+            Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(7.dp),
+            ) {
+                ScenarioPlanPolicy.DURATION_MULTIPLIERS.forEach { multiplier ->
+                    FilterChip(
+                        selected = durationMultiplier == multiplier,
+                        onClick = { selectDurationMultiplier(multiplier) },
+                        enabled = !running,
+                        label = { Text("${multiplier}×") },
+                    )
+                }
+            }
+            Text(
+                "배율은 모든 phase와 transition window/cycle에 동일 적용됩니다. 기기 안전 " +
+                    "상한을 넘는 시간은 시작 전 policy가 명시적으로 조정합니다. 위 값은 " +
+                    "policy 적용 전 요청 예상이며 " +
+                    "precheck·warm-up·cooldown·report I/O가 제외됩니다.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.labelSmall,
             )
@@ -1966,15 +2081,7 @@ private fun QueuePlanCard(
                     enabled = !selectionMatchesCatalog && !running,
                     modifier = Modifier.weight(1f),
                 ) {
-                    Text(
-                        if (ScenarioCatalog.presets.size >
-                            ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS
-                        ) {
-                            "앞 ${ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS}개로 교체"
-                        } else {
-                            "전체로 교체"
-                        },
-                    )
+                    Text("전체로 교체")
                 }
                 TextButton(
                     onClick = clearSelection,
@@ -2094,7 +2201,10 @@ private fun QueueSelectionPreviewCard(preview: ScenarioSelectionPreview) {
         ) {
             Text(
                 buildString {
-                    append("선택 요약 · ${preview.queueEntries}회 / ${preview.uniqueScenarios}종")
+                    append(
+                        "실행 목록 · ${preview.queueEntries}항목 / " +
+                            "${preview.uniqueScenarios}종",
+                    )
                     if (preview.duplicateEntries > 0) {
                         append(" · 중복 ${preview.duplicateEntries}회")
                     }
@@ -2154,22 +2264,23 @@ private fun MediaSourceCard(uri: android.net.Uri?, selectMedia: () -> Unit, clea
 private fun PlanLaunchCard(
     selectedScenarios: List<ScenarioSpec>,
     repeatCount: Int,
+    durationMultiplier: Int,
     running: Boolean,
     mediaRequired: Boolean,
     mediaSelected: Boolean,
     runSelection: () -> Unit,
 ) {
-    val plan = remember(selectedScenarios, repeatCount) {
+    val plan = remember(selectedScenarios, repeatCount, durationMultiplier) {
         ScenarioRunPlan(
             scenarios = selectedScenarios,
             repeatCount = repeatCount,
+            durationMultiplier = durationMultiplier,
             source = PlanSource.USER_SELECTION,
         )
     }
     val mediaReady = !mediaRequired || mediaSelected
     val runnable =
         selectedScenarios.isNotEmpty() &&
-            plan.totalRuns in 1..ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS &&
             mediaReady &&
             !running
     Card(
@@ -2185,7 +2296,8 @@ private fun PlanLaunchCard(
             Text("3. 확인 후 실행", style = MaterialTheme.typography.titleLarge)
             Text(
                 "${selectedScenarios.size}개 테스트 × ${repeatCount}회 반복 = " +
-                    "총 ${plan.totalRuns}회 · 약 ${formatDuration(plan.estimatedDurationMs)}",
+                    "총 ${plan.totalRuns}회 · 시간 ${durationMultiplier}× · " +
+                    "요청 예상 ${formatDuration(plan.estimatedDurationMs)}",
                 color = MaterialTheme.colorScheme.onPrimaryContainer,
             )
             if (!mediaReady) {
@@ -2218,7 +2330,6 @@ private fun PlanLaunchCard(
 private fun ScenarioCard(
     scenario: ScenarioSpec,
     selectedPositions: List<Int>,
-    queueFull: Boolean,
     queueEditable: Boolean,
     addSelection: () -> Unit,
     removeSelection: () -> Unit,
@@ -2393,7 +2504,7 @@ private fun ScenarioCard(
                     }
                     Button(
                         onClick = addSelection,
-                        enabled = queueEditable && !queueFull,
+                        enabled = queueEditable,
                         modifier = Modifier.weight(1f),
                     ) {
                         Text("1회 더 추가")
@@ -2402,10 +2513,10 @@ private fun ScenarioCard(
             } else {
                 Button(
                     onClick = addSelection,
-                    enabled = queueEditable && !queueFull,
+                    enabled = queueEditable,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
-                    Text(if (queueFull) "실행 큐가 가득 찼습니다" else "실행 큐에 추가")
+                    Text("실행 항목에 추가")
                 }
             }
         }
@@ -2617,6 +2728,12 @@ private fun BuilderScreen(controller: LabController, modifier: Modifier) {
     var backend by rememberSaveable { mutableStateOf(LayerBackend.MIXED_SURFACE_TEXTURE) }
     var route by rememberSaveable { mutableStateOf(PixelRoute.RGB_8888) }
     var size by rememberSaveable { mutableStateOf(BufferSize.DISPLAY) }
+    var bufferPresentation by rememberSaveable {
+        mutableStateOf(BufferPresentation.FIT)
+    }
+    var layerOrientation by rememberSaveable {
+        mutableStateOf(LayerOrientation.ROTATION_0)
+    }
     var layerSizeProfile by rememberSaveable {
         mutableStateOf(LayerSizeProfile.FULL_SCREEN)
     }
@@ -2656,9 +2773,45 @@ private fun BuilderScreen(controller: LabController, modifier: Modifier) {
                 EnumSelector("Pixel route", route, PixelRoute.entries) { route = it }
                 EnumSelector("Buffer size", size, BufferSize.entries) { size = it }
                 EnumSelector(
+                    "Buffer 표시",
+                    bufferPresentation,
+                    BufferPresentation.entries,
+                ) {
+                    bufferPresentation = it
+                    if (it == BufferPresentation.PIXEL_1_TO_1_CROP) {
+                        layerSizeProfile = LayerSizeProfile.FULL_SCREEN
+                        if (
+                            motion == MotionProfile.ZOOM_PAN ||
+                            motion == MotionProfile.TRANSFORM_STORM
+                        ) {
+                            motion = MotionProfile.STATIC
+                        }
+                    }
+                }
+                EnumSelector(
+                    "고정 방향",
+                    layerOrientation,
+                    LayerOrientation.entries,
+                ) { layerOrientation = it }
+                Text(
+                    when (bufferPresentation) {
+                        BufferPresentation.FIT ->
+                            "motion 적용 전 원본 종횡비를 보존해 전체 buffer를 화면 안에 맞춥니다."
+                        BufferPresentation.PIXEL_1_TO_1_CROP ->
+                            "source pixel과 display pixel을 1:1로 두고 화면 밖 영역을 중앙 " +
+                                "크롭합니다. 실제 buffer allocation은 바뀌지 않습니다."
+                    },
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelMedium,
+                )
+                EnumSelector(
                     "Layer 표시 크기",
                     layerSizeProfile,
-                    LayerSizeProfile.entries,
+                    if (bufferPresentation == BufferPresentation.PIXEL_1_TO_1_CROP) {
+                        listOf(LayerSizeProfile.FULL_SCREEN)
+                    } else {
+                        LayerSizeProfile.entries
+                    },
                 ) { layerSizeProfile = it }
                 Text(
                     when {
@@ -2680,7 +2833,15 @@ private fun BuilderScreen(controller: LabController, modifier: Modifier) {
                     "Motion",
                     motion,
                     MotionProfile.entries.filterNot {
-                        it == MotionProfile.CAPACITY_TILES
+                        it == MotionProfile.CAPACITY_TILES ||
+                            (
+                                bufferPresentation ==
+                                    BufferPresentation.PIXEL_1_TO_1_CROP &&
+                                    (
+                                        it == MotionProfile.ZOOM_PAN ||
+                                            it == MotionProfile.TRANSFORM_STORM
+                                        )
+                                )
                     },
                 ) { motion = it }
                 if (motion == MotionProfile.Z_ORDER_SWAP) {
@@ -2820,6 +2981,8 @@ private fun BuilderScreen(controller: LabController, modifier: Modifier) {
                 backend = backend,
                 pixelRoute = route,
                 bufferSize = size,
+                bufferPresentation = bufferPresentation,
+                layerOrientation = layerOrientation,
                 motion = motion,
                 layerSizeProfile = layerSizeProfile,
                 loads = LoadSetpoints(cpu, memory, gpu, npu, shape),
@@ -2908,6 +3071,8 @@ private fun enumLabel(value: Any?): String = when (value) {
     is LayerBackend -> value.label
     is PixelRoute -> value.label
     is BufferSize -> value.label
+    is BufferPresentation -> value.label
+    is LayerOrientation -> value.label
     is LayerSizeProfile -> layerSizeProfileUiLabel(value)
     is MotionProfile -> value.label
     is LoadShape -> value.label
@@ -2997,8 +3162,8 @@ private fun RunningScreen(controller: LabController) {
         }
     }
     val expectedProducersCallback = remember(controller) {
-        { generation: Long, producerIds: Set<Long> ->
-            controller.frameTracker.expectProducers(generation, producerIds)
+        { topology: AppProducerTopology ->
+            controller.frameTracker.expectProducerTopology(topology)
         }
     }
     val producerTopologyPendingCallback = remember(controller) {
@@ -3082,6 +3247,121 @@ private fun RunningScreen(controller: LabController) {
             )
             ).takeLast(60)
     }
+    var hudNowMonotonicMs by remember {
+        mutableLongStateOf(SystemClock.elapsedRealtime())
+    }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(RUNNING_HUD_REFRESH_INTERVAL_MS)
+            hudNowMonotonicMs = SystemClock.elapsedRealtime()
+        }
+    }
+    val hudRefreshBucket = runningHudRefreshBucket(hudNowMonotonicMs)
+    val hudProgress = remember(
+        hudRefreshBucket,
+        progress.stage,
+        progress.scenario?.id,
+        progress.phaseIndex,
+        progress.producerGeneration,
+        progress.expectedProducerCount,
+        progress.observedProducerCount,
+        progress.thermalDerated,
+    ) {
+        progress
+    }
+    val hudPlanProgress = remember(
+        hudRefreshBucket,
+        planProgress.state,
+        planProgress.queueIndex,
+        planProgress.repeatIndex,
+        planProgress.completedRuns,
+        planProgress.totalRuns,
+        planProgress.durationMultiplier,
+    ) {
+        planProgress
+    }
+    val hudTelemetry = remember(hudRefreshBucket) {
+        telemetry
+    }
+    val hudHistory = remember(hudRefreshBucket) {
+        hudSamples
+    }
+    val hudMediaSelected = controller.selectedMediaUri != null
+    val hudMediaWidthPx = controller.selectedMediaWidthPx
+    val hudMediaHeightPx = controller.selectedMediaHeightPx
+    val selectedDecoder = controller.selectedVideoDecoder
+    val hudDecoderVisibleWidthPx = selectedDecoder?.expectedVisibleWidthPx
+    val hudDecoderVisibleHeightPx = selectedDecoder?.expectedVisibleHeightPx
+    val hudDecoderSourceFps = selectedDecoder?.expectedSourceFps
+    val hudDecoderSourceRotationDegrees = selectedDecoder?.expectedRotationDegrees
+    val hudDecoderCodecName = selectedDecoder?.codecName
+    val hudProducerReadiness = remember(
+        hudRefreshBucket,
+        progress.producerGeneration,
+        progress.expectedProducerCount,
+        progress.observedProducerCount,
+    ) {
+        progress.producerGeneration
+            .takeIf { it > 0L }
+            ?.let(controller.frameTracker::producerReadiness)
+            ?: ProducerReadiness()
+    }
+    val hudDecoderLinearReference = controller.selectedMediaLinearReference
+    val hudSafetyAdjustments = controller.lastSafetyAdjustments
+    val hudPerformanceIsolationStatus = controller.performanceIsolationStatus
+    val hudCapacityCalibrationStatus = controller.hwcCapacityCalibration.uiSummary()
+    val hudSevereThermalDeratingEnabled =
+        controller.activeSevereThermalDeratingEnabled
+    val noExtraSurfaceHudState = remember(
+        hudProgress,
+        hudPlanProgress,
+        hudTelemetry,
+        hudHistory,
+        stageWidthPx,
+        stageHeightPx,
+        hudMediaSelected,
+        hudMediaWidthPx,
+        hudMediaHeightPx,
+        hudDecoderVisibleWidthPx,
+        hudDecoderVisibleHeightPx,
+        hudDecoderSourceFps,
+        hudDecoderSourceRotationDegrees,
+        hudDecoderCodecName,
+        hudProducerReadiness,
+        hudDecoderLinearReference,
+        hudSafetyAdjustments,
+        hudPerformanceIsolationStatus,
+        hudCapacityCalibrationStatus,
+        hudSevereThermalDeratingEnabled,
+        hudNowMonotonicMs,
+    ) {
+        NoExtraSurfaceHudState(
+            progress = hudProgress,
+            planProgress = hudPlanProgress,
+            telemetry = hudTelemetry,
+            history = hudHistory,
+            stageWidthPx = stageWidthPx,
+            stageHeightPx = stageHeightPx,
+            mediaSelected = hudMediaSelected,
+            mediaWidthPx = hudMediaWidthPx,
+            mediaHeightPx = hudMediaHeightPx,
+            decoderVisibleWidthPx = hudDecoderVisibleWidthPx,
+            decoderVisibleHeightPx = hudDecoderVisibleHeightPx,
+            decoderSourceFps = hudDecoderSourceFps,
+            decoderSourceRotationDegrees = hudDecoderSourceRotationDegrees,
+            decoderCodecName = hudDecoderCodecName,
+            producerReadiness = hudProducerReadiness,
+            decoderLinearReference = hudDecoderLinearReference,
+            safetyAdjustments = hudSafetyAdjustments.toList(),
+            performanceIsolationStatus = hudPerformanceIsolationStatus,
+            capacityCalibrationStatus = hudCapacityCalibrationStatus,
+            severeThermalDeratingEnabled = hudSevereThermalDeratingEnabled,
+            nowMonotonicMs = hudNowMonotonicMs,
+        )
+    }
+    val stopScenario = remember(controller) {
+        { controller.stopScenario() }
+    }
     Box(
         Modifier
             .fillMaxSize()
@@ -3119,45 +3399,46 @@ private fun RunningScreen(controller: LabController) {
                     },
             )
         }
-        RunningHud(
-            progress = progress,
-            planProgress = planProgress,
-            telemetry = telemetry,
-            history = hudSamples,
-            stageWidthPx = stageWidthPx,
-            stageHeightPx = stageHeightPx,
-            mediaSelected = controller.selectedMediaUri != null,
-            mediaWidthPx = controller.selectedMediaWidthPx,
-            mediaHeightPx = controller.selectedMediaHeightPx,
-            decoderLinearReference = controller.selectedMediaLinearReference,
-            safetyAdjustments = controller.lastSafetyAdjustments,
-            performanceIsolationStatus = controller.performanceIsolationStatus,
-            capacityCalibrationStatus = controller.hwcCapacityCalibration.uiSummary(),
-            severeThermalDeratingEnabled =
-                controller.activeSevereThermalDeratingEnabled,
-            stop = controller::stopScenario,
+        NoExtraSurfaceRunningHud(
+            state = noExtraSurfaceHudState,
+            stop = stopScenario,
         )
     }
 }
 
+/**
+ * Pure Compose control UI. Keep AndroidView/SurfaceView/TextureView out of this subtree so the
+ * HUD never creates another SurfaceFlinger/HWC candidate beyond the Activity root/window layer.
+ *
+ * The root window itself remains a visible composition layer whose DEVICE/CLIENT assignment is
+ * made by SurfaceFlinger/HWC. Public Android APIs cannot force or prove that assignment.
+ */
 @Composable
-private fun RunningHud(
-    progress: RunProgress,
-    planProgress: PlanProgress,
-    telemetry: TelemetrySnapshot,
-    history: List<RunningHudSample>,
-    stageWidthPx: Int,
-    stageHeightPx: Int,
-    mediaSelected: Boolean,
-    mediaWidthPx: Int?,
-    mediaHeightPx: Int?,
-    decoderLinearReference: DecoderLinearReference?,
-    safetyAdjustments: List<String>,
-    performanceIsolationStatus: String,
-    capacityCalibrationStatus: String,
-    severeThermalDeratingEnabled: Boolean,
+private fun NoExtraSurfaceRunningHud(
+    state: NoExtraSurfaceHudState,
     stop: () -> Unit,
 ) {
+    val progress = state.progress
+    val planProgress = state.planProgress
+    val telemetry = state.telemetry
+    val history = state.history
+    val stageWidthPx = state.stageWidthPx
+    val stageHeightPx = state.stageHeightPx
+    val mediaSelected = state.mediaSelected
+    val mediaWidthPx = state.mediaWidthPx
+    val mediaHeightPx = state.mediaHeightPx
+    val decoderVisibleWidthPx = state.decoderVisibleWidthPx
+    val decoderVisibleHeightPx = state.decoderVisibleHeightPx
+    val decoderSourceFps = state.decoderSourceFps
+    val decoderSourceRotationDegrees = state.decoderSourceRotationDegrees
+    val decoderCodecName = state.decoderCodecName
+    val producerReadiness = state.producerReadiness
+    val decoderLinearReference = state.decoderLinearReference
+    val safetyAdjustments = state.safetyAdjustments
+    val performanceIsolationStatus = state.performanceIsolationStatus
+    val capacityCalibrationStatus = state.capacityCalibrationStatus
+    val severeThermalDeratingEnabled = state.severeThermalDeratingEnabled
+    val nowMonotonicMs = state.nowMonotonicMs
     val phase = progress.phase
     val configuration = LocalConfiguration.current
     val compactHud =
@@ -3169,6 +3450,7 @@ private fun RunningHud(
         configuration.screenHeightDp < 720 -> 132.dp
         else -> 168.dp
     }
+    val topHudScrollState = rememberScrollState()
     val phaseFraction = phase?.let {
         if (it.durationMs > 0L) {
             (progress.phaseElapsedMs.toDouble() / it.durationMs.toDouble())
@@ -3212,7 +3494,7 @@ private fun RunningHud(
     val liveMetrics = listOf(
         LiveHudMetricSpec(
             label = "PHYSICAL",
-            provenance = logicalLayerHudLabel(phase?.activeLayers),
+            provenance = "APP PRODUCER · ${logicalLayerHudLabel(phase?.activeLayers)}",
             value = physicalProducerValue,
             valueText = if (phase != null) {
                 producerCountDisplay(
@@ -3255,190 +3537,322 @@ private fun RunningHud(
         ),
     )
 
-    Column(
+    Row(
         Modifier
             .fillMaxSize()
             .windowInsetsPadding(WindowInsets.displayCutout)
             .padding(12.dp),
-        verticalArrangement = Arrangement.SpaceBetween,
+        horizontalArrangement = Arrangement.spacedBy(if (compactHud) 6.dp else 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Surface(
+        Column(
             modifier = Modifier
-                .widthIn(max = if (compactHud) 620.dp else 370.dp)
-                .fillMaxWidth(),
-            color = Color(0xD90A1512),
-            shape = RoundedCornerShape(18.dp),
+                .weight(1f)
+                .fillMaxHeight(),
+            verticalArrangement = Arrangement.SpaceBetween,
         ) {
-            Column(
-                Modifier.padding(if (compactHud) 9.dp else 12.dp),
-                verticalArrangement = Arrangement.spacedBy(if (compactHud) 4.dp else 7.dp),
+            Surface(
+                modifier = Modifier
+                    .widthIn(max = if (compactHud) 620.dp else 370.dp)
+                    .fillMaxWidth()
+                    .weight(1f),
+                color = Color(0xD90A1512),
+                shape = RoundedCornerShape(18.dp),
             ) {
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text(
-                            planProgress.currentScenario?.name
-                                ?: progress.scenario?.name
-                                ?: "DPU test 준비",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = Color.White,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        Text(
-                            "QUEUE ${planProgress.currentQueuePosition}/" +
-                                "${planProgress.queueSize} · LOOP ${planProgress.currentRepeat}/" +
-                                "${planProgress.repeatCount} · ${progress.stage.displayLabel()}",
-                            color = Color(0xFFB8CBC5),
-                            style = MaterialTheme.typography.labelMedium,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        Text(
-                            "LAYER SIZE · " +
-                                (
-                                    phase?.layerSizeProfile?.let {
-                                        layerSizeProfileUiLabel(it, compact = true)
-                                    } ?: "준비 중"
-                                    ),
-                            color = Color(0xFF8FA9A1),
-                            fontSize = 8.sp,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        Text(
-                            visibleAppVersion(BuildConfig.VERSION_NAME),
-                            color = Color(0xFF8FA9A1),
-                            fontSize = 8.sp,
-                            maxLines = 1,
-                        )
+                Column(
+                    Modifier.padding(if (compactHud) 9.dp else 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(if (compactHud) 4.dp else 7.dp),
+                ) {
+                    // Keep the header and STOP action fixed in every layout. Only the bounded
+                    // diagnostic body below may scroll when height or font scale is tight.
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                planProgress.currentScenario?.name
+                                    ?: progress.scenario?.name
+                                    ?: "DPU test 준비",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = Color.White,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                "항목 ${planProgress.currentQueuePosition}/" +
+                                    "${planProgress.queueSize} · " +
+                                    "LOOP ${planProgress.currentRepeat}/" +
+                                    "${planProgress.repeatCount} · TIME " +
+                                    "${planProgress.durationMultiplier}× · " +
+                                    progress.stage.displayLabel(),
+                                color = Color(0xFFB8CBC5),
+                                style = MaterialTheme.typography.labelMedium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                "LAYER SIZE · " +
+                                    (
+                                        phase?.layerSizeProfile?.let {
+                                            layerSizeProfileUiLabel(it, compact = true)
+                                        } ?: "준비 중"
+                                        ),
+                                color = Color(0xFF8FA9A1),
+                                fontSize = 8.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                phase?.let {
+                                    "BUFFER · ${it.bufferSize.label} · " +
+                                        "${it.bufferPresentation.label} · " +
+                                        it.layerOrientation.label
+                                } ?: "BUFFER · 준비 중",
+                                color = Color(0xFF8FA9A1),
+                                fontSize = 8.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                visibleAppVersion(BuildConfig.VERSION_NAME),
+                                color = Color(0xFF8FA9A1),
+                                fontSize = 8.sp,
+                                maxLines = 1,
+                            )
+                        }
+                        Surface(
+                            color = Color(0xFF0F332C),
+                            shape = RoundedCornerShape(100.dp),
+                        ) {
+                            Text(
+                                progress.stage.name,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                color = Color(0xFF65E6C4),
+                                style = MaterialTheme.typography.labelLarge,
+                            )
+                        }
+                        Spacer(Modifier.width(6.dp))
+                        Button(
+                            onClick = stop,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.error,
+                                contentColor = MaterialTheme.colorScheme.onError,
+                            ),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 7.dp),
+                        ) {
+                            Text("STOP", fontWeight = FontWeight.Bold)
+                        }
                     }
-                    Surface(color = Color(0xFF0F332C), shape = RoundedCornerShape(100.dp)) {
-                        Text(
-                            progress.stage.name,
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-                            color = Color(0xFF65E6C4),
-                            style = MaterialTheme.typography.labelLarge,
-                        )
-                    }
-                    Spacer(Modifier.width(6.dp))
-                    Button(
-                        onClick = stop,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.error,
-                            contentColor = MaterialTheme.colorScheme.onError,
-                        ),
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 7.dp),
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .verticalScroll(topHudScrollState),
+                        verticalArrangement =
+                            Arrangement.spacedBy(if (compactHud) 4.dp else 7.dp),
                     ) {
-                        Text("STOP", fontWeight = FontWeight.Bold)
-                    }
-                }
-                phase
-                    ?.hwcCompositionExpectation
-                    ?.takeIf { it != HwcCompositionExpectation.NONE }
-                    ?.let { expectation ->
-                        val rawState = rawHwcExpectationState(
+                        val expectation =
+                            phase?.hwcCompositionExpectation ?: HwcCompositionExpectation.NONE
+                        val liveHwcPair = atomicHwcCompositionPair(
+                            telemetry = telemetry,
+                            nowMonotonicMs = nowMonotonicMs,
+                        )
+                        val rawHwcState = rawHwcExpectationState(
                             expectation = expectation,
                             telemetry = telemetry,
+                            nowMonotonicMs = nowMonotonicMs,
                         )
                         Text(
-                            hwcExpectationLiveSummary(
-                                expectation = expectation,
-                                telemetry = telemetry,
-                            ),
-                            color = when (rawState) {
-                                RawHwcExpectationState.MATCH -> Color(0xFFB8CBC5)
-                                RawHwcExpectationState.WAIT,
-                                RawHwcExpectationState.N_A -> Color(0xFFFFC857)
+                            if (expectation == HwcCompositionExpectation.NONE) {
+                                hwcLayerCountLiveSummary(
+                                    telemetry = telemetry,
+                                    nowMonotonicMs = nowMonotonicMs,
+                                )
+                            } else {
+                                hwcExpectationLiveSummary(
+                                    expectation = expectation,
+                                    telemetry = telemetry,
+                                    nowMonotonicMs = nowMonotonicMs,
+                                )
+                            },
+                            color = if (
+                                liveHwcPair != null &&
+                                (
+                                    expectation == HwcCompositionExpectation.NONE ||
+                                        rawHwcState == RawHwcExpectationState.MATCH
+                                    )
+                            ) {
+                                Color(0xFFB8CBC5)
+                            } else {
+                                Color(0xFFFFC857)
                             },
                             style = MaterialTheme.typography.labelSmall,
                             fontSize = if (compactHud) 8.sp else 10.sp,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis,
                         )
-                    }
-                HudProgressLine(
-                    label = if (compactHud) {
-                        "PLAN ${(planProgress.overallFraction * 100f).roundToInt()}% · " +
-                            "PHASE ${(progress.phaseIndex + 1).coerceAtLeast(1)}/" +
-                            "${progress.scenario?.phases?.size ?: 0} " +
-                            "${(phaseFraction * 100f).roundToInt()}%"
-                    } else {
-                        "DPU PLAN · ${planProgress.completedRuns}/${planProgress.totalRuns} runs"
-                    },
-                    detail = if (compactHud) {
-                        "${planProgress.completedRuns}/${planProgress.totalRuns} runs"
-                    } else {
-                        "현재 scenario ${(planProgress.boundedCurrentRunFraction * 100f).roundToInt()}%"
-                    },
-                    fraction = planProgress.overallFraction,
-                    color = Color(0xFF65E6C4),
-                )
-                if (!compactHud) phase?.let { activePhase ->
-                    HudProgressLine(
-                        label = "PHASE ${(progress.phaseIndex + 1).coerceAtLeast(1)}/" +
-                            "${progress.scenario?.phases?.size ?: 0}",
-                        detail = "${activePhase.label} · " +
-                            "${formatDuration(progress.phaseElapsedMs)} / " +
-                            formatDuration(activePhase.durationMs),
-                        fraction = phaseFraction,
-                        color = Color(0xFFFFC857),
-                    )
-                }
-                if (compactHud) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        liveMetrics.chunked(2).forEach { columnMetrics ->
-                            Column(
-                                modifier = Modifier.weight(1f),
-                                verticalArrangement = Arrangement.spacedBy(5.dp),
+                        CurrentTestContentHud(
+                            phase = phase,
+                            readiness = producerReadiness,
+                            expectedProducerCount = progress.expectedProducerCount,
+                            mediaWidthPx = mediaWidthPx,
+                            mediaHeightPx = mediaHeightPx,
+                            decoderVisibleWidthPx = decoderVisibleWidthPx,
+                            decoderVisibleHeightPx = decoderVisibleHeightPx,
+                            decoderSourceFps = decoderSourceFps,
+                            decoderSourceRotationDegrees = decoderSourceRotationDegrees,
+                            decoderCodecName = decoderCodecName,
+                            compact = compactHud,
+                        )
+                        HudProgressLine(
+                            label = if (compactHud) {
+                                "PLAN ${(planProgress.overallFraction * 100f).roundToInt()}% · " +
+                                    "PHASE ${(progress.phaseIndex + 1).coerceAtLeast(1)}/" +
+                                    "${progress.scenario?.phases?.size ?: 0} " +
+                                    "${(phaseFraction * 100f).roundToInt()}%"
+                            } else {
+                                "DPU PLAN · " +
+                                    "${planProgress.completedRuns}/${planProgress.totalRuns} runs"
+                            },
+                            detail = if (compactHud) {
+                                "${planProgress.completedRuns}/${planProgress.totalRuns} runs"
+                            } else {
+                                "현재 scenario " +
+                                    "${(planProgress.boundedCurrentRunFraction * 100f).roundToInt()}%"
+                            },
+                            fraction = planProgress.overallFraction,
+                            color = Color(0xFF65E6C4),
+                        )
+                        if (!compactHud) {
+                            phase?.let { activePhase ->
+                                HudProgressLine(
+                                    label =
+                                        "PHASE ${(progress.phaseIndex + 1).coerceAtLeast(1)}/" +
+                                            "${progress.scenario?.phases?.size ?: 0}",
+                                    detail = "${activePhase.label} · " +
+                                        "${formatDuration(progress.phaseElapsedMs)} / " +
+                                        formatDuration(activePhase.durationMs),
+                                    fraction = phaseFraction,
+                                    color = Color(0xFFFFC857),
+                                )
+                            }
+                        }
+                        if (compactHud) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
                             ) {
-                                columnMetrics.forEach { metric ->
-                                    LiveHudMetric(
-                                        label = metric.label,
-                                        provenance = metric.provenance,
-                                        value = metric.value,
-                                        valueText = metric.valueText,
-                                        history = metric.history,
-                                        maxValue = metric.maxValue,
-                                        color = metric.color,
-                                    )
+                                liveMetrics.chunked(2).forEach { columnMetrics ->
+                                    Column(
+                                        modifier = Modifier.weight(1f),
+                                        verticalArrangement = Arrangement.spacedBy(5.dp),
+                                    ) {
+                                        columnMetrics.forEach { metric ->
+                                            LiveHudMetric(
+                                                label = metric.label,
+                                                provenance = metric.provenance,
+                                                value = metric.value,
+                                                valueText = metric.valueText,
+                                                history = metric.history,
+                                                maxValue = metric.maxValue,
+                                                color = metric.color,
+                                            )
+                                        }
+                                    }
                                 }
                             }
+                        } else {
+                            liveMetrics.forEach { metric ->
+                                LiveHudMetric(
+                                    label = metric.label,
+                                    provenance = metric.provenance,
+                                    value = metric.value,
+                                    valueText = metric.valueText,
+                                    history = metric.history,
+                                    maxValue = metric.maxValue,
+                                    color = metric.color,
+                                )
+                            }
+                        }
+                        HorizontalDivider(color = Color.White.copy(alpha = 0.13f))
+                        TrafficHud(traffic, compact = compactHud)
+                    }
+                }
+            }
+            Surface(
+                modifier = Modifier
+                    .widthIn(max = if (compactHud) 760.dp else 520.dp)
+                    .fillMaxWidth(),
+                color = Color(0xD90A1512),
+                shape = RoundedCornerShape(18.dp),
+            ) {
+                if (compactHud) {
+                    Row(
+                        Modifier.padding(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Box(Modifier.weight(1f)) {
+                            RunTransitionStatus(
+                                progress = progress,
+                                planProgress = planProgress,
+                                telemetry = telemetry,
+                                safetyAdjustments = safetyAdjustments,
+                                performanceIsolationStatus = performanceIsolationStatus,
+                                capacityCalibrationStatus = capacityCalibrationStatus,
+                                severeThermalDeratingEnabled = severeThermalDeratingEnabled,
+                                compact = true,
+                                modifier = Modifier
+                                    .heightIn(max = detailPanelMaxHeight)
+                                    .verticalScroll(rememberScrollState()),
+                            )
                         }
                     }
                 } else {
-                    liveMetrics.forEach { metric ->
-                        LiveHudMetric(
-                            label = metric.label,
-                            provenance = metric.provenance,
-                            value = metric.value,
-                            valueText = metric.valueText,
-                            history = metric.history,
-                            maxValue = metric.maxValue,
-                            color = metric.color,
-                        )
-                    }
-                }
-                HorizontalDivider(color = Color.White.copy(alpha = 0.13f))
-                TrafficHud(traffic, compact = compactHud)
-            }
-        }
-        Surface(
-            modifier = Modifier
-                .widthIn(max = if (compactHud) 760.dp else 520.dp)
-                .fillMaxWidth(),
-            color = Color(0xD90A1512),
-            shape = RoundedCornerShape(18.dp),
-        ) {
-            if (compactHud) {
-                Row(
-                    Modifier.padding(8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Box(Modifier.weight(1f)) {
+                    Column(
+                        Modifier.padding(13.dp),
+                        verticalArrangement = Arrangement.spacedBy(9.dp),
+                    ) {
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                val coolingDown = progress.stage == RunnerStage.COOLDOWN
+                                val targetPhase =
+                                    if (coolingDown) null else progress.displayedTargetPhase
+                                Text(
+                                    when {
+                                        coolingDown ->
+                                            "Cooldown · 부하 해제 및 counter 안정화"
+                                        progress.phase != null ->
+                                            "현재 LOGICAL ${progress.phase.activeLayers}L / " +
+                                                "PHYSICAL PRODUCER " +
+                                                producerCountDisplay(
+                                                    observed = progress.observedProducerCount,
+                                                    expected = progress.expectedProducerCount,
+                                                ) +
+                                                " / " +
+                                                "${progress.phase.producerFps.toInt()}fps · " +
+                                                "목표 LOGICAL " +
+                                                "${targetPhase?.activeLayers ?: progress.phase.activeLayers}L / " +
+                                                "${(targetPhase?.producerFps ?: progress.phase.producerFps).toInt()}fps"
+                                        else -> "surface 준비"
+                                    },
+                                    color = Color.White,
+                                    style = MaterialTheme.typography.titleMedium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                Text(
+                                    progress.phase?.let {
+                                        "${layerSizeProfileUiLabel(it.layerSizeProfile)} · " +
+                                            "${it.backend.label} · ${it.pixelRoute.label} · " +
+                                            "${it.motion.label} · " +
+                                            "${it.requestedDisplayHz.toInt()}Hz"
+                                    } ?: "부하 없음",
+                                    color = Color(0xFFB8CBC5),
+                                    style = MaterialTheme.typography.labelLarge,
+                                    maxLines = 1,
+                                )
+                            }
+                        }
                         RunTransitionStatus(
                             progress = progress,
                             planProgress = planProgress,
@@ -3447,78 +3861,582 @@ private fun RunningHud(
                             performanceIsolationStatus = performanceIsolationStatus,
                             capacityCalibrationStatus = capacityCalibrationStatus,
                             severeThermalDeratingEnabled = severeThermalDeratingEnabled,
-                            compact = true,
+                            compact = false,
                             modifier = Modifier
                                 .heightIn(max = detailPanelMaxHeight)
                                 .verticalScroll(rememberScrollState()),
                         )
                     }
                 }
-            } else {
-                Column(
-                    Modifier.padding(13.dp),
-                    verticalArrangement = Arrangement.spacedBy(9.dp),
-                ) {
-                    Row(
-                        Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    ) {
-                        Column(Modifier.weight(1f)) {
-                            val coolingDown = progress.stage == RunnerStage.COOLDOWN
-                            val targetPhase =
-                                if (coolingDown) null else progress.displayedTargetPhase
-                            Text(
-                                when {
-                                    coolingDown -> "Cooldown · 부하 해제 및 counter 안정화"
-                                    progress.phase != null ->
-                                        "현재 LOGICAL ${progress.phase.activeLayers}L / PHYSICAL " +
-                                            producerCountDisplay(
-                                                observed = progress.observedProducerCount,
-                                                expected = progress.expectedProducerCount,
-                                            ) +
-                                            " / " +
-                                            "${progress.phase.producerFps.toInt()}fps · " +
-                                            "목표 LOGICAL " +
-                                            "${targetPhase?.activeLayers ?: progress.phase.activeLayers}L / " +
-                                            "${(targetPhase?.producerFps ?: progress.phase.producerFps).toInt()}fps"
-                                    else -> "surface 준비"
-                                },
-                                color = Color.White,
-                                style = MaterialTheme.typography.titleMedium,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            Text(
-                                progress.phase?.let {
-                                    "${layerSizeProfileUiLabel(it.layerSizeProfile)} · " +
-                                        "${it.backend.label} · ${it.pixelRoute.label} · " +
-                                        "${it.motion.label} · ${it.requestedDisplayHz.toInt()}Hz"
-                                } ?: "부하 없음",
-                                color = Color(0xFFB8CBC5),
-                                style = MaterialTheme.typography.labelLarge,
-                                maxLines = 1,
-                            )
-                        }
-                    }
-                    RunTransitionStatus(
-                        progress = progress,
-                        planProgress = planProgress,
-                        telemetry = telemetry,
-                        safetyAdjustments = safetyAdjustments,
-                        performanceIsolationStatus = performanceIsolationStatus,
-                        capacityCalibrationStatus = capacityCalibrationStatus,
-                        severeThermalDeratingEnabled = severeThermalDeratingEnabled,
-                        compact = false,
-                        modifier = Modifier
-                            .heightIn(max = detailPanelMaxHeight)
-                            .verticalScroll(rememberScrollState()),
-                    )
+            }
+        }
+        AppProducerMapPanel(
+            plannedPhase = progress.displayedTargetPhase ?: phase,
+            activePhase = phase,
+            readiness = producerReadiness,
+            expectedProducerCount = progress.expectedProducerCount,
+            observedProducerCount = progress.observedProducerCount,
+            mediaWidthPx = decoderVisibleWidthPx ?: mediaWidthPx,
+            mediaHeightPx = decoderVisibleHeightPx ?: mediaHeightPx,
+            compact = compactHud,
+        )
+    }
+}
+
+@Immutable
+internal data class CurrentTestHudSummary(
+    val source: String,
+    val presentation: String,
+    val rotation: String,
+    val motion: String,
+    val layerSize: String,
+    val producers: String,
+    val load: String,
+)
+
+internal fun currentTestHudRows(summary: CurrentTestHudSummary): List<String> = listOf(
+    summary.source,
+    summary.presentation,
+    summary.rotation,
+    summary.motion,
+    summary.layerSize,
+    summary.producers,
+    summary.load,
+)
+
+internal enum class DecoderHudEvidenceState(val label: String) {
+    NOT_APPLICABLE("N/A"),
+    TOPOLOGY_WAIT("WAIT · topology"),
+    FIRST_FRAME_WAIT("WAIT · first rendered frame"),
+    REVISION_WAIT("REV WAIT"),
+    ACTIVE("ACTIVE"),
+    STALE("STALE"),
+    INVALID("EVIDENCE INVALID"),
+}
+
+@Immutable
+internal data class DecoderHudProjection(
+    val state: DecoderHudEvidenceState,
+    val text: String,
+)
+
+internal fun currentTestHudSummary(
+    phase: PhaseSpec?,
+    decoderVisibleWidthPx: Int?,
+    decoderVisibleHeightPx: Int?,
+    decoderSourceFps: Float?,
+    decoderSourceRotationDegrees: Int?,
+): CurrentTestHudSummary {
+    if (phase == null) {
+        return CurrentTestHudSummary(
+            source = "SOURCE · 준비 중",
+            presentation = "표시 방식 · 준비 중",
+            rotation = "회전 · 준비 중",
+            motion = "이동/확대 · 준비 중",
+            layerSize = "레이어 크기 · 준비 중",
+            producers = "APP PRODUCER · 준비 중",
+            load = "부하 · 준비 중",
+        )
+    }
+    val kinds = plannedAppProducerKinds(phase)
+    val hasDecoder = AppProducerKind.VIDEO_DECODER in kinds
+    val actualWidth = decoderVisibleWidthPx?.takeIf { it > 0 }
+    val actualHeight = decoderVisibleHeightPx?.takeIf { it > 0 }
+    val actualSource = if (actualWidth != null && actualHeight != null) {
+        "${sourceResolutionClass(actualWidth, actualHeight)} " +
+            "${actualWidth}×${actualHeight}"
+    } else {
+        "metadata 대기"
+    }
+    val requestedSource = when (phase.bufferSize) {
+        BufferSize.DISPLAY -> "Display"
+        else -> "${phase.bufferSize.label} 이상"
+    }
+    val source = if (hasDecoder) {
+        val fps = decoderSourceFps
+            ?.takeIf { it.isFinite() && it > 0f }
+            ?.let(::formatHudFps)
+            ?: "FPS 대기"
+        "SOURCE · 영상/MediaCodec · 실제 $actualSource @$fps · 요구 $requestedSource"
+    } else {
+        val primaryBuffer = when (kinds.firstOrNull()) {
+            AppProducerKind.GPU_GL,
+            AppProducerKind.CANVAS_TEXTURE,
+            AppProducerKind.FLATTENED_CANVAS,
+            -> "Display"
+            AppProducerKind.CANVAS_SURFACE -> {
+                if (phase.bufferSize == BufferSize.DISPLAY) {
+                    "Display"
+                } else {
+                    "${phase.bufferSize.label} Canvas primary + Display overlay"
                 }
             }
+            AppProducerKind.VIDEO_DECODER,
+            AppProducerKind.UNKNOWN,
+            null,
+            -> "N/A"
+        }
+        "SOURCE · ${producerNatureSummary(kinds)} · $primaryBuffer"
+    }
+    val presentation = when (phase.bufferPresentation) {
+        BufferPresentation.FIT -> "기본 FIT(동작 전 전체·종횡비 유지)"
+        BufferPresentation.PIXEL_1_TO_1_CROP -> "1:1 원본 픽셀(중앙 crop)"
+    }
+    val sourceRotation = decoderSourceRotationDegrees
+        ?.takeIf { hasDecoder }
+        ?.let { " · 영상 metadata ${it}°" }
+        .orEmpty()
+    return CurrentTestHudSummary(
+        source = source,
+        presentation = "표시 방식 · $presentation",
+        rotation = "회전 · layer ${phase.layerOrientation.label}$sourceRotation",
+        motion = "이동/확대 · ${motionHudLabel(phase)}",
+        layerSize = "레이어 크기 · ${layerSizeHudLabel(phase.layerSizeProfile)}",
+        producers = "APP PRODUCER · ${producerNatureSummary(kinds)} · ${kinds.size}P",
+        load = "부하 · ${phase.workloads.summary()} · ${phase.workloads.shape.label} · " +
+            phase.transition.summary(),
+    )
+}
+
+internal fun decoderHudProjection(
+    phase: PhaseSpec?,
+    readiness: ProducerReadiness,
+    expectedProducerCount: Int,
+): DecoderHudProjection {
+    val decoderPlanned =
+        phase?.let(::plannedAppProducerKinds)?.contains(AppProducerKind.VIDEO_DECODER) == true
+    if (!decoderPlanned) {
+        return DecoderHudProjection(
+            DecoderHudEvidenceState.NOT_APPLICABLE,
+            "VIDEO DECODER · N/A",
+        )
+    }
+    val state = when {
+        readiness.topologyMissed ||
+            readiness.teardownFailed ||
+            readiness.teardownCompleted ||
+            readiness.runtimeFailureReason != null -> DecoderHudEvidenceState.INVALID
+        expectedProducerCount <= 0 ||
+            readiness.topologyPending ||
+            !readiness.topologyPublished -> DecoderHudEvidenceState.TOPOLOGY_WAIT
+        !readiness.decoderExpected -> DecoderHudEvidenceState.INVALID
+        readiness.decoderObservationFrameCount <= 0L ||
+            readiness.decoderLastFrameAgeMs == null -> DecoderHudEvidenceState.FIRST_FRAME_WAIT
+        readiness.decoderLastFrameAgeMs > DECODER_HUD_FRESHNESS_MS ->
+            DecoderHudEvidenceState.STALE
+        readiness.producerControlRequestedRevision > 0L &&
+            !readiness.decoderControlReady -> DecoderHudEvidenceState.REVISION_WAIT
+        else -> DecoderHudEvidenceState.ACTIVE
+    }
+    val age = readiness.decoderLastFrameAgeMs?.let { "${it}ms" } ?: "N/A"
+    val text = when (state) {
+        DecoderHudEvidenceState.TOPOLOGY_WAIT ->
+            "VIDEO DECODER ${state.label} —P"
+        DecoderHudEvidenceState.FIRST_FRAME_WAIT ->
+            "VIDEO DECODER ${state.label}"
+        DecoderHudEvidenceState.INVALID ->
+            "VIDEO DECODER ${state.label}"
+        DecoderHudEvidenceState.REVISION_WAIT,
+        DecoderHudEvidenceState.ACTIVE,
+        DecoderHudEvidenceState.STALE,
+        ->
+            "VIDEO DECODER ${state.label} · current " +
+                "${readiness.decoderObservationFrameCount} rendered · " +
+                "generation ${readiness.decoderGenerationFrameCount} · age $age"
+        DecoderHudEvidenceState.NOT_APPLICABLE -> "VIDEO DECODER · N/A"
+    }
+    return DecoderHudProjection(
+        state = state,
+        text = text,
+    )
+}
+
+@Composable
+private fun CurrentTestContentHud(
+    phase: PhaseSpec?,
+    readiness: ProducerReadiness,
+    expectedProducerCount: Int,
+    mediaWidthPx: Int?,
+    mediaHeightPx: Int?,
+    decoderVisibleWidthPx: Int?,
+    decoderVisibleHeightPx: Int?,
+    decoderSourceFps: Float?,
+    decoderSourceRotationDegrees: Int?,
+    decoderCodecName: String?,
+    compact: Boolean,
+) {
+    val summary = currentTestHudSummary(
+        phase = phase,
+        decoderVisibleWidthPx = decoderVisibleWidthPx ?: mediaWidthPx,
+        decoderVisibleHeightPx = decoderVisibleHeightPx ?: mediaHeightPx,
+        decoderSourceFps = decoderSourceFps,
+        decoderSourceRotationDegrees = decoderSourceRotationDegrees,
+    )
+    val decoder = decoderHudProjection(
+        phase = phase,
+        readiness = readiness,
+        expectedProducerCount = expectedProducerCount,
+    )
+    val fontSize = if (compact) 7.sp else 9.sp
+    val lines = currentTestHudRows(summary)
+    Column(verticalArrangement = Arrangement.spacedBy(if (compact) 1.dp else 2.dp)) {
+        lines.forEach { line ->
+            Text(
+                text = line,
+                color = Color(0xFFD6E6E0),
+                fontSize = fontSize,
+            )
+        }
+        if (decoder.state != DecoderHudEvidenceState.NOT_APPLICABLE) {
+            val codec = decoderCodecName
+                ?.trim()
+                ?.takeIf(String::isNotEmpty)
+                ?.let { " · HW $it" }
+                .orEmpty()
+            Text(
+                text = decoder.text + codec + " · HWC 판정 아님",
+                color = decoderEvidenceColor(decoder.state),
+                fontSize = fontSize,
+            )
         }
     }
 }
+
+@Composable
+private fun AppProducerMapPanel(
+    plannedPhase: PhaseSpec?,
+    activePhase: PhaseSpec?,
+    readiness: ProducerReadiness,
+    expectedProducerCount: Int,
+    observedProducerCount: Int,
+    mediaWidthPx: Int?,
+    mediaHeightPx: Int?,
+    compact: Boolean,
+) {
+    val plannedKinds = plannedPhase?.let(::plannedAppProducerKinds).orEmpty()
+    val committed = readiness.committedTopology?.producers.orEmpty()
+    val committedValid =
+        committed.isNotEmpty() &&
+            expectedProducerCount > 0 &&
+            readiness.expectedCount == expectedProducerCount &&
+            committed.size == expectedProducerCount &&
+            !readiness.topologyPending &&
+            !readiness.topologyMissed &&
+            !readiness.teardownFailed &&
+            !readiness.teardownCompleted
+    val shownKinds = if (committedValid) {
+        committed.map { it.kind }
+    } else {
+        plannedKinds
+    }
+    val observationReady =
+        committedValid &&
+            readiness.ready &&
+            readiness.observedCount == expectedProducerCount &&
+            observedProducerCount >= expectedProducerCount
+    val mapEvidenceInvalid =
+        readiness.topologyMissed ||
+            readiness.teardownFailed ||
+            readiness.runtimeFailureReason != null ||
+            (
+                readiness.committedTopology != null &&
+                    !committedValid &&
+                    !readiness.topologyPending
+                )
+    val mapStatus = when {
+        mapEvidenceInvalid -> "EVIDENCE INVALID"
+        committedValid && observationReady -> "COMMITTED · READY"
+        committedValid -> "COMMITTED · FRAME WAIT"
+        else -> "PLAN · OUTLINE"
+    }
+    val sourcePhase = if (committedValid) {
+        activePhase ?: plannedPhase
+    } else {
+        plannedPhase ?: activePhase
+    }
+    val boxHeight = when {
+        compact && shownKinds.size > 12 -> 11.dp
+        compact -> 13.dp
+        shownKinds.size > 12 -> 13.dp
+        else -> 17.dp
+    }
+    val boxFont = when {
+        compact && shownKinds.size > 12 -> 6.sp
+        compact -> 6.sp
+        shownKinds.size > 12 -> 7.sp
+        else -> 8.sp
+    }
+    Surface(
+        modifier = Modifier
+            .width(if (compact) 84.dp else 96.dp)
+            .fillMaxHeight(),
+        color = Color(0xD90A1512),
+        shape = RoundedCornerShape(14.dp),
+    ) {
+        val mapScrollState = rememberScrollState()
+        Column(
+            Modifier
+                .padding(horizontal = if (compact) 5.dp else 7.dp, vertical = 7.dp)
+                .verticalScroll(mapScrollState),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(if (compact) 1.dp else 2.dp),
+        ) {
+            Text(
+                "APP PRODUCER MAP",
+                color = Color.White,
+                fontWeight = FontWeight.Bold,
+                fontSize = if (compact) 6.sp else 8.sp,
+                maxLines = 1,
+            )
+            Text(
+                "PLAN ${plannedKinds.size} · COMMIT " +
+                    if (expectedProducerCount > 0) "${expectedProducerCount}P" else "—P",
+                color = Color(0xFFB8CBC5),
+                fontSize = if (compact) 5.sp else 7.sp,
+                maxLines = 1,
+            )
+            Text(
+                "OBS ${observedProducerCount.coerceAtLeast(0)}/" +
+                    if (expectedProducerCount > 0) "$expectedProducerCount" else "—",
+                color = when {
+                    mapEvidenceInvalid -> Color(0xFFFF8A80)
+                    observationReady -> Color(0xFF65E6C4)
+                    else -> Color(0xFFFFC857)
+                },
+                fontSize = if (compact) 5.sp else 7.sp,
+                maxLines = 1,
+            )
+            Text(
+                mapStatus,
+                color = when {
+                    mapEvidenceInvalid -> Color(0xFFFF8A80)
+                    observationReady -> Color(0xFF65E6C4)
+                    else -> Color(0xFFFFC857)
+                },
+                fontSize = if (compact) 5.sp else 6.sp,
+                maxLines = 1,
+            )
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(if (compact) 1.dp else 2.dp),
+            ) {
+                shownKinds.forEachIndexed { index, kind ->
+                    val sourceClass = producerSourceClass(
+                        phase = sourcePhase,
+                        layerIndex = index,
+                        kind = kind,
+                        mediaWidthPx = mediaWidthPx,
+                        mediaHeightPx = mediaHeightPx,
+                    )
+                    val color = appProducerKindColor(kind)
+                    val boxModifier = Modifier
+                        .fillMaxWidth()
+                        .height(boxHeight)
+                        .clip(RoundedCornerShape(3.dp))
+                        .semantics {
+                            contentDescription =
+                                "Layer ${index + 1}, ${appProducerKindUiLabel(kind)}, " +
+                                    "$sourceClass, " +
+                                    if (committedValid) "committed" else "planned"
+                        }
+                    Box(
+                        modifier = if (committedValid) {
+                            boxModifier.background(color.copy(alpha = 0.88f))
+                        } else {
+                            boxModifier
+                                .background(Color.Transparent)
+                                .border(1.dp, color, RoundedCornerShape(3.dp))
+                        },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            text = "${(index + 1).toString().padStart(2, '0')} " +
+                                "${kind.shortLabel} $sourceClass",
+                            color = if (committedValid) Color(0xFF07110E) else color,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = boxFont,
+                            maxLines = 1,
+                            overflow = TextOverflow.Clip,
+                        )
+                    }
+                }
+            }
+            HorizontalDivider(color = Color.White.copy(alpha = 0.16f))
+            PRODUCER_LEGEND_KINDS.forEach { kind ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(3.dp),
+                ) {
+                    Box(
+                        Modifier
+                            .size(if (compact) 5.dp else 7.dp)
+                            .background(appProducerKindColor(kind), RoundedCornerShape(2.dp)),
+                    )
+                    Text(
+                        "${kind.shortLabel} ${appProducerKindUiLabel(kind)}",
+                        color = Color(0xFFB8CBC5),
+                        fontSize = if (compact) 5.sp else 6.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            Text(
+                "HWC assignment 아님",
+                color = Color(0xFFFFC857),
+                fontSize = if (compact) 5.sp else 6.sp,
+                textAlign = TextAlign.Center,
+                maxLines = 1,
+            )
+        }
+    }
+}
+
+internal fun sourceResolutionClass(widthPx: Int, heightPx: Int): String {
+    val longEdge = maxOf(widthPx, heightPx).coerceAtLeast(0)
+    val shortEdge = minOf(widthPx, heightPx).coerceAtLeast(0)
+    return when {
+        longEdge >= 7_680 && shortEdge >= 4_320 -> "8K"
+        longEdge >= 3_840 && shortEdge >= 2_160 -> "4K"
+        longEdge >= 1_920 && shortEdge >= 1_080 -> "2K"
+        longEdge >= 1_024 && shortEdge >= 576 -> "1K"
+        longEdge > 0 && shortEdge > 0 -> "${longEdge}p-class"
+        else -> "N/A"
+    }
+}
+
+internal fun motionHudLabel(phase: PhaseSpec): String = when (phase.motion) {
+    MotionProfile.STATIC -> "이동 없음 · 추가 zoom 없음"
+    MotionProfile.CAPACITY_TILES -> "고정 tile · 이동/확대 없음"
+    MotionProfile.SCROLL -> "화면 이동(Scroll)"
+    MotionProfile.ZOOM_PAN -> {
+        val range = if (
+            phase.bufferPresentation == BufferPresentation.FIT &&
+            phase.layerOrientation == LayerOrientation.ROTATION_90
+        ) {
+            "zoom 0.72–1.00×"
+        } else {
+            "zoom 0.72–1.28×"
+        }
+        "$range + 이동(Pan)"
+    }
+    MotionProfile.ROTATE -> "연속 회전 + 이동"
+    MotionProfile.PARALLAX -> if (phase.alphaOverlap) {
+        "레이어별 이동(Parallax) + 회전 진동 ±8°"
+    } else {
+        "레이어별 이동(Parallax) · 추가 회전 없음"
+    }
+    MotionProfile.TRANSFORM_STORM ->
+        "회전 + 비균일 zoom(X 0.58–1.26×/Y 0.68–1.22×) + 이동"
+    MotionProfile.Z_ORDER_SWAP -> "이동·회전 + View Z 교대"
+}
+
+private fun layerSizeHudLabel(profile: LayerSizeProfile): String = when (profile) {
+    LayerSizeProfile.FULL_SCREEN -> "목적지 Full"
+    LayerSizeProfile.SMALL_UNIFORM -> "목적지 Small 30%"
+    LayerSizeProfile.MIXED_SIZES -> "목적지 크기 혼합"
+    LayerSizeProfile.GRADUAL_SMALL_TO_FULL -> "목적지 Small→Full 점진 확대"
+    LayerSizeProfile.ABRUPT_SMALL_FULL -> "목적지 Small↔Full 급변"
+}
+
+private fun producerNatureSummary(kinds: List<AppProducerKind>): String {
+    if (kinds.isEmpty()) return "N/A"
+    return PRODUCER_LEGEND_KINDS.mapNotNull { kind ->
+        kinds.count { it == kind }
+            .takeIf { it > 0 }
+            ?.let { count -> "${producerNatureUiLabel(kind)} ${count}" }
+    }.joinToString(" + ")
+}
+
+private fun producerSourceClass(
+    phase: PhaseSpec?,
+    layerIndex: Int,
+    kind: AppProducerKind,
+    mediaWidthPx: Int?,
+    mediaHeightPx: Int?,
+): String = when (kind) {
+    AppProducerKind.VIDEO_DECODER -> {
+        if (mediaWidthPx != null && mediaHeightPx != null) {
+            sourceResolutionClass(mediaWidthPx, mediaHeightPx)
+        } else {
+            phase?.bufferSize?.mapLabel() ?: "VIDEO"
+        }
+    }
+    AppProducerKind.CANVAS_SURFACE -> {
+        if (layerIndex == 0) phase?.bufferSize?.mapLabel() ?: "DISPLAY" else "DISPLAY"
+    }
+    AppProducerKind.CANVAS_TEXTURE,
+    AppProducerKind.GPU_GL,
+    AppProducerKind.FLATTENED_CANVAS,
+    -> "DISPLAY"
+    AppProducerKind.UNKNOWN -> "N/A"
+}
+
+private fun BufferSize.mapLabel(): String = when (this) {
+    BufferSize.DISPLAY -> "DISPLAY"
+    BufferSize.HD_1K -> "1K"
+    BufferSize.FHD -> "2K"
+    BufferSize.UHD_4K -> "4K"
+    BufferSize.UHD_8K -> "8K"
+}
+
+private fun appProducerKindUiLabel(kind: AppProducerKind): String = when (kind) {
+    AppProducerKind.VIDEO_DECODER -> "VIDEO"
+    AppProducerKind.CANVAS_SURFACE -> "CANVAS"
+    AppProducerKind.CANVAS_TEXTURE -> "TEXTURE"
+    AppProducerKind.GPU_GL -> "GPU GL"
+    AppProducerKind.FLATTENED_CANVAS -> "FLAT"
+    AppProducerKind.UNKNOWN -> "UNKNOWN"
+}
+
+private fun producerNatureUiLabel(kind: AppProducerKind): String = when (kind) {
+    AppProducerKind.VIDEO_DECODER -> "영상(MediaCodec)"
+    AppProducerKind.CANVAS_SURFACE -> "Canvas raster"
+    AppProducerKind.CANVAS_TEXTURE -> "Canvas Texture"
+    AppProducerKind.GPU_GL -> "GPU GL"
+    AppProducerKind.FLATTENED_CANVAS -> "Flattened Canvas"
+    AppProducerKind.UNKNOWN -> "Unknown"
+}
+
+private fun appProducerKindColor(kind: AppProducerKind): Color = when (kind) {
+    AppProducerKind.VIDEO_DECODER -> Color(0xFFFF4D8D)
+    AppProducerKind.CANVAS_SURFACE -> Color(0xFF3DDCFF)
+    AppProducerKind.CANVAS_TEXTURE -> Color(0xFFFFC857)
+    AppProducerKind.GPU_GL -> Color(0xFFB26CFF)
+    AppProducerKind.FLATTENED_CANVAS -> Color(0xFF57E389)
+    AppProducerKind.UNKNOWN -> Color(0xFF9AA8A3)
+}
+
+private fun decoderEvidenceColor(state: DecoderHudEvidenceState): Color = when (state) {
+    DecoderHudEvidenceState.ACTIVE -> Color(0xFF65E6C4)
+    DecoderHudEvidenceState.TOPOLOGY_WAIT,
+    DecoderHudEvidenceState.FIRST_FRAME_WAIT,
+    DecoderHudEvidenceState.REVISION_WAIT,
+    DecoderHudEvidenceState.STALE,
+    -> Color(0xFFFFC857)
+    DecoderHudEvidenceState.INVALID -> Color(0xFFFF8A80)
+    DecoderHudEvidenceState.NOT_APPLICABLE -> Color(0xFF8FA9A1)
+}
+
+private fun formatHudFps(fps: Float): String {
+    val rounded = fps.roundToInt()
+    return if (kotlin.math.abs(fps - rounded.toFloat()) < 0.05f) {
+        "${rounded}fps"
+    } else {
+        String.format(Locale.US, "%.1ffps", fps)
+    }
+}
+
+private val PRODUCER_LEGEND_KINDS = listOf(
+    AppProducerKind.VIDEO_DECODER,
+    AppProducerKind.CANVAS_SURFACE,
+    AppProducerKind.CANVAS_TEXTURE,
+    AppProducerKind.GPU_GL,
+    AppProducerKind.FLATTENED_CANVAS,
+)
+
+private const val DECODER_HUD_FRESHNESS_MS = 3_000L
 
 internal fun visibleAppVersion(versionName: String): String {
     val normalized = versionName.trim().take(MAX_VISIBLE_VERSION_CHARS)
@@ -3906,7 +4824,7 @@ private fun TrafficHud(traffic: LayerTrafficEstimate?, compact: Boolean) {
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Text(
-                "EXPECTED LAYER TRAFFIC",
+                "WORKLOAD-ONLY LINEAR TRAFFIC REF",
                 color = Color(0xFF86A39A),
                 fontWeight = FontWeight.SemiBold,
                 fontSize = 9.sp,
@@ -3920,10 +4838,10 @@ private fun TrafficHud(traffic: LayerTrafficEstimate?, compact: Boolean) {
         }
         Text(
             if (traffic == null) {
-                "DPU R N/A · producer W N/A"
+                "SCANOUT INPUT N/A · PRODUCER W N/A"
             } else {
-                "DPU R ${traffic.dpuReadBytesPerSecond.formatTrafficRate()} · " +
-                    "producer W ${traffic.producerWriteBytesPerSecond.formatTrafficRate()}"
+                "SCANOUT INPUT ${traffic.dpuReadBytesPerSecond.formatTrafficRate()} · " +
+                    "PRODUCER W ${traffic.producerWriteBytesPerSecond.formatTrafficRate()}"
             },
             color = Color(0xFF65E6C4),
             fontWeight = FontWeight.SemiBold,
@@ -3954,7 +4872,9 @@ private fun TrafficHud(traffic: LayerTrafficEstimate?, compact: Boolean) {
         )
         if (!compact) {
             Text(
-                traffic?.resolutionLabel ?: "linear full-buffer read/write estimate",
+                traffic?.let {
+                    "${it.resolutionLabel} · control/SystemUI·actual CLIENT fallback 제외"
+                } ?: "workload-only linear reference · actual DPU traffic 아님",
                 color = Color(0xFF789087),
                 fontSize = 8.sp,
                 maxLines = 1,
@@ -4007,16 +4927,7 @@ private fun ResultScreen(controller: LabController, modifier: Modifier, onDone: 
     val peakGpuBusy = summary.peakGauge(0f..100f) { it.gpuBusy }
     val peakBusBusy = summary.peakGauge(0f..100f) { it.busBusy }
     val peakProducedFps = summary.peakGauge(0f..Float.MAX_VALUE) { it.producedFps }
-    val peakHwcDeviceLayers = summary.peakLayerCount(
-        value = TelemetrySnapshot::hwcDeviceLayers,
-        quality = TelemetrySnapshot::hwcDeviceLayersQuality,
-        source = TelemetrySnapshot::hwcDeviceLayersSource,
-    )
-    val peakHwcClientLayers = summary.peakLayerCount(
-        value = TelemetrySnapshot::hwcClientLayers,
-        quality = TelemetrySnapshot::hwcClientLayersQuality,
-        source = TelemetrySnapshot::hwcClientLayersSource,
-    )
+    val peakHwcComposition = atomicHwcCompositionPeak(summary.samples)
     LazyColumn(
         modifier = modifier
             .fillMaxSize()
@@ -4092,10 +5003,15 @@ private fun ResultScreen(controller: LabController, modifier: Modifier, onDone: 
                     )
                     ResultRow(
                         "Peak HWC composition",
-                        if (peakHwcDeviceLayers == null && peakHwcClientLayers == null) {
+                        if (peakHwcComposition == null) {
                             "N/A"
                         } else {
-                            "device ${peakHwcDeviceLayers ?: "N/A"} · client ${peakHwcClientLayers ?: "N/A"}"
+                            "app raw D${peakHwcComposition.deviceLayers} · " +
+                                "C${peakHwcComposition.clientLayers} · " +
+                                "T${peakHwcComposition.totalLayers} · " +
+                                "${peakHwcComposition.quality.name}@" +
+                                peakHwcComposition.source.take(32) +
+                                " · control/root 보정 없음"
                         },
                     )
                     ResultRow("Peak memory", summary.peakMemoryUsed?.let { "%.1f%%".format(it) } ?: "N/A")
@@ -4161,26 +5077,33 @@ private fun RunSummary.peakGauge(
     selector: (TelemetrySnapshot) -> Gauge,
 ): GaugePeak = consistentGaugePeak(samples, selector, validRange)
 
-private fun RunSummary.peakLayerCount(
-    value: (TelemetrySnapshot) -> Int?,
-    quality: (TelemetrySnapshot) -> MetricQuality,
-    source: (TelemetrySnapshot) -> String,
-): Int? {
-    var peak: Int? = null
+internal fun atomicHwcCompositionPeak(
+    samples: List<TelemetrySnapshot>,
+): AtomicHwcCompositionPair? {
+    var peak: AtomicHwcCompositionPair? = null
     var firstQuality: MetricQuality? = null
     var firstSource: String? = null
     for (sample in samples) {
-        val count = value(sample)?.takeIf { it >= 0 } ?: continue
-        val sampleQuality = quality(sample)
-        val sampleSource = source(sample)
-        if (sampleQuality == MetricQuality.UNAVAILABLE || sampleSource.isBlank()) continue
+        val pair = atomicHwcCompositionPair(sample) ?: continue
+        val sampleQuality = pair.quality
+        val sampleSource = pair.source
         if (firstQuality == null) {
             firstQuality = sampleQuality
             firstSource = sampleSource
         } else if (sampleQuality != firstQuality || sampleSource != firstSource) {
             return null
         }
-        peak = peak?.let { maxOf(it, count) } ?: count
+        val previous = peak
+        if (
+            previous == null ||
+            pair.totalLayers > previous.totalLayers ||
+            (
+                pair.totalLayers == previous.totalLayers &&
+                    pair.deviceLayers > previous.deviceLayers
+                )
+        ) {
+            peak = pair
+        }
     }
     return peak
 }
@@ -4316,6 +5239,9 @@ private fun PlanResultCard(
     result: PlanRunResult,
     shareReport: () -> Unit,
 ) {
+    val reportAvailable = result.reportPath
+        ?.let { java.io.File(it) }
+        ?.isFile == true
     val verdictColor = when (result.verdict) {
         RunVerdict.CLEAN -> MaterialTheme.colorScheme.primary
         RunVerdict.UNDERRUN_DETECTED -> MaterialTheme.colorScheme.error
@@ -4352,7 +5278,7 @@ private fun PlanResultCard(
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    "Loop ${result.repeatIndex + 1} · Queue ${result.queueIndex + 1} · " +
+                    "Loop ${result.repeatIndex + 1} · 항목 ${result.queueIndex + 1} · " +
                         formatDuration(result.finishedEpochMs - result.startedEpochMs),
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     style = MaterialTheme.typography.labelMedium,
@@ -4373,15 +5299,15 @@ private fun PlanResultCard(
                     )
                 }
                 Text(
-                    if (result.reportPath.isNullOrBlank()) {
-                        "JSON 보고서 없음"
-                    } else {
+                    if (reportAvailable) {
                         "JSON 보고서 저장됨"
-                    },
-                    color = if (result.reportPath.isNullOrBlank()) {
-                        MaterialTheme.colorScheme.error
                     } else {
+                        "JSON 보고서 없음 또는 보관 한도에서 정리됨"
+                    },
+                    color = if (reportAvailable) {
                         MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.error
                     },
                     style = MaterialTheme.typography.labelSmall,
                 )
@@ -4402,7 +5328,7 @@ private fun PlanResultCard(
                 }
                 TextButton(
                     onClick = shareReport,
-                    enabled = !result.reportPath.isNullOrBlank(),
+                    enabled = reportAvailable,
                 ) {
                     Text("JSON 공유", fontSize = 10.sp)
                 }
@@ -4835,41 +5761,6 @@ private fun Gauge.provenanceLabel(): String =
         "${quality.label} · $source"
     }
 
-private fun compositionProvenance(telemetry: TelemetrySnapshot): String {
-    val sources = buildList {
-        if (telemetry.hwcDeviceLayers != null) {
-            add(
-                Triple(
-                    "D",
-                    telemetry.hwcDeviceLayersQuality,
-                    telemetry.hwcDeviceLayersSource,
-                ),
-            )
-        }
-        if (telemetry.hwcClientLayers != null) {
-            add(
-                Triple(
-                    "C",
-                    telemetry.hwcClientLayersQuality,
-                    telemetry.hwcClientLayersSource,
-                ),
-            )
-        }
-    }
-    if (sources.isEmpty()) return "Unavailable · source N/A"
-
-    val first = sources.first()
-    if (sources.all { it.second == first.second && it.third == first.third }) {
-        return Gauge(
-            quality = first.second,
-            source = first.third,
-        ).provenanceLabel()
-    }
-    return sources.joinToString(" · ") { (label, quality, source) ->
-        "$label ${Gauge(quality = quality, source = source).provenanceLabel()}"
-    }
-}
-
 internal fun dashboardPurposeScenarios(
     scenarios: List<ScenarioSpec>,
 ): List<DashboardPurposeScenario> {
@@ -4965,6 +5856,7 @@ internal fun catalogRunPlanSnapshot(
     rawQueueIds: List<String>,
     knownScenarioIds: Set<String>,
     requestedRepeat: Int,
+    requestedDurationMultiplier: Int = 1,
 ): ScenarioRunPlan? {
     val retainedIds = ScenarioQueueEditor.retainKnown(rawQueueIds, knownScenarioIds)
     val scenarios = retainedIds.mapNotNull(ScenarioCatalog::byId)
@@ -4972,6 +5864,9 @@ internal fun catalogRunPlanSnapshot(
     return ScenarioRunPlan(
         scenarios = scenarios,
         repeatCount = normalizedCatalogRepeatCount(scenarios.size, requestedRepeat),
+        durationMultiplier = requestedDurationMultiplier.takeIf {
+            it in ScenarioPlanPolicy.DURATION_MULTIPLIERS
+        } ?: 1,
         source = PlanSource.USER_SELECTION,
     )
 }
@@ -5068,13 +5963,14 @@ private inline fun <reified T : Enum<T>> enumSelectionSummary(
 internal fun scenarioSelectionPreview(
     scenarios: List<ScenarioSpec>,
 ): ScenarioSelectionPreview {
-    val phases = scenarios.flatMap(ScenarioSpec::phases)
+    val uniqueScenarios = scenarios.distinctBy(ScenarioSpec::id)
+    val phases = uniqueScenarios.flatMap(ScenarioSpec::phases)
     if (phases.isEmpty()) {
         return ScenarioSelectionPreview(
             queueEntries = scenarios.size,
-            uniqueScenarios = scenarios.distinctBy(ScenarioSpec::id).size,
+            uniqueScenarios = uniqueScenarios.size,
             duplicateEntries =
-                (scenarios.size - scenarios.distinctBy(ScenarioSpec::id).size).coerceAtLeast(0),
+                (scenarios.size - uniqueScenarios.size).coerceAtLeast(0),
             inputChange = "실행 가능한 phase 없음",
             compositionTarget = "합성 목표 N/A",
             verification = "실행 전 plan 검증 결과를 확인",
@@ -5092,7 +5988,7 @@ internal fun scenarioSelectionPreview(
         phases.map(PhaseSpec::layerSizeProfile),
     )
     val patterns = ScenarioChangePattern.entries.filter { pattern ->
-        scenarios.any { pattern in ScenarioClassifier.changePatterns(it) }
+        uniqueScenarios.any { pattern in ScenarioClassifier.changePatterns(it) }
     }
     val patternSummary = patterns.take(2).joinToString("/") { it.previewLabel() } +
         if (patterns.size > 2) " +${patterns.size - 2}" else ""
@@ -5131,7 +6027,7 @@ internal fun scenarioSelectionPreview(
         else ->
             "HWC 자동 배정/검증 목표 없음"
     }
-    val uniqueCount = scenarios.distinctBy(ScenarioSpec::id).size
+    val uniqueCount = uniqueScenarios.size
     return ScenarioSelectionPreview(
         queueEntries = scenarios.size,
         uniqueScenarios = uniqueCount,
@@ -5173,75 +6069,196 @@ internal fun HwcCompositionExpectation.validationBadge(): String = when (this) {
     HwcCompositionExpectation.CLIENT_REQUIRED -> "CLIENT 전환 검증"
 }
 
+internal data class AtomicHwcCompositionPair(
+    val deviceLayers: Int,
+    val clientLayers: Int,
+    val quality: MetricQuality,
+    val source: String,
+    val evidenceMonotonicMs: Long,
+    val ageMs: Long,
+) {
+    val totalLayers: Long
+        get() = deviceLayers.toLong() + clientLayers.toLong()
+}
+
+/**
+ * Projects only a complete, same-boundary DEVICE/CLIENT pair.
+ *
+ * [TelemetrySnapshot.hwcCompositionEvidenceAgeMs] is the age captured when the telemetry sample
+ * was published. Live UI callers additionally pass the current elapsed realtime so a frozen
+ * snapshot cannot remain visually fresh forever when the monitor stalls.
+ */
+internal fun atomicHwcCompositionPair(
+    telemetry: TelemetrySnapshot,
+    nowMonotonicMs: Long = telemetry.monotonicMs,
+): AtomicHwcCompositionPair? {
+    val device = telemetry.hwcDeviceLayers?.takeIf { it >= 0 } ?: return null
+    val client = telemetry.hwcClientLayers?.takeIf { it >= 0 } ?: return null
+    val evidenceMs = telemetry.hwcCompositionEvidenceMonotonicMs
+        ?.takeIf { it >= 0L }
+        ?: return null
+    val recordedAgeMs = telemetry.hwcCompositionEvidenceAgeMs ?: return null
+    if (
+        telemetry.monotonicMs < evidenceMs ||
+        nowMonotonicMs < telemetry.monotonicMs ||
+        recordedAgeMs != telemetry.monotonicMs - evidenceMs
+    ) {
+        return null
+    }
+    val liveAgeMs = nowMonotonicMs - evidenceMs
+    if (liveAgeMs !in 0L..HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS) return null
+
+    val deviceSource = telemetry.hwcDeviceLayersSource.trim()
+    val clientSource = telemetry.hwcClientLayersSource.trim()
+    val quality = telemetry.hwcDeviceLayersQuality
+    if (
+        quality != telemetry.hwcClientLayersQuality ||
+        quality !in RAW_HWC_COMPOSITION_QUALITIES ||
+        deviceSource.isEmpty() ||
+        deviceSource != clientSource
+    ) {
+        return null
+    }
+    return AtomicHwcCompositionPair(
+        deviceLayers = device,
+        clientLayers = client,
+        quality = quality,
+        source = deviceSource,
+        evidenceMonotonicMs = evidenceMs,
+        ageMs = liveAgeMs,
+    )
+}
+
+internal fun hwcLayerCountLiveSummary(
+    telemetry: TelemetrySnapshot,
+    nowMonotonicMs: Long = telemetry.monotonicMs,
+): String {
+    val pair = atomicHwcCompositionPair(
+        telemetry = telemetry,
+        nowMonotonicMs = nowMonotonicMs,
+    )
+    if (pair == null) {
+        val availability = liveHwcCompositionAvailability(
+            telemetry = telemetry,
+            nowMonotonicMs = nowMonotonicMs,
+        )
+        return "HWC 합성 계측 · 측정값 없음 · ${availability.hudReason()}\n" +
+            "APP_RAW_UNSEPARATED · control/root 포함·보정 없음 · PHYSICAL producer와 별도"
+    }
+    val provenance = compactHwcSource(
+        valueAvailable = true,
+        quality = pair.quality,
+        source = pair.source,
+    )
+    return "HWC APP RAW · D ${pair.deviceLayers}/C ${pair.clientLayers}/" +
+        "T ${pair.totalLayers} · AGE ${pair.ageMs}ms · SRC $provenance\n" +
+        "APP_RAW_UNSEPARATED · control/root 포함·보정 없음 · PHYSICAL producer와 별도"
+}
+
 internal fun hwcExpectationLiveSummary(
     expectation: HwcCompositionExpectation,
     telemetry: TelemetrySnapshot,
+    nowMonotonicMs: Long = telemetry.monotonicMs,
 ): String {
     val rawState = rawHwcExpectationState(
         expectation = expectation,
         telemetry = telemetry,
+        nowMonotonicMs = nowMonotonicMs,
     )
-    val deviceValue = telemetry.hwcDeviceLayers?.takeIf { it >= 0 }
-    val clientValue = telemetry.hwcClientLayers?.takeIf { it >= 0 }
-    val device = deviceValue?.toString() ?: "N/A"
-    val client = clientValue?.toString() ?: "N/A"
-    val age = telemetry.hwcCompositionEvidenceAgeMs
-        ?.takeIf { it >= 0L }
-        ?.let { "${it}ms" }
-        ?: "N/A"
-    val deviceSource = compactHwcSource(
-        valueAvailable = deviceValue != null,
-        quality = telemetry.hwcDeviceLayersQuality,
-        source = telemetry.hwcDeviceLayersSource,
+    val pair = atomicHwcCompositionPair(
+        telemetry = telemetry,
+        nowMonotonicMs = nowMonotonicMs,
     )
-    val clientSource = compactHwcSource(
-        valueAvailable = clientValue != null,
-        quality = telemetry.hwcClientLayersQuality,
-        source = telemetry.hwcClientLayersSource,
-    )
-    val provenance = if (deviceSource == clientSource) {
-        deviceSource
-    } else {
-        "D $deviceSource / C $clientSource"
+    if (pair == null) {
+        val availability = liveHwcCompositionAvailability(
+            telemetry = telemetry,
+            nowMonotonicMs = nowMonotonicMs,
+        )
+        return "HWC 합성 계측 · 측정값 없음 · ${availability.hudReason()}\n" +
+            "목표 ${expectation.validationBadge()} · APP_RAW_UNSEPARATED · " +
+            "PHYSICAL producer/최종 판정 별도"
     }
-    return "HWC ${rawState.label} · D $device/C $client · AGE $age · SRC $provenance\n" +
-        "목표 ${expectation.validationBadge()} · controller target-fresh 최종 판정 별도"
+    val provenance = compactHwcSource(
+        valueAvailable = true,
+        quality = pair.quality,
+        source = pair.source,
+    )
+    return "HWC APP RAW · ${rawState.label} · D ${pair.deviceLayers}/" +
+        "C ${pair.clientLayers}/T ${pair.totalLayers} · AGE ${pair.ageMs}ms · " +
+        "SRC $provenance\n" +
+        "목표 ${expectation.validationBadge()} · APP_RAW_UNSEPARATED · " +
+        "PHYSICAL producer/최종 판정 별도"
+}
+
+internal fun liveHwcCompositionAvailability(
+    telemetry: TelemetrySnapshot,
+    nowMonotonicMs: Long = telemetry.monotonicMs,
+): HwcCompositionEvidenceAvailability {
+    if (
+        atomicHwcCompositionPair(
+            telemetry = telemetry,
+            nowMonotonicMs = nowMonotonicMs,
+        ) != null
+    ) {
+        return HwcCompositionEvidenceAvailability.AVAILABLE
+    }
+    val evidenceMs = telemetry.hwcCompositionEvidenceMonotonicMs
+    if (
+        evidenceMs != null &&
+        evidenceMs >= 0L &&
+        nowMonotonicMs >= evidenceMs &&
+        nowMonotonicMs - evidenceMs > HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS
+    ) {
+        return HwcCompositionEvidenceAvailability.EVIDENCE_STALE
+    }
+    return telemetry.hwcCompositionEvidenceAvailability.takeUnless {
+        it == HwcCompositionEvidenceAvailability.AVAILABLE
+    } ?: HwcCompositionEvidenceAvailability.EVIDENCE_INVALID
+}
+
+private fun HwcCompositionEvidenceAvailability.hudReason(): String = when (this) {
+    HwcCompositionEvidenceAvailability.AVAILABLE -> "사용 가능"
+    HwcCompositionEvidenceAvailability.ACTIVE_RUN_VENDOR_PAIR_UNAVAILABLE ->
+        "실행 중 SF 조회 억제 · fresh Vendor D/C 없음"
+    HwcCompositionEvidenceAvailability.ACTIVE_RUN_VENDOR_PAIR_INVALID ->
+        "실행 중 SF 조회 억제 · Vendor D/C 무효"
+    HwcCompositionEvidenceAvailability.ACTIVE_RUN_VENDOR_PAIR_STALE ->
+        "실행 중 SF 조회 억제 · Vendor D/C 만료"
+    HwcCompositionEvidenceAvailability.DUMP_PERMISSION_UNAVAILABLE ->
+        "DUMP 권한 없음 · SF 계측 불가"
+    HwcCompositionEvidenceAvailability.SURFACE_FLINGER_PAIR_UNAVAILABLE ->
+        "SF에 앱 D/C pair 없음"
+    HwcCompositionEvidenceAvailability.SURFACE_FLINGER_PAIR_INVALID ->
+        "SF D/C pair 무효"
+    HwcCompositionEvidenceAvailability.SURFACE_FLINGER_EVIDENCE_STALE ->
+        "SF 계측값 만료"
+    HwcCompositionEvidenceAvailability.SURFACE_FLINGER_PROBE_FAILED ->
+        "SF 조회 실패 또는 시간 초과"
+    HwcCompositionEvidenceAvailability.EVIDENCE_INVALID ->
+        "D/C 원자쌍 형식 무효"
+    HwcCompositionEvidenceAvailability.EVIDENCE_STALE ->
+        "계측값 만료(2.5초 초과)"
+    HwcCompositionEvidenceAvailability.UNAVAILABLE ->
+        "계측 경로 정보 없음"
 }
 
 internal fun rawHwcExpectationState(
     expectation: HwcCompositionExpectation,
     telemetry: TelemetrySnapshot,
+    nowMonotonicMs: Long = telemetry.monotonicMs,
 ): RawHwcExpectationState {
     if (expectation == HwcCompositionExpectation.NONE) return RawHwcExpectationState.N_A
 
-    val device = telemetry.hwcDeviceLayers?.takeIf { it >= 0 }
-        ?: return RawHwcExpectationState.N_A
-    val client = telemetry.hwcClientLayers?.takeIf { it >= 0 }
-        ?: return RawHwcExpectationState.N_A
-    val evidenceMonotonicMs = telemetry.hwcCompositionEvidenceMonotonicMs
-        ?.takeIf { it >= 0L }
-        ?: return RawHwcExpectationState.N_A
-    val evidenceAgeMs = telemetry.hwcCompositionEvidenceAgeMs
-        ?: return RawHwcExpectationState.N_A
-    if (telemetry.monotonicMs < evidenceMonotonicMs) return RawHwcExpectationState.N_A
-    val computedAgeMs = telemetry.monotonicMs - evidenceMonotonicMs
-    val deviceSource = telemetry.hwcDeviceLayersSource.trim()
-    val clientSource = telemetry.hwcClientLayersSource.trim()
-    val validQuality =
-        telemetry.hwcDeviceLayersQuality == telemetry.hwcClientLayersQuality &&
-            telemetry.hwcDeviceLayersQuality in RAW_HWC_COMPOSITION_QUALITIES
-    val atomicFreshPair =
-        evidenceAgeMs == computedAgeMs &&
-            evidenceAgeMs in 0L..HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS &&
-            validQuality &&
-            deviceSource.isNotEmpty() &&
-            deviceSource == clientSource
-    if (!atomicFreshPair) return RawHwcExpectationState.N_A
+    val pair = atomicHwcCompositionPair(
+        telemetry = telemetry,
+        nowMonotonicMs = nowMonotonicMs,
+    ) ?: return RawHwcExpectationState.N_A
 
     val matches = when (expectation) {
         HwcCompositionExpectation.NONE -> false
-        HwcCompositionExpectation.DEVICE_ONLY -> device > 0 && client == 0
-        HwcCompositionExpectation.CLIENT_REQUIRED -> client > 0
+        HwcCompositionExpectation.DEVICE_ONLY ->
+            pair.deviceLayers > 0 && pair.clientLayers == 0
+        HwcCompositionExpectation.CLIENT_REQUIRED -> pair.clientLayers > 0
     }
     return if (matches) RawHwcExpectationState.MATCH else RawHwcExpectationState.WAIT
 }
@@ -5475,9 +6492,17 @@ private fun List<Int>.positionSummary(): String {
     return if (size > 2) "$visible +${size - 2}" else visible
 }
 
-private fun formatDuration(ms: Long): String {
+internal fun formatDuration(ms: Long): String {
     val seconds = (ms / 1_000).coerceAtLeast(0)
-    return if (seconds >= 60) "${seconds / 60}m ${seconds % 60}s" else "${seconds}s"
+    val minutes = seconds / 60
+    val hours = minutes / 60
+    val days = hours / 24
+    return when {
+        days > 0 -> "${days}d ${hours % 24}h"
+        hours > 0 -> "${hours}h ${minutes % 60}m"
+        minutes > 0 -> "${minutes}m ${seconds % 60}s"
+        else -> "${seconds}s"
+    }
 }
 
 private fun yesNo(value: Boolean) = if (value) "✓" else "–"

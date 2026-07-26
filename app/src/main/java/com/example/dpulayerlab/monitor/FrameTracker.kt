@@ -2,6 +2,8 @@ package com.example.dpulayerlab.monitor
 
 import android.os.SystemClock
 import android.view.Choreographer
+import com.example.dpulayerlab.model.AppProducerKind
+import com.example.dpulayerlab.model.AppProducerTopology
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
@@ -48,6 +50,13 @@ class FrameTracker : Choreographer.FrameCallback {
         producerGeneration.expect(
             candidate = generation,
             producerIds = producerIds,
+            nowMs = SystemClock.elapsedRealtime(),
+        )
+    }
+
+    fun expectProducerTopology(topology: AppProducerTopology) {
+        producerGeneration.expect(
+            topology = topology,
             nowMs = SystemClock.elapsedRealtime(),
         )
     }
@@ -130,6 +139,7 @@ class FrameTracker : Choreographer.FrameCallback {
             !producerGeneration.accept(
                 candidate = generation,
                 producerId = producerId,
+                primary = primary,
                 nowMs = SystemClock.elapsedRealtime(),
                 controlRevision = controlRevision,
             )
@@ -219,6 +229,9 @@ class FrameTracker : Choreographer.FrameCallback {
 internal class ProducerGenerationGate {
     private var generation = 0L
     private var expectedProducerIds = LongArray(0)
+    private var expectedProducerKindOrdinals = IntArray(0)
+    private var expectedProducerPrimary = BooleanArray(0)
+    private var committedTopology: AppProducerTopology? = null
     private var topologyDeclared = false
     private var topologyPending = false
     private var activated = false
@@ -244,11 +257,18 @@ internal class ProducerGenerationGate {
     private var teardownFailed = false
     private var teardownCompleted = false
     private var runtimeFailureReason: String? = null
+    private var decoderGenerationFrameCount = 0L
+    private var decoderObservationFrameCount = 0L
+    private var decoderLastFrameMs = -1L
+    private var decoderLastControlRevision = 0L
 
     @Synchronized
     fun begin(nowMs: Long = 0L): Long {
         generation = if (generation == Long.MAX_VALUE) 1L else generation + 1L
         expectedProducerIds = LongArray(0)
+        expectedProducerKindOrdinals = IntArray(0)
+        expectedProducerPrimary = BooleanArray(0)
+        committedTopology = null
         topologyDeclared = false
         topologyPending = false
         activated = false
@@ -271,6 +291,8 @@ internal class ProducerGenerationGate {
         teardownFailed = false
         teardownCompleted = false
         runtimeFailureReason = null
+        decoderGenerationFrameCount = 0L
+        resetDecoderObservation()
         return generation
     }
 
@@ -299,6 +321,62 @@ internal class ProducerGenerationGate {
             normalizedBuffer.copyOf(normalizedCount)
         }
         normalized.sort()
+        return commitExpectedTopology(
+            candidate = candidate,
+            normalizedIds = normalized,
+            kindOrdinals = IntArray(normalized.size) { AppProducerKind.UNKNOWN.ordinal },
+            primaryFlags = BooleanArray(normalized.size),
+            typedTopology = null,
+            nowMs = nowMs,
+        )
+    }
+
+    @Synchronized
+    fun expect(
+        topology: AppProducerTopology,
+        nowMs: Long,
+    ): Boolean {
+        if (
+            topology.generation != generation ||
+            topology.producers.isEmpty() ||
+            topology.producers.size > MAX_TRACKED_PHYSICAL_PRODUCERS
+        ) {
+            return false
+        }
+        val ids = LongArray(topology.producers.size)
+        val kinds = IntArray(topology.producers.size)
+        val primaryFlags = BooleanArray(topology.producers.size)
+        topology.producers.forEachIndexed { index, descriptor ->
+            ids[index] = descriptor.producerId
+            kinds[index] = descriptor.kind.ordinal
+            primaryFlags[index] = descriptor.primary
+        }
+        return commitExpectedTopology(
+            candidate = topology.generation,
+            normalizedIds = ids,
+            kindOrdinals = kinds,
+            primaryFlags = primaryFlags,
+            typedTopology = topology,
+            nowMs = nowMs,
+        )
+    }
+
+    private fun commitExpectedTopology(
+        candidate: Long,
+        normalizedIds: LongArray,
+        kindOrdinals: IntArray,
+        primaryFlags: BooleanArray,
+        typedTopology: AppProducerTopology?,
+        nowMs: Long,
+    ): Boolean {
+        if (
+            candidate != generation ||
+            normalizedIds.isEmpty() ||
+            normalizedIds.size != kindOrdinals.size ||
+            normalizedIds.size != primaryFlags.size
+        ) {
+            return false
+        }
         val wasTopologyPending = topologyPending
         if (!topologyDeclared) {
             topologyPublishedMs = nowMs.coerceAtLeast(0L)
@@ -309,24 +387,40 @@ internal class ProducerGenerationGate {
         // lifecycle stop/start race). Any newly published producer topology revokes the earlier
         // stage-removal acknowledgement; only a later terminal removal may complete the barrier.
         teardownCompleted = false
-        if (!normalized.contentEquals(expectedProducerIds)) {
+        val idsChanged = !normalizedIds.contentEquals(expectedProducerIds)
+        val sameProducerMembership =
+            normalizedIds.size == expectedProducerIds.size &&
+                normalizedIds.all { id -> expectedProducerIds.containsId(id) }
+        val descriptorsChanged =
+            idsChanged ||
+                !kindOrdinals.contentEquals(expectedProducerKindOrdinals) ||
+                !primaryFlags.contentEquals(expectedProducerPrimary)
+        if (descriptorsChanged) {
             topologyRevision =
                 if (topologyRevision == Long.MAX_VALUE) 1L else topologyRevision + 1L
             for (id in expectedProducerIds) {
-                if (!normalized.containsId(id) && !lastObservedMs.contains(id)) {
+                if (!normalizedIds.containsId(id) && !lastObservedMs.contains(id)) {
                     topologyMissed = true
                     break
                 }
             }
-            expectedSinceMs.retainAll(normalized)
-            lastObservedMs.retainAll(normalized)
-            producerControlAppliedRevisions.retainAll(normalized)
+            expectedSinceMs.retainAll(normalizedIds)
+            lastObservedMs.retainAll(normalizedIds)
+            producerControlAppliedRevisions.retainAll(normalizedIds)
             val normalizedNow = nowMs.coerceAtLeast(0L)
-            for (id in normalized) {
+            for (id in normalizedIds) {
                 expectedSinceMs.putIfAbsent(id, normalizedNow)
             }
-            expectedProducerIds = normalized
+            expectedProducerIds = normalizedIds
+            expectedProducerKindOrdinals = kindOrdinals
+            expectedProducerPrimary = primaryFlags
+            if (sameProducerMembership) {
+                // Reordering the same IDs or changing their typed roles is a fresh topology
+                // contract. Old buffers cannot satisfy the new layer-index/primary mapping.
+                resetObservationWindow(nowMs)
+            }
         }
+        committedTopology = typedTopology
         if (wasTopologyPending) {
             // A physical Surface/BufferQueue can be rebuilt without changing its relay producer
             // ID. Once that lifecycle boundary has been published, pre-boundary heartbeats must
@@ -448,6 +542,7 @@ internal class ProducerGenerationGate {
         topologyPending = true
         teardownCompleted = false
         producerControlAppliedRevisions.clear()
+        resetDecoderObservation()
         return true
     }
 
@@ -482,7 +577,8 @@ internal class ProducerGenerationGate {
             !activated ||
             !topologyDeclared ||
             topologyPending ||
-            activeEvidenceTerminal()
+            activeEvidenceTerminal() ||
+            runtimeFailureReason != null
         ) {
             return false
         }
@@ -495,6 +591,7 @@ internal class ProducerGenerationGate {
     fun accept(
         candidate: Long,
         producerId: Long = 0L,
+        primary: Boolean = false,
         nowMs: Long = 0L,
         controlRevision: Long = 0L,
     ): Boolean {
@@ -503,11 +600,20 @@ internal class ProducerGenerationGate {
             !activated ||
             !topologyDeclared ||
             topologyPending ||
+            runtimeFailureReason != null ||
             activeEvidenceTerminal()
         ) {
             return false
         }
-        if (expectedProducerIds.isNotEmpty() && !expectedProducerIds.containsId(producerId)) {
+        val producerIndex = expectedProducerIds.indexOfId(producerId)
+        if (expectedProducerIds.isNotEmpty() && producerIndex < 0) {
+            return false
+        }
+        if (
+            producerIndex >= 0 &&
+            expectedProducerKindOrdinals[producerIndex] != AppProducerKind.UNKNOWN.ordinal &&
+            expectedProducerPrimary[producerIndex] != primary
+        ) {
             return false
         }
         lastObservedMs.put(producerId, nowMs.coerceAtLeast(0L))
@@ -516,6 +622,15 @@ internal class ProducerGenerationGate {
             controlRevision == producerControlRequestedRevision
         ) {
             producerControlAppliedRevisions.put(producerId, controlRevision)
+        }
+        if (
+            producerIndex >= 0 &&
+            expectedProducerKindOrdinals[producerIndex] == AppProducerKind.VIDEO_DECODER.ordinal
+        ) {
+            if (decoderGenerationFrameCount < Long.MAX_VALUE) decoderGenerationFrameCount++
+            if (decoderObservationFrameCount < Long.MAX_VALUE) decoderObservationFrameCount++
+            decoderLastFrameMs = nowMs.coerceAtLeast(0L)
+            decoderLastControlRevision = controlRevision.coerceAtLeast(0L)
         }
         return true
     }
@@ -526,6 +641,7 @@ internal class ProducerGenerationGate {
         if (!teardownFailed) advanceTopologyDiscontinuitySerial()
         teardownFailed = true
         activated = false
+        resetDecoderObservation()
         invalidateGeometryEvidence()
         return true
     }
@@ -536,6 +652,7 @@ internal class ProducerGenerationGate {
         if (!teardownCompleted) advanceTopologyDiscontinuitySerial()
         teardownCompleted = true
         activated = false
+        resetDecoderObservation()
         invalidateGeometryEvidence()
         return true
     }
@@ -548,6 +665,7 @@ internal class ProducerGenerationGate {
                 .trim()
                 .ifEmpty { "Producer runtime failure" }
                 .take(MAX_RUNTIME_FAILURE_REASON_CHARS)
+            resetDecoderObservation()
         }
         return true
     }
@@ -586,6 +704,16 @@ internal class ProducerGenerationGate {
             }
         }
         val evidenceTerminal = activeEvidenceTerminal()
+        val decoderExpected =
+            !evidenceTerminal &&
+                runtimeFailureReason == null &&
+                !topologyPending &&
+                expectedProducerKindOrdinals.any {
+                    it == AppProducerKind.VIDEO_DECODER.ordinal
+                }
+        val decoderLastFrameAgeMs = decoderLastFrameMs
+            .takeIf { decoderExpected && it >= 0L }
+            ?.let { (normalizedNow - it).coerceAtLeast(0L) }
         val ready = topologyDeclared &&
             !topologyPending &&
             activated &&
@@ -665,6 +793,25 @@ internal class ProducerGenerationGate {
             teardownFailed = teardownFailed,
             teardownCompleted = teardownCompleted,
             runtimeFailureReason = runtimeFailureReason,
+            committedTopology = committedTopology.takeIf {
+                topologyDeclared &&
+                    !topologyPending &&
+                    !evidenceTerminal &&
+                    runtimeFailureReason == null
+            },
+            decoderExpected = decoderExpected,
+            decoderGenerationFrameCount = decoderGenerationFrameCount,
+            decoderObservationFrameCount = decoderObservationFrameCount,
+            decoderLastFrameAgeMs = decoderLastFrameAgeMs,
+            decoderLastControlRevision = decoderLastControlRevision,
+            decoderControlReady =
+                decoderExpected &&
+                    decoderLastFrameAgeMs != null &&
+                    decoderLastFrameAgeMs <= PRODUCER_FRESHNESS_WINDOW_MS &&
+                    (
+                        producerControlRequestedRevision == 0L ||
+                            decoderLastControlRevision == producerControlRequestedRevision
+                        ),
         )
     }
 
@@ -686,6 +833,13 @@ internal class ProducerGenerationGate {
         }
         producerControlAppliedRevisions.clear()
         generationStartedMs = normalizedNow
+        resetDecoderObservation()
+    }
+
+    private fun resetDecoderObservation() {
+        decoderObservationFrameCount = 0L
+        decoderLastFrameMs = -1L
+        decoderLastControlRevision = 0L
     }
 
     private fun activeEvidenceTerminal(): Boolean =
@@ -805,6 +959,13 @@ private fun LongArray.containsId(id: Long): Boolean {
     return false
 }
 
+private fun LongArray.indexOfId(id: Long): Int {
+    for (index in indices) {
+        if (this[index] == id) return index
+    }
+    return -1
+}
+
 data class ProducerReadiness(
     val expectedCount: Int = 0,
     val observedCount: Int = 0,
@@ -833,4 +994,11 @@ data class ProducerReadiness(
     val teardownFailed: Boolean = false,
     val teardownCompleted: Boolean = false,
     val runtimeFailureReason: String? = null,
+    val committedTopology: AppProducerTopology? = null,
+    val decoderExpected: Boolean = false,
+    val decoderGenerationFrameCount: Long = 0L,
+    val decoderObservationFrameCount: Long = 0L,
+    val decoderLastFrameAgeMs: Long? = null,
+    val decoderLastControlRevision: Long = 0L,
+    val decoderControlReady: Boolean = false,
 )

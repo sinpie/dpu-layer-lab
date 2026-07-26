@@ -91,7 +91,7 @@ object AutomationIntentContract {
                     splitCommaPreservingEmpty(value.toString())
                 }
                 is Array<*> -> {
-                    if (value.size > ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS) {
+                    if (value.size > ScenarioPlanPolicy.MAX_EXTERNAL_TOTAL_PLAN_RUNS) {
                         return tooManyScenarioIds(value.size)
                     }
                     value.mapTo(ArrayList(value.size)) { item ->
@@ -104,7 +104,7 @@ object AutomationIntentContract {
                     }
                 }
                 is List<*> -> {
-                    if (value.size > ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS) {
+                    if (value.size > ScenarioPlanPolicy.MAX_EXTERNAL_TOTAL_PLAN_RUNS) {
                         return tooManyScenarioIds(value.size)
                     }
                     value.mapTo(ArrayList(value.size)) { item ->
@@ -124,7 +124,7 @@ object AutomationIntentContract {
             }
         }
 
-        if (rawIds.size > ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS) {
+        if (rawIds.size > ScenarioPlanPolicy.MAX_EXTERNAL_TOTAL_PLAN_RUNS) {
             return tooManyScenarioIds(rawIds.size)
         }
         val scenarioIds = rawIds.map(String::trim)
@@ -155,10 +155,10 @@ object AutomationIntentContract {
             )
         }
         val totalRuns = scenarioIds.size.toLong() * repeatCount.toLong()
-        if (totalRuns > ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS) {
+        if (totalRuns > ScenarioPlanPolicy.MAX_EXTERNAL_TOTAL_PLAN_RUNS) {
             return AutomationIntentParseResult.Rejected(
                 "총 실행 수 $totalRuns 회는 최대 " +
-                    "${ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS} 회를 초과합니다.",
+                    "${ScenarioPlanPolicy.MAX_EXTERNAL_TOTAL_PLAN_RUNS} 회를 초과합니다.",
             )
         }
 
@@ -173,7 +173,7 @@ object AutomationIntentContract {
     private fun tooManyScenarioIds(count: Int): AutomationIntentParseResult.Rejected =
         AutomationIntentParseResult.Rejected(
             "scenario_ids 항목 수 $count 개는 최대 " +
-                "${ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS} 개를 초과합니다.",
+                "${ScenarioPlanPolicy.MAX_EXTERNAL_TOTAL_PLAN_RUNS} 개를 초과합니다.",
         )
 
     private fun parseRepeatCount(input: AutomationIntentInput): Int? {

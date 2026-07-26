@@ -1,7 +1,9 @@
 package com.example.dpulayerlab
 
+import android.provider.Settings
 import com.example.dpulayerlab.engine.AutomationCommand
 import com.example.dpulayerlab.engine.AutomationIntentParseResult
+import com.example.dpulayerlab.engine.TestWindowIsolationPhase
 import com.example.dpulayerlab.engine.enqueuePendingAutomation
 import java.util.ArrayDeque
 import org.junit.Assert.assertEquals
@@ -10,6 +12,53 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class MainActivityMathTest {
+    @Test
+    fun batterySaverSettingsUsesDedicatedPageBeforeGeneralFallback() {
+        assertEquals(
+            listOf(
+                Settings.ACTION_BATTERY_SAVER_SETTINGS,
+                Settings.ACTION_SETTINGS,
+            ),
+            batterySaverSettingsActionOrder(),
+        )
+    }
+
+    @Test
+    fun batterySaverSettingsWaitsForPlanAndWindowCleanup() {
+        assertTrue(
+            batterySaverSettingsNavigationReady(
+                planCleanupComplete = true,
+                isolationPhase = TestWindowIsolationPhase.IDLE,
+                processLeaseActive = false,
+                foreignLeaseMasking = false,
+            ),
+        )
+        assertFalse(
+            batterySaverSettingsNavigationReady(
+                planCleanupComplete = false,
+                isolationPhase = TestWindowIsolationPhase.IDLE,
+                processLeaseActive = false,
+                foreignLeaseMasking = false,
+            ),
+        )
+        assertFalse(
+            batterySaverSettingsNavigationReady(
+                planCleanupComplete = true,
+                isolationPhase = TestWindowIsolationPhase.RESTORING,
+                processLeaseActive = true,
+                foreignLeaseMasking = false,
+            ),
+        )
+        assertFalse(
+            batterySaverSettingsNavigationReady(
+                planCleanupComplete = true,
+                isolationPhase = TestWindowIsolationPhase.IDLE,
+                processLeaseActive = false,
+                foreignLeaseMasking = true,
+            ),
+        )
+    }
+
     @Test
     fun orientationAxisSwapKeepsTheSameDisplaySafetyEnvelope() {
         val portrait = DisplayEnvelopeIdentity(
