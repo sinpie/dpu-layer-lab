@@ -107,8 +107,9 @@ scenario 상세와 결과에 두어 첫 화면의 기술 용어를 줄인다. �
 - condition/format
 - composition target
 
-Filtered result는 catalog 원래 순서를 유지한다. 일괄 `queue 교체`와 `뒤에 추가`는
-한 위치에서만 제공한다. Scenario card는 이름·설명·부하 패턴·최대 layer/Hz·강도·크기와
+Filtered result는 catalog 원래 순서를 유지한다. 일괄 `결과로 교체`와 `목록 끝에 추가`는
+한 위치에서만 제공하고, 결과의 테스트 종류 수와 현재 실행 목록 항목 수를 분리해
+표시한다. Scenario card는 이름·설명·부하 패턴·최대 layer/Hz·강도·크기와
 선택 action을 기본 표시하고 phase/tag/검증 evidence는 명시적으로 펼쳤을 때만 표시한다.
 
 ### Queue와 loop
@@ -116,14 +117,15 @@ Filtered result는 catalog 원래 순서를 유지한다. 일괄 `queue 교체`�
 - 항목 순서와 duplicate를 보존
 - 항목별 remove와 explicit move
 - 기본 세로 preview는 앞 4개만 표시하고, 전체 편집기는 화면 높이에 비례한 bounded
-  내부 scroll과 목록 위 `큐 접기` action을 사용
+  lazy 내부 scroll과 목록 위 `목록 접기` action을 사용
 - 이동/삭제 action의 접근성 이름에 scenario 이름과 occurrence 번호 포함
 - position action은 render 시 queue snapshot과 event 시 최신 queue가 다르면 적용하지
   않아 연속 입력이 다른 occurrence를 수정하지 않음
 - catalog 순서로 reset
 - repeat count와 expanded run 수. `N`회는 전체 queue를 N번 실행하고 `N > 1`인 회차
   경계에서만 마지막 항목 다음에 첫 항목으로 돌아간다. 1회는 전체 queue 한 번이다.
-- 앱 UI는 40-entry × 10 loop = 400 run, 외부 Intent는 기존 40 run
+- 수동 UI 목록에는 임의의 고정 entry/expanded-run 상한이 없고, 외부 Intent만 기존
+  40 run 상한을 유지
 - 1×/2×/5×/10×/50×/100× phase/transition 시간 배율
 - policy 적용 전 요청 예상 duration과 phase 10분/scenario 30분 safety cap 안내
 - unknown restored ID 자동 제거
@@ -195,7 +197,7 @@ Activity root buffer가 갱신될 수 있으며, cadence를 멈추거나 HUD를 
 | DPU | busy % 또는 N/A | provenance segment별 gap |
 | CPU | AP CPU % 또는 N/A | provenance segment별 gap |
 | GPU | busy % 또는 N/A | provenance segment별 gap |
-| HWC APP RAW D/C/T | complete same-sample pair와 `T=D+C`; control/root 보정 없음 | pair가 없거나 stale이면 N/A |
+| HWC APP RAW D/C/T | complete same-sample pair와 `T=D+C`; control/root 보정 없음 | pair가 없거나 stale이면 측정값 없음+bounded reason |
 
 각 metric은 source/quality label을 숨기지 않는다. Gauge provenance가 바뀌거나 unavailable인
 경계에서 graph 선을 연결하지 않는다.
@@ -233,8 +235,9 @@ Producer count 표기:
 - safety clamp/thermal derate/memory low
 - performance isolation
 - process-session HWC calibration requested/actual/result
-- HWC expectation은 `HWC APP RAW · D n/C n/T n`과 `RAW MATCH`, `RAW WAIT`,
-  `RAW N/A` 보조 표시
+- HWC expectation은 fresh pair가 있을 때 `HWC APP RAW · D n/C n/T n`과
+  `현재값 일치`/`현재값 불일치`, 없을 때
+  `HWC 합성 계측 · 측정값 없음 · reason` 표시
 
 `HWC APP RAW`는 동일 source·quality·evidence timestamp의 complete atomic D/C pair이며
 `T`도 같은 pair의 합으로만 계산한다. 이 값은 scope가 미분리되어 control/root를
@@ -243,6 +246,11 @@ Producer count 표기:
 contribution을 보정하지 않는다.
 RAW 상태는 controller의 target readiness, distinct-sample/coverage verdict 또는
 workload-only plane 판정을 대체하지 않는다.
+
+Unavailable reason은 active load의 SurfaceFlinger 조회 억제와 fresh vendor pair
+없음/무효/만료, idle/calibration의 DUMP 미허용·SF pair/probe 실패를 구분한다.
+`hwcCompositionEvidenceAvailability`은 bounded availability 진단이며 controller
+verdict가 아니다. N/A token을 D/C/T/AGE/SRC마다 반복하지 않는다.
 
 각 run은 `HWC_COUNT_SCOPE` event로 `APP_RAW_UNSEPARATED`,
 `controlLayerIncluded=true`, control/root subtraction 없음, FrameTracker `PHYSICAL`

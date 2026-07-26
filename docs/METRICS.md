@@ -182,14 +182,19 @@ SurfaceFlinger process를 만들지 않고 같은 telemetry transaction의 vendo
 실행 HUD는 complete tuple을
 `HWC APP RAW · D <device>/C <client>/T <device+client> · AGE <freshness> · SRC <provenance>`
 형태로 표시한다. Live age가 2.5초를 넘거나 source/quality/timestamp가 원자 쌍을
-이루지 못하면 D/C/T 전체가 `N/A`다. `T`는 같은 sample의 `D+C`일 뿐 committed
-physical producer count가 아니다.
+이루지 못하면 반복 `D/C/T/AGE/SRC N/A` 대신 `HWC 합성 계측 · 측정값 없음`과 bounded
+reason을 표시한다. Active load에서는 `실행 중 SF 조회 억제`와 fresh vendor D/C
+없음/무효/만료를, idle/calibration에서는 DUMP 미허용 또는 SF pair/probe 상태를
+구분한다. `T`는 같은 sample의 `D+C`일 뿐 committed physical producer count가 아니다.
+`hwcCompositionEvidenceAvailability` reason은 availability 진단이지 controller verdict가
+아니다.
 
 HUD subtree는 pure Compose이며 별도 `SurfaceView`/`TextureView` 또는 추가
 SurfaceFlinger/HWC candidate를 만들지 않는다. 다만 Activity root/window layer는
 남고 그 DEVICE/CLIENT assignment를 public Android API로 강제하거나 증명할 수 없다.
 현재 vendor/SF tuple도 control/root와 workload producer의 per-layer identity를
-분리하지 않으므로 HUD는 `SCOPE 미분리(control/root 보정 없음)`을 표시한다. 동적
+분리하지 않으므로 HUD는 `APP_RAW_UNSEPARATED`, control/root 보정 없음과
+`PHYSICAL` app producer가 별도임을 표시한다. 동적
 HUD는 상위 renderer의 100 ms recomposition과 분리된 immutable app-side state
 snapshot을 사용한다. Text/progress snapshot 교체는 최대 1 Hz bucket으로 제한하되
 topology pending, stage 또는 safety 상태 같은 경계는 즉시 갱신한다. 이는 Activity
@@ -198,7 +203,7 @@ root layer를 제거하거나 그 HWC assignment를 고정한다는 뜻이 아�
 `APP_RAW_UNSEPARATED`, `controlLayerIncluded=true`, `control/root subtraction=none`과
 FrameTracker `PHYSICAL` producer count가 별도라는 해석 계약을 보존한다.
 
-`RAW MATCH`, `RAW WAIT`, `RAW N/A`는 이 current raw tuple의 보조 해석이다.
+`현재값 일치`, `현재값 불일치`, `현재값 없음`은 이 current raw tuple의 보조 해석이다.
 controller는 target activation, distinct sample 수, topology revision과 phase coverage를
 별도로 검증한다. Scoped BSP evidence가 없는 상태에서 raw count를 특정 producer의
 assignment로 승격하지 않는다.

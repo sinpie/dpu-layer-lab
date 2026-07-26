@@ -5,6 +5,7 @@ import com.example.dpulayerlab.model.BufferPresentation
 import com.example.dpulayerlab.model.BufferSize
 import com.example.dpulayerlab.model.Gauge
 import com.example.dpulayerlab.model.HwcCompositionExpectation
+import com.example.dpulayerlab.model.HwcCompositionEvidenceAvailability
 import com.example.dpulayerlab.model.LayerBackend
 import com.example.dpulayerlab.model.LayerOrientation
 import com.example.dpulayerlab.model.LayerSizeProfile
@@ -3779,8 +3780,16 @@ class LabControllerMathTest {
     fun reportTelemetryUsesOneRunRelativeMonotonicAxis() {
         val relative = TelemetrySnapshot(
             monotonicMs = 1_200L,
+            hwcDeviceLayers = 2,
+            hwcDeviceLayersQuality = MetricQuality.SYSTEM_SERVICE,
+            hwcDeviceLayersSource = "SurfaceFlinger",
+            hwcClientLayers = 0,
+            hwcClientLayersQuality = MetricQuality.SYSTEM_SERVICE,
+            hwcClientLayersSource = "SurfaceFlinger",
             hwcCompositionEvidenceMonotonicMs = 1_100L,
             hwcCompositionEvidenceAgeMs = 100L,
+            hwcCompositionEvidenceAvailability =
+                HwcCompositionEvidenceAvailability.AVAILABLE,
             surfaceFlingerEvidenceMonotonicMs = 1_150L,
             surfaceFlingerEvidenceAgeMs = 50L,
         ).toRunRelativeTelemetry(runStartMonotonicMs = 1_000L)
@@ -3788,6 +3797,10 @@ class LabControllerMathTest {
         assertEquals(200L, relative.monotonicMs)
         assertEquals(100L, relative.hwcCompositionEvidenceMonotonicMs)
         assertEquals(100L, relative.hwcCompositionEvidenceAgeMs)
+        assertEquals(
+            HwcCompositionEvidenceAvailability.AVAILABLE,
+            relative.hwcCompositionEvidenceAvailability,
+        )
         assertEquals(150L, relative.surfaceFlingerEvidenceMonotonicMs)
         assertEquals(50L, relative.surfaceFlingerEvidenceAgeMs)
 
@@ -3829,6 +3842,8 @@ class LabControllerMathTest {
             hwcClientLayersSource = "SurfaceFlinger",
             hwcCompositionEvidenceMonotonicMs = 900L,
             hwcCompositionEvidenceAgeMs = 0L,
+            hwcCompositionEvidenceAvailability =
+                HwcCompositionEvidenceAvailability.AVAILABLE,
         ).toRunRelativeTelemetry(runStartMonotonicMs = 1_000L)
         assertEquals(0L, preRunSample.monotonicMs)
         assertNull(preRunSample.hwcCompositionEvidenceMonotonicMs)
@@ -3837,6 +3852,10 @@ class LabControllerMathTest {
         assertNull(preRunSample.hwcClientLayers)
         assertEquals(MetricQuality.UNAVAILABLE, preRunSample.hwcDeviceLayersQuality)
         assertEquals("", preRunSample.hwcDeviceLayersSource)
+        assertEquals(
+            HwcCompositionEvidenceAvailability.EVIDENCE_INVALID,
+            preRunSample.hwcCompositionEvidenceAvailability,
+        )
 
         val inconsistentAge = TelemetrySnapshot(
             monotonicMs = 1_200L,
@@ -3848,11 +3867,17 @@ class LabControllerMathTest {
             hwcClientLayersSource = "SurfaceFlinger",
             hwcCompositionEvidenceMonotonicMs = 1_100L,
             hwcCompositionEvidenceAgeMs = 99L,
+            hwcCompositionEvidenceAvailability =
+                HwcCompositionEvidenceAvailability.AVAILABLE,
         ).toRunRelativeTelemetry(runStartMonotonicMs = 1_000L)
         assertNull(inconsistentAge.hwcCompositionEvidenceMonotonicMs)
         assertNull(inconsistentAge.hwcDeviceLayers)
         assertEquals(MetricQuality.UNAVAILABLE, inconsistentAge.hwcDeviceLayersQuality)
         assertEquals("", inconsistentAge.hwcDeviceLayersSource)
+        assertEquals(
+            HwcCompositionEvidenceAvailability.EVIDENCE_INVALID,
+            inconsistentAge.hwcCompositionEvidenceAvailability,
+        )
     }
 
     @Test

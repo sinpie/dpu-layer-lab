@@ -25,6 +25,7 @@ import com.example.dpulayerlab.model.BufferPresentation
 import com.example.dpulayerlab.model.DecoderLinearReference
 import com.example.dpulayerlab.model.Gauge
 import com.example.dpulayerlab.model.HwcCompositionExpectation
+import com.example.dpulayerlab.model.HwcCompositionEvidenceAvailability
 import com.example.dpulayerlab.model.LayerBackend
 import com.example.dpulayerlab.model.LayerOrientation
 import com.example.dpulayerlab.model.LayerSizeProfile
@@ -1178,8 +1179,9 @@ class LabController internal constructor(
     /**
      * Starts an immutable snapshot of [requestedPlan].
      *
-     * Empty queues and excessive repeat/expanded-run counts are rejected. Duplicate scenarios
-     * are deliberately preserved because queue order itself is part of the experiment.
+     * Empty queues, invalid repeat counts, unrepresentable indexed progress, and oversized
+     * external plans are rejected. Duplicate scenarios are deliberately preserved because queue
+     * order itself is part of the experiment.
      */
     fun startPlan(requestedPlan: ScenarioRunPlan): Boolean {
         if (closed) {
@@ -1553,6 +1555,7 @@ class LabController internal constructor(
                     val reason =
                         "Battery Saver 복원 결과를 보고서에 안전하게 기록하지 못해 plan을 " +
                             "완료로 판정하지 않습니다."
+
                     cancellationReason = reason
                     throw PlanAbortException(reason)
                 }
@@ -2563,6 +2566,7 @@ class LabController internal constructor(
                 }
             }
             constructedRenewal = renewalOwner
+
             performanceRenewalJob = renewalOwner
             renewalOwner.invokeOnCompletion { cause ->
                 val operationFailure =
@@ -2802,6 +2806,7 @@ class LabController internal constructor(
             val originalStateRestored =
                 awaitOriginalBatterySaverState(originalPowerSaveMode)
             performanceSessionTicket = null
+
             performanceIsolationOwned = false
             if (originalStateRestored) {
                 performancePolicyRestoreConfirmed.set(true)
@@ -2815,9 +2820,9 @@ class LabController internal constructor(
                 performanceBaselinePowerSaveMode = null
                 "복원 확인 · Battery Saver 정책"
             } else if (!originalStateRestored) {
-                errorMessage =
+                errorMessage = (
                     "성능 정책 원상복구 실패($reason): Battery Saver 원래 상태 불일치"
-                        .take(MAX_EVENT_MESSAGE_CHARS)
+                    ).take(MAX_EVENT_MESSAGE_CHARS)
                 "복원 실패 · Battery Saver 원상태 불일치"
             } else {
                 "복원 실패 · renew 종료 미확인"
@@ -2865,9 +2870,7 @@ class LabController internal constructor(
         while (currentCoroutineContext().isActive) {
             val saverOff = runCatching {
                 !powerManager.isPowerSaveMode
-            }.getOrElse {
-                return false
-            }
+            }.getOrElse { return false }
             if (saverOff) return true
             if (SystemClock.elapsedRealtime() >= deadline) return false
             delay(PERFORMANCE_POLICY_POLL_MS)
@@ -3878,6 +3881,7 @@ class LabController internal constructor(
                     val reason =
                         "Warm-up producer topology/teardown 증거가 무효화되어 baseline을 " +
                             "수집하지 않습니다."
+
                     cancellationReason = reason
                     throw PlanAbortException(reason)
                 }
@@ -4012,6 +4016,7 @@ class LabController internal constructor(
                 val reason =
                     "부하, physical producer 또는 compression 해제를 확인할 수 없어 " +
                         "plan을 안전 중단합니다."
+
                 cancellationReason = reason
                 throw PlanAbortException(reason)
             }
@@ -4779,6 +4784,7 @@ class LabController internal constructor(
                 pendingControlCoverage =
                     discardPendingControlCoverageForProducerRecovery(discardedControlCoverage)
                 recoveryPaused = true
+
                 producerRecoveryPaused = true
                 phaseClock.pause(
                     boundedBoundaryMs,
@@ -5794,6 +5800,7 @@ class LabController internal constructor(
                 }
                 }
             } finally {
+
                 producerRecoveryPaused = false
                 if (activePhaseClock === phaseClock) {
                     activePhaseClock = null
@@ -6434,9 +6441,7 @@ class LabController internal constructor(
     }
 
     private fun throwForStaleRuntimeLoadReleaseFailure(
-        phaseId: String,
-        operation: String,
-        orderedZeroConfirmed: Boolean,
+        phaseId: String, operation: String, orderedZeroConfirmed: Boolean,
     ) {
         if (orderedZeroConfirmed) return
         val reason =
@@ -7432,9 +7437,9 @@ class LabController internal constructor(
                 summary = publicationFailureSummary,
                 reportFile = null,
             )
-            errorMessage =
+            errorMessage = (
                 "성능 정책 복원 결과 보고서 저장 실패: ${error.javaClass.simpleName}"
-                    .take(MAX_EVENT_MESSAGE_CHARS)
+                ).take(MAX_EVENT_MESSAGE_CHARS)
             withContext(NonCancellable + Dispatchers.IO) {
                 deleteManagedCompletedReportBestEffort(
                     reportsDirectory = File(appContext.filesDir, "reports"),
@@ -7444,6 +7449,7 @@ class LabController internal constructor(
             return false
         }
         lastReportFile = replacement
+
         lastPerformanceRestoreReportPersisted = true
         updateLatestPlanResultFromSummary(
             summary = updatedSummary,
@@ -7945,6 +7951,7 @@ class LabController internal constructor(
             throw cancelled
         }
         if (!completedInTime) {
+
             var terminalFailure: Throwable? = null
             try {
                 abandonProviderOpen()
@@ -7970,6 +7977,7 @@ class LabController internal constructor(
             // Cancellation can arrive after the provider worker has published its descriptor but
             // before ownership is transferred below. Reclaim that completed result as well as a
             // still-running provider open.
+
             var terminal: Throwable = cancelled
             try {
                 abandonProviderOpen()
@@ -8102,6 +8110,7 @@ class LabController internal constructor(
             throw cancelled
         }
         if (!completedInTime) {
+
             var terminalFailure: Throwable? = null
             try {
                 abandonInspection()
@@ -8458,13 +8467,13 @@ class LabController internal constructor(
         // The concrete input format is configured unchanged. Bind every advertised optional
         // profile/level/bitrate key, not only P010, to the chosen codec's format support query.
         val requiredProfile = boundMedia.profile
+        // MediaCodec receives the selected track's original format. A 120 fps source used by a
+        // 60 fps phase must therefore be assigned to a codec that advertises 120 fps, even though
+        // output release is intentionally paced at the lower phase target.
         val hardwareCodecName = CapabilityScanner.findHardwareVideoDecoder(
             mime = mime,
             width = width,
             height = height,
-            // MediaCodec receives the selected track's original format. A 120 fps source used
-            // by a 60 fps phase must therefore be assigned to a codec that advertises 120 fps,
-            // even though output release is intentionally paced at the lower phase target.
             framesPerSecond = decoderCapabilityFps,
             requiredProfile = requiredProfile,
             requiredLevel = boundMedia.level,
@@ -10085,6 +10094,16 @@ internal fun TelemetrySnapshot.toRunRelativeTelemetry(
         hwcCompositionEvidenceAgeMs =
             hwcCompositionEvidenceAgeMs.takeIf {
                 relativeHwcEvidenceMs != null
+            },
+        hwcCompositionEvidenceAvailability =
+            if (
+                relativeHwcEvidenceMs == null &&
+                hwcCompositionEvidenceAvailability ==
+                HwcCompositionEvidenceAvailability.AVAILABLE
+            ) {
+                HwcCompositionEvidenceAvailability.EVIDENCE_INVALID
+            } else {
+                hwcCompositionEvidenceAvailability
             },
         surfaceFlingerHwcMissed = surfaceFlingerHwcMissed.takeIf {
             relativeSurfaceFlingerEvidenceMs != null

@@ -14,11 +14,11 @@ Launcher와 Gradle project의 표시 이름은 `DPULayerTest`이고 canonical re
 `https://github.com/sinpie/dpu-layer-lab`이다. 제품 호환성 계약인 package
 `com.example.dpulayerlab`, automation component/action, `dpu-layer-lab-` report
 prefix, Soong module/APK 이름 `DpuLayerLab`은 별도 migration 요구 없이 바꾸지 않는다.
-현재 release version은 `20260726_101046`(`versionCode 8`), debug version은
-`20260726_101046-debug`이며 tag는 `v20260726_101046`이다.
+현재 release version은 `20260726_152112`(`versionCode 9`), debug version은
+`20260726_152112-debug`이며 tag는 `v20260726_152112`이다.
 `yyyyMMdd_HHmmss`는 KST build 시각이다. Release asset은
-`DPULayerTest-20260726_101046-debug.apk`,
-`DPULayerTest-20260726_101046-release-unsigned.apk`, `SHA256SUMS.txt` 이름을 사용한다.
+`DPULayerTest-20260726_152112-debug.apk`,
+`DPULayerTest-20260726_152112-release-unsigned.apk`, `SHA256SUMS.txt` 이름을 사용한다.
 
 ## 기본 작업 규칙
 
@@ -174,12 +174,14 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   폐기하며 기존 STOP과의 중복 제거보다 우선한다. Extra unmarshalling은 START에서만
   수행해 malformed START payload가 STOP 처리를 막지 않게 한다.
 - UI catalog facet은 같은 행 OR/서로 다른 행 AND 의미를 유지한다. Filtered
-  append/replace는 catalog 순서와 40-entry queue cap을 지키고, queue의 중복·명시적
-  이동은 보존하되 복원된 unknown preset ID는 표시/index/실행 전에 제거한다.
-  앱 UI plan은 이 queue를 통째로 1~10회 loop해 최대 400 run을 허용하되 외부 Intent의
-  expanded 40-run cap은 유지한다. Duration multiplier는 1/2/5/10/50/100만 허용하고
-  immutable execution copy의 phase duration과 transition window/cycle에 정확히 한 번
-  적용한 뒤 기존 duration safety cap을 통과시킨다.
+  append/replace는 catalog 순서를 지키고, 수동 실행 목록에는 임의의 고정 항목/expanded
+  run 상한을 두지 않는다. 목록의 중복·명시적 이동은 보존하되 복원된 unknown preset
+  ID는 표시/index/실행 전에 제거한다. 앱 UI plan은 이 목록을 통째로 1~10회 loop하며
+  외부 Intent의 expanded 40-run cap은 별도 계약으로 유지한다. Repeat를 펼친 전체
+  목록을 만들지 않고 queue×repeat를 순차 실행하며, 중복 preset의 immutable
+  materialization은 같은 copy를 재사용한다. Duration multiplier는
+  1/2/5/10/50/100만 허용하고 immutable execution copy의 phase duration과 transition
+  window/cycle에 정확히 한 번 적용한 뒤 기존 duration safety cap을 통과시킨다.
 - 외부 control은 explicit `AutomationActivity` alias에서만 처리한다. Release의
   `CONTROL_TESTS`(`signature|privileged`) 보호, debug-only permission 제거,
   `CATEGORY_DEFAULT` 부재와 direct `MainActivity` START 무시를 유지한다.
@@ -333,10 +335,11 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   않을 때만 SF fallback을 한 번 허용하며 vendor snapshot을 두 번 호출하지 않는다.
   Session calibration cache를 phase evidence로 재사용하지 않는다. HWC count를 logcat이나
   임의 sysfs/debugfs plane 탐색으로 추론하지 않는다.
-- HUD의 typed HWC `HWC APP RAW D/C/T`와 `RAW MATCH/WAIT/N/A`는 2.5초 이내 동일
+- HUD의 typed HWC `HWC APP RAW D/C/T`와 `현재값 일치/불일치/없음`은 2.5초 이내 동일
   source·quality·timestamp DEVICE/CLIENT pair와 그 pair의 `T=D+C`를 사용한 보조 해석일
-  뿐이다. Target readiness, distinct sample 수와 cross-phase 방향성을 확인하는
-  controller 최종 판정처럼 표시하지 않는다. 각 run은 `HWC_COUNT_SCOPE` event로
+  뿐이다. Pair가 없으면 반복 N/A 대신 bounded availability reason을 표시하되 Target
+  readiness, distinct sample 수와 cross-phase 방향성을 확인하는 controller 최종 판정처럼
+  표시하지 않는다. 각 run은 `HWC_COUNT_SCOPE` event로
   `APP_RAW_UNSEPARATED`, `controlLayerIncluded=true`, root subtraction 없음,
   FrameTracker `PHYSICAL` 분리와 scoped BSP evidence 필요를 남긴다.
 - 16 ms producer hand-off를 넘기면 새 codec/EGL/Canvas replacement를 만들지 않고

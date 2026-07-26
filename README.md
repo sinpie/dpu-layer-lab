@@ -18,8 +18,8 @@ service를 연결하면 DPU·DDR·HWC·SBWC·NPU와 같은 제품 전용 기능�
 있습니다.
 
 현재 launcher/Gradle project 표시 이름은 **DPULayerTest**입니다. 현재 release는
-[`v20260726_101046`](https://github.com/sinpie/dpu-layer-lab/releases/tag/v20260726_101046)
-(`versionCode 8`), debug version은 `20260726_101046-debug`입니다. Version name은 KST
+[`v20260726_152112`](https://github.com/sinpie/dpu-layer-lab/releases/tag/v20260726_152112)
+(`versionCode 9`), debug version은 `20260726_152112-debug`입니다. Version name은 KST
 build 시각을 `yyyyMMdd_HHmmss`로 고정한
 형식입니다. 앱 상단과 실행 HUD에 실제 build version을 노출해 결과를 만든 바이너리를
 현장에서 바로 식별할 수 있습니다.
@@ -100,7 +100,9 @@ Soong module/APK 통합 이름 `DpuLayerLab`은 이름을 바꾸지 않는 호�
 - 실행 HUD의 `HWC APP RAW · D/C/T · AGE · SRC`. `T`는 하나의 fresh 원자 tuple 안의
   `D+C`이며 physical producer 수가 아닙니다. 현재 portable/vendor tuple은 Activity
   root/control과 workload producer를 per-layer로 분리하지 못하므로 HUD에
-  `SCOPE 미분리(control/root 보정 없음)`을 함께 표시합니다.
+  `APP_RAW_UNSEPARATED`, control/root 포함·보정 없음과 `PHYSICAL` app producer가
+  별도임을 함께 표시합니다. Pair가 없으면 반복 N/A 대신 측정값 없음과 원인을
+  표시합니다.
 - 실행 HUD의 destination screen-equivalent footprint. 일반 phase는
   `LayerSizeProfile`의 base scale만 합하고, `CAPACITY_TILES`는 명시적인 예외로 crop
   union 1 screen-equivalent와 평균 `100 / producer count`%를 표시합니다. HUD는
@@ -484,8 +486,9 @@ Plan-wide Battery Saver `END`는 scenario의 terminal counter/producer teardown 
 판정을 성공으로 덮지 않습니다. Plan-wide 복원이 확인되지 않으면 이미 완료된 앞
 scenario도 안전한 plan 종료를 증명할 수 없으므로 결과를 `ABORTED`로 바꾸고 기존
 report 경로를 철회하며, managed JSON은 best-effort로 삭제합니다.
-마지막 report 교체는 새 파일 publish → 이전 managed 파일 삭제 확인 → 400개 retention
-순서로 직렬화해 최대 400-run plan의 첫 report가 교체 중 먼저 잘리지 않게 합니다.
+마지막 report 교체는 새 파일 publish → 이전 managed 파일 삭제 확인 → 최신 400개
+retention 순서로 직렬화합니다. 이 400개는 수동 실행 목록 제한이 아니라 독립적인
+로컬 저장 정책이며, 더 긴 plan에서는 오래된 JSON부터 정리됩니다.
 Renewal/health/service-session integrity가 한 번 깨진 경우에는 나중에 exact
 Battery Saver 복원만 성공해도 같은 process의 새 plan을 허용하지 않습니다. Restore
 결과 JSON 재발행이 실패한 경우도 메모리의 summary를 `ABORTED`로 고정해 finalizer가
@@ -636,10 +639,10 @@ DVFS preset의 settle 구간은 작은 layer/FPS/Hz 부하를 유지해 governor
    필터 결과를 기존 queue 뒤에 **결과 추가**하거나 **결과로 교체**할 수 있고, 개별
    항목은 중복 추가·`←`/`→` 이동·`×` 제거가 가능합니다. 저장 상태에 더 이상 catalog에
    없는 ID가 있으면 복원 시 제거합니다.
-5. 전체 queue 반복 횟수를 1~10회에서 선택합니다. `N`회는 전체 queue를 처음부터 끝까지
-   `N`번 실행하며, `N > 1`이면 회차 경계에서 마지막 scenario 다음에 첫 scenario로
-   돌아갑니다. 1회는 전체 queue를 한 번 실행합니다. 앱 UI queue는 최대 40개,
-   확장 run은 `40 × 10 = 400`회까지이며, 외부 Intent automation은 기존 40-run 상한을
+5. 전체 실행 목록 반복 횟수를 1~10회에서 선택합니다. `N`회는 전체 목록을 처음부터
+   끝까지 `N`번 실행하며, `N > 1`이면 회차 경계에서 마지막 scenario 다음에 첫
+   scenario로 돌아갑니다. 1회는 전체 목록을 한 번 실행합니다. 수동 실행 목록에는
+   임의의 40개/400회 제한이 없고, 외부 Intent automation만 기존 40-run 안전 상한을
    유지합니다. 같은 실행 직전 화면에서 1×/2×/5×/10×/50×/100× 시간 배율도 고릅니다.
    배율은 각 phase duration과 transition window/cycle에 정확히 한 번 함께 적용됩니다.
    이후 기존 phase 10분/scenario 30분 안전 상한이 명시적으로 조정하거나 거부할 수
@@ -660,10 +663,11 @@ DVFS preset의 settle 구간은 작은 layer/FPS/Hz 부하를 유지해 governor
    text/progress는 최대 1 Hz로 갱신됩니다.
    `HWC APP RAW`는 한 fresh tuple의 D/C/T, age와 provenance를 표시하지만
    Activity root/control과 workload producer의 scope는 분리하지 않습니다.
-   Typed HWC phase의 `RAW MATCH/WAIT/N/A`는 2.5초 이내의 동일 source·quality·timestamp
-   DEVICE/CLIENT 쌍을 즉시 해석한 보조 표시입니다. Target topology 이후의 distinct
+   Typed HWC phase의 `현재값 일치/불일치/없음`은 2.5초 이내의 동일
+   source·quality·timestamp DEVICE/CLIENT 쌍을 즉시 해석한 보조 표시입니다. Pair가
+   없으면 반복 N/A 대신 측정값 없음과 bounded reason을 표시합니다. Target topology 이후의 distinct
    fresh sample 수와 phase 간 방향성까지 확인하는 controller 최종 판정은 결과 event를
-   사용하므로 `RAW MATCH`만으로 phase 성공을 확정하면 안 됩니다.
+   사용하므로 `현재값 일치`만으로 phase 성공을 확정하면 안 됩니다.
    `STOP`은 작은 화면/landscape의 스크롤 아래로 숨지 않도록 상단 실행 header에 항상
    표시됩니다.
 9. 종료 후 run별 결과와 report를 확인하고 안전 clamp/reject/derate/abort event가
@@ -1002,14 +1006,14 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 - debug: `app/build/outputs/apk/debug/app-debug.apk`
 - release: `app/build/outputs/apk/release/app-release-unsigned.apk`
 
-### `20260726_101046` 릴리스 산출물의 의미
+### `20260726_152112` 릴리스 산출물의 의미
 
-- release tag는 `v20260726_101046`입니다.
-- `DPULayerTest-20260726_101046-debug.apk`는 Android debug key로 서명되어 바로 설치 가능한
+- release tag는 `v20260726_152112`입니다.
+- `DPULayerTest-20260726_152112-debug.apk`는 Android debug key로 서명되어 바로 설치 가능한
   **전용 lab/개발용** APK입니다. Explicit automation alias에는 debug manifest에서
   `CONTROL_TESTS` permission이 제거되어 있으므로 ADB 사용이 쉽지만, 신뢰 경계가 열린
   이 동작을 제품 release 보안으로 간주하거나 일반 사용자 단말에 배포하면 안 됩니다.
-- `DPULayerTest-20260726_101046-release-unsigned.apk`는 제품 빌드/서명 파이프라인
+- `DPULayerTest-20260726_152112-release-unsigned.apk`는 제품 빌드/서명 파이프라인
   입력을 위한 **서명되지 않은 통합 산출물**입니다. 그대로 설치 가능한 최종 제품
   APK가 아닙니다.
 - 실제 제품 APK는 secure product build 환경에서 platform/product key로 서명하고

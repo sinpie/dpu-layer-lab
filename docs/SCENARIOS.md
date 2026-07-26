@@ -54,8 +54,9 @@ cooldown, report I/O는 포함하지 않는다.
 `ScenarioRunPlan`은 queue 순서와 repeat를 보존한다. 같은 scenario를 여러 번 넣는 것은
 A/B/A 실험을 위해 허용된다. `repeatCount=N`은 전체 queue를 처음부터 끝까지 N회
 실행한다. `N > 1`이면 각 회차 경계에서 마지막 scenario 다음에 첫 scenario로 돌아가며,
-1은 전체 queue 한 번이다. 앱 UI는 최대 40-entry queue × 10 loop = 400 run이다.
-외부 Intent automation은 기존 expanded 40-run 상한을 유지한다.
+1은 전체 queue 한 번이다. 앱 UI의 수동 queue에는 임의의 고정 항목/expanded-run
+상한이 없고 repeat는 expanded list로 만들지 않고 순차 실행한다. 외부 Intent
+automation은 기존 expanded 40-run 상한을 유지한다.
 
 `durationMultiplier`는 실행 직전 `1×, 2×, 5×, 10×, 50×, 100×` 중 하나를 고른다.
 각 phase의 duration, transition window와 cycle에 immutable execution snapshot을 만들 때
@@ -358,7 +359,7 @@ UI의 빠른 목적은 다음 질문에 대응한다.
 - **CLIENT 전환 목표:** mixed/alpha/GL pressure 뒤 CLIENT>0 fresh evidence가 반복되는가?
 
 각 card는 “입력 변화”, “합성 목표”, “확인할 metric”을 실행 전에 보여야 한다.
-`RAW MATCH/WAIT/N/A`와 `HWC APP RAW D/C/T`는 2.5초 이내 동일
+`현재값 일치/불일치/없음`과 `HWC APP RAW D/C/T`는 2.5초 이내 동일
 source/quality/timestamp pair의 보조 표시이며 controller의 phase coverage verdict를
 대신하지 않는다. Pure Compose HUD는 별도 Surface를 추가하지 않지만 Activity
 root/window layer의 HWC assignment를 강제하지도 않으며, 현재 raw tuple에서 이를

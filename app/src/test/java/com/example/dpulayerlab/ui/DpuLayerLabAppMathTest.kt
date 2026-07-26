@@ -3,6 +3,7 @@ package com.example.dpulayerlab.ui
 import com.example.dpulayerlab.engine.ScenarioCatalog
 import com.example.dpulayerlab.model.Gauge
 import com.example.dpulayerlab.model.HwcCompositionExpectation
+import com.example.dpulayerlab.model.HwcCompositionEvidenceAvailability
 import com.example.dpulayerlab.model.LayerSizeProfile
 import com.example.dpulayerlab.model.LayerTrafficEstimate
 import com.example.dpulayerlab.model.MetricQuality
@@ -434,19 +435,21 @@ class DpuLayerLabAppMathTest {
     fun startSnapshotUsesLatestKnownQueueAndPreservesWholeQueueLoop() {
         val scenario = checkNotNull(ScenarioCatalog.byId("baseline-display-modes"))
         val knownIds = ScenarioCatalog.presets.mapTo(LinkedHashSet()) { it.id }
+        val repeatedQueue = List(45) { scenario.id }
         val plan = checkNotNull(
             catalogRunPlanSnapshot(
-                rawQueueIds = listOf("unknown") + List(5) { scenario.id },
+                rawQueueIds = listOf("unknown") + repeatedQueue,
                 knownScenarioIds = knownIds,
                 requestedRepeat = 10,
                 requestedDurationMultiplier = 100,
             ),
         )
 
-        assertEquals(List(5) { scenario.id }, plan.scenarios.map { it.id })
+        assertEquals(repeatedQueue, plan.scenarios.map { it.id })
         assertEquals(10, plan.repeatCount)
-        assertEquals(50, plan.totalRuns)
+        assertEquals(450, plan.totalRuns)
         assertEquals(100, plan.durationMultiplier)
+        assertEquals(null, ScenarioPlanPolicy.validate(plan))
         assertEquals(
             null,
             catalogRunPlanSnapshot(
@@ -523,7 +526,7 @@ class DpuLayerLabAppMathTest {
     }
 
     @Test
-    fun runningHwcSummaryKeepsUnavailableValuesAgeAndSourceVisible() {
+    fun runningHwcSummaryExplainsUnavailableEvidenceWithoutRepeatingNaValues() {
         val summary = hwcExpectationLiveSummary(
             expectation = HwcCompositionExpectation.DEVICE_ONLY,
             telemetry = TelemetrySnapshot(
@@ -532,16 +535,17 @@ class DpuLayerLabAppMathTest {
                 hwcClientLayers = null,
                 hwcClientLayersSource = "",
                 hwcCompositionEvidenceAgeMs = null,
+                hwcCompositionEvidenceAvailability =
+                    HwcCompositionEvidenceAvailability.ACTIVE_RUN_VENDOR_PAIR_UNAVAILABLE,
             ),
         )
 
-        assertTrue(summary.contains("HWC APP RAW"))
-        assertTrue(summary.contains("RAW N/A"))
-        assertTrue(summary.contains("D N/A/C N/A"))
-        assertTrue(summary.contains("AGE N/A"))
-        assertTrue(summary.contains("SRC D N/A:kernel pro"))
-        assertTrue(summary.contains("C N/A:source N/A"))
-        assertTrue(summary.contains("target/횟수는 controller 최종 판정"))
+        assertTrue(summary.contains("HWC 합성 계측 · 측정값 없음"))
+        assertTrue(summary.contains("실행 중 SF 조회 억제"))
+        assertTrue(summary.contains("fresh Vendor D/C 없음"))
+        assertTrue(summary.contains("APP_RAW_UNSEPARATED"))
+        assertTrue(summary.contains("PHYSICAL producer/최종 판정 별도"))
+        assertFalse(summary.contains("N/A"))
     }
 
     @Test
@@ -552,9 +556,9 @@ class DpuLayerLabAppMathTest {
 
         assertTrue(summary.contains("HWC APP RAW"))
         assertTrue(summary.contains("D 4/C 2/T 6"))
-        assertTrue(summary.contains("SCOPE 미분리"))
-        assertTrue(summary.contains("control/root 보정 없음"))
-        assertTrue(summary.contains("HUD extra Surface 0"))
+        assertTrue(summary.contains("APP_RAW_UNSEPARATED"))
+        assertTrue(summary.contains("control/root 포함·보정 없음"))
+        assertTrue(summary.contains("PHYSICAL producer와 별도"))
     }
 
     @Test
@@ -568,10 +572,34 @@ class DpuLayerLabAppMathTest {
             telemetry = atomicHwcTelemetry(device = 4, client = 0),
         )
 
-        assertTrue(match.contains("RAW MATCH"))
-        assertTrue(wait.contains("RAW WAIT"))
-        assertTrue(match.contains("controller 최종 판정"))
-        assertTrue(wait.contains("controller 최종 판정"))
+        assertTrue(match.contains("현재값 일치"))
+        assertTrue(wait.contains("현재값 불일치"))
+        assertTrue(match.contains("최종 판정 별도"))
+        assertTrue(wait.contains("최종 판정 별도"))
+    }
+
+    @Test
+    fun unavailableHwcSummaryDistinguishesDumpPermissionAndLiveStaleness() {
+        val noDump = hwcLayerCountLiveSummary(
+            telemetry = TelemetrySnapshot(
+                hwcCompositionEvidenceAvailability =
+                    HwcCompositionEvidenceAvailability.DUMP_PERMISSION_UNAVAILABLE,
+            ),
+        )
+        val staleTelemetry = atomicHwcTelemetry(
+            device = 4,
+            client = 0,
+            evidenceAgeMs = HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS,
+        )
+        val stale = hwcLayerCountLiveSummary(
+            telemetry = staleTelemetry,
+            nowMonotonicMs = staleTelemetry.monotonicMs + 1L,
+        )
+
+        assertTrue(noDump.contains("측정값 없음"))
+        assertTrue(noDump.contains("DUMP 권한 없음"))
+        assertTrue(stale.contains("계측값 만료(2.5초 초과)"))
+        assertFalse(stale.contains("D N/A"))
     }
 
     @Test
@@ -714,7 +742,7 @@ class DpuLayerLabAppMathTest {
     }
 
     @Test
-    fun quickPurposeAppendKeepsQueueDuplicatesCatalogOrderAndHardCap() {
+    fun quickPurposeAppendKeepsQueueDuplicatesAndCatalogOrderPastFortyItems() {
         val purposeIds = scenariosForCatalogPurpose(
             ScenarioCatalog.presets,
             CatalogPurpose.DPU_BURST,
@@ -726,11 +754,23 @@ class DpuLayerLabAppMathTest {
         assertEquals(existing, appended.take(existing.size))
         assertEquals(purposeIds, appended.drop(existing.size))
 
-        val almostFull = List(ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS - 1) { duplicate }
-        val capped = ScenarioQueueEditor.appendAll(almostFull, purposeIds)
-        assertEquals(ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS, capped.size)
-        assertEquals(almostFull, capped.take(almostFull.size))
-        assertEquals(purposeIds.first(), capped.last())
+        val fortyItems = List(40) { duplicate }
+        val extended = ScenarioQueueEditor.appendAll(fortyItems, purposeIds)
+        assertEquals(fortyItems.size + purposeIds.size, extended.size)
+        assertEquals(fortyItems, extended.take(fortyItems.size))
+        assertEquals(purposeIds, extended.drop(fortyItems.size))
+    }
+
+    @Test
+    fun addingAllThirtySixCatalogResultsAgainCreatesSeventyTwoExecutionEntries() {
+        val catalogIds = ScenarioCatalog.presets.map { it.id }
+
+        val appended = ScenarioQueueEditor.appendAll(catalogIds, catalogIds)
+
+        assertEquals(36, catalogIds.size)
+        assertEquals(72, appended.size)
+        assertEquals(catalogIds, appended.take(36))
+        assertEquals(catalogIds, appended.drop(36))
     }
 
     private fun atomicHwcTelemetry(

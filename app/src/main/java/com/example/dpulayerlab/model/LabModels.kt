@@ -1,6 +1,7 @@
 package com.example.dpulayerlab.model
 
 import android.os.Build
+import java.util.IdentityHashMap
 import kotlin.math.roundToInt
 
 const val MIN_EFFECTIVE_LOAD = 0.001f
@@ -537,29 +538,20 @@ data class ScenarioRunPlan(
 
 object ScenarioPlanPolicy {
     const val MAX_REPEAT_COUNT = 10
-    const val MAX_QUEUE_ENTRIES = 40
     /** External automation expanded-run cap retained as a compatibility/security contract. */
-    const val MAX_TOTAL_PLAN_RUNS = 40
-    /** Explicit in-app plans may loop the full bounded 40-entry queue ten times. */
-    const val MAX_USER_TOTAL_PLAN_RUNS = MAX_TOTAL_PLAN_RUNS * MAX_REPEAT_COUNT
+    const val MAX_EXTERNAL_TOTAL_PLAN_RUNS = 40
     val DURATION_MULTIPLIERS: List<Int> = listOf(1, 2, 5, 10, 50, 100)
     const val ALLOW_DUPLICATE_SCENARIOS = true
-
-    fun maximumTotalRuns(source: PlanSource): Int = when (source) {
-        PlanSource.USER_SELECTION -> MAX_USER_TOTAL_PLAN_RUNS
-        PlanSource.SINGLE_SCENARIO,
-        PlanSource.EXTERNAL_INTENT,
-        -> MAX_TOTAL_PLAN_RUNS
-    }
 
     fun maximumRepeatCount(
         queueSize: Int,
         source: PlanSource = PlanSource.USER_SELECTION,
     ): Int {
+        if (source != PlanSource.EXTERNAL_INTENT) return MAX_REPEAT_COUNT
         if (queueSize <= 0) return MAX_REPEAT_COUNT
         return minOf(
             MAX_REPEAT_COUNT,
-            (maximumTotalRuns(source) / queueSize).coerceAtLeast(1),
+            (MAX_EXTERNAL_TOTAL_PLAN_RUNS / queueSize).coerceAtLeast(1),
         )
     }
 
@@ -571,9 +563,6 @@ object ScenarioPlanPolicy {
 
     fun validate(plan: ScenarioRunPlan): String? {
         if (plan.scenarios.isEmpty()) return "Plan scenario queue must not be empty"
-        if (plan.scenarios.size > MAX_QUEUE_ENTRIES) {
-            return "Plan queue has ${plan.scenarios.size} entries; maximum is $MAX_QUEUE_ENTRIES"
-        }
         if (plan.repeatCount !in 1..MAX_REPEAT_COUNT) {
             return "Plan repeat count must be between 1 and $MAX_REPEAT_COUNT"
         }
@@ -582,9 +571,15 @@ object ScenarioPlanPolicy {
                 DURATION_MULTIPLIERS.joinToString()
         }
         val totalRuns = plan.scenarios.size.toLong() * plan.repeatCount.toLong()
-        val maximumRuns = maximumTotalRuns(plan.source)
-        if (totalRuns > maximumRuns) {
-            return "Plan has $totalRuns runs; maximum for ${plan.source.name} is $maximumRuns"
+        if (totalRuns > Int.MAX_VALUE) {
+            return "Plan is too large for indexed progress"
+        }
+        if (
+            plan.source == PlanSource.EXTERNAL_INTENT &&
+            totalRuns > MAX_EXTERNAL_TOTAL_PLAN_RUNS
+        ) {
+            return "Plan has $totalRuns runs; maximum for ${plan.source.name} is " +
+                MAX_EXTERNAL_TOTAL_PLAN_RUNS
         }
         val multiplier = plan.durationMultiplier.toLong()
         if (plan.scenarios.any { scenario ->
@@ -612,22 +607,16 @@ object ScenarioPlanPolicy {
  * reports every such adjustment instead of silently running a different duration.
  */
 fun ScenarioRunPlan.materializeDurationMultiplier(): ScenarioRunPlan {
-    if (durationMultiplier == 1) return copy(
-        scenarios = scenarios.map { scenario ->
-            scenario.copy(
-                tags = scenario.tags.toSet(),
-                requirements = scenario.requirements.toSet(),
-                phases = scenario.phases.map { it.copy() },
-            )
-        },
-    )
     val multiplier = durationMultiplier.toLong()
-    return copy(
-        scenarios = scenarios.map { scenario ->
-            scenario.copy(
-                tags = scenario.tags.toSet(),
-                requirements = scenario.requirements.toSet(),
-                phases = scenario.phases.map { phase ->
+    val immutableCopies = IdentityHashMap<ScenarioSpec, ScenarioSpec>()
+    fun immutableCopyOf(scenario: ScenarioSpec): ScenarioSpec =
+        immutableCopies[scenario] ?: scenario.copy(
+            tags = scenario.tags.toSet(),
+            requirements = scenario.requirements.toSet(),
+            phases = scenario.phases.map { phase ->
+                if (multiplier == 1L) {
+                    phase.copy()
+                } else {
                     phase.copy(
                         durationMs = Math.multiplyExact(phase.durationMs, multiplier),
                         transition = phase.transition.copy(
@@ -643,9 +632,14 @@ fun ScenarioRunPlan.materializeDurationMultiplier(): ScenarioRunPlan {
                             cycleMs = Math.multiplyExact(phase.transition.cycleMs, multiplier),
                         ),
                     )
-                },
-            )
-        },
+                }
+            },
+        ).also { copy ->
+            immutableCopies[scenario] = copy
+        }
+
+    return copy(
+        scenarios = scenarios.map(::immutableCopyOf),
         durationMultiplier = 1,
     )
 }
@@ -789,6 +783,28 @@ enum class MetricQuality(val label: String) {
     UNAVAILABLE("Unavailable"),
 }
 
+/**
+ * Stable reason code for the current atomic HWC DEVICE/CLIENT evidence.
+ *
+ * This is deliberately bounded and source-aware so UI/report consumers do not have to infer a
+ * cause from localized probe detail text. It describes evidence availability only; it is not a
+ * composition verdict and never upgrades APP_RAW_UNSEPARATED counts to workload-only evidence.
+ */
+enum class HwcCompositionEvidenceAvailability {
+    AVAILABLE,
+    ACTIVE_RUN_VENDOR_PAIR_UNAVAILABLE,
+    ACTIVE_RUN_VENDOR_PAIR_INVALID,
+    ACTIVE_RUN_VENDOR_PAIR_STALE,
+    DUMP_PERMISSION_UNAVAILABLE,
+    SURFACE_FLINGER_PAIR_UNAVAILABLE,
+    SURFACE_FLINGER_PAIR_INVALID,
+    SURFACE_FLINGER_EVIDENCE_STALE,
+    SURFACE_FLINGER_PROBE_FAILED,
+    EVIDENCE_INVALID,
+    EVIDENCE_STALE,
+    UNAVAILABLE,
+}
+
 data class Gauge(
     val value: Float? = null,
     val unit: String = "",
@@ -842,6 +858,9 @@ data class TelemetrySnapshot(
     val hwcCompositionEvidenceMonotonicMs: Long? = null,
     /** Age of the selected DEVICE/CLIENT pair at [monotonicMs]. */
     val hwcCompositionEvidenceAgeMs: Long? = null,
+    /** Typed availability reason for the current atomic pair; never a controller verdict. */
+    val hwcCompositionEvidenceAvailability: HwcCompositionEvidenceAvailability =
+        HwcCompositionEvidenceAvailability.UNAVAILABLE,
     val surfaceFlingerHwcMissed: Long? = null,
     val surfaceFlingerGpuMissed: Long? = null,
     val surfaceFlingerMissSource: String = "",

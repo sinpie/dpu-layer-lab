@@ -25,7 +25,7 @@ dpu-layer-lab-yyyyMMdd-HHmmss-SSS-<safeScenarioId>[-<collision>].json
 - `.json.part` write/flush/fsync 뒤 rename
 - scenario ID는 `[A-Za-z0-9._-]`, 최대 80자
 - collision suffix는 1~999
-- newest 400 managed completed report 보존(40-entry UI queue × 10 whole-queue loops)
+- newest 400 managed completed report 보존(수동 plan 길이와 독립된 로컬 저장 정책)
 - FileProvider 공유는 canonical internal completed file이면서 현재 controller의
   `lastReportFile` 또는 plan result history에 publish된 경로만 허용
 
@@ -250,6 +250,7 @@ pattern만으로 추론하지 않는다.
 | `hwcDeviceLayersSource`, `hwcClientLayersSource` | string | pair source |
 | `hwcCompositionEvidenceMonotonicMs` | integer/null | run-relative pair completion; 음수 가능 |
 | `hwcCompositionEvidenceAgeMs` | integer/null | sample 시점 age |
+| `hwcCompositionEvidenceAvailability` | enum string | 항상 존재하는 bounded availability/reason code |
 | `surfaceFlingerHwcMissed`, `surfaceFlingerGpuMissed` | integer/null | SF proxy |
 | `surfaceFlingerMissQuality`, `surfaceFlingerMissSource` | enum/string | proxy provenance |
 | `surfaceFlingerEvidenceMonotonicMs` | integer/null | run-relative SF completion; 음수 가능 |
@@ -258,6 +259,17 @@ pattern만으로 추론하지 않는다.
 DEVICE/CLIENT source와 quality는 서로 같아야 usable pair다. Consumer가 한쪽만 다른
 source와 결합하면 안 된다. Evidence timestamp도 같고 freshness가 유효한 complete
 pair에서만 `HWC APP RAW T=D+C`를 계산한다.
+
+`hwcCompositionEvidenceAvailability`은
+`AVAILABLE`, `ACTIVE_RUN_VENDOR_PAIR_UNAVAILABLE`,
+`ACTIVE_RUN_VENDOR_PAIR_INVALID`, `ACTIVE_RUN_VENDOR_PAIR_STALE`,
+`DUMP_PERMISSION_UNAVAILABLE`, `SURFACE_FLINGER_PAIR_UNAVAILABLE`,
+`SURFACE_FLINGER_PAIR_INVALID`, `SURFACE_FLINGER_EVIDENCE_STALE`,
+`SURFACE_FLINGER_PROBE_FAILED`, `EVIDENCE_INVALID`, `EVIDENCE_STALE`,
+`UNAVAILABLE` 중 하나다. 실행 중 SF probe 억제와 fresh vendor pair 부재/무효/만료,
+idle/calibration의 DUMP 권한·SF pair/probe 실패를 free-form message parsing 없이
+구분한다. 이 값은 계측 가능성 진단일 뿐 HWC target 충족이나 run verdict가 아니다.
+Unavailable reason이 있어도 기존 D/C field는 계속 `null`을 사용한다.
 
 이 pair는 control/root 보정이나 workload producer identity partition을 제공하지 않는다.
 `controlLayerIncluded=true`는 pure Compose HUD를 포함한 Activity/app Window root가

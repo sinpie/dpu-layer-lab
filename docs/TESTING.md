@@ -92,8 +92,8 @@ release configuration에 local keystore, platform key 경로나 credential을 �
 | Test | 계약 |
 |---|---|
 | `model/LabModelsTest.kt` | model normalization, duration, terminal reason, dynamic size coverage mask |
-| `model/ScenarioPlanPolicyTest.kt` | UI 400/external 40 source cap, whole-queue repeat, 지원 시간 배율, overflow, immutable single materialization과 duration safety cap |
-| `model/ScenarioQueueEditorTest.kt` | duplicate, order, move, unknown restore |
+| `model/ScenarioPlanPolicyTest.kt` | 수동 queue 무고정상한/external 40 source cap, whole-queue repeat, 지원 시간 배율, overflow, 중복 preset 1회 immutable materialization과 duration safety cap |
+| `model/ScenarioQueueEditorTest.kt` | 40개 초과 수동 append/restore, duplicate, order, move, unknown restore |
 | `model/ScenarioSafetyPolicyTest.kt` | hard cap, negative/sub-effective load reject, duration, graphics budget, typed phase, FIT/1:1/90°와 capacity-tile 조합 |
 | `model/ScenarioClassifierTest.kt` | facet OR/AND, 1K/2K/1:1/90° 조건과 intensity |
 | `model/LoadShapeEvaluatorTest.kt` | worker modulation |
@@ -155,7 +155,7 @@ release configuration에 local keystore, platform key 경로나 credential을 �
 
 | Test | 계약 |
 |---|---|
-| `ui/DpuLayerLabAppMathTest.kt`, `engine/LabControllerMathTest.kt` | 목적/facet/preview, bounded queue, whole-loop repeat/time 배율 복원, 400-run/장시간 format, decoder-media 노출, topology-pending 즉시 `—P`, 1 Hz dynamic HUD bucket, HWC APP RAW D/C/T freshness/provenance/scope 문구와 atomic-tuple peak |
+| `ui/DpuLayerLabAppMathTest.kt`, `engine/LabControllerMathTest.kt` | 목적/facet/preview, lazy queue 편집, 40개/400회 초과 수동 whole-loop repeat와 시간 배율 복원, 장시간 format, decoder-media 노출, topology-pending 즉시 `—P`, 1 Hz dynamic HUD bucket, HWC APP RAW D/C/T freshness/provenance/scope 문구와 atomic-tuple peak |
 | `ui/RendererContainerRememberOwnerTest.kt` | Compose renderer owner identity |
 | `MainActivityMathTest.kt` | display/window/automation, Battery Saver 전용→일반 settings 순서와 cleanup defer |
 | `engine/ReportWriterMathTest.kt` | projection/orientation/effective duration schema, provenance, 400 retention, atomic naming helper |
@@ -253,9 +253,14 @@ Capacity 변경은 다음 경계를 별도로 검증해야 한다.
 
 - D와 C가 같은 source, quality, evidence timestamp를 가진 complete pair일 때만
   `T=D+C`를 표시
-- live age가 2.5초를 넘거나 timestamp/recorded age가 모순되면 D/C/T 전체가 N/A
-- HUD summary가 `HWC APP RAW`, age, provenance,
-  `SCOPE 미분리(control/root 보정 없음)`과 `HUD extra Surface 0`을 함께 표시
+- live age가 2.5초를 넘거나 timestamp/recorded age가 모순되면 반복 N/A 대신
+  `HWC 합성 계측 · 측정값 없음`과 bounded reason을 표시
+- active load의 SF 조회 억제+fresh vendor D/C 없음/무효/만료와 idle/calibration의
+  DUMP 미허용·SF pair/probe 실패가 localized detail parsing 없이 구분됨
+- HUD summary가 available일 때 `HWC APP RAW`, age, provenance를 유지하고 unavailable일
+  때도 `APP_RAW_UNSEPARATED`, control/root 무보정과 `PHYSICAL` producer 분리를 표시
+- report sample의 `hwcCompositionEvidenceAvailability`가 항상 enum name으로 존재하고
+  availability reason을 verdict로 표현하지 않으며 unavailable D/C는 null을 유지
 - pure Compose HUD subtree에는 별도 AndroidView/SurfaceView/TextureView를 추가하지
   않지만 Activity root HWC assignment를 force/verified로 표현하지 않음
 - immutable HUD state 단일 인자가 상위 renderer의 100 ms recomposition과 격리되고
@@ -328,7 +333,7 @@ Capacity 변경은 다음 경계를 별도로 검증해야 한다.
 - `0 < load <= 0.001`
 - phase와 total duration overflow
 - unsupported duration multiplier, 중복 materialization과 100× 뒤 duration cap
-- UI 40×10=400 whole-queue loop와 외부 40-run 분리
+- 40개/400회 초과 수동 whole-queue loop 허용과 외부 40-run 분리
 - 1:1 + scaling motion/dynamic size reject, capacity tiles + crop/90° reject
 - typed HWC minimum duration 부족
 - malformed START extra와 oversized queue

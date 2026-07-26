@@ -11,6 +11,7 @@ class ScenarioPlanPolicyTest {
         assertEquals(10, ScenarioPlanPolicy.normalizeRepeatCount(queueSize = 0, requested = 99))
         assertEquals(10, ScenarioPlanPolicy.normalizeRepeatCount(queueSize = 1, requested = 11))
         assertEquals(10, ScenarioPlanPolicy.normalizeRepeatCount(queueSize = 10, requested = 10))
+        assertEquals(10, ScenarioPlanPolicy.normalizeRepeatCount(queueSize = 80, requested = 10))
         assertEquals(1, ScenarioPlanPolicy.normalizeRepeatCount(queueSize = 40, requested = 0))
         assertEquals(
             4,
@@ -56,15 +57,23 @@ class ScenarioPlanPolicyTest {
     }
 
     @Test
-    fun expandedRunCountIsBoundedWithoutIntegerOverflow() {
-        val acceptedQueue = List(ScenarioPlanPolicy.MAX_QUEUE_ENTRIES) { scenario("same") }
+    fun manualQueueHasNoAutomationCapWhileExternalExpandedRunsRemainBounded() {
+        val acceptedQueue = List(80) { scenario("same") }
         val accepted = ScenarioRunPlan(
             acceptedQueue,
             repeatCount = ScenarioPlanPolicy.MAX_REPEAT_COUNT,
             source = PlanSource.USER_SELECTION,
         )
-        assertEquals(ScenarioPlanPolicy.MAX_USER_TOTAL_PLAN_RUNS, accepted.totalRuns)
+        assertEquals(800, accepted.totalRuns)
         assertNull(ScenarioPlanPolicy.validate(accepted))
+
+        val externalBoundary = ScenarioRunPlan(
+            List(4) { scenario("external") },
+            repeatCount = ScenarioPlanPolicy.MAX_REPEAT_COUNT,
+            source = PlanSource.EXTERNAL_INTENT,
+        )
+        assertEquals(ScenarioPlanPolicy.MAX_EXTERNAL_TOTAL_PLAN_RUNS, externalBoundary.totalRuns)
+        assertNull(ScenarioPlanPolicy.validate(externalBoundary))
 
         val rejected = ScenarioRunPlan(
             List(5) { scenario("external") },
@@ -110,6 +119,20 @@ class ScenarioPlanPolicyTest {
         assertEquals(1_000L, base.phases.single().transition.cycleMs)
         assertTrue(materialized.scenarios.single() !== base)
         assertTrue(materialized.scenarios.single().phases.single() !== base.phases.single())
+    }
+
+    @Test
+    fun materializationCopiesEachRepeatedPresetOnlyOnce() {
+        val repeated = scenario("repeated")
+        val materialized = ScenarioRunPlan(
+            scenarios = List(80) { repeated },
+            durationMultiplier = 10,
+        ).materializeDurationMultiplier()
+
+        assertEquals(80, materialized.scenarios.size)
+        assertTrue(materialized.scenarios.first() !== repeated)
+        assertTrue(materialized.scenarios.all { it === materialized.scenarios.first() })
+        assertEquals(10_000L, materialized.scenarios.first().durationMs)
     }
 
     @Test
@@ -211,6 +234,25 @@ class ScenarioPlanPolicyTest {
             ScenarioPlanPolicy.validate(
                 ScenarioRunPlan(listOf(hostile), durationMultiplier = 100),
             )?.contains("safely scale") == true,
+        )
+    }
+
+    @Test
+    fun planBeyondIndexedProgressRepresentationIsRejectedBeforeIteration() {
+        val item = scenario("virtual")
+        val virtualQueue = object : AbstractList<ScenarioSpec>() {
+            override val size: Int = Int.MAX_VALUE
+            override fun get(index: Int): ScenarioSpec = item
+        }
+
+        assertTrue(
+            ScenarioPlanPolicy.validate(
+                ScenarioRunPlan(
+                    scenarios = virtualQueue,
+                    repeatCount = 2,
+                    source = PlanSource.USER_SELECTION,
+                ),
+            )?.contains("indexed progress") == true,
         )
     }
 

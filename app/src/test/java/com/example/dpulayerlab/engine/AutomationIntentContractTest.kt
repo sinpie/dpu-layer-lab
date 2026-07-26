@@ -203,7 +203,7 @@ class AutomationIntentContractTest {
             ),
         )
         assertEquals(
-            ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS,
+            ScenarioPlanPolicy.MAX_EXTERNAL_TOTAL_PLAN_RUNS,
             atLimit.scenarioIds.size * atLimit.repeatCount,
         )
 

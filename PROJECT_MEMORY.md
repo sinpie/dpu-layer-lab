@@ -154,8 +154,10 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
     결과는 catalog 순서로 queue에 append/replace하고, queue는 중복과 명시적 이동을
     보존하되 복원된 unknown ID는 실행 index를 만들기 전에 제거한다. 앱 UI repeat
     `N`은 전체 queue를 N회 실행하며, `N > 1`인 회차 경계에서만 마지막 scenario 다음에
-    첫 scenario로 돌아간다. 1은 전체 queue 한 번이고 40-entry queue × 10회 = 400 run
-    상한이다. 외부 Intent는 기존 expanded 40-run 상한을 유지한다.
+    첫 scenario로 돌아간다. 1은 전체 queue 한 번이며 수동 목록에는 임의의 고정
+    entry/expanded-run 상한을 두지 않는다. 외부 Intent는 기존 expanded 40-run 상한을
+    유지한다. Repeat는 전체 expanded list로 만들지 않고 queue×repeat 중첩 순회로
+    실행한다.
     실행 직전의 1/2/5/10/50/100× 시간 배율은 immutable plan copy의 phase duration과
     transition window/cycle에 정확히 한 번 적용한 뒤 기존 duration safety cap을
     통과한다. DPU 저→고 burst와 HWC DEVICE/CLIENT 목적도
@@ -554,12 +556,14 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
   pair만 사용하고 없으면 INCONCLUSIVE다. Session calibration의 SF cache를 phase evidence로
   재사용하지 않으며 untyped active sweep도 vendor pair가 없으면 N/A를 보존한다.
 - 실행 HUD는 동일 source·quality·timestamp이고 2.5초 freshness를 만족한 tuple만
-  `HWC APP RAW D/C/T · AGE · SRC`와 typed `RAW MATCH/WAIT`로 표시하며 그 밖은
-  `RAW N/A`다. `T=D+C`는 같은 tuple의 합이지 physical producer count가 아니다.
+  `HWC APP RAW D/C/T · AGE · SRC`와 typed `현재값 일치/불일치`로 표시하며 그 밖은
+  반복 N/A 대신 `HWC 합성 계측 · 측정값 없음 · bounded reason`을 표시한다.
+  `T=D+C`는 같은 tuple의 합이지 physical producer count가 아니다.
   Pure Compose HUD subtree는 추가 Surface를 만들지 않지만 Activity root/window
   layer는 남고 HWC assignment를 강제할 수 없다. 현재 tuple은 control/root와
   workload producer의 per-layer scope를 분리하지 않으므로
-  `SCOPE 미분리(control/root 보정 없음)`을 표시한다. 동적 HUD text/progress는 최대
+  `APP_RAW_UNSEPARATED`, control/root 무보정과 PHYSICAL producer 분리를 표시한다.
+  동적 HUD text/progress는 최대
   1 Hz로 제한한다. 이를 위해 상위 renderer의 100 ms recomposition과 분리된 immutable
   app-side HUD state snapshot 하나를 넘기며 topology/safety 경계는 즉시 반영한다. 각 run의
   `HWC_COUNT_SCOPE` event도 `APP_RAW_UNSEPARATED`, control layer 포함, subtraction
@@ -607,7 +611,7 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
 
 ## 현재 구현
 
-- DPULayerTest release `20260726_101046` / `20260726_101046-debug`(`versionCode 8`)
+- DPULayerTest release `20260726_152112` / `20260726_152112-debug`(`versionCode 9`)
   launcher/Gradle project, 화면/HUD/report build version과 stable
   `com.example.dpulayerlab`/`DpuLayerLab` 제품 통합 identifier
 - Compose 기반 scenario browser, system dashboard, running HUD, result 화면. 실행
@@ -622,8 +626,9 @@ authority다. 이 문서는 “왜 이 선택을 했는가”만 장기 보존�
 - Typed DPU burst/DEVICE-only/CLIENT-required 목적 quick filter와 접힌 고급
   카테고리/변화 파형/예상 강도/부하·조건 filter. 같은 행 OR, 목적을 포함한 서로 다른
   행 AND를 유지하며 filtered append/replace, 중복·이동이 가능한 ordered queue,
-  restored unknown-ID sanitize, UI whole-queue repeat 1~10/expanded 400-run cap과
-  1/2/5/10/50/100× 시간 배율을 적용한다. 외부 automation은 40-run cap을 유지한다.
+  restored unknown-ID sanitize, 고정 상한 없는 수동 ordered queue, UI whole-queue
+  repeat 1~10과 1/2/5/10/50/100× 시간 배율을 적용한다. 외부 automation은 별도의
+  40-run cap을 유지한다.
 - 독립 Surface, mixed Surface/Texture, flattened RGBA, app-owned EGL stress layer
 - scroll/zoom/pan/rotate/parallax/storm과 physical HWC 변경으로 오해하지 않는
   View/client Z-order proxy animation

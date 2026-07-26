@@ -216,8 +216,8 @@ manifest output에서 다음을 확인한다.
 - hard layer 20
 - producer FPS 120
 - requested display 240 Hz
-- 앱 UI는 40-entry queue × whole-queue repeat 10 = expanded plan 400,
-  외부 Intent는 repeat 10/expanded plan 40
+- 앱 UI 수동 queue에는 임의의 고정 항목/expanded-run 상한이 없고 whole-queue repeat는
+  10회, 외부 Intent는 repeat 10/expanded plan 40
 - UI duration multiplier는 1/2/5/10/50/100이며 phase duration과 transition
   window/cycle에 한 번 materialize한 뒤 기존 duration cap을 적용
 - exact 0 또는 `0.001` 초과 load
@@ -664,7 +664,7 @@ exact DPU, SBWC, NPU와 DEVICE/CLIENT acceptance는
 - pure policy와 boundary test 통과
 - renderer/load의 bounded owner·teardown 증거
 - exact/proxy와 N/A provenance 보존
-- scenario queue/automation cap 유지
+- 수동 queue 무고정상한과 외부 automation 40-run cap 분리 유지
 - schema v2 및 `LayerSizeProfile` round-trip
 - debug/release build 성공
 - 공개 release와 다른 APK를 기존 tag로 위장하지 않음

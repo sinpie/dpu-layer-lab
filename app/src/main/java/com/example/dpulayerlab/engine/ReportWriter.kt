@@ -5,15 +5,14 @@ import com.example.dpulayerlab.BuildConfig
 import com.example.dpulayerlab.model.DeviceIdentity
 import com.example.dpulayerlab.model.MetricQuality
 import com.example.dpulayerlab.model.RunSummary
-import com.example.dpulayerlab.model.ScenarioPlanPolicy
 import java.io.File
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-internal const val MANAGED_REPORT_RETENTION_COUNT =
-    ScenarioPlanPolicy.MAX_USER_TOTAL_PLAN_RUNS
+/** Independent storage-retention policy; it is not a manual plan or queue limit. */
+internal const val MANAGED_REPORT_RETENTION_COUNT = 400
 
 object ReportWriter {
     @Synchronized
@@ -26,8 +25,8 @@ object ReportWriter {
 
     /**
      * Atomically publishes a revised report, removes the obsolete publication, and only then
-     * applies retention. This ordering keeps a full 400-run plan at 400 reports instead of pruning
-     * its first report before the final report replacement is removed.
+     * applies retention. This ordering keeps the retained set at 400 reports instead of pruning
+     * one extra report before the obsolete replacement is removed.
      */
     @Synchronized
     fun replace(context: Context, summary: RunSummary, obsoleteReport: File?): File =
@@ -372,6 +371,11 @@ object ReportWriter {
                 append(
                     """"hwcCompositionEvidenceAgeMs": ${
                         sample.hwcCompositionEvidenceAgeMs ?: "null"
+                    }, """,
+                )
+                append(
+                    """"hwcCompositionEvidenceAvailability": ${
+                        quote(sample.hwcCompositionEvidenceAvailability.name)
                     }, """,
                 )
                 append(""""surfaceFlingerHwcMissed": ${sample.surfaceFlingerHwcMissed ?: "null"}, """)

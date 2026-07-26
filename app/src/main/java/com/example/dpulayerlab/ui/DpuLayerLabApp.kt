@@ -37,6 +37,7 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -106,6 +107,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.example.dpulayerlab.BuildConfig
 import com.example.dpulayerlab.engine.LabController
+import com.example.dpulayerlab.engine.MANAGED_REPORT_RETENTION_COUNT
 import com.example.dpulayerlab.engine.ErrorRecoveryAction
 import com.example.dpulayerlab.engine.ScenarioCatalog
 import com.example.dpulayerlab.engine.GaugePeak
@@ -115,6 +117,7 @@ import com.example.dpulayerlab.model.BufferPresentation
 import com.example.dpulayerlab.model.DecoderLinearReference
 import com.example.dpulayerlab.model.Gauge
 import com.example.dpulayerlab.model.HwcCompositionExpectation
+import com.example.dpulayerlab.model.HwcCompositionEvidenceAvailability
 import com.example.dpulayerlab.model.LayerBackend
 import com.example.dpulayerlab.model.LayerOrientation
 import com.example.dpulayerlab.model.LayerSizeProfile
@@ -281,9 +284,9 @@ internal data class DashboardPurposeScenario(
 )
 
 internal enum class RawHwcExpectationState(val label: String) {
-    MATCH("RAW MATCH"),
-    WAIT("RAW WAIT"),
-    N_A("RAW N/A"),
+    MATCH("현재값 일치"),
+    WAIT("현재값 불일치"),
+    N_A("현재값 없음"),
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -1240,8 +1243,6 @@ private fun CatalogScreen(
                     ScenarioCard(
                         scenario = scenario,
                         selectedPositions = selectedPositions[scenario.id].orEmpty(),
-                        queueFull =
-                            selectedScenarioIds.size >= ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS,
                         queueEditable = !controller.isRunning,
                         addSelection = { addScenario(scenario.id) },
                         removeSelection = { removeScenario(scenario.id) },
@@ -1630,13 +1631,7 @@ private fun CatalogBulkSelectionCard(
     appendResults: () -> Unit,
     replaceWithResults: () -> Unit,
 ) {
-    val availableQueueSlots =
-        (ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS - queueSize).coerceAtLeast(0)
-    val appendCount = minOf(resultCount.coerceAtLeast(0), availableQueueSlots)
-    val replaceCount = minOf(
-        resultCount.coerceAtLeast(0),
-        ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS,
-    )
+    val selectionCount = resultCount.coerceAtLeast(0)
     Card(
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.55f),
@@ -1649,18 +1644,19 @@ private fun CatalogBulkSelectionCard(
         ) {
             Text("2. 테스트 선택", style = MaterialTheme.typography.titleMedium)
             Text(
-                "현재 조건의 ${resultCount}개를 한 번에 선택하거나 아래에서 하나씩 추가하세요. " +
-                    "실행 큐는 $queueSize/${ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS}개입니다.",
+                "조건에 맞는 테스트 ${selectionCount}개 · 실행 목록 " +
+                    "${queueSize.coerceAtLeast(0)}항목\n" +
+                    "결과 전체로 목록을 바꾸거나, 같은 테스트를 반복하려면 목록 끝에 추가하세요.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.labelLarge,
             )
             if (queueSize == 0) {
                 Button(
                     onClick = replaceWithResults,
-                    enabled = replaceCount > 0 && !running,
+                    enabled = selectionCount > 0 && !running,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
-                    Text("보이는 테스트 모두 선택 · $replaceCount")
+                    Text("보이는 테스트 ${selectionCount}개를 실행 목록에 담기")
                 }
             } else {
                 Row(
@@ -1669,19 +1665,19 @@ private fun CatalogBulkSelectionCard(
                 ) {
                     OutlinedButton(
                         onClick = replaceWithResults,
-                        enabled = replaceCount > 0 && !running,
+                        enabled = selectionCount > 0 && !running,
                         modifier = Modifier.weight(1f),
                         contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp),
                     ) {
-                        Text("큐 교체 · $replaceCount")
+                        Text("결과로 교체 · $selectionCount")
                     }
                     Button(
                         onClick = appendResults,
-                        enabled = appendCount > 0 && !running,
+                        enabled = selectionCount > 0 && !running,
                         modifier = Modifier.weight(1f),
                         contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp),
                     ) {
-                        Text("뒤에 추가 · $appendCount")
+                        Text("목록 끝에 추가 · $selectionCount")
                     }
                 }
             }
@@ -1725,7 +1721,7 @@ private fun SelectionPlanDock(
                     if (selectedScenarios.isEmpty()) {
                         "실행할 테스트를 선택하세요"
                     } else {
-                        "선택 ${selectedScenarios.size}개 · 총 ${plan.totalRuns}회"
+                        "실행 목록 ${selectedScenarios.size}항목 · 총 ${plan.totalRuns}회"
                     },
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.SemiBold,
@@ -1804,7 +1800,7 @@ private fun QueuePlanCard(
 ) {
     var queueExpanded by rememberSaveable { mutableStateOf(false) }
     var detailsExpanded by rememberSaveable { mutableStateOf(false) }
-    val expandedQueueScroll = rememberScrollState()
+    val expandedQueueScroll = rememberLazyListState()
     val expandedQueueMaxHeight = (
         LocalConfiguration.current.screenHeightDp * 0.55f
         ).roundToInt().coerceIn(220, 420).dp
@@ -1835,7 +1831,6 @@ private fun QueuePlanCard(
     val selectAllTarget = remember {
         ScenarioCatalog.presets
             .map { it.id }
-            .take(ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS)
     }
     val selectionMatchesCatalog = remember(selectedScenarios, selectAllTarget) {
         selectedScenarios.map { it.id } == selectAllTarget
@@ -1878,7 +1873,7 @@ private fun QueuePlanCard(
                     shape = RoundedCornerShape(100.dp),
                 ) {
                     Text(
-                        "${selectedScenarios.size}개",
+                        "${selectedScenarios.size}항목",
                         modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.dp),
                         color = if (selectedScenarios.isEmpty()) {
                             MaterialTheme.colorScheme.onSurfaceVariant
@@ -1896,7 +1891,7 @@ private fun QueuePlanCard(
             ) {
                 ScenarioAttribute(
                     label = "항목",
-                    value = "${selectedScenarios.size} tests",
+                    value = "${selectedScenarios.size}개",
                     modifier = Modifier.weight(1f),
                 )
                 ScenarioAttribute(
@@ -1938,15 +1933,15 @@ private fun QueuePlanCard(
                             onClick = { queueExpanded = false },
                             modifier = Modifier.fillMaxWidth(),
                         ) {
-                            Text("큐 접기 · 앞 ${COLLAPSED_QUEUE_ENTRY_LIMIT}개만 보기")
+                            Text("목록 접기 · 앞 ${COLLAPSED_QUEUE_ENTRY_LIMIT}개만 보기")
                         }
-                        Column(
+                        LazyColumn(
                             modifier = Modifier
-                                .heightIn(max = expandedQueueMaxHeight)
-                                .verticalScroll(expandedQueueScroll),
+                                .heightIn(max = expandedQueueMaxHeight),
+                            state = expandedQueueScroll,
                             verticalArrangement = Arrangement.spacedBy(7.dp),
                         ) {
-                            selectedScenarios.forEachIndexed { index, scenario ->
+                            itemsIndexed(selectedScenarios) { index, scenario ->
                                 QueueEntryRow(
                                     index = index,
                                     scenario = scenario,
@@ -2021,13 +2016,20 @@ private fun QueuePlanCard(
                 }
             }
             Text(
-                "반복 최대 ${ScenarioPlanPolicy.MAX_REPEAT_COUNT}회 · 전체 실행 최대 " +
-                    "${ScenarioPlanPolicy.MAX_USER_TOTAL_PLAN_RUNS}회 · 현재 ${totalRuns}회",
+                "반복 최대 ${ScenarioPlanPolicy.MAX_REPEAT_COUNT}회 · 현재 총 ${totalRuns}회 실행",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.labelMedium,
             )
+            if (totalRuns > MANAGED_REPORT_RETENTION_COUNT) {
+                Text(
+                    "실행 횟수 제한은 없지만 JSON 보고서는 최신 " +
+                        "${MANAGED_REPORT_RETENTION_COUNT}개를 보관합니다.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
             Text(
-                "한 LOOP는 위 queue 전체를 끝까지 실행한 뒤 첫 항목으로 돌아갑니다.",
+                "한 LOOP는 위 실행 목록 전체를 끝까지 실행한 뒤 첫 항목으로 돌아갑니다.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.labelSmall,
             )
@@ -2069,15 +2071,7 @@ private fun QueuePlanCard(
                     enabled = !selectionMatchesCatalog && !running,
                     modifier = Modifier.weight(1f),
                 ) {
-                    Text(
-                        if (ScenarioCatalog.presets.size >
-                            ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS
-                        ) {
-                            "앞 ${ScenarioPlanPolicy.MAX_TOTAL_PLAN_RUNS}개로 교체"
-                        } else {
-                            "전체로 교체"
-                        },
-                    )
+                    Text("전체로 교체")
                 }
                 TextButton(
                     onClick = clearSelection,
@@ -2197,7 +2191,10 @@ private fun QueueSelectionPreviewCard(preview: ScenarioSelectionPreview) {
         ) {
             Text(
                 buildString {
-                    append("선택 요약 · ${preview.queueEntries}회 / ${preview.uniqueScenarios}종")
+                    append(
+                        "실행 목록 · ${preview.queueEntries}항목 / " +
+                            "${preview.uniqueScenarios}종",
+                    )
                     if (preview.duplicateEntries > 0) {
                         append(" · 중복 ${preview.duplicateEntries}회")
                     }
@@ -2274,7 +2271,6 @@ private fun PlanLaunchCard(
     val mediaReady = !mediaRequired || mediaSelected
     val runnable =
         selectedScenarios.isNotEmpty() &&
-            plan.totalRuns in 1..ScenarioPlanPolicy.MAX_USER_TOTAL_PLAN_RUNS &&
             mediaReady &&
             !running
     Card(
@@ -2324,7 +2320,6 @@ private fun PlanLaunchCard(
 private fun ScenarioCard(
     scenario: ScenarioSpec,
     selectedPositions: List<Int>,
-    queueFull: Boolean,
     queueEditable: Boolean,
     addSelection: () -> Unit,
     removeSelection: () -> Unit,
@@ -2499,7 +2494,7 @@ private fun ScenarioCard(
                     }
                     Button(
                         onClick = addSelection,
-                        enabled = queueEditable && !queueFull,
+                        enabled = queueEditable,
                         modifier = Modifier.weight(1f),
                     ) {
                         Text("1회 더 추가")
@@ -2508,10 +2503,10 @@ private fun ScenarioCard(
             } else {
                 Button(
                     onClick = addSelection,
-                    enabled = queueEditable && !queueFull,
+                    enabled = queueEditable,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
-                    Text(if (queueFull) "실행 큐가 가득 찼습니다" else "실행 큐에 추가")
+                    Text("실행 항목에 추가")
                 }
             }
         }
@@ -3453,7 +3448,7 @@ private fun NoExtraSurfaceRunningHud(
     val liveMetrics = listOf(
         LiveHudMetricSpec(
             label = "PHYSICAL",
-            provenance = logicalLayerHudLabel(phase?.activeLayers),
+            provenance = "APP PRODUCER · ${logicalLayerHudLabel(phase?.activeLayers)}",
             value = physicalProducerValue,
             valueText = if (phase != null) {
                 producerCountDisplay(
@@ -3526,7 +3521,7 @@ private fun NoExtraSurfaceRunningHud(
                             overflow = TextOverflow.Ellipsis,
                         )
                         Text(
-                            "QUEUE ${planProgress.currentQueuePosition}/" +
+                            "항목 ${planProgress.currentQueuePosition}/" +
                                 "${planProgress.queueSize} · LOOP ${planProgress.currentRepeat}/" +
                                 "${planProgress.repeatCount} · TIME " +
                                 "${planProgress.durationMultiplier}× · " +
@@ -3742,7 +3737,8 @@ private fun NoExtraSurfaceRunningHud(
                                 when {
                                     coolingDown -> "Cooldown · 부하 해제 및 counter 안정화"
                                     progress.phase != null ->
-                                        "현재 LOGICAL ${progress.phase.activeLayers}L / PHYSICAL " +
+                                        "현재 LOGICAL ${progress.phase.activeLayers}L / " +
+                                            "PHYSICAL PRODUCER " +
                                             producerCountDisplay(
                                                 observed = progress.observedProducerCount,
                                                 expected = progress.expectedProducerCount,
@@ -4591,6 +4587,9 @@ private fun PlanResultCard(
     result: PlanRunResult,
     shareReport: () -> Unit,
 ) {
+    val reportAvailable = result.reportPath
+        ?.let { java.io.File(it) }
+        ?.isFile == true
     val verdictColor = when (result.verdict) {
         RunVerdict.CLEAN -> MaterialTheme.colorScheme.primary
         RunVerdict.UNDERRUN_DETECTED -> MaterialTheme.colorScheme.error
@@ -4627,7 +4626,7 @@ private fun PlanResultCard(
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    "Loop ${result.repeatIndex + 1} · Queue ${result.queueIndex + 1} · " +
+                    "Loop ${result.repeatIndex + 1} · 항목 ${result.queueIndex + 1} · " +
                         formatDuration(result.finishedEpochMs - result.startedEpochMs),
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     style = MaterialTheme.typography.labelMedium,
@@ -4648,15 +4647,15 @@ private fun PlanResultCard(
                     )
                 }
                 Text(
-                    if (result.reportPath.isNullOrBlank()) {
-                        "JSON 보고서 없음"
-                    } else {
+                    if (reportAvailable) {
                         "JSON 보고서 저장됨"
-                    },
-                    color = if (result.reportPath.isNullOrBlank()) {
-                        MaterialTheme.colorScheme.error
                     } else {
+                        "JSON 보고서 없음 또는 보관 한도에서 정리됨"
+                    },
+                    color = if (reportAvailable) {
                         MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.error
                     },
                     style = MaterialTheme.typography.labelSmall,
                 )
@@ -4677,7 +4676,7 @@ private fun PlanResultCard(
                 }
                 TextButton(
                     onClick = shareReport,
-                    enabled = !result.reportPath.isNullOrBlank(),
+                    enabled = reportAvailable,
                 ) {
                     Text("JSON 공유", fontSize = 10.sp)
                 }
@@ -5312,13 +5311,14 @@ private inline fun <reified T : Enum<T>> enumSelectionSummary(
 internal fun scenarioSelectionPreview(
     scenarios: List<ScenarioSpec>,
 ): ScenarioSelectionPreview {
-    val phases = scenarios.flatMap(ScenarioSpec::phases)
+    val uniqueScenarios = scenarios.distinctBy(ScenarioSpec::id)
+    val phases = uniqueScenarios.flatMap(ScenarioSpec::phases)
     if (phases.isEmpty()) {
         return ScenarioSelectionPreview(
             queueEntries = scenarios.size,
-            uniqueScenarios = scenarios.distinctBy(ScenarioSpec::id).size,
+            uniqueScenarios = uniqueScenarios.size,
             duplicateEntries =
-                (scenarios.size - scenarios.distinctBy(ScenarioSpec::id).size).coerceAtLeast(0),
+                (scenarios.size - uniqueScenarios.size).coerceAtLeast(0),
             inputChange = "실행 가능한 phase 없음",
             compositionTarget = "합성 목표 N/A",
             verification = "실행 전 plan 검증 결과를 확인",
@@ -5336,7 +5336,7 @@ internal fun scenarioSelectionPreview(
         phases.map(PhaseSpec::layerSizeProfile),
     )
     val patterns = ScenarioChangePattern.entries.filter { pattern ->
-        scenarios.any { pattern in ScenarioClassifier.changePatterns(it) }
+        uniqueScenarios.any { pattern in ScenarioClassifier.changePatterns(it) }
     }
     val patternSummary = patterns.take(2).joinToString("/") { it.previewLabel() } +
         if (patterns.size > 2) " +${patterns.size - 2}" else ""
@@ -5375,7 +5375,7 @@ internal fun scenarioSelectionPreview(
         else ->
             "HWC 자동 배정/검증 목표 없음"
     }
-    val uniqueCount = scenarios.distinctBy(ScenarioSpec::id).size
+    val uniqueCount = uniqueScenarios.size
     return ScenarioSelectionPreview(
         queueEntries = scenarios.size,
         uniqueScenarios = uniqueCount,
@@ -5485,31 +5485,22 @@ internal fun hwcLayerCountLiveSummary(
         telemetry = telemetry,
         nowMonotonicMs = nowMonotonicMs,
     )
-    val device = pair?.deviceLayers?.toString() ?: "N/A"
-    val client = pair?.clientLayers?.toString() ?: "N/A"
-    val total = pair?.totalLayers?.toString() ?: "N/A"
-    val age = pair?.ageMs?.let { "${it}ms" } ?: "N/A"
-    val provenance = pair?.let {
-        compactHwcSource(
-            valueAvailable = true,
-            quality = it.quality,
-            source = it.source,
+    if (pair == null) {
+        val availability = liveHwcCompositionAvailability(
+            telemetry = telemetry,
+            nowMonotonicMs = nowMonotonicMs,
         )
-    } ?: run {
-        val deviceSource = compactHwcSource(
-            valueAvailable = false,
-            quality = telemetry.hwcDeviceLayersQuality,
-            source = telemetry.hwcDeviceLayersSource,
-        )
-        val clientSource = compactHwcSource(
-            valueAvailable = false,
-            quality = telemetry.hwcClientLayersQuality,
-            source = telemetry.hwcClientLayersSource,
-        )
-        if (deviceSource == clientSource) deviceSource else "D $deviceSource / C $clientSource"
+        return "HWC 합성 계측 · 측정값 없음 · ${availability.hudReason()}\n" +
+            "APP_RAW_UNSEPARATED · control/root 포함·보정 없음 · PHYSICAL producer와 별도"
     }
-    return "HWC APP RAW · D $device/C $client/T $total · AGE $age · SRC $provenance\n" +
-        "SCOPE 미분리(control/root 보정 없음) · HUD extra Surface 0"
+    val provenance = compactHwcSource(
+        valueAvailable = true,
+        quality = pair.quality,
+        source = pair.source,
+    )
+    return "HWC APP RAW · D ${pair.deviceLayers}/C ${pair.clientLayers}/" +
+        "T ${pair.totalLayers} · AGE ${pair.ageMs}ms · SRC $provenance\n" +
+        "APP_RAW_UNSEPARATED · control/root 포함·보정 없음 · PHYSICAL producer와 별도"
 }
 
 internal fun hwcExpectationLiveSummary(
@@ -5526,29 +5517,77 @@ internal fun hwcExpectationLiveSummary(
         telemetry = telemetry,
         nowMonotonicMs = nowMonotonicMs,
     )
-    val device = pair?.deviceLayers?.toString() ?: "N/A"
-    val client = pair?.clientLayers?.toString() ?: "N/A"
-    val total = pair?.totalLayers?.toString() ?: "N/A"
-    val age = pair?.ageMs?.let { "${it}ms" } ?: "N/A"
-    val deviceSource = compactHwcSource(
-        valueAvailable = pair != null,
-        quality = telemetry.hwcDeviceLayersQuality,
-        source = telemetry.hwcDeviceLayersSource,
-    )
-    val clientSource = compactHwcSource(
-        valueAvailable = pair != null,
-        quality = telemetry.hwcClientLayersQuality,
-        source = telemetry.hwcClientLayersSource,
-    )
-    val provenance = if (deviceSource == clientSource) {
-        deviceSource
-    } else {
-        "D $deviceSource / C $clientSource"
+    if (pair == null) {
+        val availability = liveHwcCompositionAvailability(
+            telemetry = telemetry,
+            nowMonotonicMs = nowMonotonicMs,
+        )
+        return "HWC 합성 계측 · 측정값 없음 · ${availability.hudReason()}\n" +
+            "목표 ${expectation.validationBadge()} · APP_RAW_UNSEPARATED · " +
+            "PHYSICAL producer/최종 판정 별도"
     }
-    return "HWC APP RAW · ${rawState.label} · D $device/C $client/T $total · " +
-        "AGE $age · SRC $provenance\n" +
-        "목표 ${expectation.validationBadge()} · scope 미분리 · " +
-        "target/횟수는 controller 최종 판정"
+    val provenance = compactHwcSource(
+        valueAvailable = true,
+        quality = pair.quality,
+        source = pair.source,
+    )
+    return "HWC APP RAW · ${rawState.label} · D ${pair.deviceLayers}/" +
+        "C ${pair.clientLayers}/T ${pair.totalLayers} · AGE ${pair.ageMs}ms · " +
+        "SRC $provenance\n" +
+        "목표 ${expectation.validationBadge()} · APP_RAW_UNSEPARATED · " +
+        "PHYSICAL producer/최종 판정 별도"
+}
+
+internal fun liveHwcCompositionAvailability(
+    telemetry: TelemetrySnapshot,
+    nowMonotonicMs: Long = telemetry.monotonicMs,
+): HwcCompositionEvidenceAvailability {
+    if (
+        atomicHwcCompositionPair(
+            telemetry = telemetry,
+            nowMonotonicMs = nowMonotonicMs,
+        ) != null
+    ) {
+        return HwcCompositionEvidenceAvailability.AVAILABLE
+    }
+    val evidenceMs = telemetry.hwcCompositionEvidenceMonotonicMs
+    if (
+        evidenceMs != null &&
+        evidenceMs >= 0L &&
+        nowMonotonicMs >= evidenceMs &&
+        nowMonotonicMs - evidenceMs > HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS
+    ) {
+        return HwcCompositionEvidenceAvailability.EVIDENCE_STALE
+    }
+    return telemetry.hwcCompositionEvidenceAvailability.takeUnless {
+        it == HwcCompositionEvidenceAvailability.AVAILABLE
+    } ?: HwcCompositionEvidenceAvailability.EVIDENCE_INVALID
+}
+
+private fun HwcCompositionEvidenceAvailability.hudReason(): String = when (this) {
+    HwcCompositionEvidenceAvailability.AVAILABLE -> "사용 가능"
+    HwcCompositionEvidenceAvailability.ACTIVE_RUN_VENDOR_PAIR_UNAVAILABLE ->
+        "실행 중 SF 조회 억제 · fresh Vendor D/C 없음"
+    HwcCompositionEvidenceAvailability.ACTIVE_RUN_VENDOR_PAIR_INVALID ->
+        "실행 중 SF 조회 억제 · Vendor D/C 무효"
+    HwcCompositionEvidenceAvailability.ACTIVE_RUN_VENDOR_PAIR_STALE ->
+        "실행 중 SF 조회 억제 · Vendor D/C 만료"
+    HwcCompositionEvidenceAvailability.DUMP_PERMISSION_UNAVAILABLE ->
+        "DUMP 권한 없음 · SF 계측 불가"
+    HwcCompositionEvidenceAvailability.SURFACE_FLINGER_PAIR_UNAVAILABLE ->
+        "SF에 앱 D/C pair 없음"
+    HwcCompositionEvidenceAvailability.SURFACE_FLINGER_PAIR_INVALID ->
+        "SF D/C pair 무효"
+    HwcCompositionEvidenceAvailability.SURFACE_FLINGER_EVIDENCE_STALE ->
+        "SF 계측값 만료"
+    HwcCompositionEvidenceAvailability.SURFACE_FLINGER_PROBE_FAILED ->
+        "SF 조회 실패 또는 시간 초과"
+    HwcCompositionEvidenceAvailability.EVIDENCE_INVALID ->
+        "D/C 원자쌍 형식 무효"
+    HwcCompositionEvidenceAvailability.EVIDENCE_STALE ->
+        "계측값 만료(2.5초 초과)"
+    HwcCompositionEvidenceAvailability.UNAVAILABLE ->
+        "계측 경로 정보 없음"
 }
 
 internal fun rawHwcExpectationState(

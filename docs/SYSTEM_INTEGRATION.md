@@ -56,10 +56,10 @@ Product image
 
 샘플 `Android.bp`는 Soong이 platform certificate로 다시 서명하는 구성입니다. 외부에서 이미 platform key로 서명한 APK를 쓴다면 `certificate: "PRESIGNED"`로 바꿉니다.
 
-최신 공개 GitHub Release의 `DPULayerTest-20260726_101046-debug.apk`는 Android debug key로 서명된
+최신 공개 GitHub Release의 `DPULayerTest-20260726_152112-debug.apk`는 Android debug key로 서명된
 lab-only 산출물이며 debug manifest가 automation alias의 `CONTROL_TESTS` permission을
 제거합니다. 제품 이미지에 넣지 마세요.
-`DPULayerTest-20260726_101046-release-unsigned.apk`는 Soong 또는 secure signing
+`DPULayerTest-20260726_152112-release-unsigned.apk`는 Soong 또는 secure signing
 pipeline 입력용이며 그대로 설치하는 최종 제품 APK가 아닙니다. Platform key,
 certificate, keystore, password/token은 저장소, GitHub Release, `dist/`에 두지 않고
 제품 보안 환경에서만 사용합니다. Release에는 두 APK와 `SHA256SUMS.txt`만 배포합니다.
@@ -720,7 +720,7 @@ matching priority owner를 반드시 해제합니다.
 
 API v1 원자 쌍과 SurfaceFlinger text fallback은 app raw scope이며 control/root를
 workload producer에서 분리하지 않습니다. 따라서 HUD의 `HWC APP RAW D/C/T`와
-`RAW MATCH/WAIT/N/A`는 보조 관측일 뿐 workload-only plane 판정이 아닙니다. 특히 pure
+`현재값 일치/불일치/없음`은 보조 관측일 뿐 workload-only plane 판정이 아닙니다. 특히 pure
 Compose HUD의 extra Surface가 0이라는 사실은 app Window root의 HWC contribution이
 0이라는 뜻이 아닙니다. Alpha, rotation, `TextureView`, software/hardware View layer,
 `SurfaceControl.Transaction` geometry 같은 app 입력은 HWC 선택에 영향을 줄 수 있지만

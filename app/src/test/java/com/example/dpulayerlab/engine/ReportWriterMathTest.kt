@@ -3,10 +3,10 @@ package com.example.dpulayerlab.engine
 import com.example.dpulayerlab.model.DeviceIdentity
 import com.example.dpulayerlab.model.Gauge
 import com.example.dpulayerlab.model.HwcCompositionExpectation
+import com.example.dpulayerlab.model.HwcCompositionEvidenceAvailability
 import com.example.dpulayerlab.model.MetricQuality
 import com.example.dpulayerlab.model.RunSummary
 import com.example.dpulayerlab.model.RunVerdict
-import com.example.dpulayerlab.model.ScenarioPlanPolicy
 import com.example.dpulayerlab.model.TelemetrySnapshot
 import java.nio.file.Files
 import org.junit.Assert.assertEquals
@@ -16,12 +16,8 @@ import org.junit.Test
 
 class ReportWriterMathTest {
     @Test
-    fun reportRetentionCoversTheLargestInAppPlan() {
+    fun reportRetentionIsIndependentFromManualPlanLength() {
         assertEquals(400, MANAGED_REPORT_RETENTION_COUNT)
-        assertEquals(
-            ScenarioPlanPolicy.MAX_USER_TOTAL_PLAN_RUNS,
-            MANAGED_REPORT_RETENTION_COUNT,
-        )
     }
 
     @Test
@@ -352,6 +348,8 @@ class ReportWriterMathTest {
             hwcClientLayersSource = "IDpuLabVendorService",
             hwcCompositionEvidenceMonotonicMs = 9L,
             hwcCompositionEvidenceAgeMs = 1L,
+            hwcCompositionEvidenceAvailability =
+                HwcCompositionEvidenceAvailability.AVAILABLE,
             surfaceFlingerHwcMissed = 1L,
             surfaceFlingerMissSource = "SurfaceFlinger latency",
             surfaceFlingerEvidenceMonotonicMs = 9L,
@@ -416,6 +414,7 @@ class ReportWriterMathTest {
         assertTrue(json.contains(""""hwcClientLayersSource": "IDpuLabVendorService""""))
         assertTrue(json.contains(""""hwcCompositionEvidenceMonotonicMs": 9"""))
         assertTrue(json.contains(""""hwcCompositionEvidenceAgeMs": 1"""))
+        assertTrue(json.contains(""""hwcCompositionEvidenceAvailability": "AVAILABLE""""))
         assertTrue(json.contains(""""hwcDeviceLayersSource": "SurfaceFlinger""""))
         assertTrue(json.contains(""""hwcClientLayersSource": "SurfaceFlinger""""))
         assertTrue(json.contains(""""hwcCompositionEvidenceMonotonicMs": 18"""))
@@ -431,6 +430,41 @@ class ReportWriterMathTest {
         assertTrue(
             json.indexOf(""""dpuBusySource": "IDpuLabVendorService"""") <
                 json.indexOf(""""dpuBusySource": "/sys/class/dpu/busy""""),
+        )
+    }
+
+    @Test
+    fun unavailableHwcEvidenceKeepsNullCountsAndBoundedReasonCode() {
+        val summary = RunSummary(
+            scenario = ScenarioCatalog.presets.first(),
+            startedEpochMs = 1_000L,
+            finishedEpochMs = 2_000L,
+            verdict = RunVerdict.INCONCLUSIVE,
+            exactUnderrunDelta = null,
+            exactUnderrunSource = null,
+            exactUnderrunQuality = MetricQuality.UNAVAILABLE,
+            suspectedUnderrunDelta = 0L,
+            peakCpu = null,
+            peakMemoryUsed = null,
+            peakGeneratedBandwidth = null,
+            events = emptyList(),
+            samples = listOf(
+                TelemetrySnapshot(
+                    hwcCompositionEvidenceAvailability =
+                        HwcCompositionEvidenceAvailability
+                            .ACTIVE_RUN_VENDOR_PAIR_UNAVAILABLE,
+                ),
+            ),
+        )
+
+        val json = ReportWriter.toJson(summary, TEST_DEVICE)
+
+        assertTrue(json.contains(""""hwcDeviceLayers": null"""))
+        assertTrue(json.contains(""""hwcClientLayers": null"""))
+        assertTrue(
+            json.contains(
+                """"hwcCompositionEvidenceAvailability": "ACTIVE_RUN_VENDOR_PAIR_UNAVAILABLE"""",
+            ),
         )
     }
 

@@ -8,9 +8,9 @@ class AppVersionTest {
     @Test
     fun releaseVersionUsesTimestampAndOnlyDebugAddsVariantSuffix() {
         val expected = if (BuildConfig.DEBUG) {
-            "20260726_101046-debug"
+            "20260726_152112-debug"
         } else {
-            "20260726_101046"
+            "20260726_152112"
         }
         assertEquals(expected, BuildConfig.VERSION_NAME)
         assertTrue(
@@ -22,6 +22,6 @@ class AppVersionTest {
 
     @Test
     fun versionCodeMatchesRelease() {
-        assertEquals(8, BuildConfig.VERSION_CODE)
+        assertEquals(9, BuildConfig.VERSION_CODE)
     }
 }

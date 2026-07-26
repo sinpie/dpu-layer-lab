@@ -174,7 +174,7 @@ Result를 observed로 수락하려면 다음이 모두 참이어야 한다.
 UI 예:
 
 ```text
-HWC capacity · session 1회 · 요청 20L · 실제 후보 12L · HWC APP RAW D8/C4/T12 · SCOPE 미분리
+HWC capacity · session 1회 · 요청 20L · 실제 후보 12L · HWC APP RAW D8/C4/T12 · APP_RAW_UNSEPARATED
 ```
 
 Report event:

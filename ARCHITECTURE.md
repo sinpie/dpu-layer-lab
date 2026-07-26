@@ -133,7 +133,9 @@ app API로 root를 HWC `DEVICE`/`CLIENT` 중 하나로 강제하거나 HWC 관�
 
 queue의 duplicate는 A/B/A를 표현하기 위해 의도적으로 유지한다. 외부 automation은
 catalog preset만 사용할 수 있고 repeat 10, expanded run 40 상한을 가진다.
-앱 UI plan은 bounded 40-entry queue 전체를 최대 10회 loop해 최대 400 run을 허용한다.
+앱 UI plan의 수동 queue에는 임의의 고정 항목/expanded-run 상한이 없고 전체를 최대
+10회 loop한다. Controller는 repeat를 펼친 목록을 만들지 않고 queue×repeat를 순차
+순회하며, 같은 preset이 중복된 immutable execution copy는 공유한다.
 `durationMultiplier`는 1/2/5/10/50/100 중 하나이며 controller가 immutable execution
 copy를 만들 때 phase duration과 transition window/cycle에 한 번만 적용한다. 이후
 device safety policy가 phase 10분/scenario 30분 상한을 명시적으로 적용한다.
@@ -468,6 +470,9 @@ sticky cleanup latch가 남으면 같은 process에서 새 controller/plan을 �
 `dpu-layer-lab-*.json.part`를 쓰고 flush/fsync한 뒤 `.json`으로 rename한다.
 publisher는 process 안에서 직렬화된다. 방금 게시한 파일을 보호하면서 managed completed
 JSON만 최신 400개로 best-effort 보존한다.
+이 retention은 수동 plan 길이와 독립된 저장 정책이다. 400회를 넘는 plan도 실행할 수
+있지만 오래된 JSON은 실행 중 정리될 수 있으며 결과 UI는 실제 파일 존재 여부를
+기준으로 공유 가능 상태를 표시한다.
 
 report에는 device fingerprint와 vendor provenance가 포함되며 네트워크로 자동 전송하지
 않는다. schema와 metric 의미는 [docs/METRICS.md](docs/METRICS.md), privacy와 사용자
