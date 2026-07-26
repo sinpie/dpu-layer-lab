@@ -104,6 +104,18 @@ Compose의 주요 section은 다음과 같다.
 UI는 실행 권한의 authority가 아니다. 모든 renderer 입력은 controller의 runtime safety
 policy를 다시 통과한다.
 
+Running HUD는 `LayerStageView`를 감싼 같은 Activity root 안에서 그리는 pure Compose다.
+HUD 자체가 `SurfaceView`, `TextureView` 또는 별도 `SurfaceControl`을 만들지 않으므로
+추가 physical producer와 SurfaceFlinger/HWC surface 수는 0이다.
+`controlLayerIncluded=true`는 HUD 전용 layer가 있다는 뜻이 아니라 Compose를 담은 app
+Window root가 화면에 남는다는 뜻이다. Running HUD는 동적 값을 하나의 immutable
+snapshot 인자로 받고 그 snapshot 교체를 app-side 최대 1 Hz로 제한해 상위 renderer의
+100 ms progress recomposition과 격리한다. 이 정책은 불필요한 app-side redraw를 줄일
+뿐 root buffer update를 없애거나, Android public API 또는 platform-signed/privileged
+app API로 root를 HWC `DEVICE`/`CLIENT` 중 하나로 강제하거나 HWC 관측에서 제외하는
+보장이 아니다. Compose나 `TextureView`가 app-side에서 root buffer로 flatten된다는
+사실도 HWC `CLIENT` composition의 증거가 아니다.
+
 ## 핵심 모델
 
 `model/LabModels.kt`의 계층은 다음과 같다.
@@ -225,6 +237,15 @@ serialization과 cleanup 조건은
 [HWC capacity calibration](docs/HWC_CAPACITY_CALIBRATION.md)에 정의한다. Architecture
 관점에서 이 calibration은 첫 scenario의 warm-up/baseline보다 앞에 있는 advisory
 sub-transaction이며 이후 plan execution과 evidence budget을 오염시키지 않아야 한다.
+Requested/actual candidate와 같은-sample app raw `T`는 해당 topology의 관측값일 뿐
+workload plane ceiling, 보편적 HWC maximum 또는 renderer safety cap이 아니다.
+
+Scenario-wide counter baseline은 warm-up 시간만 채웠다고 시작하지 않는다. Bounded
+readiness window 안에서 warm-up topology publication과 matching geometry acknowledgment를
+먼저 확인하고 generation을 activation한 뒤, preparation-era callback을 지운 이후의
+모든 producer fresh first buffer를 확인해야 한다. Fresh baseline sample 완료 뒤에도
+같은 topology/geometry/readiness를 다시 검사하며, 중간 변경은 baseline을 무효화하고
+run을 fail-closed한다.
 
 ## Phase transaction
 
@@ -261,6 +282,12 @@ seal하므로 늦은 control tick도 ratio 분자만 늘리지 않는다.
 - `INDEPENDENT_SURFACES`: logical layer마다 독립 physical producer
 - `MIXED_SURFACE_TEXTURE`: Surface/Texture 혼합, 필요하면 GL tail
 - `FLATTENED_TEXTURE`: display-sized RGBA producer 하나
+
+여기서 physical producer는 generation에 결속된 BufferQueue/frame callback 단위다.
+Pure Compose HUD/Activity root는 이 수에 들어가지 않고, `TextureView` producer는
+physical producer에는 들어가지만 app Window root로 flatten되므로 독립 HWC layer와
+일대일 대응하지 않는다. 따라서 HUD의 `PHYSICAL` 값으로 HWC plane 수나
+DEVICE/CLIENT total을 계산하지 않는다.
 
 topology 생성, child add, relay 연결과 runtime control은 하나의 transaction이다.
 모두 성공하기 전에 expected topology를 publish하지 않는다. 실패/OOM에서는 callback
@@ -361,6 +388,14 @@ one-shot은 같은 telemetry transaction에서 vendor snapshot을 한 번 prefet
 current-session nonnegative DEVICE/CLIENT 원자 쌍이면 SF를 생략한다. Pair가 없을 때만
 SF fallback을 한 번 실행하며 vendor를 다시 읽지 않는다.
 
+UI와 result가 표시하는 `HWC APP RAW D/C/T`는 한 completion boundary의 완전한
+DEVICE/CLIENT 원자 쌍이며 `T = D + C`로 같은 sample에서만 계산한다. 이 pair에는
+control/root 보정이나 workload producer identity 분리가 없고, `PHYSICAL` producer
+count와도 별도다. 서로 다른 sample에서 D와 C의 개별 최대를 뽑아 합치지 않는다.
+각 run의 `HWC_COUNT_SCOPE` event는 이 계약을
+`APP_RAW_UNSEPARATED`, `controlLayerIncluded=true`, control/root subtraction 없음,
+FrameTracker `PHYSICAL` 분리와 scoped BSP identity evidence 필요로 명시한다.
+
 ## Vendor와 BSP 경계
 
 `VendorBridge`는 process singleton이며 다음을 분리된 bounded lane으로 처리한다.
@@ -374,6 +409,15 @@ SF fallback을 한 번 실행하며 vendor를 다시 읽지 않는다.
 Binder registration마다 service-session ID를 부여한다. API v2 결과와 HWC 원자 쌍,
 SBWC acknowledgment, NPU ticket, performance ticket은 같은 session에 결속된다.
 timeout은 disconnect와 같지 않으며, 실제 session 변경 시 이전 snapshot/ack를 폐기한다.
+
+API v1 `getCompositionLayerCounts()`는 app display의 미분리 raw D/C pair일 뿐이다.
+Control/root 또는 foreign layer를 workload layer에서 구분하거나 특정 producer의
+composition type을 증명하지 못한다. Workload-only `DEVICE_ONLY`/`CLIENT_REQUIRED`
+판정이 제품 acceptance에 필요하면 BSP broker가 display ID, owner UID, producer
+generation/revision과 exact SurfaceFlinger/HWC layer identity를 같은 validate/present
+boundary에 결속한 scoped typed evidence를 추가해야 한다. 이름 문자열이나 raw total의
+차감으로 identity를 추정하지 않는다. Android app-facing API에는 특정 app layer를
+CLIENT로 강제하거나 해당 layer의 최종 HWC composition type을 읽는 portable API가 없다.
 
 Portable build는 implicit action discovery를 신뢰 경계로 사용하지 않는다.
 `/product/etc/dpulayerlab/vendor_broker.conf`의 explicit component, permission owner와
@@ -428,6 +472,11 @@ JSON만 최신 400개로 best-effort 보존한다.
 report에는 device fingerprint와 vendor provenance가 포함되며 네트워크로 자동 전송하지
 않는다. schema와 metric 의미는 [docs/METRICS.md](docs/METRICS.md), privacy와 사용자
 공유 방법은 [README.md](README.md)를 따른다.
+
+Result의 HWC peak는 보존된 sample 중 complete atomic pair만 후보로 삼아 같은
+source/quality가 run 전체에서 유지될 때 한 sample의 `(D, C, T)` tuple을 선택한다.
+`T`가 큰 tuple을 우선하고 동률일 때 `D`가 큰 tuple을 사용하며, 서로 다른 sample의
+`max(D)`와 `max(C)`를 합성하지 않는다.
 
 ## 확장 지점
 

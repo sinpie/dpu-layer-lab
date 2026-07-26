@@ -29,8 +29,11 @@
 3. exact DPU underrun은 검증된 vendor 또는 allowlisted kernel counter만 사용한다.
 4. missed frame, Choreographer, SurfaceFlinger miss와 producer shortfall은 proxy다.
 5. source/encoding/quality가 바뀐 counter interval을 이어 붙이지 않는다.
-6. estimated traffic과 measured bus utilization은 서로 다른 metric이다.
+6. workload-only linear scanout-input reference와 measured bus utilization은 서로
+   다른 metric이다.
 7. non-finite 값은 HUD에서 `N/A`, JSON에서 `null`이다.
+8. HWC raw D/C/T는 complete atomic tuple로만 표시하며 control/root와 workload
+   producer scope가 분리되지 않았음을 숨기지 않는다.
 
 ## MetricQuality
 
@@ -116,8 +119,12 @@ attribute와 bounded input 검사를 통과하지 못하면 `N/A`다.
 
 ### Baseline과 continuity
 
-- warm-up과 모든 producer first-buffer readiness 뒤 serialized fresh sample로 baseline을
-  설정한다.
+- warm-up topology publish, matching geometry acknowledgment와 generation activation 뒤
+  모든 expected producer가 fresh first buffer를 게시했는지 bounded하게 확인한다.
+- 고정 warm-up delay는 readiness 증거가 아니다. 위 readiness와 최소 warm-up 시간이
+  모두 충족된 뒤 serialized fresh sample로 baseline을 설정한다.
+- baseline sample 수집 직후에도 같은 generation/topology/geometry/all-producer
+  readiness가 유지되는지 다시 확인하며 바뀌면 fail-closed 중단한다.
 - source와 quality는 baseline에 결속된다.
 - 현재 값은 baseline과 지금까지의 highest보다 작아질 수 없다.
 - null, source/quality 변경, reset/regress, telemetry gap은 continuity를 무효화한다.
@@ -172,14 +179,38 @@ SurfaceFlinger process를 만들지 않고 같은 telemetry transaction의 vendo
 사용한다. snapshot timeout은 Binder disconnect가 아니다. 실제 service session이
 바뀌면 pair를 폐기한다.
 
-HUD의 `RAW MATCH`, `RAW WAIT`, `RAW N/A`는 현재 raw pair의 보조 해석이다. controller는
-target activation, distinct sample 수, topology revision과 phase coverage를 별도로
-검증한다.
+실행 HUD는 complete tuple을
+`HWC APP RAW · D <device>/C <client>/T <device+client> · AGE <freshness> · SRC <provenance>`
+형태로 표시한다. Live age가 2.5초를 넘거나 source/quality/timestamp가 원자 쌍을
+이루지 못하면 D/C/T 전체가 `N/A`다. `T`는 같은 sample의 `D+C`일 뿐 committed
+physical producer count가 아니다.
+
+HUD subtree는 pure Compose이며 별도 `SurfaceView`/`TextureView` 또는 추가
+SurfaceFlinger/HWC candidate를 만들지 않는다. 다만 Activity root/window layer는
+남고 그 DEVICE/CLIENT assignment를 public Android API로 강제하거나 증명할 수 없다.
+현재 vendor/SF tuple도 control/root와 workload producer의 per-layer identity를
+분리하지 않으므로 HUD는 `SCOPE 미분리(control/root 보정 없음)`을 표시한다. 동적
+HUD는 상위 renderer의 100 ms recomposition과 분리된 immutable app-side state
+snapshot을 사용한다. Text/progress snapshot 교체는 최대 1 Hz bucket으로 제한하되
+topology pending, stage 또는 safety 상태 같은 경계는 즉시 갱신한다. 이는 Activity
+root layer를 제거하거나 그 HWC assignment를 고정한다는 뜻이 아니다. 각 run의
+`HWC_COUNT_SCOPE` event는
+`APP_RAW_UNSEPARATED`, `controlLayerIncluded=true`, `control/root subtraction=none`과
+FrameTracker `PHYSICAL` producer count가 별도라는 해석 계약을 보존한다.
+
+`RAW MATCH`, `RAW WAIT`, `RAW N/A`는 이 current raw tuple의 보조 해석이다.
+controller는 target activation, distinct sample 수, topology revision과 phase coverage를
+별도로 검증한다. Scoped BSP evidence가 없는 상태에서 raw count를 특정 producer의
+assignment로 승격하지 않는다.
 
 Process-session HWC capacity 결과도 위 complete-pair 규칙을 따른다. Requested 20과
 safety-approved actual candidate를 구분하고, source/quality/evidence time이 불완전하면
 0이 아니라 terminal `UNAVAILABLE`을 보존한다. 이 값과 calibration 중 얻은
 SurfaceFlinger cache는 typed phase evidence가 아니며 matching topology의 advisory다.
+Raw D/C/T에는 Activity root/control 분리가 없으므로 requested/actual candidate 또는
+raw D/T의 차이로 workload producer ceiling을 계산하지 않는다. Reuse guidance는
+`candidateProducerCount`와 observed app raw D/C를 분리하고
+`workloadDeviceCeiling=N/A`를 보존한다.
 상세 topology, deadline, probe serialization, display scope, cleanup과 event는
 [HWC capacity calibration](HWC_CAPACITY_CALIBRATION.md)이 authority다.
 
@@ -259,13 +290,14 @@ teardown 뒤 reattach도 새 topology와 geometry acknowledgment를 publish하�
 HUD의 expected count는 topology unpublished/pending 또는 process lease 중에는 0,
 `—P` 의미로 표시한다. committed frame-budget count와 UI projection을 혼동하지 않는다.
 
-## Estimated layer traffic
+## Workload-only linear scanout-input reference
 
-`LayerTrafficEstimator`는 linear full-buffer model이다.
+`LayerTrafficEstimator`는 workload producer만 대상으로 하는 linear full-buffer
+reference model이다.
 
 ```text
 producer write = Σ(producer buffer bytes) × producer FPS
-DPU read       = Σ(direct scanout buffer bytes + client target bytes) × display Hz
+scanout input  = Σ(direct scanout buffer bytes + app-window composite bytes) × display Hz
 ```
 
 주요 전제:
@@ -276,11 +308,15 @@ DPU read       = Σ(direct scanout buffer bytes + client target bytes) × displa
 - decoder B/px는 finite, 0 초과, 16 이하
 - format/size가 불명확하면 aggregate는 N/A
 - `FLATTENED_TEXTURE`는 display-sized RGBA producer 하나
-- mixed Texture output은 display-sized RGBA client target read를 추가
+- mixed Texture output은 display-sized RGBA app-window composite read를 추가
 - SBWC compression ratio는 제외
 
 tiling, cache, crop/occlusion, partial update, source/destination scaling, HWC client-target
 fallback의 실제 bandwidth와 vendor compression metadata는 포함하지 않는다.
+Activity root/HUD, SystemUI와 다른 display layer도 포함하지 않는다. 따라서 이 값을
+actual DPU traffic, 전체 display read 또는 measured bus bandwidth로 부르지 않는다.
+HUD label은 `SCANOUT INPUT`/`PRODUCER W`이고 scope는
+`workload-only linear reference`다.
 
 `LayerSizeProfile`이 small/mixed destination footprint를 선택해도 source buffer allocation과
 producer full-buffer write가 자동으로 작아졌다고 계산하지 않는다.
@@ -298,8 +334,8 @@ average percent     = screen equivalents × 100 / physical producer count
 non-overlap crop union을 합계 1 screen-equivalent, 평균 `100 / physical producer
 count`%로 투영한다. HUD는 estimator가 반환한 `BASE PROFILE` 또는
 `CAPACITY TILE CROP UNION` scope를 그대로 표시한다. `FLATTENED_TEXTURE`는 physical
-producer 1개를 사용한다. 값은 full-buffer DPU read/producer write나 measured bus
-utilization에서 빼지 않는다.
+producer 1개를 사용한다. 값은 workload-only full-buffer scanout-input/producer-write
+reference나 measured bus utilization에서 빼지 않는다.
 
 ### Layer geometry apply evidence
 
@@ -336,7 +372,10 @@ event를 남긴다.
 
 run peak는 유효 범위 안에서 동일 quality와 동일 source가 끝까지 유지된 metric만
 집계한다. CPU, memory, generated traffic, DPU/GPU/bus, produced FPS와 HWC D/C의
-provenance가 중간에 바뀌면 하나의 peak로 합치지 않고 N/A다.
+provenance가 중간에 바뀌면 하나의 peak로 합치지 않고 N/A다. HWC peak는 D와 C를
+각각 독립적으로 최대화해 존재하지 않았던 쌍을 만들지 않는다. 각 complete atomic
+tuple의 `T=D+C`가 가장 큰 tuple 하나를 선택하고, T 동률이면 D가 큰 tuple을 사용한다.
+결과의 D/C/T는 항상 같은 evidence timestamp/provenance에서 나온 값이다.
 
 HUD graph는 다음 경계에 선을 이어 그리지 않는다.
 
@@ -375,6 +414,9 @@ type, nullability, enum, 단위, publication과 consumer 규칙은
 5. typed phase의 DEVICE/CLIENT pair가 fresh하고 distinct한가?
 6. producer expected/actual fidelity가 충분한가?
 7. GPU/DPU/bus의 source ABI와 unit을 확인했는가?
-8. estimated traffic을 measured bus utilization처럼 해석하지 않았는가?
+8. workload-only scanout-input reference를 actual DPU traffic이나 measured bus
+   utilization처럼 해석하지 않았는가?
 9. thermal, power-save, low-memory 또는 topology recovery pause가 있었는가?
 10. provenance가 바뀐 peak/graph 구간을 합치지 않았는가?
+11. HWC APP RAW D/C/T를 workload producer count, per-layer assignment 또는 capacity
+    ceiling으로 해석하지 않았는가?

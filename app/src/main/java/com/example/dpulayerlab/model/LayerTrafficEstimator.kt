@@ -179,15 +179,15 @@ object LayerTrafficEstimator {
 
         val trafficKnown = producerDimensionsKnown && producerFormatsKnown
         val knownProducerBytes = producerFrameBytes.takeIf { trafficKnown }
-        val mixedClientTargetBytes = if (hasTextureOutput && displaySizeKnown) {
+        val mixedAppWindowCompositeBytes = if (hasTextureOutput && displaySizeKnown) {
             displayWidthPx.toDouble() * displayHeightPx.toDouble() * 4.0
         } else if (hasTextureOutput) {
             null
         } else {
             0.0
         }
-        val knownDpuBytes = if (trafficKnown && mixedClientTargetBytes != null) {
-            directScanoutFrameBytes + mixedClientTargetBytes
+        val knownDpuBytes = if (trafficKnown && mixedAppWindowCompositeBytes != null) {
+            directScanoutFrameBytes + mixedAppWindowCompositeBytes
         } else {
             null
         }

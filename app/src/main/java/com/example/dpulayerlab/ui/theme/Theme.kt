@@ -2,7 +2,6 @@ package com.example.dpulayerlab.ui.theme
 
 import android.app.Activity
 import android.os.Build
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
@@ -52,9 +51,7 @@ fun DpuLabTheme(
     val view = LocalView.current
     if (!view.isInEditMode) {
         SideEffect {
-            val window = (view.context as Activity).window
-            window.statusBarColor = Color.Transparent.toArgb()
-            window.navigationBarColor = Color.Transparent.toArgb()
+            applyLegacyTransparentSystemBarColors(view.context as Activity)
         }
     }
     MaterialTheme(
@@ -88,4 +85,15 @@ fun DpuLabTheme(
         ),
         content = content,
     )
+}
+
+/**
+ * Android 15+ enforces edge-to-edge and ignores these legacy color setters. Keep them only for
+ * older releases where a transparent bar color is still part of the Window contract.
+ */
+@Suppress("DEPRECATION")
+private fun applyLegacyTransparentSystemBarColors(activity: Activity) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) return
+    activity.window.statusBarColor = Color.Transparent.toArgb()
+    activity.window.navigationBarColor = Color.Transparent.toArgb()
 }

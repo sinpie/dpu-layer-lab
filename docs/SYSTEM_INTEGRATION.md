@@ -56,10 +56,10 @@ Product image
 
 샘플 `Android.bp`는 Soong이 platform certificate로 다시 서명하는 구성입니다. 외부에서 이미 platform key로 서명한 APK를 쓴다면 `certificate: "PRESIGNED"`로 바꿉니다.
 
-최신 공개 GitHub Release의 `DPULayerTest-20260725_232013-debug.apk`는 Android debug key로 서명된
+최신 공개 GitHub Release의 `DPULayerTest-20260726_101046-debug.apk`는 Android debug key로 서명된
 lab-only 산출물이며 debug manifest가 automation alias의 `CONTROL_TESTS` permission을
 제거합니다. 제품 이미지에 넣지 마세요.
-`DPULayerTest-20260725_232013-release-unsigned.apk`는 Soong 또는 secure signing
+`DPULayerTest-20260726_101046-release-unsigned.apk`는 Soong 또는 secure signing
 pipeline 입력용이며 그대로 설치하는 최종 제품 APK가 아닙니다. Platform key,
 certificate, keystore, password/token은 저장소, GitHub Release, `dist/`에 두지 않고
 제품 보안 환경에서만 사용합니다. Release에는 두 APK와 `SHA256SUMS.txt`만 배포합니다.
@@ -274,7 +274,10 @@ fail-safe는 이 옵션과 무관하게 항상 활성이고 즉시 안전값으�
 - `getDpuUnderrunCount()`: boot 이후 monotonic 누적값, 미지원이면 `-1`
 - `getDpuUtilizationPercent()`: 동일 sampling interval의 active/total cycle, 미지원이면 음수
 - `getMemoryBusUtilizationPercent()`: DDR/interconnect 기준 busy %, 미지원이면 음수
-- `getCompositionLayerCounts()`: 앱 display의 `[DEVICE, CLIENT]`, 미지원은 `[-1, -1]`
+- `getCompositionLayerCounts()`: 앱 display의 미분리 raw `[DEVICE, CLIENT]`, 미지원은
+  `[-1, -1]`. 두 값은 같은 validate/present 관측 boundary의 원자 쌍이어야 하지만
+  API v1에는 control/root 차감, workload producer identity 또는 foreign layer
+  partition field가 없다.
 - `setCompressionMode(0)`: linear/default
 - `setCompressionMode(1)`: SBWC auto
 - `setCompressionMode(2)`: SBWC required; 실제로 강제·검증할 수 없으면 `false`
@@ -600,8 +603,14 @@ graph/peak continuity를 끊습니다.
 ## Exact counter와 report 계약
 
 `getDpuUnderrunCount()` 또는 allowlisted kernel counter의 baseline은 Surface/codec
-warm-up이 끝난 뒤 실제 scenario phase 직전에 잡습니다. 앱은 1초 HUD sampler와
-post-warm-up baseline 요청을 한 lane에서 직렬화하고 fresh sample 완료를 기다립니다.
+warm-up과 bounded producer readiness가 끝난 뒤 실제 scenario phase 직전에 잡습니다.
+Warm-up 지연만으로 readiness를 추정하지 않습니다. Expected topology가 published되고
+pending/missed가 아니며 matching geometry revision/profile이 acknowledged된 뒤 generation을
+activation하고, preparation callback을 지운 이후의 모든 producer fresh first buffer를
+확인해야 합니다. 앱은 1초 HUD sampler와 post-warm-up baseline 요청을 한 lane에서
+직렬화하고 fresh sample 완료를 기다립니다. Baseline sample 뒤 같은
+topology/geometry/readiness가 유지되는지도 다시 확인하며 변경되면 baseline을 폐기하고
+run을 중단합니다.
 Run generation 이전에 요청된 in-flight sample은 다음 queue 항목의 counter/peak/sample로
 귀속하지 않습니다. Baseline 이후 source,
 `MetricQuality`, monotonic value가 연속적인지 검사하며 unavailable/source 변경/
@@ -651,11 +660,28 @@ sample 앞뒤를 한 선으로 연결하지 않고 gap으로 표시합니다. BS
 문자열을 동적으로 바꾸어 서로 다른 counter를 하나의 연속 추세처럼 보이게 해서는 안
 됩니다.
 
+Running HUD는 같은 Activity root에 그려지는 pure Compose이므로 HUD 자체가 추가하는
+SurfaceFlinger/HWC surface와 physical producer는 0입니다. 동적 HUD 값은 하나의
+immutable snapshot으로 전달하고 app-side 최대 1 Hz로만 교체해 상위 renderer의 100 ms
+recomposition과 격리합니다. 이 redraw 정책에서도 app Window root buffer는 갱신될 수
+있고 root Window 자체는 여전히 composition candidate입니다. Public Android API나
+platform signing/privileged 권한만으로 이 root를 `DEVICE`/`CLIENT`로 강제하거나 raw
+count에서 제외할 수 없습니다. `PHYSICAL`은 generation이 승인한 BufferQueue producer
+수이며 HWC layer count가 아닙니다.
+
 Result peak도 provenance 계약을 따릅니다. CPU/memory/generated traffic과
 DPU/GPU/bus/produced FPS/HWC DEVICE·CLIENT는 유효 범위의 sample이 같은 quality/source를
 유지할 때만 집계하며, 도중 source가 바뀌면 서로 다른 계측을 합친 peak 대신 `N/A`를
 표시합니다. DPU/GPU/bus/FPS/HWC peak는 schema에 중복 필드를 추가하지 않고 보존된
 sample에서 결과 UI가 계산합니다.
+
+HWC result는 별도 `max(D)`와 `max(C)`를 합치지 않습니다. Complete same-sample pair에서
+`T=D+C`를 계산하고 T가 가장 큰 `(D,C,T)` tuple 하나를 선택하며, T 동률이면 D가 큰
+같은-sample tuple을 사용합니다. 이 `HWC APP RAW` tuple은 control/root 보정과 workload
+identity 분리가 없는 관측값입니다.
+각 run의 `HWC_COUNT_SCOPE` event도 `APP_RAW_UNSEPARATED`,
+`controlLayerIncluded=true`, control/root subtraction 없음, FrameTracker `PHYSICAL`
+분리와 scoped BSP identity evidence 필요를 명시합니다.
 
 보고서는 credential-encrypted internal `files/reports`에서 temp write/fsync/rename으로
 발행한 뒤 `dpu-layer-lab-` prefix와 앱 파일명
@@ -692,6 +718,29 @@ fresh producer count와 topology revision을 재검증합니다. 각 forced samp
 safety/exact telemetry를 함께 갱신하고, terminal/cancel/error/phase-finally에서는
 matching priority owner를 반드시 해제합니다.
 
+API v1 원자 쌍과 SurfaceFlinger text fallback은 app raw scope이며 control/root를
+workload producer에서 분리하지 않습니다. 따라서 HUD의 `HWC APP RAW D/C/T`와
+`RAW MATCH/WAIT/N/A`는 보조 관측일 뿐 workload-only plane 판정이 아닙니다. 특히 pure
+Compose HUD의 extra Surface가 0이라는 사실은 app Window root의 HWC contribution이
+0이라는 뜻이 아닙니다. Alpha, rotation, `TextureView`, software/hardware View layer,
+`SurfaceControl.Transaction` geometry 같은 app 입력은 HWC 선택에 영향을 줄 수 있지만
+특정 layer의 `CLIENT` composition을 portable하게 보장하지 않습니다.
+
+제품 acceptance가 workload-only composition을 요구하면 BSP는 기존 v1 count와 별도로
+scoped identity evidence를 제공해야 합니다. 최소한 하나의 validate/present boundary에
+다음을 원자적으로 결속합니다.
+
+- physical display/CRTC ID, sample/frame ID와 completion monotonic timestamp
+- caller/app UID와 service session
+- producer generation, topology/geometry revision과 expected producer set
+- 이름 추정이 아닌 exact SurfaceFlinger/HWC layer identity
+- workload, control/root, foreign/system partition별 DEVICE/CLIENT/unknown
+- 누락·stale·identity mismatch를 성공 count가 아닌 unavailable로 만드는 completeness
+
+App-facing public API만으로 이 mapping을 만들 수 없으므로 system-side broker/HWC
+instrumentation이 필요합니다. Scoped contract가 없을 때 raw D/C total에서 control/root
+한 장을 상수로 빼거나 `PHYSICAL` count와 비교해 workload plane 수를 추정하지 않습니다.
+
 여기서 target geometry readiness는 renderer가 실제 base transform apply 시 요청한
 generation-scoped revision/profile과 두 번의 후속 `Choreographer` callback/traversal
 opportunity 뒤 acknowledgment가 일치한다는 app-side 증거입니다. Producer activation과
@@ -713,7 +762,10 @@ nonnegative DEVICE/CLIENT 원자 쌍을 반환하고, bounded cancellation과 �
 completion을 제공해야 합니다. Optional v2 frequency getter는 이 calibration의 필수
 transaction이 아닙니다. Provider pair가 불완전하면 앱이 worker quiescence를 확인한
 뒤에만 SurfaceFlinger fallback을 시작하므로 timeout 뒤 Binder work를 계속 남기지
-마세요. 이 advisory 결과로 HWC maximum이나 app safety cap을 바꾸지 않습니다.
+마세요. 이 pair는 `HWC APP RAW`이며 `T=D+C`도 같은 pair에서만 계산합니다. Control/root
+보정이나 workload identity 분리가 없으므로 candidate physical producer 수, D, C 또는
+T로 workload plane ceiling/HWC maximum을 역산하지 않고 app safety cap도 바꾸지
+않습니다.
 
 Composition source는 API v1 `compositionLayerCounts`의 같은-snapshot 원자 쌍을
 우선합니다. Dashboard/idle은 3-sample cadence의 bounded `dumpsys SurfaceFlinger
@@ -836,14 +888,16 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 - process-session capacity가 requested 20L와 safety-approved actual candidate를
   구분하고, 성공/실패/취소 terminal result를 queue/repeat/후속 START/Activity 재생성에서
   재사용해 두 번째 burst를 만들지 않는지
-- capacity topology+100ms stabilize+single sample이 absolute 6000ms producer-active
-  deadline 안이고, 모든 terminal path의 load zero/teardown/counter drain과
-  cleanup-confirmed non-cancelled path의 3초 settle이 구분되는지
+- capacity topology/geometry commit → activation → post-activation all-first-buffer
+  readiness+100ms stabilize+single sample이 absolute 6000ms producer-active deadline
+  안이고, 모든 terminal path의 load zero/teardown/counter drain과 cleanup-confirmed
+  non-cancelled path의 3초 settle이 구분되는지
 - current-session vendor D/C 원자 쌍이면 SF child가 없고 incomplete pair일 때만 SF
   fallback 한 번인지. Orientation 축 교환은 reuse하고 display ID/normalized-size 변경은
   N/A projection+process restart 요구인지
-- exact counter의 post-warmup baseline, post-teardown terminal sample, telemetry gap,
-  source/quality 변화, reset/wrap, invalid-delta provenance와 stable-source peak
+- exact counter의 bounded warm-up readiness 뒤 baseline과 post-baseline topology/geometry/
+  first-buffer recheck, post-teardown terminal sample, telemetry gap, source/quality 변화,
+  reset/wrap, invalid-delta provenance와 stable-source peak
 - SBWC route 거부/timeout/provider death와 linear reset 실패가 fail-closed이고 모든
   route/reset event가 report에 남는지, 정상 cooldown에서 physical producer teardown
   acknowledgment가 compression reset보다 먼저인지
@@ -901,7 +955,11 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 - provider open 5초/parser 10초 timeout·cancel 뒤 worker `finally`까지 preflight
   refcount lease가 후속 plan을 차단하고 pinned AFD가 seekable인지
 - GL color/depth triple-buffer budget 경계와 Adaptive Hunt의 `STEADY` memory plateau
-- HUD build version과 gauge source/quality, provenance/unavailable graph gap,
-  View/client Z-order proxy가 physical HWC 증거로 표시되지 않는지
+- HUD build version과 gauge source/quality, provenance/unavailable graph gap, immutable
+  snapshot의 app-side 최대 1 Hz 교체가 상위 100 ms recomposition과 격리되는지
+- pure Compose HUD extra SF/HWC surface 0, app root 강제/제외 불가, `HWC APP RAW D/C/T`
+  same-sample tuple과 `PHYSICAL` 분리, `HWC_COUNT_SCOPE` event 및 raw count로 workload
+  plane ceiling을 추론하지 않는지. View/client Z-order proxy가 physical HWC 증거로
+  표시되지 않는지
 - report share가 canonical internal managed completed file만 허용하고 traversal,
   foreign/missing JSON을 거부하는지

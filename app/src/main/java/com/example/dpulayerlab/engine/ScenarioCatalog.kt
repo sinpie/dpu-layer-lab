@@ -449,20 +449,22 @@ object ScenarioCatalog {
 
     private fun dpuOnlyRepeatShock() = ScenarioSpec(
         id = "dpu-only-repeat-shock",
-        name = "DPU-only Repeated Step Shock",
+        name = "Display-pipeline Repeated Step Shock",
         description =
-            "CPU·memory·GPU·NPU cross-load와 alpha/GL을 모두 0으로 유지한 채 " +
+            "명시적 CPU·memory·GPU·NPU generator와 alpha/GL을 모두 0으로 유지한 채 " +
                 "1L/30fps/60Hz와 12L/120fps/120Hz를 세 번 STEP 왕복합니다. " +
-                "요청한 layer/FPS/Hz edge의 반복성과 DPU recovery를 비교하며, 실제 " +
+                "producer Canvas draw·buffer post·memory write 비용은 0이 아니므로 " +
+                "DPU 단일축이 아닌 display-pipeline shock입니다. 요청한 layer/FPS/Hz " +
+                "edge의 반복성과 DPU recovery를 비교하며, 실제 " +
                 "DEVICE/CLIENT 경로·주사율·DPU clock 변화는 계측 결과로만 판단합니다.",
         category = ScenarioCategory.TRANSITION,
         risk = RiskLevel.HIGH,
         tags = setOf(
-            "DPU-only",
+            "display-pipeline",
             "DPU low→high",
             "idle→burst",
             "repeat shock",
-            "no cross-load",
+            "generated cross-load 0",
             "120fps",
         ),
         requirements = setOf(
@@ -472,34 +474,34 @@ object ScenarioCatalog {
             phase("dr-settle", "DPU low-load settle · 1L/30fps", 10, 1, 30f, 60f),
             phase(
                 "dr-burst-1",
-                "DPU-only burst 1 · 12L/120fps",
+                "Display-pipeline burst 1 · 12L/120fps",
                 5,
                 12,
                 120f,
                 120f,
                 layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
             ),
-            phase("dr-release-1", "DPU-only release 1", 6, 1, 30f, 60f),
+            phase("dr-release-1", "Display-pipeline release 1", 6, 1, 30f, 60f),
             phase(
                 "dr-burst-2",
-                "DPU-only burst 2 · 12L/120fps",
+                "Display-pipeline burst 2 · 12L/120fps",
                 5,
                 12,
                 120f,
                 120f,
                 layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
             ),
-            phase("dr-release-2", "DPU-only release 2", 6, 1, 30f, 60f),
+            phase("dr-release-2", "Display-pipeline release 2", 6, 1, 30f, 60f),
             phase(
                 "dr-burst-3",
-                "DPU-only burst 3 · 12L/120fps",
+                "Display-pipeline burst 3 · 12L/120fps",
                 5,
                 12,
                 120f,
                 120f,
                 layerSizeProfile = LayerSizeProfile.SMALL_UNIFORM,
             ),
-            phase("dr-recover", "DPU-only final recovery", 8, 1, 30f, 60f),
+            phase("dr-recover", "Display-pipeline final recovery", 8, 1, 30f, 60f),
         ),
     )
 

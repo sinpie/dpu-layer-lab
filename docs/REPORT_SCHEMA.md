@@ -68,7 +68,7 @@ Run 시작 전에 수집됐지만 freshness가 유효한 cached HWC/SF evidence�
 | `verdict` | enum string | no | `RunVerdict.name` |
 | `startedEpochMs` | integer | no | run 시작 wall clock |
 | `finishedEpochMs` | integer | no | run 종료 wall clock |
-| `controlLayerIncluded` | boolean | no | 항상 true, app control layer가 display에 존재 |
+| `controlLayerIncluded` | boolean | no | 항상 true, pure Compose HUD를 포함한 app Window root가 display에 남음; HUD 전용 extra Surface를 뜻하지 않음 |
 | `device` | object | no | build/device identity |
 | `exactUnderrunDelta` | integer | yes | verified exact delta |
 | `exactUnderrunSource` | string | no | unavailable이면 empty |
@@ -125,6 +125,11 @@ Key:
 다른 peak가 필요하면 consumer가 `samples`에서 source/quality 연속성을 확인해 계산한다.
 서로 다른 provenance segment의 max를 조용히 합치지 않는다.
 
+HWC peak는 complete same-sample atomic pair만 후보로 삼는다. 각 후보의 `T`는 그
+sample의 `D+C`이고, 가장 큰 `T`, 동률이면 가장 큰 `D` 순서로 tuple 하나를 선택한다.
+서로 다른 sample의 `max(D)`와 `max(C)`를 조합하지 않으며 run 중 pair source/quality가
+바뀌면 peak를 `N/A`로 처리한다. `T`는 현재 schema의 독립 serialized field가 아니다.
+
 ## `phases[]`
 
 | Field | Type | 의미 |
@@ -176,6 +181,25 @@ adjustment 뒤의 effective 값이다.
 Machine consumer는 실제 실행 시간을 `phases[].durationMs`와 sample/event timestamp에서
 읽어야 하며 message parsing에 계약을 걸면 안 된다.
 
+각 run의 `HWC_COUNT_SCOPE` event는 현재 HWC count 해석을 다음과 같이 고정한다.
+
+- scope는 `APP_RAW_UNSEPARATED`
+- `controlLayerIncluded=true`이며 control/root subtraction은 없음
+- FrameTracker `PHYSICAL` BufferQueue producer count는 별도 값
+- workload-scoped attribution에는 typed BSP layer identity evidence가 필요
+
+이는 stable event type의 계약이고 `message`를 새 machine-readable schema처럼 임의
+확장해 parsing하라는 뜻은 아니다.
+
+Warm-up baseline gate는 다음 event로 감사한다.
+
+- `WARMUP_READY`: topology/geometry commit, generation activation과 post-activation
+  all-producer fresh first buffer가 bounded window 안에서 확인됨
+- `WARMUP_READINESS_TIMEOUT`: 위 readiness가 deadline 안에 충족되지 않아 baseline 전
+  run 중단
+- `WARMUP_BASELINE_INVALIDATED`: fresh baseline sample 중 topology/geometry/readiness가
+  바뀌어 baseline 폐기와 run 중단
+
 Consumer는 모르는 event type을 무시할 수 있어야 하며 known event의 의미를 문자열
 pattern만으로 추론하지 않는다.
 
@@ -221,7 +245,7 @@ pattern만으로 추론하지 않는다.
 
 | Field | Type | 의미 |
 |---|---|---|
-| `hwcDeviceLayers`, `hwcClientLayers` | integer/null | same-snapshot pair |
+| `hwcDeviceLayers`, `hwcClientLayers` | integer/null | unpartitioned app-display raw same-snapshot pair |
 | `hwcDeviceLayersQuality`, `hwcClientLayersQuality` | enum | pair quality |
 | `hwcDeviceLayersSource`, `hwcClientLayersSource` | string | pair source |
 | `hwcCompositionEvidenceMonotonicMs` | integer/null | run-relative pair completion; 음수 가능 |
@@ -232,7 +256,17 @@ pattern만으로 추론하지 않는다.
 | `surfaceFlingerEvidenceAgeMs` | integer/null | sample 시점 age |
 
 DEVICE/CLIENT source와 quality는 서로 같아야 usable pair다. Consumer가 한쪽만 다른
-source와 결합하면 안 된다.
+source와 결합하면 안 된다. Evidence timestamp도 같고 freshness가 유효한 complete
+pair에서만 `HWC APP RAW T=D+C`를 계산한다.
+
+이 pair는 control/root 보정이나 workload producer identity partition을 제공하지 않는다.
+`controlLayerIncluded=true`는 pure Compose HUD를 포함한 Activity/app Window root가
+display에 남는다는 뜻이다. HUD 전용 extra SF/HWC surface는 0이지만 1 Hz 갱신으로 root가
+다시 그려질 수 있다. 이 1 Hz는 immutable HUD snapshot을 상위 100 ms recomposition과
+격리하는 app-side redraw 정책이며, app API로 root를 `DEVICE`/`CLIENT`에 강제하거나
+raw count에서 제외하는 보장이 아니다. `PHYSICAL`은 별도
+BufferQueue/frame-callback producer 수이므로 HWC total이나 workload plane count로
+해석하지 않는다.
 
 ### Generated load와 safety
 
@@ -301,9 +335,14 @@ source와 결합하면 안 된다.
 4. exact delta가 usable하면 proxy보다 우선한다.
 5. source/quality 변경 전후의 peak·trend를 하나의 연속 segment로 합치지 않는다.
 6. HWC D/C 한쪽만 있는 sample을 완전한 pair로 만들지 않는다.
-7. estimated layer traffic은 현재 schema sample의 measured bus와 합치지 않는다.
-8. fingerprint와 status string을 외부 공유 전에 privacy 검토한다.
-9. 이전 schema v2 report에 `bufferPresentation`/`layerOrientation`이 없으면 명시적인
+7. HWC peak는 같은 sample의 atomic `(D,C,T)` tuple로 선택하며 독립 `max(D)`와
+   `max(C)`를 조합하지 않는다.
+8. HWC app raw D/C/T에서 root 상수를 차감하거나 `PHYSICAL` producer 수와 비교해
+   workload plane ceiling을 추론하지 않는다. Workload attribution에는 scoped typed BSP
+   layer identity evidence가 필요하다.
+9. workload-only linear traffic reference는 현재 schema sample의 measured bus와 합치지 않는다.
+10. fingerprint와 status string을 외부 공유 전에 privacy 검토한다.
+11. 이전 schema v2 report에 `bufferPresentation`/`layerOrientation`이 없으면 명시적인
    FIT 또는 90° 증거로 추정하지 않고 projection/orientation을 `UNKNOWN`으로 취급한다.
 
 ## Schema migration

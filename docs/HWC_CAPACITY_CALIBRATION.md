@@ -18,12 +18,14 @@
 목적:
 
 - system bar가 숨겨진 test Window에서 많은 opaque RGB producer를 한 번 게시
-- 같은 candidate topology의 fresh DEVICE/CLIENT 원자 쌍 관찰
+- 같은 candidate topology의 fresh `HWC APP RAW` DEVICE/CLIENT 원자 쌍과
+  같은 sample의 `T=D+C` 관찰
 - 뒤의 scenario가 참고할 수 있는 process-local advisory boundary 제공
 
 비목적:
 
 - 모든 format/scale/transform/display에 통용되는 HWC plane maximum 결정
+- raw total에서 app Window root를 차감하거나 workload-only plane ceiling 추론
 - ScenarioSafetyPolicy hard cap 자동 변경
 - catalog의 `DEVICE_ONLY`/`CLIENT_REQUIRED` typed evidence 대체
 - 반복적인 1→20 layer 탐색 또는 binary search
@@ -47,6 +49,15 @@
 
 Runtime safety와 graphics budget은 actual candidate layer 수를 20보다 줄일 수 있다.
 UI/event/report는 항상 requested `20L`과 actual candidate를 별도로 표시한다.
+
+Running HUD는 같은 Activity root에 그리는 pure Compose이고 HUD 전용
+`SurfaceView`/`TextureView`/`SurfaceControl`을 만들지 않으므로 extra physical
+producer와 SF/HWC surface는 0이다. 그러나 Compose HUD와 1 Hz telemetry 갱신은 app
+Window root를 다시 그릴 수 있다. HUD 동적 state를 하나의 immutable snapshot으로
+격리하고 app-side 최대 1 Hz로만 교체해도 이는 redraw 빈도 정책일 뿐이다. Android의
+public/privileged app API로 이 root를 HWC `DEVICE`/`CLIENT` 중 하나로 강제하거나 raw
+count에서 제외할 수 없으므로 calibration D/C/T는 control/root 보정 없는 미분리
+app-display raw 값이다.
 
 ## Scope와 lifetime
 
@@ -72,8 +83,10 @@ flowchart TD
     CLAIM --> P["typed telemetry priority + capability admission token"]
     P --> D["periodic drop/pause · local/SF/vendor/capability pre-drain"]
     D --> S["safety-approved actual candidate"]
-    S --> G["producer generation · CAPACITY_TILES geometry"]
-    G --> R["all first buffer + fresh heartbeat + 100ms stabilize"]
+    S --> G["producer generation · CAPACITY_TILES geometry request"]
+    G --> C["topology publish · matching geometry commit"]
+    C --> A2["generation activation · preparation callback clear"]
+    A2 --> R["post-activation all first buffer + fresh heartbeat + 100ms stabilize"]
     R --> V["v1 vendor D/C snapshot 1회"]
     V -->|complete current-session pair| Q["post-sample topology continuity"]
     V -->|null/partial| B["actual vendor worker quiescence ≤500ms"]
@@ -100,15 +113,18 @@ Capability retry/discovery admission token은 pre-drain 전에 획득하고 fina
 뒤에만 identity-matched release한다. 그 사이 도착한 service callback/retry는 하나의
 deferred refresh로 합쳐지고 20L candidate가 내려간 뒤 Handler에 게시된다.
 
-Producer readiness를 기다리는 구간은 100ms control cadence로 direct
+Topology publication과 matching geometry acknowledgment 뒤 generation을 activation하면
+preparation-era first-buffer 관측은 지운다. 따라서 calibration readiness는 activation
+이후 같은 committed producer set이 새로 낸 모든 first buffer와 fresh heartbeat만으로
+충족한다. Producer readiness를 기다리는 구간은 100ms control cadence로 direct
 thermal/power/low-memory를 확인한다. Pre-drain과 bounded composition sample 자체에는
 별도의 100ms poll을 병렬로 추가하지 않으며 cancellation과 전체 deadline으로 제한한다.
 
 ## Deadline
 
-Topology 준비, 모든 first buffer, 100ms stabilization, single calibration composition
-transaction과
-post-sample validation은 하나의 최대 6000ms producer-active deadline 안에서 끝나야 한다.
+Topology/geometry commit, generation activation, post-activation 모든 first buffer,
+100ms stabilization, single calibration composition transaction과 post-sample
+validation은 하나의 최대 6000ms producer-active deadline 안에서 끝나야 한다.
 
 - readiness poll은 stabilization+snapshot completion reserve를 남기는 범위로 clamp한다.
 - 100ms stabilization 전체와 snapshot reserve를 확보할 수 없으면 target을 즉시 null로
@@ -126,12 +142,15 @@ Result를 observed로 수락하려면 다음이 모두 참이어야 한다.
 2. expected/observed physical producer count가 candidate와 일치
 3. 같은 generation의 topology가 published/ready이고 pending/missed가 아님
 4. geometry requested/applied revision과 profile이 일치
-5. sample 전후 topology revision, publication timestamp와 discontinuity serial이 같음
-6. 모든 producer heartbeat가 fresh
-7. runtime/teardown failure와 renderer cleanup pending이 없음
-8. D/C가 같은 source·quality·timestamp의 완전한 fresh pair
-9. vendor service pair이면 snapshot session이 현재 registration과 같음
-10. sample/validation이 producer-active deadline 안에 완료
+5. topology/geometry commit 뒤 같은 generation을 activation함
+6. activation이 preparation-era callback을 지운 뒤 모든 producer의 fresh first buffer와
+   heartbeat를 다시 확인함
+7. sample 전후 topology revision, publication timestamp와 discontinuity serial이 같음
+8. runtime/teardown failure와 renderer cleanup pending이 없음
+9. D/C가 같은 source·quality·timestamp의 완전한 fresh `APP_RAW_UNSEPARATED` pair이고
+   `T`는 그 pair에서만 계산됨
+10. vendor service pair이면 snapshot session이 현재 registration과 같음
+11. sample/validation이 producer-active deadline 안에 완료
 
 한 항목이라도 실패하면 0이나 추정 max가 아니라 terminal `UNAVAILABLE`이다.
 
@@ -140,13 +159,14 @@ Result를 observed로 수락하려면 다음이 모두 참이어야 한다.
 | Status | 의미 |
 |---|---|
 | `PENDING` | 아직 process claim을 시도하지 않은 UI 상태 |
-| `OBSERVED_AT_CANDIDATE` | actual candidate에서 fresh D/C pair를 관측 |
+| `OBSERVED_AT_CANDIDATE` | actual candidate에서 fresh app raw D/C pair를 관측 |
 | `UNAVAILABLE` | reject, timeout, STOP, source/topology/teardown 실패의 terminal 결과 |
 
 주요 field:
 
 - `candidateLayers`: safety-approved actual candidate 또는 producer handoff 전 실패의 null
 - `observedDeviceLayers`, `observedClientLayers`
+- `T`: 별도 독립 peak나 workload count가 아니라 위 두 field의 같은-sample 합
 - `source`, `quality`, `evidenceMonotonicMs`
 - calibration display ID와 normalized dimensions
 - bounded detail
@@ -154,7 +174,7 @@ Result를 observed로 수락하려면 다음이 모두 참이어야 한다.
 UI 예:
 
 ```text
-HWC capacity · session 1회 · 요청 20L · 실제 후보 12L에서 D8/C4
+HWC capacity · session 1회 · 요청 20L · 실제 후보 12L · HWC APP RAW D8/C4/T12 · SCOPE 미분리
 ```
 
 Report event:
@@ -163,6 +183,12 @@ Report event:
 - `SESSION_HWC_CAPACITY_REUSE_GUIDANCE`
 
 Reuse guidance는 matching opaque RGB/crop topology의 advisory일 뿐 safety cap이 아니다.
+Candidate 수나 raw `T`로 workload plane ceiling, 보편적 HWC maximum 또는 renderer hard
+cap을 추론하지 않는다. Workload-only composition attribution이 제품 acceptance에
+필요하면 BSP가 display/session, producer generation/revision과 exact HWC layer identity를
+같은 validate/present sample에 결속한 scoped typed evidence를 제공해야 한다. 앱은
+이름 문자열, `PHYSICAL` producer 수 또는 root 상수 차감으로 그 identity를 대신하지
+않는다.
 
 ## Cleanup과 scenario 격리
 
@@ -183,6 +209,11 @@ settle과 마지막 direct thermal/power/low-memory recheck를 수행한 뒤 sce
 이동한다. STOP/cancel은 mandatory cleanup을 생략하지 않지만 optional settle은 즉시
 건너뛰고 process-session을 terminal `UNAVAILABLE`로 닫아 두 번째 20L burst 없이
 Window/performance owner를 복구한다.
+
+Calibration의 readiness를 첫 scenario baseline에 재사용하지 않는다. 기존 1L warm-up도
+자기 generation의 topology/geometry commit → activation → preparation callback clear →
+post-activation all-producer fresh first buffer를 bounded하게 확인한 뒤 baseline을
+수집하고, baseline 직후 같은 readiness를 다시 검증한다.
 
 Barrier 미확인은 telemetry lifecycle을 process-sticky failure로 만들고 후속 START를
 차단한다. Calibration frame, traffic와 exact counter delta는 첫 scenario의 fresh
@@ -221,5 +252,9 @@ baseline/peak에 포함하지 않는다.
 - cancel 중 pre/post drain과 identity-matched priority release
 - deadline 직전 poll/stabilization clamp와 STOP 시 optional settle 생략
 - safety-clamped partial final row의 non-overlap full crop union
+- topology/geometry commit 전 activation 거부와 activation 뒤 preparation callback 제거
+- post-activation all-producer first-buffer/heartbeat 누락 시 observed 거부
+- app raw D/C/T의 same-sample 원자성, control/root 무보정과 PHYSICAL producer 분리
+- raw candidate/T로 workload plane ceiling을 추론하지 않음
 - post-sample deadline/topology discontinuity 거부
 - teardown/counter drain 뒤 첫 scenario 시작

@@ -199,7 +199,9 @@ data class HwcCapacityCalibrationResult(
             "${calibrationDisplayShortEdgePx ?: "N/A"}x" +
             "${calibrationDisplayLongEdgePx ?: "N/A"}; " +
             "lifetime=process-session; " +
-            "scope=observed-at-candidate-not-universal-max; detail=${detail.ifBlank { "N/A" }}"
+            "scope=unseparated-app-raw-control-root-not-corrected; " +
+            "meaning=observed-at-candidate-not-universal-max; " +
+            "detail=${detail.ifBlank { "N/A" }}"
 
     fun uiSummary(): String =
         when (status) {
@@ -207,26 +209,37 @@ data class HwcCapacityCalibrationResult(
                 "HWC capacity · 앱 session 최초 1회 · 요청 20L · 측정 대기"
             HwcCapacityCalibrationStatus.OBSERVED_AT_CANDIDATE ->
                 "HWC capacity · session 1회 · 요청 20L · " +
-                    "실제 후보 ${candidateLayers ?: "N/A"}L에서 " +
-                    "D${observedDeviceLayers ?: "N/A"}/C${observedClientLayers ?: "N/A"} · " +
+                    "실제 producer 후보 ${candidateProducerLabel()} · " +
+                    "APP RAW D${observedDeviceLayers ?: "N/A"}/" +
+                    "C${observedClientLayers ?: "N/A"}/" +
+                    "T${observedCompositionTotal()} · " +
                     "${quality.name}@${source.ifBlank { "N/A" }} · " +
                     capacityReuseGuidance(this).uiSummary()
             HwcCapacityCalibrationStatus.UNAVAILABLE ->
                 "HWC capacity · session 1회 N/A · 요청 20L · " +
-                    "실제 후보 ${candidateLayers ?: "N/A"}L · " +
+                    "실제 producer 후보 ${candidateProducerLabel()} · " +
                     "${quality.name}@${source.ifBlank { "N/A" }} · " +
                     detail.ifBlank { "fresh pair unavailable" }
         }
+
+    private fun observedCompositionTotal(): String {
+        val device = observedDeviceLayers?.takeIf { it >= 0 } ?: return "N/A"
+        val client = observedClientLayers?.takeIf { it >= 0 } ?: return "N/A"
+        return (device.toLong() + client.toLong()).toString()
+    }
+
+    private fun candidateProducerLabel(): String =
+        candidateLayers?.takeIf { it > 0 }?.let { "${it}P" } ?: "N/A"
 }
 
 data class HwcCapacityReuseGuidance(
-    val deviceCandidateCeiling: Int? = null,
-    val clientPressureCandidate: Int? = null,
+    val candidateProducerCount: Int? = null,
+    val observedAppDeviceLayers: Int? = null,
+    val observedAppClientLayers: Int? = null,
     val detail: String,
 ) {
     fun uiSummary(): String =
-        "ref DEVICE≤${deviceCandidateCeiling ?: "N/A"}L / " +
-            "CLIENT≥${clientPressureCandidate ?: "N/A"}L · topology별 재검증"
+        "workload DEVICE ceiling N/A · control/root 보정 없음"
 }
 
 /**
@@ -3642,12 +3655,22 @@ class LabController internal constructor(
             runEvents += event(
                 "SESSION_HWC_CAPACITY_REUSE_GUIDANCE",
                 capacityReuseGuidance(hwcCapacityCalibration).let { guidance ->
-                    "deviceCandidateCeiling=" +
-                        "${guidance.deviceCandidateCeiling ?: "N/A"}; " +
-                        "clientPressureCandidate=" +
-                        "${guidance.clientPressureCandidate ?: "N/A"}; " +
-                        guidance.detail
+                    "candidateProducerCount=" +
+                        "${guidance.candidateProducerCount ?: "N/A"}; " +
+                        "observedAppDeviceLayers=" +
+                        "${guidance.observedAppDeviceLayers ?: "N/A"}; " +
+                        "observedAppClientLayers=" +
+                        "${guidance.observedAppClientLayers ?: "N/A"}; " +
+                        "workloadDeviceCeiling=N/A; " +
+                    guidance.detail
                 },
+            )
+            runEvents += event(
+                "HWC_COUNT_SCOPE",
+                "APP_RAW_UNSEPARATED; controlLayerIncluded=true; " +
+                    "control/root subtraction=none; FrameTracker PHYSICAL producer count is " +
+                    "reported separately; workload-scoped HWC attribution requires typed BSP " +
+                    "layer identity evidence",
             )
             val isolationToken = activeTestWindowIsolationToken
             if (
@@ -3790,13 +3813,15 @@ class LabController internal constructor(
             delay(PRECHECK_DELAY_MS)
             verifyPerformanceEnvironmentBeforeProducer()
 
+            val warmupPhase = scenario.phases.firstOrNull()
+                ?.let(::applyPersistentSafety)
+                ?.let(::safeWarmupPhaseFor)
+                ?: throw UnsupportedRunException("실행할 warm-up phase가 없습니다.")
             val warmupProducerGeneration = beginTrackedProducerGeneration()
             progress = progress.copy(
                 stage = RunnerStage.WARMUP,
                 phaseIndex = 0,
-                phase = scenario.phases.firstOrNull()
-                    ?.let(::applyPersistentSafety)
-                    ?.let(::safeWarmupPhaseFor),
+                phase = warmupPhase,
                 targetPhase = scenario.phases.firstOrNull()?.let(::applyPersistentSafety),
                 transitionFraction = 0f,
                 statusText = "surface warm-up",
@@ -3829,7 +3854,113 @@ class LabController internal constructor(
                     "working-set allocation/page touch confirmed; measured-byte baseline reset",
                 )
             }
-            delay(WARMUP_DELAY_MS)
+            val warmupReadinessStartedMs = SystemClock.elapsedRealtime()
+            val warmupReadinessDeadlineMs = saturatingAdd(
+                warmupReadinessStartedMs,
+                PRODUCER_RECOVERY_TIMEOUT_MS,
+            )
+            val warmupMinimumCompleteMs = saturatingAdd(
+                warmupReadinessStartedMs,
+                WARMUP_DELAY_MS,
+            )
+            var warmupGenerationActivated = false
+            var warmupReadyBoundary: WarmupBaselineProducerBoundary
+            while (true) {
+                currentCoroutineContext().ensureActive()
+                val readiness = frameTracker.producerReadiness(warmupProducerGeneration)
+                val processLeaseActive = RendererSafetyState.hasUnconfirmedTeardown()
+                readiness.runtimeFailureReason?.let { failure ->
+                    val reason = "Warm-up producer 실행 실패: $failure"
+                    cancellationReason = reason
+                    throw PlanAbortException(reason)
+                }
+                if (readiness.teardownFailed || readiness.topologyMissed) {
+                    val reason =
+                        "Warm-up producer topology/teardown 증거가 무효화되어 baseline을 " +
+                            "수집하지 않습니다."
+                    cancellationReason = reason
+                    throw PlanAbortException(reason)
+                }
+                if (
+                    !warmupGenerationActivated &&
+                    readiness.topologyPublished &&
+                    !readiness.topologyPending &&
+                    readiness.geometryReady &&
+                    readiness.geometryAppliedProfileOrdinal ==
+                    warmupPhase.layerSizeProfile.ordinal &&
+                    !processLeaseActive &&
+                    frameTracker.activateProducerGeneration(warmupProducerGeneration)
+                ) {
+                    // Activation clears every preparation-era callback. Baseline readiness can
+                    // now be satisfied only by a fresh first buffer from the committed producer.
+                    warmupGenerationActivated = true
+                }
+                val refreshedReadiness =
+                    frameTracker.producerReadiness(warmupProducerGeneration)
+                val refreshedProcessLeaseActive =
+                    RendererSafetyState.hasUnconfirmedTeardown()
+                val nowMs = SystemClock.elapsedRealtime()
+                val readyBoundary = captureWarmupBaselineProducerBoundary(
+                    readiness = refreshedReadiness,
+                    expectedProfileOrdinal = warmupPhase.layerSizeProfile.ordinal,
+                    processLeaseActive = refreshedProcessLeaseActive,
+                )
+                if (
+                    warmupGenerationActivated &&
+                    readyBoundary != null &&
+                    warmupReadyWindowOpen(
+                        nowMs = nowMs,
+                        minimumReadyMs = warmupMinimumCompleteMs,
+                        deadlineMs = warmupReadinessDeadlineMs,
+                    )
+                ) {
+                    warmupReadyBoundary = readyBoundary
+                    progress = progress.copy(
+                        expectedProducerCount = refreshedReadiness.expectedCount,
+                        observedProducerCount = refreshedReadiness.observedCount,
+                        statusText = "warm-up first buffer 확인 · fresh baseline 수집",
+                    )
+                    runEvents += event(
+                        "WARMUP_READY",
+                        "generation=$warmupProducerGeneration; " +
+                            "expected=${refreshedReadiness.expectedCount}; " +
+                            "observed=${refreshedReadiness.observedCount}; " +
+                            "geometryRevision=${refreshedReadiness.geometryAppliedRevision}",
+                    )
+                    break
+                }
+                if (nowMs >= warmupReadinessDeadlineMs) {
+                    frameTracker.markProducerTeardownFailure(warmupProducerGeneration)
+                    val reason =
+                        "Warm-up topology와 fresh first buffer가 " +
+                            "${PRODUCER_RECOVERY_TIMEOUT_MS}ms 안에 준비되지 않았습니다 " +
+                            "(published=${refreshedReadiness.topologyPublished}, " +
+                            "pending=${refreshedReadiness.topologyPending}, " +
+                            "expected=${refreshedReadiness.expectedCount}, " +
+                            "observed=${refreshedReadiness.observedCount}, " +
+                            "geometry=${refreshedReadiness.geometryAppliedRevision}/" +
+                            "${refreshedReadiness.geometryRequestedRevision}, " +
+                            "processLease=$processLeaseActive)."
+                    cancellationReason = reason
+                    runEvents += event("WARMUP_READINESS_TIMEOUT", reason)
+                    throw PlanAbortException(reason)
+                }
+                progress = progress.copy(
+                    expectedProducerCount = visibleExpectedProducerCount(
+                        committedExpectedCount = refreshedReadiness.expectedCount,
+                        topologyPublished = refreshedReadiness.topologyPublished,
+                        topologyPending = refreshedReadiness.topologyPending,
+                        processLeaseActive = refreshedProcessLeaseActive,
+                    ),
+                    observedProducerCount = refreshedReadiness.observedCount,
+                    statusText = if (warmupGenerationActivated) {
+                        "warm-up fresh first buffer 확인 중"
+                    } else {
+                        "warm-up topology/geometry commit 확인 중"
+                    },
+                )
+                delay(RENDERER_TEARDOWN_POLL_MS)
+            }
             // Attribute deltas to the actual scenario, not Surface creation, codec preparation,
             // or the Compose transition into the run screen.
             val baselineSample = try {
@@ -3841,6 +3972,32 @@ class LabController internal constructor(
                     "warm-up 이후 fresh counter baseline을 얻지 못했습니다: " +
                         error.javaClass.simpleName,
                 )
+            }
+            val postBaselineReadiness =
+                frameTracker.producerReadiness(warmupProducerGeneration)
+            val expectedWarmupReadyBoundary = warmupReadyBoundary
+            if (
+                !warmupBaselineProducerBoundaryUnchanged(
+                    expected = expectedWarmupReadyBoundary,
+                    readiness = postBaselineReadiness,
+                    expectedProfileOrdinal = warmupPhase.layerSizeProfile.ordinal,
+                    processLeaseActive = RendererSafetyState.hasUnconfirmedTeardown(),
+                )
+            ) {
+                val reason =
+                    "Fresh baseline 수집 중 warm-up producer topology/readiness가 변경되어 " +
+                        "측정 시작을 중단합니다."
+                cancellationReason = reason
+                runEvents += event(
+                    "WARMUP_BASELINE_INVALIDATED",
+                    "$reason before=$expectedWarmupReadyBoundary; " +
+                        "afterTopologyRevision=${postBaselineReadiness.topologyRevision}; " +
+                        "afterDiscontinuitySerial=" +
+                        "${postBaselineReadiness.topologyDiscontinuitySerial}; " +
+                        "afterGeometryRevision=" +
+                        "${postBaselineReadiness.geometryAppliedRevision}",
+                )
+                throw PlanAbortException(reason)
             }
             establishCounterBaseline(baselineSample)
             runScenarioPhases(scenario)
@@ -9124,6 +9281,82 @@ internal fun producerRecoveryDeadlineExceeded(
 }
 
 /**
+ * A warm-up delay is not producer readiness. The scenario-wide counter baseline is valid only
+ * after the committed warm-up topology, matching geometry, and a fresh post-activation buffer are
+ * all visible at the same bounded observation point.
+ */
+internal fun warmupProducerReadyForBaseline(
+    readiness: ProducerReadiness,
+    expectedProfileOrdinal: Int,
+    processLeaseActive: Boolean,
+): Boolean =
+    readiness.topologyPublished &&
+        !readiness.topologyPending &&
+        !readiness.topologyMissed &&
+        !readiness.teardownFailed &&
+        !readiness.teardownCompleted &&
+        readiness.runtimeFailureReason == null &&
+        !processLeaseActive &&
+        readiness.ready &&
+        readiness.expectedCount > 0 &&
+        readiness.observedCount == readiness.expectedCount &&
+        readiness.geometryReady &&
+        readiness.geometryAppliedProfileOrdinal == expectedProfileOrdinal
+
+internal data class WarmupBaselineProducerBoundary(
+    val expectedCount: Int,
+    val topologyRevision: Long,
+    val topologyDiscontinuitySerial: Long,
+    val geometryRequestedRevision: Long,
+    val geometryAppliedRevision: Long,
+    val geometryProfileOrdinal: Int,
+)
+
+internal fun captureWarmupBaselineProducerBoundary(
+    readiness: ProducerReadiness,
+    expectedProfileOrdinal: Int,
+    processLeaseActive: Boolean,
+): WarmupBaselineProducerBoundary? {
+    if (
+        !warmupProducerReadyForBaseline(
+            readiness = readiness,
+            expectedProfileOrdinal = expectedProfileOrdinal,
+            processLeaseActive = processLeaseActive,
+        )
+    ) {
+        return null
+    }
+    return WarmupBaselineProducerBoundary(
+        expectedCount = readiness.expectedCount,
+        topologyRevision = readiness.topologyRevision,
+        topologyDiscontinuitySerial = readiness.topologyDiscontinuitySerial,
+        geometryRequestedRevision = readiness.geometryRequestedRevision,
+        geometryAppliedRevision = readiness.geometryAppliedRevision,
+        geometryProfileOrdinal = readiness.geometryAppliedProfileOrdinal,
+    )
+}
+
+internal fun warmupBaselineProducerBoundaryUnchanged(
+    expected: WarmupBaselineProducerBoundary,
+    readiness: ProducerReadiness,
+    expectedProfileOrdinal: Int,
+    processLeaseActive: Boolean,
+): Boolean =
+    captureWarmupBaselineProducerBoundary(
+        readiness = readiness,
+        expectedProfileOrdinal = expectedProfileOrdinal,
+        processLeaseActive = processLeaseActive,
+    ) == expected
+
+internal fun warmupReadyWindowOpen(
+    nowMs: Long,
+    minimumReadyMs: Long,
+    deadlineMs: Long,
+): Boolean =
+    minimumReadyMs <= deadlineMs &&
+        nowMs in minimumReadyMs..deadlineMs
+
+/**
  * Warm-up must never allocate codec/SBWC-labelled buffers before the matching vendor route has
  * been applied. It is intentionally a small portable RGB producer; the measured generation is
  * created only after the route-transition teardown barrier.
@@ -10122,25 +10355,29 @@ internal fun capacityReuseGuidance(
 ): HwcCapacityReuseGuidance {
     val candidate = calibration.candidateLayers
     val device = calibration.observedDeviceLayers
+    val client = calibration.observedClientLayers
     if (
         calibration.status != HwcCapacityCalibrationStatus.OBSERVED_AT_CANDIDATE ||
         candidate == null ||
         candidate <= 0 ||
         device == null ||
-        device < 0
+        device < 0 ||
+        client == null ||
+        client < 0
     ) {
         return HwcCapacityReuseGuidance(
-            detail = "calibration unavailable; preserve catalog target and verify fresh vendor pair",
+            candidateProducerCount = candidate?.takeIf { it > 0 },
+            detail =
+                "calibration unavailable; no numeric workload composition boundary is inferred",
         )
     }
-    val deviceCeiling = minOf(device, candidate)
-    val clientCandidate = (deviceCeiling + 1)
-        .takeIf { it in 1..candidate }
     return HwcCapacityReuseGuidance(
-        deviceCandidateCeiling = deviceCeiling,
-        clientPressureCandidate = clientCandidate,
+        candidateProducerCount = candidate,
+        observedAppDeviceLayers = device,
+        observedAppClientLayers = client,
         detail =
-            "advisory only for matching opaque RGB/crop topology; never a universal safety cap",
+            "raw app composition is advisory only; control/root is not subtracted and " +
+                "no producer ceiling is inferred",
     )
 }
 

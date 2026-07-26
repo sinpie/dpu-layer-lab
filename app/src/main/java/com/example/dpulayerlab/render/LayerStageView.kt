@@ -59,9 +59,10 @@ import kotlin.math.sin
 
 /**
  * A stage made of actual BufferQueue-backed views. Each SurfaceView becomes a distinct
- * SurfaceFlinger layer; TextureView phases intentionally collapse content into client/GPU
- * composition. The UI does not claim a given layer is DEVICE-composed until the privileged
- * SurfaceFlinger probe confirms it.
+ * SurfaceFlinger layer; TextureView phases intentionally flatten content into the Activity root
+ * through the app rendering pipeline. App-side flattening is not HWC `CLIENT` evidence: HWC may
+ * still scan out that root layer as `DEVICE`. The UI does not claim either composition type until
+ * a typed observation confirms it.
  */
 class LayerStageView @JvmOverloads constructor(
     context: Context,

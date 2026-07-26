@@ -571,12 +571,15 @@ class LabControllerMathTest {
         )
 
         val guidance = capacityReuseGuidance(observed)
-        assertEquals(8, guidance.deviceCandidateCeiling)
-        assertEquals(9, guidance.clientPressureCandidate)
-        assertTrue(guidance.detail.contains("advisory only"))
+        assertEquals(20, guidance.candidateProducerCount)
+        assertEquals(8, guidance.observedAppDeviceLayers)
+        assertEquals(12, guidance.observedAppClientLayers)
+        assertTrue(guidance.detail.contains("no producer ceiling is inferred"))
+        assertTrue(guidance.uiSummary().contains("workload DEVICE ceiling N/A"))
         assertTrue(observed.uiSummary().contains("HARDWARE_COUNTER@vendor:test"))
         assertTrue(observed.eventDetail().contains("requested=20; candidate=20"))
         assertTrue(observed.eventDetail().contains("lifetime=process-session"))
+        assertTrue(observed.eventDetail().contains("control-root-not-corrected"))
 
         val unavailable = capacityReuseGuidance(
             HwcCapacityCalibrationResult(
@@ -585,8 +588,9 @@ class LabControllerMathTest {
                 detail = "no fresh pair",
             ),
         )
-        assertNull(unavailable.deviceCandidateCeiling)
-        assertNull(unavailable.clientPressureCandidate)
+        assertEquals(20, unavailable.candidateProducerCount)
+        assertNull(unavailable.observedAppDeviceLayers)
+        assertNull(unavailable.observedAppClientLayers)
     }
 
     @Test
@@ -1699,6 +1703,131 @@ class LabControllerMathTest {
             hwcCompositionContractPreserved(
                 typedOrigin,
                 typedOrigin.copy(layerOrientation = LayerOrientation.ROTATION_90),
+            ),
+        )
+    }
+
+    @Test
+    fun warmupBaselineRequiresFreshProducerGeometryAndNoCleanupLease() {
+        val profile = LayerSizeProfile.FULL_SCREEN.ordinal
+        val ready = ProducerReadiness(
+            expectedCount = 1,
+            observedCount = 1,
+            everObservedCount = 1,
+            ready = true,
+            topologyPublished = true,
+            topologyPending = false,
+            geometryRequestedRevision = 2L,
+            geometryAppliedRevision = 2L,
+            geometryRequestedProfileOrdinal = profile,
+            geometryAppliedProfileOrdinal = profile,
+            geometryReady = true,
+        )
+
+        assertTrue(
+            warmupProducerReadyForBaseline(
+                readiness = ready,
+                expectedProfileOrdinal = profile,
+                processLeaseActive = false,
+            ),
+        )
+        listOf(
+            ready.copy(ready = false),
+            ready.copy(observedCount = 0),
+            ready.copy(topologyPublished = false),
+            ready.copy(topologyPending = true),
+            ready.copy(topologyMissed = true),
+            ready.copy(teardownCompleted = true),
+            ready.copy(teardownFailed = true),
+            ready.copy(runtimeFailureReason = "failed"),
+            ready.copy(geometryReady = false),
+            ready.copy(geometryAppliedProfileOrdinal = profile + 1),
+        ).forEach { invalid ->
+            assertFalse(
+                warmupProducerReadyForBaseline(
+                    readiness = invalid,
+                    expectedProfileOrdinal = profile,
+                    processLeaseActive = false,
+                ),
+            )
+        }
+        assertFalse(
+            warmupProducerReadyForBaseline(
+                readiness = ready,
+                expectedProfileOrdinal = profile,
+                processLeaseActive = true,
+            ),
+        )
+
+        val boundary = checkNotNull(
+            captureWarmupBaselineProducerBoundary(
+                readiness = ready,
+                expectedProfileOrdinal = profile,
+                processLeaseActive = false,
+            ),
+        )
+        assertTrue(
+            warmupBaselineProducerBoundaryUnchanged(
+                expected = boundary,
+                readiness = ready,
+                expectedProfileOrdinal = profile,
+                processLeaseActive = false,
+            ),
+        )
+        assertFalse(
+            warmupBaselineProducerBoundaryUnchanged(
+                expected = boundary,
+                readiness = ready.copy(topologyDiscontinuitySerial = 1L),
+                expectedProfileOrdinal = profile,
+                processLeaseActive = false,
+            ),
+        )
+        assertFalse(
+            warmupBaselineProducerBoundaryUnchanged(
+                expected = boundary,
+                readiness = ready.copy(topologyRevision = 1L),
+                expectedProfileOrdinal = profile,
+                processLeaseActive = false,
+            ),
+        )
+        assertFalse(
+            warmupBaselineProducerBoundaryUnchanged(
+                expected = boundary,
+                readiness = ready.copy(geometryAppliedRevision = 3L),
+                expectedProfileOrdinal = profile,
+                processLeaseActive = false,
+            ),
+        )
+    }
+
+    @Test
+    fun warmupReadinessCannotSucceedAfterItsDeadline() {
+        assertFalse(
+            warmupReadyWindowOpen(
+                nowMs = 1_199L,
+                minimumReadyMs = 1_200L,
+                deadlineMs = 5_000L,
+            ),
+        )
+        assertTrue(
+            warmupReadyWindowOpen(
+                nowMs = 1_200L,
+                minimumReadyMs = 1_200L,
+                deadlineMs = 5_000L,
+            ),
+        )
+        assertTrue(
+            warmupReadyWindowOpen(
+                nowMs = 5_000L,
+                minimumReadyMs = 1_200L,
+                deadlineMs = 5_000L,
+            ),
+        )
+        assertFalse(
+            warmupReadyWindowOpen(
+                nowMs = 5_001L,
+                minimumReadyMs = 1_200L,
+                deadlineMs = 5_000L,
             ),
         )
     }

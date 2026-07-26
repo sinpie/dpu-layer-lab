@@ -3,6 +3,7 @@ package com.example.dpulayerlab.ui
 import android.app.Activity
 import android.content.Intent
 import android.content.res.Configuration
+import android.os.SystemClock
 import android.text.format.DateUtils
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -68,6 +69,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.RememberObserver
 import androidx.compose.runtime.getValue
@@ -155,6 +157,7 @@ import com.example.dpulayerlab.monitor.HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS
 import com.example.dpulayerlab.render.LayerStageView
 import com.example.dpulayerlab.render.ProducerFrameCallback
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.util.Locale
 import kotlin.math.roundToInt
@@ -174,12 +177,35 @@ private enum class CatalogSetupStep {
 }
 
 internal const val COLLAPSED_QUEUE_ENTRY_LIMIT = 4
+internal const val RUNNING_HUD_REFRESH_INTERVAL_MS = 1_000L
+
+internal fun runningHudRefreshBucket(monotonicMs: Long): Long =
+    monotonicMs.coerceAtLeast(0L) / RUNNING_HUD_REFRESH_INTERVAL_MS
 
 private data class RunningHudSample(
     val physicalProducerCount: Float?,
     val dpuBusy: Gauge,
     val cpuBusy: Gauge,
     val gpuBusy: Gauge,
+)
+
+@Immutable
+private data class NoExtraSurfaceHudState(
+    val progress: RunProgress,
+    val planProgress: PlanProgress,
+    val telemetry: TelemetrySnapshot,
+    val history: List<RunningHudSample>,
+    val stageWidthPx: Int,
+    val stageHeightPx: Int,
+    val mediaSelected: Boolean,
+    val mediaWidthPx: Int?,
+    val mediaHeightPx: Int?,
+    val decoderLinearReference: DecoderLinearReference?,
+    val safetyAdjustments: List<String>,
+    val performanceIsolationStatus: String,
+    val capacityCalibrationStatus: String,
+    val severeThermalDeratingEnabled: Boolean,
+    val nowMonotonicMs: Long,
 )
 
 private data class LiveHudMetricSpec(
@@ -748,15 +774,14 @@ private fun HeroValue(label: String, value: String) {
 
 @Composable
 private fun MetricGrid(telemetry: TelemetrySnapshot) {
+    val compositionPair = atomicHwcCompositionPair(
+        telemetry = telemetry,
+        nowMonotonicMs = SystemClock.elapsedRealtime(),
+    )
     val compositionGauge = Gauge(
-        value = telemetry.hwcDeviceLayers?.toFloat()
-            ?: telemetry.hwcClientLayers?.toFloat(),
-        quality = when {
-            telemetry.hwcDeviceLayers != null -> telemetry.hwcDeviceLayersQuality
-            telemetry.hwcClientLayers != null -> telemetry.hwcClientLayersQuality
-            else -> MetricQuality.UNAVAILABLE
-        },
-        source = compositionProvenance(telemetry),
+        value = compositionPair?.deviceLayers?.toFloat(),
+        quality = compositionPair?.quality ?: MetricQuality.UNAVAILABLE,
+        source = compositionPair?.source.orEmpty(),
     )
     val metrics = listOf(
         DashboardMetricSpec("AP CPU", telemetry.cpu, "전체 CPU"),
@@ -775,11 +800,14 @@ private fun MetricGrid(telemetry: TelemetrySnapshot) {
             detail = telemetry.dpuBusy.provenanceLabel(),
         ),
         DashboardMetricSpec(
-            label = "HWC D / C",
+            label = "HWC APP D / C",
             gauge = compositionGauge,
-            detail = compositionProvenance(telemetry),
-            valueText = "${telemetry.hwcDeviceLayers ?: "–"} / " +
-                "${telemetry.hwcClientLayers ?: "–"}",
+            detail = compositionPair?.let {
+                "${it.quality.label} · ${it.source} · age ${it.ageMs}ms · " +
+                    "control/root 보정 없음"
+            } ?: "N/A · atomic fresh pair 없음 · control/root 보정 없음",
+            valueText = "${compositionPair?.deviceLayers ?: "–"} / " +
+                "${compositionPair?.clientLayers ?: "–"}",
         ),
     )
     LazyVerticalGrid(
@@ -3214,6 +3242,92 @@ private fun RunningScreen(controller: LabController) {
             )
             ).takeLast(60)
     }
+    var hudNowMonotonicMs by remember {
+        mutableLongStateOf(SystemClock.elapsedRealtime())
+    }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(RUNNING_HUD_REFRESH_INTERVAL_MS)
+            hudNowMonotonicMs = SystemClock.elapsedRealtime()
+        }
+    }
+    val hudRefreshBucket = runningHudRefreshBucket(hudNowMonotonicMs)
+    val hudProgress = remember(
+        hudRefreshBucket,
+        progress.stage,
+        progress.scenario?.id,
+        progress.phaseIndex,
+        progress.producerGeneration,
+        progress.expectedProducerCount,
+        progress.observedProducerCount,
+        progress.thermalDerated,
+    ) {
+        progress
+    }
+    val hudPlanProgress = remember(
+        hudRefreshBucket,
+        planProgress.state,
+        planProgress.queueIndex,
+        planProgress.repeatIndex,
+        planProgress.completedRuns,
+        planProgress.totalRuns,
+        planProgress.durationMultiplier,
+    ) {
+        planProgress
+    }
+    val hudTelemetry = remember(hudRefreshBucket) {
+        telemetry
+    }
+    val hudHistory = remember(hudRefreshBucket) {
+        hudSamples
+    }
+    val hudMediaSelected = controller.selectedMediaUri != null
+    val hudMediaWidthPx = controller.selectedMediaWidthPx
+    val hudMediaHeightPx = controller.selectedMediaHeightPx
+    val hudDecoderLinearReference = controller.selectedMediaLinearReference
+    val hudSafetyAdjustments = controller.lastSafetyAdjustments
+    val hudPerformanceIsolationStatus = controller.performanceIsolationStatus
+    val hudCapacityCalibrationStatus = controller.hwcCapacityCalibration.uiSummary()
+    val hudSevereThermalDeratingEnabled =
+        controller.activeSevereThermalDeratingEnabled
+    val noExtraSurfaceHudState = remember(
+        hudProgress,
+        hudPlanProgress,
+        hudTelemetry,
+        hudHistory,
+        stageWidthPx,
+        stageHeightPx,
+        hudMediaSelected,
+        hudMediaWidthPx,
+        hudMediaHeightPx,
+        hudDecoderLinearReference,
+        hudSafetyAdjustments,
+        hudPerformanceIsolationStatus,
+        hudCapacityCalibrationStatus,
+        hudSevereThermalDeratingEnabled,
+        hudNowMonotonicMs,
+    ) {
+        NoExtraSurfaceHudState(
+            progress = hudProgress,
+            planProgress = hudPlanProgress,
+            telemetry = hudTelemetry,
+            history = hudHistory,
+            stageWidthPx = stageWidthPx,
+            stageHeightPx = stageHeightPx,
+            mediaSelected = hudMediaSelected,
+            mediaWidthPx = hudMediaWidthPx,
+            mediaHeightPx = hudMediaHeightPx,
+            decoderLinearReference = hudDecoderLinearReference,
+            safetyAdjustments = hudSafetyAdjustments.toList(),
+            performanceIsolationStatus = hudPerformanceIsolationStatus,
+            capacityCalibrationStatus = hudCapacityCalibrationStatus,
+            severeThermalDeratingEnabled = hudSevereThermalDeratingEnabled,
+            nowMonotonicMs = hudNowMonotonicMs,
+        )
+    }
+    val stopScenario = remember(controller) {
+        { controller.stopScenario() }
+    }
     Box(
         Modifier
             .fillMaxSize()
@@ -3251,45 +3365,40 @@ private fun RunningScreen(controller: LabController) {
                     },
             )
         }
-        RunningHud(
-            progress = progress,
-            planProgress = planProgress,
-            telemetry = telemetry,
-            history = hudSamples,
-            stageWidthPx = stageWidthPx,
-            stageHeightPx = stageHeightPx,
-            mediaSelected = controller.selectedMediaUri != null,
-            mediaWidthPx = controller.selectedMediaWidthPx,
-            mediaHeightPx = controller.selectedMediaHeightPx,
-            decoderLinearReference = controller.selectedMediaLinearReference,
-            safetyAdjustments = controller.lastSafetyAdjustments,
-            performanceIsolationStatus = controller.performanceIsolationStatus,
-            capacityCalibrationStatus = controller.hwcCapacityCalibration.uiSummary(),
-            severeThermalDeratingEnabled =
-                controller.activeSevereThermalDeratingEnabled,
-            stop = controller::stopScenario,
+        NoExtraSurfaceRunningHud(
+            state = noExtraSurfaceHudState,
+            stop = stopScenario,
         )
     }
 }
 
+/**
+ * Pure Compose control UI. Keep AndroidView/SurfaceView/TextureView out of this subtree so the
+ * HUD never creates another SurfaceFlinger/HWC candidate beyond the Activity root/window layer.
+ *
+ * The root window itself remains a visible composition layer whose DEVICE/CLIENT assignment is
+ * made by SurfaceFlinger/HWC. Public Android APIs cannot force or prove that assignment.
+ */
 @Composable
-private fun RunningHud(
-    progress: RunProgress,
-    planProgress: PlanProgress,
-    telemetry: TelemetrySnapshot,
-    history: List<RunningHudSample>,
-    stageWidthPx: Int,
-    stageHeightPx: Int,
-    mediaSelected: Boolean,
-    mediaWidthPx: Int?,
-    mediaHeightPx: Int?,
-    decoderLinearReference: DecoderLinearReference?,
-    safetyAdjustments: List<String>,
-    performanceIsolationStatus: String,
-    capacityCalibrationStatus: String,
-    severeThermalDeratingEnabled: Boolean,
+private fun NoExtraSurfaceRunningHud(
+    state: NoExtraSurfaceHudState,
     stop: () -> Unit,
 ) {
+    val progress = state.progress
+    val planProgress = state.planProgress
+    val telemetry = state.telemetry
+    val history = state.history
+    val stageWidthPx = state.stageWidthPx
+    val stageHeightPx = state.stageHeightPx
+    val mediaSelected = state.mediaSelected
+    val mediaWidthPx = state.mediaWidthPx
+    val mediaHeightPx = state.mediaHeightPx
+    val decoderLinearReference = state.decoderLinearReference
+    val safetyAdjustments = state.safetyAdjustments
+    val performanceIsolationStatus = state.performanceIsolationStatus
+    val capacityCalibrationStatus = state.capacityCalibrationStatus
+    val severeThermalDeratingEnabled = state.severeThermalDeratingEnabled
+    val nowMonotonicMs = state.nowMonotonicMs
     val phase = progress.phase
     val configuration = LocalConfiguration.current
     val compactHud =
@@ -3477,30 +3586,46 @@ private fun RunningHud(
                         Text("STOP", fontWeight = FontWeight.Bold)
                     }
                 }
-                phase
-                    ?.hwcCompositionExpectation
-                    ?.takeIf { it != HwcCompositionExpectation.NONE }
-                    ?.let { expectation ->
-                        val rawState = rawHwcExpectationState(
+                val expectation =
+                    phase?.hwcCompositionExpectation ?: HwcCompositionExpectation.NONE
+                val liveHwcPair = atomicHwcCompositionPair(
+                    telemetry = telemetry,
+                    nowMonotonicMs = nowMonotonicMs,
+                )
+                val rawHwcState = rawHwcExpectationState(
+                    expectation = expectation,
+                    telemetry = telemetry,
+                    nowMonotonicMs = nowMonotonicMs,
+                )
+                Text(
+                    if (expectation == HwcCompositionExpectation.NONE) {
+                        hwcLayerCountLiveSummary(
+                            telemetry = telemetry,
+                            nowMonotonicMs = nowMonotonicMs,
+                        )
+                    } else {
+                        hwcExpectationLiveSummary(
                             expectation = expectation,
                             telemetry = telemetry,
+                            nowMonotonicMs = nowMonotonicMs,
                         )
-                        Text(
-                            hwcExpectationLiveSummary(
-                                expectation = expectation,
-                                telemetry = telemetry,
-                            ),
-                            color = when (rawState) {
-                                RawHwcExpectationState.MATCH -> Color(0xFFB8CBC5)
-                                RawHwcExpectationState.WAIT,
-                                RawHwcExpectationState.N_A -> Color(0xFFFFC857)
-                            },
-                            style = MaterialTheme.typography.labelSmall,
-                            fontSize = if (compactHud) 8.sp else 10.sp,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
+                    },
+                    color = if (
+                        liveHwcPair != null &&
+                        (
+                            expectation == HwcCompositionExpectation.NONE ||
+                                rawHwcState == RawHwcExpectationState.MATCH
+                            )
+                    ) {
+                        Color(0xFFB8CBC5)
+                    } else {
+                        Color(0xFFFFC857)
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    fontSize = if (compactHud) 8.sp else 10.sp,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
                 HudProgressLine(
                     label = if (compactHud) {
                         "PLAN ${(planProgress.overallFraction * 100f).roundToInt()}% · " +
@@ -4051,7 +4176,7 @@ private fun TrafficHud(traffic: LayerTrafficEstimate?, compact: Boolean) {
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Text(
-                "EXPECTED LAYER TRAFFIC",
+                "WORKLOAD-ONLY LINEAR TRAFFIC REF",
                 color = Color(0xFF86A39A),
                 fontWeight = FontWeight.SemiBold,
                 fontSize = 9.sp,
@@ -4065,10 +4190,10 @@ private fun TrafficHud(traffic: LayerTrafficEstimate?, compact: Boolean) {
         }
         Text(
             if (traffic == null) {
-                "DPU R N/A · producer W N/A"
+                "SCANOUT INPUT N/A · PRODUCER W N/A"
             } else {
-                "DPU R ${traffic.dpuReadBytesPerSecond.formatTrafficRate()} · " +
-                    "producer W ${traffic.producerWriteBytesPerSecond.formatTrafficRate()}"
+                "SCANOUT INPUT ${traffic.dpuReadBytesPerSecond.formatTrafficRate()} · " +
+                    "PRODUCER W ${traffic.producerWriteBytesPerSecond.formatTrafficRate()}"
             },
             color = Color(0xFF65E6C4),
             fontWeight = FontWeight.SemiBold,
@@ -4099,7 +4224,9 @@ private fun TrafficHud(traffic: LayerTrafficEstimate?, compact: Boolean) {
         )
         if (!compact) {
             Text(
-                traffic?.resolutionLabel ?: "linear full-buffer read/write estimate",
+                traffic?.let {
+                    "${it.resolutionLabel} · control/SystemUI·actual CLIENT fallback 제외"
+                } ?: "workload-only linear reference · actual DPU traffic 아님",
                 color = Color(0xFF789087),
                 fontSize = 8.sp,
                 maxLines = 1,
@@ -4152,16 +4279,7 @@ private fun ResultScreen(controller: LabController, modifier: Modifier, onDone: 
     val peakGpuBusy = summary.peakGauge(0f..100f) { it.gpuBusy }
     val peakBusBusy = summary.peakGauge(0f..100f) { it.busBusy }
     val peakProducedFps = summary.peakGauge(0f..Float.MAX_VALUE) { it.producedFps }
-    val peakHwcDeviceLayers = summary.peakLayerCount(
-        value = TelemetrySnapshot::hwcDeviceLayers,
-        quality = TelemetrySnapshot::hwcDeviceLayersQuality,
-        source = TelemetrySnapshot::hwcDeviceLayersSource,
-    )
-    val peakHwcClientLayers = summary.peakLayerCount(
-        value = TelemetrySnapshot::hwcClientLayers,
-        quality = TelemetrySnapshot::hwcClientLayersQuality,
-        source = TelemetrySnapshot::hwcClientLayersSource,
-    )
+    val peakHwcComposition = atomicHwcCompositionPeak(summary.samples)
     LazyColumn(
         modifier = modifier
             .fillMaxSize()
@@ -4237,10 +4355,15 @@ private fun ResultScreen(controller: LabController, modifier: Modifier, onDone: 
                     )
                     ResultRow(
                         "Peak HWC composition",
-                        if (peakHwcDeviceLayers == null && peakHwcClientLayers == null) {
+                        if (peakHwcComposition == null) {
                             "N/A"
                         } else {
-                            "device ${peakHwcDeviceLayers ?: "N/A"} · client ${peakHwcClientLayers ?: "N/A"}"
+                            "app raw D${peakHwcComposition.deviceLayers} · " +
+                                "C${peakHwcComposition.clientLayers} · " +
+                                "T${peakHwcComposition.totalLayers} · " +
+                                "${peakHwcComposition.quality.name}@" +
+                                peakHwcComposition.source.take(32) +
+                                " · control/root 보정 없음"
                         },
                     )
                     ResultRow("Peak memory", summary.peakMemoryUsed?.let { "%.1f%%".format(it) } ?: "N/A")
@@ -4306,26 +4429,33 @@ private fun RunSummary.peakGauge(
     selector: (TelemetrySnapshot) -> Gauge,
 ): GaugePeak = consistentGaugePeak(samples, selector, validRange)
 
-private fun RunSummary.peakLayerCount(
-    value: (TelemetrySnapshot) -> Int?,
-    quality: (TelemetrySnapshot) -> MetricQuality,
-    source: (TelemetrySnapshot) -> String,
-): Int? {
-    var peak: Int? = null
+internal fun atomicHwcCompositionPeak(
+    samples: List<TelemetrySnapshot>,
+): AtomicHwcCompositionPair? {
+    var peak: AtomicHwcCompositionPair? = null
     var firstQuality: MetricQuality? = null
     var firstSource: String? = null
     for (sample in samples) {
-        val count = value(sample)?.takeIf { it >= 0 } ?: continue
-        val sampleQuality = quality(sample)
-        val sampleSource = source(sample)
-        if (sampleQuality == MetricQuality.UNAVAILABLE || sampleSource.isBlank()) continue
+        val pair = atomicHwcCompositionPair(sample) ?: continue
+        val sampleQuality = pair.quality
+        val sampleSource = pair.source
         if (firstQuality == null) {
             firstQuality = sampleQuality
             firstSource = sampleSource
         } else if (sampleQuality != firstQuality || sampleSource != firstSource) {
             return null
         }
-        peak = peak?.let { maxOf(it, count) } ?: count
+        val previous = peak
+        if (
+            previous == null ||
+            pair.totalLayers > previous.totalLayers ||
+            (
+                pair.totalLayers == previous.totalLayers &&
+                    pair.deviceLayers > previous.deviceLayers
+                )
+        ) {
+            peak = pair
+        }
     }
     return peak
 }
@@ -4980,41 +5110,6 @@ private fun Gauge.provenanceLabel(): String =
         "${quality.label} · $source"
     }
 
-private fun compositionProvenance(telemetry: TelemetrySnapshot): String {
-    val sources = buildList {
-        if (telemetry.hwcDeviceLayers != null) {
-            add(
-                Triple(
-                    "D",
-                    telemetry.hwcDeviceLayersQuality,
-                    telemetry.hwcDeviceLayersSource,
-                ),
-            )
-        }
-        if (telemetry.hwcClientLayers != null) {
-            add(
-                Triple(
-                    "C",
-                    telemetry.hwcClientLayersQuality,
-                    telemetry.hwcClientLayersSource,
-                ),
-            )
-        }
-    }
-    if (sources.isEmpty()) return "Unavailable · source N/A"
-
-    val first = sources.first()
-    if (sources.all { it.second == first.second && it.third == first.third }) {
-        return Gauge(
-            quality = first.second,
-            source = first.third,
-        ).provenanceLabel()
-    }
-    return sources.joinToString(" · ") { (label, quality, source) ->
-        "$label ${Gauge(quality = quality, source = source).provenanceLabel()}"
-    }
-}
-
 internal fun dashboardPurposeScenarios(
     scenarios: List<ScenarioSpec>,
 ): List<DashboardPurposeScenario> {
@@ -5322,29 +5417,126 @@ internal fun HwcCompositionExpectation.validationBadge(): String = when (this) {
     HwcCompositionExpectation.CLIENT_REQUIRED -> "CLIENT 전환 검증"
 }
 
+internal data class AtomicHwcCompositionPair(
+    val deviceLayers: Int,
+    val clientLayers: Int,
+    val quality: MetricQuality,
+    val source: String,
+    val evidenceMonotonicMs: Long,
+    val ageMs: Long,
+) {
+    val totalLayers: Long
+        get() = deviceLayers.toLong() + clientLayers.toLong()
+}
+
+/**
+ * Projects only a complete, same-boundary DEVICE/CLIENT pair.
+ *
+ * [TelemetrySnapshot.hwcCompositionEvidenceAgeMs] is the age captured when the telemetry sample
+ * was published. Live UI callers additionally pass the current elapsed realtime so a frozen
+ * snapshot cannot remain visually fresh forever when the monitor stalls.
+ */
+internal fun atomicHwcCompositionPair(
+    telemetry: TelemetrySnapshot,
+    nowMonotonicMs: Long = telemetry.monotonicMs,
+): AtomicHwcCompositionPair? {
+    val device = telemetry.hwcDeviceLayers?.takeIf { it >= 0 } ?: return null
+    val client = telemetry.hwcClientLayers?.takeIf { it >= 0 } ?: return null
+    val evidenceMs = telemetry.hwcCompositionEvidenceMonotonicMs
+        ?.takeIf { it >= 0L }
+        ?: return null
+    val recordedAgeMs = telemetry.hwcCompositionEvidenceAgeMs ?: return null
+    if (
+        telemetry.monotonicMs < evidenceMs ||
+        nowMonotonicMs < telemetry.monotonicMs ||
+        recordedAgeMs != telemetry.monotonicMs - evidenceMs
+    ) {
+        return null
+    }
+    val liveAgeMs = nowMonotonicMs - evidenceMs
+    if (liveAgeMs !in 0L..HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS) return null
+
+    val deviceSource = telemetry.hwcDeviceLayersSource.trim()
+    val clientSource = telemetry.hwcClientLayersSource.trim()
+    val quality = telemetry.hwcDeviceLayersQuality
+    if (
+        quality != telemetry.hwcClientLayersQuality ||
+        quality !in RAW_HWC_COMPOSITION_QUALITIES ||
+        deviceSource.isEmpty() ||
+        deviceSource != clientSource
+    ) {
+        return null
+    }
+    return AtomicHwcCompositionPair(
+        deviceLayers = device,
+        clientLayers = client,
+        quality = quality,
+        source = deviceSource,
+        evidenceMonotonicMs = evidenceMs,
+        ageMs = liveAgeMs,
+    )
+}
+
+internal fun hwcLayerCountLiveSummary(
+    telemetry: TelemetrySnapshot,
+    nowMonotonicMs: Long = telemetry.monotonicMs,
+): String {
+    val pair = atomicHwcCompositionPair(
+        telemetry = telemetry,
+        nowMonotonicMs = nowMonotonicMs,
+    )
+    val device = pair?.deviceLayers?.toString() ?: "N/A"
+    val client = pair?.clientLayers?.toString() ?: "N/A"
+    val total = pair?.totalLayers?.toString() ?: "N/A"
+    val age = pair?.ageMs?.let { "${it}ms" } ?: "N/A"
+    val provenance = pair?.let {
+        compactHwcSource(
+            valueAvailable = true,
+            quality = it.quality,
+            source = it.source,
+        )
+    } ?: run {
+        val deviceSource = compactHwcSource(
+            valueAvailable = false,
+            quality = telemetry.hwcDeviceLayersQuality,
+            source = telemetry.hwcDeviceLayersSource,
+        )
+        val clientSource = compactHwcSource(
+            valueAvailable = false,
+            quality = telemetry.hwcClientLayersQuality,
+            source = telemetry.hwcClientLayersSource,
+        )
+        if (deviceSource == clientSource) deviceSource else "D $deviceSource / C $clientSource"
+    }
+    return "HWC APP RAW · D $device/C $client/T $total · AGE $age · SRC $provenance\n" +
+        "SCOPE 미분리(control/root 보정 없음) · HUD extra Surface 0"
+}
+
 internal fun hwcExpectationLiveSummary(
     expectation: HwcCompositionExpectation,
     telemetry: TelemetrySnapshot,
+    nowMonotonicMs: Long = telemetry.monotonicMs,
 ): String {
     val rawState = rawHwcExpectationState(
         expectation = expectation,
         telemetry = telemetry,
+        nowMonotonicMs = nowMonotonicMs,
     )
-    val deviceValue = telemetry.hwcDeviceLayers?.takeIf { it >= 0 }
-    val clientValue = telemetry.hwcClientLayers?.takeIf { it >= 0 }
-    val device = deviceValue?.toString() ?: "N/A"
-    val client = clientValue?.toString() ?: "N/A"
-    val age = telemetry.hwcCompositionEvidenceAgeMs
-        ?.takeIf { it >= 0L }
-        ?.let { "${it}ms" }
-        ?: "N/A"
+    val pair = atomicHwcCompositionPair(
+        telemetry = telemetry,
+        nowMonotonicMs = nowMonotonicMs,
+    )
+    val device = pair?.deviceLayers?.toString() ?: "N/A"
+    val client = pair?.clientLayers?.toString() ?: "N/A"
+    val total = pair?.totalLayers?.toString() ?: "N/A"
+    val age = pair?.ageMs?.let { "${it}ms" } ?: "N/A"
     val deviceSource = compactHwcSource(
-        valueAvailable = deviceValue != null,
+        valueAvailable = pair != null,
         quality = telemetry.hwcDeviceLayersQuality,
         source = telemetry.hwcDeviceLayersSource,
     )
     val clientSource = compactHwcSource(
-        valueAvailable = clientValue != null,
+        valueAvailable = pair != null,
         quality = telemetry.hwcClientLayersQuality,
         source = telemetry.hwcClientLayersSource,
     )
@@ -5353,44 +5545,29 @@ internal fun hwcExpectationLiveSummary(
     } else {
         "D $deviceSource / C $clientSource"
     }
-    return "HWC ${rawState.label} · D $device/C $client · AGE $age · SRC $provenance\n" +
-        "목표 ${expectation.validationBadge()} · controller target-fresh 최종 판정 별도"
+    return "HWC APP RAW · ${rawState.label} · D $device/C $client/T $total · " +
+        "AGE $age · SRC $provenance\n" +
+        "목표 ${expectation.validationBadge()} · scope 미분리 · " +
+        "target/횟수는 controller 최종 판정"
 }
 
 internal fun rawHwcExpectationState(
     expectation: HwcCompositionExpectation,
     telemetry: TelemetrySnapshot,
+    nowMonotonicMs: Long = telemetry.monotonicMs,
 ): RawHwcExpectationState {
     if (expectation == HwcCompositionExpectation.NONE) return RawHwcExpectationState.N_A
 
-    val device = telemetry.hwcDeviceLayers?.takeIf { it >= 0 }
-        ?: return RawHwcExpectationState.N_A
-    val client = telemetry.hwcClientLayers?.takeIf { it >= 0 }
-        ?: return RawHwcExpectationState.N_A
-    val evidenceMonotonicMs = telemetry.hwcCompositionEvidenceMonotonicMs
-        ?.takeIf { it >= 0L }
-        ?: return RawHwcExpectationState.N_A
-    val evidenceAgeMs = telemetry.hwcCompositionEvidenceAgeMs
-        ?: return RawHwcExpectationState.N_A
-    if (telemetry.monotonicMs < evidenceMonotonicMs) return RawHwcExpectationState.N_A
-    val computedAgeMs = telemetry.monotonicMs - evidenceMonotonicMs
-    val deviceSource = telemetry.hwcDeviceLayersSource.trim()
-    val clientSource = telemetry.hwcClientLayersSource.trim()
-    val validQuality =
-        telemetry.hwcDeviceLayersQuality == telemetry.hwcClientLayersQuality &&
-            telemetry.hwcDeviceLayersQuality in RAW_HWC_COMPOSITION_QUALITIES
-    val atomicFreshPair =
-        evidenceAgeMs == computedAgeMs &&
-            evidenceAgeMs in 0L..HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS &&
-            validQuality &&
-            deviceSource.isNotEmpty() &&
-            deviceSource == clientSource
-    if (!atomicFreshPair) return RawHwcExpectationState.N_A
+    val pair = atomicHwcCompositionPair(
+        telemetry = telemetry,
+        nowMonotonicMs = nowMonotonicMs,
+    ) ?: return RawHwcExpectationState.N_A
 
     val matches = when (expectation) {
         HwcCompositionExpectation.NONE -> false
-        HwcCompositionExpectation.DEVICE_ONLY -> device > 0 && client == 0
-        HwcCompositionExpectation.CLIENT_REQUIRED -> client > 0
+        HwcCompositionExpectation.DEVICE_ONLY ->
+            pair.deviceLayers > 0 && pair.clientLayers == 0
+        HwcCompositionExpectation.CLIENT_REQUIRED -> pair.clientLayers > 0
     }
     return if (matches) RawHwcExpectationState.MATCH else RawHwcExpectationState.WAIT
 }

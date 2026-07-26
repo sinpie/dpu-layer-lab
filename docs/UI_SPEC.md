@@ -172,8 +172,19 @@ Selected-media가 필요한 route는 media와 codec preflight 없이 실행하�
 └────────────────────────────────────────────┘
 ```
 
-HUD는 display cutout inset을 적용하고 좌측 상단에 둔다. Renderer 전체 화면을 차지하지만
-HUD는 control layer로 남으며 report의 `controlLayerIncluded=true`와 일치한다.
+HUD는 display cutout inset을 적용하고 좌측 상단에 둔다. HUD는 `LayerStageView` 뒤에
+같은 Activity root가 그리는 pure Compose이며 HUD 전용
+`SurfaceView`/`TextureView`/`SurfaceControl`을 만들지 않는다. 따라서 HUD가 직접
+추가하는 physical producer와 SF/HWC surface는 0이다. Report의
+`controlLayerIncluded=true`는 Compose HUD를 담은 app Window root가 화면에 남는다는
+뜻이지 HUD 전용 HWC layer가 있다는 뜻이 아니다.
+
+Running HUD의 동적 값은 하나의 immutable snapshot 인자로 전달하고 그 snapshot을
+app-side 최대 1 Hz로만 교체한다. 상위 renderer/progress가 100 ms cadence로
+recomposition되어도 HUD snapshot을 따라 무효화하지 않는다. 이 redraw 정책으로도
+Activity root buffer가 갱신될 수 있으며, cadence를 멈추거나 HUD를 pure Compose로
+유지하는 것만으로 root를 HWC `DEVICE`/`CLIENT` 중 하나로 강제하거나 raw HWC count에서
+제외할 수 없다. UI는 그런 보장을 표시하지 않는다.
 
 ### 필수 live metric
 
@@ -184,6 +195,7 @@ HUD는 control layer로 남으며 report의 `controlLayerIncluded=true`와 일�
 | DPU | busy % 또는 N/A | provenance segment별 gap |
 | CPU | AP CPU % 또는 N/A | provenance segment별 gap |
 | GPU | busy % 또는 N/A | provenance segment별 gap |
+| HWC APP RAW D/C/T | complete same-sample pair와 `T=D+C`; control/root 보정 없음 | pair가 없거나 stale이면 N/A |
 
 각 metric은 source/quality label을 숨기지 않는다. Gauge provenance가 바뀌거나 unavailable인
 경계에서 graph 선을 연결하지 않는다.
@@ -196,6 +208,9 @@ Producer count 표기:
 - `PHYSICAL` 현재 값과 history는 양수인 committed expected count만 사용한다. 따라서
   `FLATTENED_TEXTURE`의 logical N-layer는 `1P`이고 pending sample은 이전 값으로 채우지
   않는다.
+- `PHYSICAL`은 BufferQueue/frame callback producer 수다. Pure Compose HUD/Activity
+  root는 포함하지 않고, mixed backend의 `TextureView` producer는 포함하므로
+  SurfaceFlinger/HWC layer 수 또는 `HWC APP RAW T`와 같다고 해석하지 않는다.
 
 ### Traffic
 
@@ -218,9 +233,23 @@ Producer count 표기:
 - safety clamp/thermal derate/memory low
 - performance isolation
 - process-session HWC calibration requested/actual/result
-- HWC expectation은 `RAW MATCH`, `RAW WAIT`, `RAW N/A` 보조 표시
+- HWC expectation은 `HWC APP RAW · D n/C n/T n`과 `RAW MATCH`, `RAW WAIT`,
+  `RAW N/A` 보조 표시
 
-RAW 상태는 controller의 distinct-sample/coverage verdict를 대체하지 않는다.
+`HWC APP RAW`는 동일 source·quality·evidence timestamp의 complete atomic D/C pair이며
+`T`도 같은 pair의 합으로만 계산한다. 이 값은 scope가 미분리되어 control/root를
+차감하지 않았고 workload producer identity도 제공하지 않는다. HUD의 extra Surface가
+0이라는 사실이나 app-side 최대 1 Hz immutable-snapshot redraw 정책으로 이 root
+contribution을 보정하지 않는다.
+RAW 상태는 controller의 target readiness, distinct-sample/coverage verdict 또는
+workload-only plane 판정을 대체하지 않는다.
+
+각 run은 `HWC_COUNT_SCOPE` event로 `APP_RAW_UNSEPARATED`,
+`controlLayerIncluded=true`, control/root subtraction 없음, FrameTracker `PHYSICAL`
+분리와 scoped BSP layer identity evidence 필요를 report에 남긴다. UI label이나
+candidate 숫자로 이 event의 제한을 숨기지 않는다. Calibration의 requested/actual
+candidate와 raw `T`도 workload plane ceiling이나 보편적 HWC maximum으로 표시하지
+않는다.
 
 ### Compact/landscape
 
@@ -245,12 +274,16 @@ Scenario detail:
 - suspected proxy delta
 - peak CPU/memory/generated traffic
 - stable-source peak DPU/GPU/bus/produced FPS
-- peak HWC DEVICE/CLIENT와 provenance
+- peak HWC app raw `(D, C, T)` atomic tuple과 provenance; control/root 보정 없음
 - sample 수
 - report path/share
 
 Exact evidence가 없으면 proxy를 exact로 승격하지 않는다. Result color만으로 verdict를
 전달하지 않고 label과 terminal reason을 함께 표시한다.
+
+HWC peak는 `max(D)`와 `max(C)`를 서로 다른 sample에서 고르지 않는다. Complete atomic
+pair가 있는 한 sample의 `T=D+C`가 가장 큰 tuple을 선택하고, 같은 T에서는 D가 큰
+tuple을 선택한다. Run 중 pair source/quality가 바뀌면 peak는 `N/A`다.
 
 ## System
 

@@ -39,6 +39,9 @@ DEVICE→CLIENT 전환, layer 크기 변화와 교차 자원 경합을 선택하
 
 - HWC 경로를 topology만으로 보장하지 않는다. `DEVICE_ONLY`와
   `CLIENT_REQUIRED`는 fresh DEVICE/CLIENT evidence를 요구하는 관측 계약이다.
+- 현재 `HWC APP RAW D/C/T`는 Activity root/control과 workload producer scope가
+  분리되지 않은 atomic tuple이다. FrameTracker `PHYSICAL` producer count와 별도로
+  보존하며 raw count로 producer ceiling이나 per-layer assignment를 추론하지 않는다.
 - layer 표시 면적을 줄여도 physical producer 수, buffer allocation과 graphics
   safety budget을 축소했다고 가정하지 않는다.
 - HWC capacity candidate는 process session에서 한 번만 시도하고 terminal 결과를
@@ -48,6 +51,26 @@ DEVICE→CLIENT 전환, layer 크기 변화와 교차 자원 경합을 선택하
   display request와 system bar 상태 복구를 확인한다.
 
 ## Now
+
+### P-007 scoped HWC evidence와 per-layer producer identity (P0)
+
+- **상태:** `PROPOSED`
+- **우선순위:** 향후 BSP 통합의 P0. 현재 portable/raw 계측을 scoped evidence로
+  승격하지 않는다.
+- **의존성:**
+  - app이 실행 중인 display/CRTC에 결속된 snapshot scope
+  - committed producer generation/physical ID와 대응할 안정적인 per-layer identity
+  - Activity root/control과 workload producer를 구분하는 provider 계약
+  - 기존 API v1 raw D/C pair와 report consumer를 위한 version/migration 결정
+- **완료 조건:**
+  - D/C와 per-layer identity, display scope, completion timestamp, source/quality를
+    하나의 원자 evidence로 수집
+  - target generation/topology와 identity가 일치하지 않으면 typed verdict에서 사용하지
+    않고 `INCONCLUSIVE`
+  - HUD/report에서 `APP_RAW_UNSEPARATED`와 scoped evidence를 명확히 구분
+  - process-session capacity의 raw D/C/T 또는 candidate 차이로 producer ceiling을
+    추론하지 않는 boundary test 유지
+  - control/root subtraction이 실제 provider evidence 없이 숫자 보정으로 구현되지 않음
 
 ### P-006 수동 device validation matrix
 
@@ -63,7 +86,8 @@ DEVICE→CLIENT 전환, layer 크기 변화와 교차 자원 경합을 선택하
 
 ## Later
 
-- 제품별 HWC capacity advisory 결과를 scenario 결과와 비교하는 분석 도구
+- P-007 scoped evidence가 구현된 뒤 제품별 HWC capacity advisory 결과를 scenario
+  결과와 비교하는 분석 도구
 - schema v2 report의 offline 비교·회귀 요약 도구
 - vendor provider reference implementation은 별도 BSP repository에서 관리
 

@@ -14,11 +14,11 @@ Launcher와 Gradle project의 표시 이름은 `DPULayerTest`이고 canonical re
 `https://github.com/sinpie/dpu-layer-lab`이다. 제품 호환성 계약인 package
 `com.example.dpulayerlab`, automation component/action, `dpu-layer-lab-` report
 prefix, Soong module/APK 이름 `DpuLayerLab`은 별도 migration 요구 없이 바꾸지 않는다.
-현재 release version은 `20260725_232013`(`versionCode 7`), debug version은
-`20260725_232013-debug`이며 tag는 `v20260725_232013`이다.
+현재 release version은 `20260726_101046`(`versionCode 8`), debug version은
+`20260726_101046-debug`이며 tag는 `v20260726_101046`이다.
 `yyyyMMdd_HHmmss`는 KST build 시각이다. Release asset은
-`DPULayerTest-20260725_232013-debug.apk`,
-`DPULayerTest-20260725_232013-release-unsigned.apk`, `SHA256SUMS.txt` 이름을 사용한다.
+`DPULayerTest-20260726_101046-debug.apk`,
+`DPULayerTest-20260726_101046-release-unsigned.apk`, `SHA256SUMS.txt` 이름을 사용한다.
 
 ## 기본 작업 규칙
 
@@ -195,8 +195,10 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   순서로 rollback한 뒤 fatal error는 다시 throw한다.
 - topology pending 중 fake expected producer를 게시하지 않는다. 실제 relay set을
   commit한 뒤 같은 generation에 한 번 게시하고, 그 전에는 phase clock/transition/
-  workload/frame budget을 시작하지 않는다. Activation은 fresh counter sample 뒤에
-  수행하고 preparation first-buffer를 active startup 성공으로 세지 않는다.
+  workload/frame budget을 시작하지 않는다. Scenario warm-up은 topology publication과
+  matching geometry acknowledgment 뒤 generation을 activation하고 preparation-era
+  callback을 지운다. 그 뒤 committed producer 전부의 fresh first buffer를 bounded하게
+  다시 확인하기 전에는 scenario-wide counter baseline을 수집하지 않는다.
   HUD의 expected count는 unpublished/pending/process-lease 동안 0(`—P`)으로 투영하고
   frame-budget용 committed count와 분리한다.
 - active topology-pending callback에서 callback timestamp/physical total까지 expected
@@ -281,6 +283,12 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   readiness, 최대 4초 pre-target periodic sample mutex drain, probe당 4초 bounded fresh
   composition과 post-target 관측 tick을 위해 `DEVICE_ONLY`는 최소 12초, distinct fresh
   sample 2회를 요구하는 `CLIENT_REQUIRED`는 최소 16초다.
+  현재 `HWC APP RAW D/C/T`는 control/root 보정과 workload identity partition이 없는
+  `APP_RAW_UNSEPARATED` 원자쌍이다. Pure Compose HUD가 extra SF/HWC surface를 만들지
+  않아도 Activity root는 raw scope에 남으며, public/privileged app API로 특정 app
+  layer나 root를 DEVICE/CLIENT로 강제하거나 count에서 제외할 수 없다. Workload-only
+  acceptance에는 display/session, generation/revision과 exact HWC layer identity를 같은
+  validate/present boundary에 결속한 scoped typed BSP evidence가 필요하다.
 - Typed HWC target arm 중 periodic telemetry는 latest-wins try-lock/drop으로 처리해
   forced probe 앞에 waiter를 쌓지 않는다. 필요한 forced sample은 같은 serialized
   ownership에서 수집하되 각 sample 사이 cancellation/thermal contract/fresh producer
@@ -290,9 +298,11 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
 - 앱 process session의 최초 승인된 START는 첫 scenario 전에 HWC capacity 관측을
   정확히 한 번 시도한다. 요청 topology는 20L/30fps/60Hz independent opaque RGB DISPLAY
   `CAPACITY_TILES`이며 runtime safety/graphics budget이 실제 candidate를 줄일 수 있으므로
-  requested=20과 actual candidate를 UI/event/report에서 구분한다. 모든 first buffer 뒤
-  100ms 안정화와 single fresh DEVICE/CLIENT sample까지 producer-active 전체 구간은 하나의
-  absolute 6000ms deadline 안에 있어야 한다. 모든 terminal path에서 producer/generated
+  requested=20과 actual candidate를 UI/event/report에서 구분한다. Topology publication과
+  matching geometry acknowledgment 뒤 activation하고 preparation callback을 지운 뒤
+  post-activation 모든 first buffer, 100ms 안정화와 single fresh DEVICE/CLIENT sample까지
+  producer-active 전체 구간은 하나의 absolute 6000ms deadline 안에 있어야 한다. 모든
+  terminal path에서 producer/generated
   load zero, teardown과 counter drain을 확인한다. Cleanup-confirmed non-cancelled
   경로만 deadline 밖의 3초 settle과 direct safety recheck 뒤 기존 1L scenario
   warm-up/fresh baseline을 시작한다. Renderer target handoff 전에 실패하면 actual
@@ -314,7 +324,8 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   physical dimensions가 바뀌면 projection을 N/A로 무효화하되 같은 process에서 다시
   측정하지 않고 process 재시작을 요구한다. 단순 width/height 축 교환은 재사용한다.
   결과는 matching topology의 advisory boundary일 뿐 universal maximum, renderer safety
-  cap 또는 typed phase evidence가 아니다.
+  cap, workload plane ceiling 또는 typed phase evidence가 아니다. Raw D/C/T에서 root
+  상수를 차감하거나 candidate/`PHYSICAL` 수로 workload composition을 추론하지 않는다.
 - Active run은 periodic/typed 모두 SurfaceFlinger child process를 만들지 않는다. Typed
   boundary는 같은 현재 vendor session의 fresh 원자 쌍만 사용하고 없으면 INCONCLUSIVE다.
   Session calibration의 `CALIBRATION_ONESHOT`은 vendor snapshot을 최대 한 번 prefetch하고
@@ -322,9 +333,12 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   않을 때만 SF fallback을 한 번 허용하며 vendor snapshot을 두 번 호출하지 않는다.
   Session calibration cache를 phase evidence로 재사용하지 않는다. HWC count를 logcat이나
   임의 sysfs/debugfs plane 탐색으로 추론하지 않는다.
-- HUD의 typed HWC `RAW MATCH/WAIT/N/A`는 2.5초 이내 동일 source·quality·timestamp
-  DEVICE/CLIENT pair의 보조 해석일 뿐이다. Target readiness, distinct sample 수와
-  cross-phase 방향성을 확인하는 controller 최종 판정처럼 표시하지 않는다.
+- HUD의 typed HWC `HWC APP RAW D/C/T`와 `RAW MATCH/WAIT/N/A`는 2.5초 이내 동일
+  source·quality·timestamp DEVICE/CLIENT pair와 그 pair의 `T=D+C`를 사용한 보조 해석일
+  뿐이다. Target readiness, distinct sample 수와 cross-phase 방향성을 확인하는
+  controller 최종 판정처럼 표시하지 않는다. 각 run은 `HWC_COUNT_SCOPE` event로
+  `APP_RAW_UNSEPARATED`, `controlLayerIncluded=true`, root subtraction 없음,
+  FrameTracker `PHYSICAL` 분리와 scoped BSP evidence 필요를 남긴다.
 - 16 ms producer hand-off를 넘기면 새 codec/EGL/Canvas replacement를 만들지 않고
   process-wide lease를 bounded poll한다. 5초 안의 transient drain은 phase active time과
   frame budget에서 제외하고 교차 부하를 0으로 유지한다. 연속 recovery deadline을
@@ -376,7 +390,13 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   `PHYSICAL` layer 값은 requested/logical `activeLayers`가 아니라 commit된 expected/
   observed physical producer count를 사용한다. Unpublished/topology-pending/process-lease
   동안 값과 history를 null gap(`—P`)으로 유지하고 logical count를 표시하면 별도 label로
-  구분한다.
+  구분한다. Running HUD는 Activity root의 pure Compose로 유지하고 HUD 전용
+  `SurfaceView`/`TextureView`/`SurfaceControl`을 만들지 않아 extra physical producer와
+  SF/HWC surface가 0이어야 한다. 동적 HUD 값은 하나의 immutable snapshot 인자로
+  전달하고 그 교체를 app-side 최대 1 Hz로 제한해 상위 renderer의 100 ms recomposition과
+  격리한다. 이 redraw 정책에서도 root는 다시 그려질 수 있으며 HWC composition type을
+  강제/제외할 수 없다. `PHYSICAL`에는 root/HUD가 없고 `TextureView` BufferQueue
+  producer가 들어갈 수 있으므로 HWC APP RAW total과 별도다.
 - Test Window의 immersive hide는 status/navigation bar가 모두 invisible이라는 Insets
   acknowledgment 전에는 producer를 시작하지 않는다. 종료 시 `show()` 요청 성공만으로
   token을 해제하지 않고 원래 bar visibility mask의 Insets acknowledgment까지
@@ -441,10 +461,15 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   자동 exact로 승격하지 않는다. Custom probe는 key별 sysfs namespace와 canonical
   regular/readable attribute를 통과해야 하며 `/proc`, traversal, control/whitespace
   path는 거부한다.
-- exact counter baseline은 warm-up 뒤에 잡고 source/quality/monotonic continuity를
-  유지한다. Baseline은 fresh sample barrier로 획득하고 이전 run에서 시작된 in-flight
-  sample은 새 run에 귀속하지 않는다. 양의 delta 증거는 보존하되 0-delta `CLEAN`은
-  baseline 뒤 sample과 끝까지 이어진 연속성이 있을 때만 허용한다.
+- exact counter baseline은 단순 warm-up delay 뒤가 아니라 bounded readiness 뒤에 잡고
+  source/quality/monotonic continuity를 유지한다. Expected topology가 published되어
+  pending/missed가 아니고 matching geometry가 acknowledged된 뒤 activation하고,
+  preparation callback을 지운 이후 committed producer 전부의 fresh first buffer를
+  확인해야 한다. Baseline은 fresh sample barrier로 획득하고 직후 같은
+  topology/geometry/readiness를 재검증하며, 바뀌면 baseline을 폐기하고 fail-closed한다.
+  이전 run에서 시작된 in-flight sample은 새 run에 귀속하지 않는다. 양의 delta 증거는
+  보존하되 0-delta `CLEAN`은 baseline 뒤 sample과 끝까지 이어진 연속성이 있을 때만
+  허용한다.
 - 정상 verdict는 최종 physical producer teardown을 확인한 뒤 serialized fresh terminal
   counter sample까지 성공한 후에만 계산한다. 이 sample 또는 periodic telemetry 실패는
   telemetry gap으로 exact continuity를 무효화한다. Sample evidence timestamp는 모든
@@ -485,7 +510,9 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
   256자로 제한하고 whitespace/control/format 문자를 정규화한다.
 - run peak는 유효 범위 안의 sample 중 같은 `MetricQuality`와 source가 유지된 경우에만
   집계한다. 도중 provenance가 바뀐 CPU/memory/generated traffic/DPU/GPU/bus/produced
-  FPS/HWC DEVICE·CLIENT peak는 합치지 않고 `N/A`로 표시한다.
+  FPS/HWC DEVICE·CLIENT peak는 합치지 않고 `N/A`로 표시한다. HWC peak는 complete
+  same-sample pair의 `(D,C,T=D+C)` tuple 중 T가 가장 크고 동률이면 D가 큰 하나를
+  선택하며 서로 다른 sample의 `max(D)`와 `max(C)`를 결합하지 않는다.
 - traffic은 linear full-buffer `ESTIMATED` 모델이다. 실측 bus 점유율과 합치거나 capacity
   판정에 사용하지 않는다. Selected decoder B/px는 route에서 추론하지 말고 검증된
   MIME/profile descriptor만 사용하며, bit depth/chroma가 불명확하면 aggregate를
@@ -581,8 +608,11 @@ $env:ANDROID_HOME='<ANDROID_SDK_ROOT>'
     system-wide overlapping-client arbitration을 함수 단위와 전체 run/cancel/Activity
     재생성 흐름에서 검증했다.
 11. HWC capacity session 변경은 one-shot claim/terminal reuse, requested/actual,
+    topology/geometry commit → activation → post-activation all-first-buffer readiness,
     6000ms total producer deadline, vendor-prefetch/SF-fallback, Activity 재생성과
-    display-scope projection을 test하고 `SESSION_HWC_CAPACITY_*` event를 검증했다.
+    display-scope projection을 test했다. `SESSION_HWC_CAPACITY_*`와
+    `HWC_COUNT_SCOPE` event, app raw D/C/T same-sample tuple, PHYSICAL 분리 및
+    workload-plane ceiling 미추론도 검증했다.
 12. tracked 파일에 secret, APK, report, local path가 없다.
 13. 보고서는 internal `files/reports`만 사용하고 FileProvider로만 공유한다. 공유할
     파일은 canonical internal directory 안에 실제 존재하며 managed completed

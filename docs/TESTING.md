@@ -98,14 +98,14 @@ release configuration에 local keystore, platform key 경로나 credential을 �
 | `model/ScenarioClassifierTest.kt` | facet OR/AND, 1K/2K/1:1/90° 조건과 intensity |
 | `model/LoadShapeEvaluatorTest.kt` | worker modulation |
 | `model/LoadTransitionEvaluatorTest.kt` | STEP/ramp/stair/pulse/triangle/soak |
-| `model/LayerTrafficEstimatorTest.kt` | format/dimensions/linear traffic와 N/A |
+| `model/LayerTrafficEstimatorTest.kt` | format/dimensions, workload-only linear scanout-input/producer-write reference와 N/A |
 
 ### Catalog와 controller
 
 | Test | 계약 |
 |---|---|
 | `engine/ScenarioCatalogTest.kt` | 36개 preset uniqueness/validity, 1K↔8K, 2K/4K/8K 90° FIT, resolution-only와 FIT/crop A/B/A |
-| `engine/LabControllerMathTest.kt` | verdict, telemetry/HWC coverage, session-calibration deadline, projection/orientation origin·topology·HWC contract, atomic error notice, size-profile arm·coverage, terminal linear endpoint revision/timeout/recovery/fidelity seal, cleanup fatal precedence와 media-worker fatal relay |
+| `engine/LabControllerMathTest.kt` | verdict, bounded warm-up topology/geometry/fresh-first-buffer baseline gate, telemetry/HWC coverage, session-calibration deadline, projection/orientation origin·topology·HWC contract, atomic error notice, size-profile arm·coverage, terminal linear endpoint revision/timeout/recovery/fidelity seal, cleanup fatal precedence와 media-worker fatal relay |
 | `engine/HwcCapacityCalibrationSessionTest.kt` | process one-shot claim/reuse, terminal N/A, Activity recreation scope와 display projection invalidation |
 | `engine/DeviceRenderSafetyTest.kt` | RAM/power-save/low-RAM envelope |
 | `engine/AutomationIntentContractTest.kt` | explicit action, malformed extras, STOP ordering |
@@ -155,11 +155,28 @@ release configuration에 local keystore, platform key 경로나 credential을 �
 
 | Test | 계약 |
 |---|---|
-| `ui/DpuLayerLabAppMathTest.kt`, `engine/LabControllerMathTest.kt` | 목적/facet/preview, bounded queue, whole-loop repeat/time 배율 복원, 400-run/장시간 format, decoder-media 노출, topology-pending 즉시 `—P`와 atomic notice |
+| `ui/DpuLayerLabAppMathTest.kt`, `engine/LabControllerMathTest.kt` | 목적/facet/preview, bounded queue, whole-loop repeat/time 배율 복원, 400-run/장시간 format, decoder-media 노출, topology-pending 즉시 `—P`, 1 Hz dynamic HUD bucket, HWC APP RAW D/C/T freshness/provenance/scope 문구와 atomic-tuple peak |
 | `ui/RendererContainerRememberOwnerTest.kt` | Compose renderer owner identity |
 | `MainActivityMathTest.kt` | display/window/automation, Battery Saver 전용→일반 settings 순서와 cleanup defer |
 | `engine/ReportWriterMathTest.kt` | projection/orientation/effective duration schema, provenance, 400 retention, atomic naming helper |
 | `AppVersionTest.kt` | versionName/versionCode 계약 |
+
+## Warm-up baseline 검증
+
+Scenario-wide exact baseline 변경은 다음 경계를 별도로 검증해야 한다.
+
+- 고정 `WARMUP_DELAY_MS` 경과만으로 baseline-ready가 되지 않음
+- warm-up topology published, not-pending, matching geometry profile과 process teardown
+  lease 없음이 동시에 필요
+- generation activation 전 preparation buffer는 readiness로 사용하지 않고 activation
+  뒤 모든 expected producer의 fresh first buffer를 요구
+- `expectedCount > 0`, `observedCount == expectedCount`, `readiness.ready`를 모두 확인
+- topology missed/teardown/runtime failure 또는 bounded deadline 초과는 baseline을
+  만들지 않고 fail-closed terminal 처리
+- serialized baseline sample 직후 같은 generation의 topology/geometry/readiness를
+  다시 확인하고 중간 변경이면 `WARMUP_BASELINE_INVALIDATED`
+- 정상 경로는 `WARMUP_READY` 뒤 `COUNTER_BASELINE` 순서이며 이전 run의 in-flight
+  telemetry가 baseline이나 peak로 들어오지 않음
 
 ## Process-session HWC capacity 검증
 
@@ -221,8 +238,34 @@ Capacity 변경은 다음 경계를 별도로 검증해야 한다.
 - width/height만 바뀐 orientation swap은 같은 normalized scope로 재사용
 - result가 advisory-only이며 ScenarioSafetyPolicy cap, catalog target, typed phase
   evidence로 사용되지 않음
+- raw D/C/T에 Activity root/control scope가 분리되지 않으며 candidate producer 수,
+  raw D 또는 T의 차이로 producer ceiling을 추론하지 않음
 - 각 scenario report event가 `SESSION_HWC_CAPACITY_CALIBRATION`과
   `SESSION_HWC_CAPACITY_REUSE_GUIDANCE` 이름을 사용
+- reuse guidance가 `candidateProducerCount`,
+  `observedAppDeviceLayers`/`observedAppClientLayers`를 별도 기록하고
+  `workloadDeviceCeiling=N/A`를 유지
+- 각 run event에 `HWC_COUNT_SCOPE=APP_RAW_UNSEPARATED`,
+  `controlLayerIncluded=true`, `control/root subtraction=none`과 FrameTracker
+  `PHYSICAL` count가 별도라는 의미가 남음
+
+## HWC HUD와 raw tuple 검증
+
+- D와 C가 같은 source, quality, evidence timestamp를 가진 complete pair일 때만
+  `T=D+C`를 표시
+- live age가 2.5초를 넘거나 timestamp/recorded age가 모순되면 D/C/T 전체가 N/A
+- HUD summary가 `HWC APP RAW`, age, provenance,
+  `SCOPE 미분리(control/root 보정 없음)`과 `HUD extra Surface 0`을 함께 표시
+- pure Compose HUD subtree에는 별도 AndroidView/SurfaceView/TextureView를 추가하지
+  않지만 Activity root HWC assignment를 force/verified로 표현하지 않음
+- immutable HUD state 단일 인자가 상위 renderer의 100 ms recomposition과 격리되고
+  dynamic text/progress가 1초 bucket 안에서 교체되지 않되 topology pending,
+  stage/safety 경계는 즉시 반영
+- result peak는 독립 D max와 C max를 합치지 않고 한 atomic tuple을 선택하며,
+  `T` 최대·D tie-break와 provenance 변경 시 N/A를 검증
+- raw D/C/T와 FrameTracker의 committed `PHYSICAL` producer count를 별도 값으로 유지
+- scoped BSP evidence/per-layer producer identity가 없을 때 raw tuple로 capacity
+  ceiling이나 producer별 DEVICE/CLIENT assignment를 산출하지 않는 boundary를 검증
 
 ## LayerSizeProfile 검증
 
@@ -272,7 +315,7 @@ Capacity 변경은 다음 경계를 별도로 검증해야 한다.
   따르고 `MotionProfile` scale, overlap, crop/clipping을 포함하지 않음
 - `CAPACITY_TILES`는 base profile 대신 crop-union 1 screen-equivalent와
   평균 `100 / producer count`%, HUD는 estimator scope label을 그대로 표시
-- footprint가 full-buffer DPU read/producer write estimate를 줄이지 않음
+- footprint가 workload-only full-buffer scanout-input/producer-write reference를 줄이지 않음
 - physical producer count와 graphics budget이 visible footprint로 축소되지 않음
 
 관련 source를 추가했는데 위 test가 없다면 `LayerSizeProfile`은 완료로 판정하지 않는다.
@@ -433,6 +476,7 @@ foreach ($relativeFile in $markdown) {
             if (
                 $target -match '[/\\]build[/\\]' -or
                 $target -match '[*?${}<>…]' -or
+                $target.Contains('...') -or
                 $target.EndsWith('.apk') -or
                 (
                     -not $knownRootFile -and
@@ -493,16 +537,21 @@ if ($missing.Count -gt 0) {
 
 - status/navigation bar hide acknowledgment 뒤 producer 시작
 - HUD 값에 source/quality 표시
+- `HWC APP RAW D/C/T`, age/source와 scope 미분리 문구가 표시되고 HUD subtree가
+  추가 Surface를 만들지 않는지
 - expected/observed producer와 frame fidelity 충족
 - typed phase의 fresh HWC pair coverage
 - 첫 process-session HWC capacity attempt 뒤 같은 process의 queue/repeat/새 START에서
   동일 terminal result가 재사용되고 두 번째 calibration producer burst가 없는지
 - requested 20L와 safety-approved actual candidate, calibration display scope가 HUD와
   `SESSION_HWC_CAPACITY_*` report event에 구분되어 남는지
+- run report event에 `HWC_COUNT_SCOPE=APP_RAW_UNSEPARATED`와 no-subtraction/
+  `PHYSICAL` separate 의미가 남고 raw D/C/T로 producer ceiling을 보고하지 않는지
 - 2K/4K/8K 90° FIT phase에서 전체 source가 보이고, 8K 1:1은 centered crop인지
 - whole-queue repeat 경계가 마지막→첫 scenario 순서이고 선택 배율별 effective phase
   시간이 report와 일치하는지
-- exact baseline과 post-teardown terminal sample continuity
+- bounded warm-up topology/geometry/fresh-first-buffer gate 뒤 exact baseline과
+  post-teardown terminal sample continuity
 - STOP/완료 뒤 thread, Surface, codec, NPU/SBWC, wake/display와 system bar 복구
 - 새 plan 시작 전에 sticky cleanup latch 없음
 - report JSON parsing과 schema/provenance 확인

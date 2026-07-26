@@ -19,6 +19,7 @@ import com.example.dpulayerlab.model.TelemetrySnapshot
 import com.example.dpulayerlab.monitor.HWC_COMPOSITION_EVIDENCE_MAX_AGE_MS
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -534,12 +535,43 @@ class DpuLayerLabAppMathTest {
             ),
         )
 
-        assertTrue(summary.contains("HWC RAW N/A"))
+        assertTrue(summary.contains("HWC APP RAW"))
+        assertTrue(summary.contains("RAW N/A"))
         assertTrue(summary.contains("D N/A/C N/A"))
         assertTrue(summary.contains("AGE N/A"))
         assertTrue(summary.contains("SRC D N/A:kernel pro"))
         assertTrue(summary.contains("C N/A:source N/A"))
-        assertTrue(summary.contains("target-fresh 최종 판정 별도"))
+        assertTrue(summary.contains("target/횟수는 controller 최종 판정"))
+    }
+
+    @Test
+    fun runningHwcCountSummaryShowsOnlyAtomicPairAndUnseparatedScope() {
+        val summary = hwcLayerCountLiveSummary(
+            telemetry = atomicHwcTelemetry(device = 4, client = 2),
+        )
+
+        assertTrue(summary.contains("HWC APP RAW"))
+        assertTrue(summary.contains("D 4/C 2/T 6"))
+        assertTrue(summary.contains("SCOPE 미분리"))
+        assertTrue(summary.contains("control/root 보정 없음"))
+        assertTrue(summary.contains("HUD extra Surface 0"))
+    }
+
+    @Test
+    fun typedRunningHwcSummaryKeepsRawStateAuxiliaryToControllerVerdict() {
+        val match = hwcExpectationLiveSummary(
+            expectation = HwcCompositionExpectation.DEVICE_ONLY,
+            telemetry = atomicHwcTelemetry(device = 4, client = 0),
+        )
+        val wait = hwcExpectationLiveSummary(
+            expectation = HwcCompositionExpectation.CLIENT_REQUIRED,
+            telemetry = atomicHwcTelemetry(device = 4, client = 0),
+        )
+
+        assertTrue(match.contains("RAW MATCH"))
+        assertTrue(wait.contains("RAW WAIT"))
+        assertTrue(match.contains("controller 최종 판정"))
+        assertTrue(wait.contains("controller 최종 판정"))
     }
 
     @Test
@@ -590,6 +622,32 @@ class DpuLayerLabAppMathTest {
     }
 
     @Test
+    fun rawHwcStateExpiresAgainstLiveClockWhenTelemetryStops() {
+        val telemetry = atomicHwcTelemetry(
+            device = 4,
+            client = 0,
+            evidenceAgeMs = 1_000L,
+        )
+
+        assertEquals(
+            RawHwcExpectationState.MATCH,
+            rawHwcExpectationState(
+                expectation = HwcCompositionExpectation.DEVICE_ONLY,
+                telemetry = telemetry,
+                nowMonotonicMs = 11_500L,
+            ),
+        )
+        assertEquals(
+            RawHwcExpectationState.N_A,
+            rawHwcExpectationState(
+                expectation = HwcCompositionExpectation.DEVICE_ONLY,
+                telemetry = telemetry,
+                nowMonotonicMs = 11_501L,
+            ),
+        )
+    }
+
+    @Test
     fun rawHwcStateRejectsMixedSourceOrQualityAndDistinguishesWait() {
         val clientMatch = atomicHwcTelemetry(device = 2, client = 3)
         val mixedSource = clientMatch.copy(hwcClientLayersSource = "vendor display")
@@ -617,6 +675,42 @@ class DpuLayerLabAppMathTest {
             RawHwcExpectationState.N_A,
             rawHwcExpectationState(HwcCompositionExpectation.NONE, clientMatch),
         )
+    }
+
+    @Test
+    fun peakHwcCompositionKeepsOneAtomicTupleInsteadOfCombiningIndependentMaxima() {
+        val lowerTotalHigherDevice = atomicHwcTelemetry(device = 5, client = 0)
+        val higherTotal = atomicHwcTelemetry(device = 2, client = 6).copy(
+            monotonicMs = 11_000L,
+            hwcCompositionEvidenceMonotonicMs = 10_000L,
+        )
+
+        val peak = checkNotNull(
+            atomicHwcCompositionPeak(listOf(lowerTotalHigherDevice, higherTotal)),
+        )
+
+        assertEquals(2, peak.deviceLayers)
+        assertEquals(6, peak.clientLayers)
+        assertEquals(8L, peak.totalLayers)
+        assertNull(
+            atomicHwcCompositionPeak(
+                listOf(
+                    lowerTotalHigherDevice,
+                    higherTotal.copy(
+                        hwcDeviceLayersSource = "other",
+                        hwcClientLayersSource = "other",
+                    ),
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun runningHudRefreshBucketCapsDynamicControlUiAtOneHertz() {
+        assertEquals(0L, runningHudRefreshBucket(monotonicMs = 999L))
+        assertEquals(1L, runningHudRefreshBucket(monotonicMs = 1_000L))
+        assertEquals(2L, runningHudRefreshBucket(monotonicMs = 2_999L))
+        assertEquals(0L, runningHudRefreshBucket(monotonicMs = -1L))
     }
 
     @Test

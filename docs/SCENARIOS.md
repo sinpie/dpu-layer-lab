@@ -237,6 +237,14 @@ Fresh evidence가 같은 target geometry를 나타내야 하므로
 `GRADUAL_SMALL_TO_FULL`/`ABRUPT_SMALL_FULL` dynamic profile을 결합한 typed phase도
 reject한다.
 
+실행 HUD의 `HWC APP RAW · D/C/T · AGE · SRC`는 위 controller 계약의 입력이 될 수
+있는 현재 atomic tuple을 보여줄 뿐이다. `T`는 같은 tuple의 `D+C`이고, 현재
+portable/vendor 계약은 Activity root/control과 committed workload producer를
+per-layer identity로 분리하지 않는다. 따라서 raw D/C/T가 matching target에서
+관측됐다는 사실을 producer별 assignment나 plane ceiling으로 바꾸어 해석하지 않는다.
+그 주장은 display/CRTC scope와 committed producer identity에 결속된 BSP evidence가
+추가된 뒤에만 가능하다.
+
 ## Catalog 목적별 지도
 
 현재 source candidate의 catalog는 36개 preset이며 Custom은 이 수에 포함하지 않는다.
@@ -250,13 +258,21 @@ reject한다.
 | `dvfs-composition-shock` | settle 뒤 HWC-friendly, alpha/client, DRAM+3D shock | 단계별 복합 ramp |
 | `dpu-device-envelope-burst` | 1L/30fps→opaque RGB 4L/120fps/120Hz | 보수적 DEVICE candidate |
 | `dpu-client-fallback-burst` | 1L/30fps→20L mixed/alpha/GL 120fps | CLIENT fallback candidate |
-| `dpu-only-repeat-shock` | cross-load 0, 1L/30fps↔12L/120fps 반복 | display-only 급변 |
+| `dpu-only-repeat-shock` | generated cross-load 0, 1L/30fps↔12L/120fps 반복 | display-pipeline 급변; DPU 단일축 아님 |
 
 4L이나 20L은 제품의 보편적 HWC 한계가 아니다. Process-session capacity calibration은
 20L를 요청하지만 safety/graphics budget이 actual candidate를 줄일 수 있다. 최초
 terminal 결과를 이후 scenario/repeat/START가 재사용하더라도 matching opaque RGB
 DISPLAY tile topology의 advisory boundary일 뿐이며 catalog target, safety cap 또는 typed
-phase evidence를 바꾸지 않는다.
+phase evidence를 바꾸지 않는다. Raw D/C/T에는 Activity root/control 분리가 없으므로
+candidate producer 수와 raw D 또는 T의 차이를 이용해 producer ceiling을 추론하지
+않는다.
+
+`dpu-only-repeat-shock`는 automation 호환성을 위해 stable ID를 유지하지만
+사용자-facing 이름은 `Display-pipeline Repeated Step Shock`이다. `workloads=0`은
+명시적 CPU/memory/GPU/NPU generator가 idle이라는 뜻이다. 각 Canvas producer의 draw,
+buffer post와 memory write는 producer FPS에 따라 계속되므로 이 preset을 DPU-only,
+GPU/CPU/DRAM-free 또는 단일 원인 실험으로 설명하면 안 된다.
 
 ### Layer size profile
 
@@ -342,8 +358,11 @@ UI의 빠른 목적은 다음 질문에 대응한다.
 - **CLIENT 전환 목표:** mixed/alpha/GL pressure 뒤 CLIENT>0 fresh evidence가 반복되는가?
 
 각 card는 “입력 변화”, “합성 목표”, “확인할 metric”을 실행 전에 보여야 한다.
-`RAW MATCH/WAIT/N/A`는 2.5초 이내 동일 source/quality/timestamp pair의 보조 표시이며
-controller의 phase coverage verdict를 대신하지 않는다.
+`RAW MATCH/WAIT/N/A`와 `HWC APP RAW D/C/T`는 2.5초 이내 동일
+source/quality/timestamp pair의 보조 표시이며 controller의 phase coverage verdict를
+대신하지 않는다. Pure Compose HUD는 별도 Surface를 추가하지 않지만 Activity
+root/window layer의 HWC assignment를 강제하지도 않으며, 현재 raw tuple에서 이를
+workload producer와 분리하지 못한다.
 
 ## Custom scenario
 

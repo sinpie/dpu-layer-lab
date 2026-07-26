@@ -434,10 +434,13 @@ class ScenarioCatalogTest {
     }
 
     @Test
-    fun dpuOnlyRepeatShockChangesOnlyLayerFpsAndHzAndEndsRecovered() {
+    fun displayPipelineRepeatShockKeepsGeneratedCrossLoadsZeroAndEndsRecovered() {
         val scenario = checkNotNull(ScenarioCatalog.byId("dpu-only-repeat-shock"))
         assertEquals(ScenarioCategory.TRANSITION, scenario.category)
         assertEquals(7, scenario.phases.size)
+        assertTrue(scenario.name.contains("Display-pipeline"))
+        assertTrue(scenario.description.contains("producer Canvas draw"))
+        assertTrue(scenario.description.contains("DPU 단일축이 아닌"))
 
         val low = scenario.phases.first()
         val burstIndices = listOf(1, 3, 5)
